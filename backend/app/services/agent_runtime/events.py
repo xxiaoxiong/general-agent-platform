@@ -372,6 +372,18 @@ class EventBus:
         ev.agent_id = ev.agent_id if ev.agent_id is not None else self.agent_id
         ev.status = ev.status or self.status
         ev.trace_id = ev.trace_id or self.trace_id
+        # P1-05：工具事件统一计数（覆盖 adapter/内部/子代理所有工具来源）；
+        # 只按终态计数（completed/failed），指标故障绝不影响事件发布
+        if ev.type in (TOOL_COMPLETED, TOOL_FAILED):
+            try:
+                from app.observability import metrics
+
+                metrics.observe_tool(
+                    str((ev.data or {}).get("tool") or "unknown"),
+                    "completed" if ev.type == TOOL_COMPLETED else "failed",
+                )
+            except Exception:  # noqa: BLE001
+                pass
         if self.persist and ev.run_id:
             if ev.type == MODEL_DELTA:
                 # P1-06 §14.5：MODEL_DELTA 批量持久化（不每 Token 一个事务）。

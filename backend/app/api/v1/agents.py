@@ -765,6 +765,11 @@ async def stream_run_events(
         raise HTTPException(status_code=404, detail="运行不存在")
     if last_event_id and last_event_id.strip().isdigit():
         after_seq = int(last_event_id.strip())
+    if after_seq is not None:
+        # P1-05：SSE 断线重连计数（after_seq / Last-Event-ID 续传）
+        from app.observability import metrics
+
+        metrics.inc_sse_reconnect()
 
     async def event_stream():
         async for event in get_runtime_service().replay_events(run_id, after_seq):

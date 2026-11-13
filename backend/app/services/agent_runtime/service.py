@@ -416,7 +416,10 @@ class AgentRuntimeService:
         batch_action_ids = await self._current_batch_action_ids(run_id)
 
         # 审批决策必须先持久化成功（关键写入失败向上抛出，不得带病执行副作用）
-        await self._record_approval_decision(run_id, decisions, deciding_user_id)
+        with platform_span("hitl_approval", run_id=run_id,
+                           attributes={"deciding_user_id": deciding_user_id,
+                                       "decision_types": [str(d.get("type")) for d in decisions]}):
+            await self._record_approval_decision(run_id, decisions, deciding_user_id)
 
         # 图内恢复用决策（P1-03 A）：**只按当前 Interrupt 批次**的动作顺序构造。
         # langchain HITL batched 模式 decisions 数组与 action_requests 按位置对齐
@@ -1174,6 +1177,9 @@ class AgentRuntimeService:
             # P0-02 E / LF-04：fencing 失败 —— 立即中止推进：
             # 不写 Session、不发布 RUN_COMPLETED / RUN_FAILED、不产生新副作用，
             # 保留数据库中当前有效 Worker 的状态；本地流以 run_suspended 边界终止
+            from app.observability import metrics as _metrics
+
+            _metrics.inc_lease_lost()
             logger.warning("run %s 执行权丢失（fencing 拒绝），中止推进：%s", run.run_id, e)
             try:
                 await bus.publish(RuntimeEvent(
@@ -1194,6 +1200,16 @@ class AgentRuntimeService:
                 error=run.error,
                 attributes=run.summary or {},
             )
+            # P1-05：Run 终态/耗时指标（防御式，不影响收尾）
+            try:
+                from app.observability import metrics as _metrics
+
+                _metrics.observe_run_finished(
+                    status=run.status or "unknown",
+                    duration_seconds=(ctx.elapsed() if ctx else 0.0),
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     # ── Run 级执行预算（P1-05 §13）：跨崩溃/HITL 恢复不重置 ─────────────
 

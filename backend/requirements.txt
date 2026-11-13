@@ -59,6 +59,7 @@ opentelemetry-instrumentation-fastapi==0.66b2
 opentelemetry-instrumentation-sqlalchemy==0.66b2
 opentelemetry-instrumentation-httpx==0.66b2
 opentelemetry-instrumentation-redis==0.66b2
+prometheus-client==0.26.0
 
 # Vector DB
 chromadb==1.5.9

@@ -18,6 +18,7 @@ import socket
 import time
 import uuid
 from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from app.core.config import settings
@@ -181,6 +182,7 @@ class RunWorker:
     async def claim_run(self, run_id: str, *, paused: bool = False) -> Optional[Any]:
         """原子领取 Run，返回领取后的 agent_runs 行（含新 lease_version）；失败返回 None。"""
         from app.observability.langfuse_tracing import platform_span
+        from app.observability import metrics
 
         try:
             with platform_span("worker_claim", run_id=run_id,
@@ -210,6 +212,13 @@ class RunWorker:
                         )
                         return None
                     await db.commit()
+                if row is not None:
+                    # P1-05：排队等待（创建 → 领取）与恢复领取计数
+                    created = getattr(row, "created_at", None)
+                    if created is not None:
+                        metrics.observe_queue_wait((datetime.utcnow() - created).total_seconds())
+                    if paused:
+                        metrics.inc_recovery("claimed_paused")
                 return row
         except Exception:
             logger.exception("run %s 领取失败", run_id)
@@ -479,6 +488,13 @@ class RunWorker:
                 raise
             except Exception:
                 logger.exception("Worker 轮询失败")
+            # P1-05：活跃 Run 数（每轮刷新，指标故障不影响轮询）
+            try:
+                from app.observability import metrics
+
+                metrics.set_active_runs(len(self._active))
+            except Exception:  # noqa: BLE001
+                pass
             await asyncio.sleep(self.poll_interval)
 
     async def _cleanup_events(self) -> None:

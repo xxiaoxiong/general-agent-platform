@@ -219,3 +219,14 @@ app.include_router(databases.router, prefix=API_PREFIX)
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok", "version": settings.APP_VERSION}
+
+
+@app.get("/metrics")
+async def prometheus_metrics():
+    """P1-05：Prometheus 抓取端点（独立注册表，未启用指标时返回空文本）。"""
+    from fastapi import Response
+
+    from app.observability.metrics import render
+
+    body, content_type = render()
+    return Response(content=body, media_type=content_type)

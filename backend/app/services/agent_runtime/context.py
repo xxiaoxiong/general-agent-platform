@@ -244,4 +244,17 @@ class ModelUsageCallback(BaseCallbackHandler):
     def _finish(self, run_id: Any, response: Any) -> None:
         streamed = self._streamed.pop(run_id, 0)
         used = _usage_output_tokens(response)
-        self.ctx.tokens_generated += used if used is not None else streamed
+        tokens = used if used is not None else streamed
+        self.ctx.tokens_generated += tokens
+        # P1-05：模型调用/Token 指标（防御式，不影响计数路径）
+        try:
+            from app.observability import metrics
+
+            metrics.observe_model(
+                provider="platform",
+                model=self.ctx.model_id or "unknown",
+                status="completed",
+                completion_tokens=tokens,
+            )
+        except Exception:  # noqa: BLE001
+            pass
