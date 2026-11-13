@@ -180,33 +180,37 @@ class RunWorker:
 
     async def claim_run(self, run_id: str, *, paused: bool = False) -> Optional[Any]:
         """原子领取 Run，返回领取后的 agent_runs 行（含新 lease_version）；失败返回 None。"""
+        from app.observability.langfuse_tracing import platform_span
+
         try:
-            async with AsyncSessionLocal() as db:
-                repo = RunRepository(db)
-                if paused:
-                    lease_version = await repo.claim_paused(
-                        run_id, self.worker_id, self.lease_seconds
-                    )
-                else:
-                    lease_version = await repo.claim(
-                        run_id, self.worker_id, self.lease_seconds
-                    )
-                row = await repo.get_run(run_id) if lease_version is not None else None
-                if row is not None and row.session_id and not await SessionRepository(db).claim_execution(
-                    row.session_id, run_id, self.lease_seconds
-                ):
-                    # Session 执行权被其他活跃 Run 持有（P1-02 A：单 Session 单
-                    # 活跃 Run）：释放 Run 领取回到可领取状态，等待 Session
-                    # 空闲后由轮询重试，绝不并发驱动同一 Session
-                    await repo.release(run_id, self.worker_id, lease_version)
+            with platform_span("worker_claim", run_id=run_id,
+                               attributes={"worker_id": self.worker_id, "paused": paused}):
+                async with AsyncSessionLocal() as db:
+                    repo = RunRepository(db)
+                    if paused:
+                        lease_version = await repo.claim_paused(
+                            run_id, self.worker_id, self.lease_seconds
+                        )
+                    else:
+                        lease_version = await repo.claim(
+                            run_id, self.worker_id, self.lease_seconds
+                        )
+                    row = await repo.get_run(run_id) if lease_version is not None else None
+                    if row is not None and row.session_id and not await SessionRepository(db).claim_execution(
+                        row.session_id, run_id, self.lease_seconds
+                    ):
+                        # Session 执行权被其他活跃 Run 持有（P1-02 A：单 Session 单
+                        # 活跃 Run）：释放 Run 领取回到可领取状态，等待 Session
+                        # 空闲后由轮询重试，绝不并发驱动同一 Session
+                        await repo.release(run_id, self.worker_id, lease_version)
+                        await db.commit()
+                        logger.info(
+                            "run %s 未取得 session %s 执行权，放弃本次领取",
+                            run_id, row.session_id,
+                        )
+                        return None
                     await db.commit()
-                    logger.info(
-                        "run %s 未取得 session %s 执行权，放弃本次领取",
-                        run_id, row.session_id,
-                    )
-                    return None
-                await db.commit()
-            return row
+                return row
         except Exception:
             logger.exception("run %s 领取失败", run_id)
             return None

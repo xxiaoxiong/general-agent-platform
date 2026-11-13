@@ -133,6 +133,16 @@ class Settings(BaseSettings):
     AGENT_RUNTIME_POLL_INTERVAL: float = 1.0    # 扫描待执行/孤儿 Run 的间隔
     AGENT_RUNTIME_SHUTDOWN_GRACE: float = 30.0  # 优雅关闭时等待在途 Run 的秒数
 
+    # ── 可观测性（Phase 1）：Langfuse / OpenTelemetry ─────────────────────
+    LANGFUSE_PUBLIC_KEY: str = ""               # 未配置时整条 Langfuse 链路为 no-op
+    LANGFUSE_SECRET_KEY: str = ""
+    LANGFUSE_BASE_URL: str = "https://cloud.langfuse.com"
+    LANGFUSE_TRACING_SAMPLE_RATE: float = 1.0   # 0.0~1.0 采样率（P1-04）
+    LANGFUSE_RELEASE: str = ""                  # 版本关联（缺省用 APP_VERSION）
+    OTEL_ENABLED: bool = False                  # OpenTelemetry 导出（P1-02）
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = ""       # 如 http://localhost:4317
+    OTEL_SERVICE_NAME: str = "ai-generalplat"
+
     @property
     def cors_origins_list(self) -> List[str]:
         return json.loads(self.CORS_ORIGINS)

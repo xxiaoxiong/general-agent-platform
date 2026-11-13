@@ -66,6 +66,9 @@ async def lifespan(app: FastAPI):
     from app.services.inference import ModelManager
     await ModelManager.get_instance().cleanup_idle(max_idle_seconds=0)
     await close_redis()
+    # P1-01：冲刷 Langfuse 批量缓冲（未配置时为 no-op）
+    from app.observability.langfuse_tracing import shutdown_langfuse
+    shutdown_langfuse()
     logger.info("服务已关闭")
 
 

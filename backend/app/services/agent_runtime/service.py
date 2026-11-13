@@ -28,6 +28,7 @@ from langgraph.types import Command
 from app.core.config import settings
 from app.models.agent import AgentRun as AgentRunRow, AgentSession
 from app.core.database import AsyncSessionLocal
+from app.observability.langfuse_tracing import make_callback_handler, platform_span
 
 from .context import (
     ExecutionBudget,
@@ -1045,8 +1046,6 @@ class AgentRuntimeService:
                 config["recursion_limit"] = (
                     ctx.budget.max_steps * 12 + 40 if ctx.budget.max_steps > 0 else 10000
                 )
-                # FR-10：模型调用按一次请求计数（Runnable 生命周期回调，不按 Chunk）
-                config["callbacks"] = [ModelUsageCallback(ctx)]
                 run_config = config
 
                 # FR-09：挂起/重启恢复后从事件日志重建已产生的最终文本片段，
@@ -1054,17 +1053,30 @@ class AgentRuntimeService:
                 if not run.final_text_parts:
                     run.final_text_parts = await self._load_prior_final_text(run.run_id)
 
-                try:
-                    # P1-05 §13：按绝对 deadline 计算剩余超时（重启不重新获得完整时间）
-                    _deadline = ctx.budget_deadline_at
-                    if _deadline is not None:
-                        _remaining = max(0.0, (_deadline - datetime.utcnow()).total_seconds())
-                    else:
-                        _remaining = ctx.budget.run_timeout_seconds
-                    async with asyncio.timeout(_remaining):
-                        await self._consume_stream(agent, payload, run_config, ctx, run, bus)
-                except asyncio.TimeoutError:
-                    raise _RunLimitExceeded(f"运行超时（>{ctx.budget.run_timeout_seconds}s）")
+                with platform_span(
+                    "agent_run", run_id=run.run_id,
+                    attributes={
+                        "thread_id": run.thread_id, "agent_id": run.agent_id,
+                        "session_id": run.session_id, "model_id": log_fields["model_id"],
+                    },
+                ):
+                    callbacks: List[Any] = [ModelUsageCallback(ctx)]
+                    lf_handler = make_callback_handler(run.run_id)
+                    if lf_handler is not None:
+                        callbacks.append(lf_handler)
+                    config["callbacks"] = callbacks
+
+                    try:
+                        # P1-05 §13：按绝对 deadline 计算剩余超时（重启不重新获得完整时间）
+                        _deadline = ctx.budget_deadline_at
+                        if _deadline is not None:
+                            _remaining = max(0.0, (_deadline - datetime.utcnow()).total_seconds())
+                        else:
+                            _remaining = ctx.budget.run_timeout_seconds
+                        async with asyncio.timeout(_remaining):
+                            await self._consume_stream(agent, payload, run_config, ctx, run, bus)
+                    except asyncio.TimeoutError:
+                        raise _RunLimitExceeded(f"运行超时（>{ctx.budget.run_timeout_seconds}s）")
 
             # 结束分支
             if run.status == STATUS_RUNNING:
@@ -1438,7 +1450,9 @@ class AgentRuntimeService:
         重启后可恢复），绝不改变 Run 终态。写回失败向上抛出（Completion 路径
         调用方先已持久化 Run 结果，失败态路径调用方仅记日志）。
         """
-        await self._deliver_outbox(run.run_id)
+        with platform_span("session_writeback", run_id=run.run_id,
+                           attributes={"session_id": run.session_id}):
+            await self._deliver_outbox(run.run_id)
 
     async def _deliver_outbox(self, run_id: str) -> None:
         """按 Outbox 记录执行一次 Session 写回（幂等、可重试）。"""
