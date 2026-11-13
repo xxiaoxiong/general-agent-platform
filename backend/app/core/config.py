@@ -2,6 +2,16 @@ from pydantic_settings import BaseSettings
 from typing import List, Optional
 import json
 
+# P0-04：生产环境拒绝的默认/弱凭据（大小写不敏感）
+_INSECURE_SECRET_KEYS = frozenset({
+    "change-me-in-production-min-32-chars-long!!",
+    "change-me-in-production-please-use-a-long-random-key",
+})
+_INSECURE_ADMIN_PASSWORDS = frozenset({
+    "admin@123456", "admin123", "admin123456", "password", "123456",
+    "password123", "changeme", "root", "test",
+})
+
 
 class Settings(BaseSettings):
     APP_NAME: str = "AI-GeneralPlat"
@@ -146,6 +156,25 @@ class Settings(BaseSettings):
                     "请配置持久化后端（postgresql://... 或 sqlite:///...），"
                     "多 Worker 部署必须使用 PostgreSQL 以共享 Graph State。"
                 )
+        if self.is_production:
+            self._validate_production_secrets()
+
+    def _validate_production_secrets(self) -> None:
+        """P0-04 部署安全：生产环境拒绝默认凭据，强制经环境变量/Secret 注入真实值。"""
+        secret = (self.SECRET_KEY or "").strip()
+        if secret.lower() in _INSECURE_SECRET_KEYS or "change-me" in secret.lower() or len(secret) < 32:
+            raise RuntimeError(
+                "配置非法，拒绝启动：APP_ENV=production 时 SECRET_KEY 必须为"
+                "至少 32 位的随机密钥，不得使用默认占位值。"
+                "请通过环境变量或 Secret 注入（如 openssl rand -hex 32 生成）。"
+            )
+        admin_pwd = (self.ADMIN_PASSWORD or "").strip()
+        if admin_pwd.lower() in _INSECURE_ADMIN_PASSWORDS or len(admin_pwd) < 12:
+            raise RuntimeError(
+                "配置非法，拒绝启动：APP_ENV=production 时 ADMIN_PASSWORD 必须"
+                "更换为至少 12 位的强初始口令，不得使用默认值 Admin@123456 等。"
+                "请通过环境变量或 Secret 注入，首次登录后立即修改。"
+            )
 
     class Config:
         env_file = ".env"

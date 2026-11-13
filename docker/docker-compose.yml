@@ -1,17 +1,21 @@
 name: ai-generalplat
 
+# P0-04 部署安全：所有凭据经环境变量 / Secret 注入，文件内不保留默认密码。
+# 启动前先准备 .env（参考 docker/.env.example），缺失必填变量时 compose 直接报错。
+# MySQL/PostgreSQL/Redis 端口仅绑定 127.0.0.1，不对公网暴露。
+
 services:
   mysql:
     image: mysql:8.0
     container_name: ai_plat_mysql
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: 123456
-      MYSQL_DATABASE: ai_plat
-      MYSQL_USER: ai_plat
-      MYSQL_PASSWORD: 123456
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD is required}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-ai_plat}
+      MYSQL_USER: ${MYSQL_USER:-ai_plat}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD is required}
     ports:
-      - "3308:3306"
+      - "127.0.0.1:3308:3306"
     volumes:
       - mysql_data:/var/lib/mysql
       - ./mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -27,7 +31,7 @@ services:
     container_name: ai_plat_redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes
@@ -44,15 +48,15 @@ services:
     container_name: ai_plat_checkpoint_pg
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ai_cp
-      POSTGRES_PASSWORD: 123456
-      POSTGRES_DB: agent_checkpoints
+      POSTGRES_USER: ${POSTGRES_USER:-ai_cp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-agent_checkpoints}
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - checkpoint_pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ai_cp -d agent_checkpoints"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -64,27 +68,27 @@ services:
       dockerfile: docker/backend.Dockerfile
       args:
         # pip 镜像加速（可改为 https://pypi.org/simple 或本地镜像）
-        PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
     container_name: ai_plat_backend
     restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
-      APP_ENV: production
-      DATABASE_URL: mysql+aiomysql://ai_plat:123456@mysql:3306/ai_plat
-      DATABASE_SYNC_URL: mysql+pymysql://ai_plat:123456@mysql:3306/ai_plat
+      APP_ENV: ${APP_ENV:-production}
+      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-ai_plat}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-ai_plat}
+      DATABASE_SYNC_URL: mysql+pymysql://${MYSQL_USER:-ai_plat}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-ai_plat}
       REDIS_URL: redis://redis:6379/0
-      SECRET_KEY: change-me-in-production-please-use-a-long-random-key
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required (openssl rand -hex 32)}
       DEBUG: "false"
       UPLOAD_DIR: /app/data/uploads
       CHROMA_PERSIST_DIR: /app/data/chroma
-      ADMIN_EMAIL: admin@example.com
-      ADMIN_PASSWORD: Admin@123456
-      ADMIN_USERNAME: admin
-      CORS_ORIGINS: '["http://localhost:5173","http://localhost:3000","http://localhost:80"]'
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required (>=12 chars, change on first login)}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      CORS_ORIGINS: ${CORS_ORIGINS:-'["http://localhost:5173","http://localhost:3000","http://localhost:80"]'}
       # Durable Execution：多 Worker 共享 PostgreSQL Checkpointer（禁止 memory）
       AGENT_RUNTIME_ENABLED: "true"
-      AGENT_CHECKPOINT_DSN: postgresql://ai_cp:123456@checkpoint_pg:5432/agent_checkpoints
+      AGENT_CHECKPOINT_DSN: postgresql://${POSTGRES_USER:-ai_cp}:${POSTGRES_PASSWORD}@checkpoint_pg:5432/${POSTGRES_DB:-agent_checkpoints}
       UVICORN_WORKERS: "2"
     volumes:
       - app_data:/app/data

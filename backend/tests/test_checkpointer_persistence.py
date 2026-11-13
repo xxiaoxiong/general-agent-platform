@@ -170,17 +170,22 @@ def test_production_rejects_memory_checkpointer():
         empty.validate_startup()
 
     # 非生产 / 生产但 Runtime 关闭 / 生产用持久化后端：允许
+    # （P0-04 后生产还需合法凭据，这里显式给强凭据以隔离 Checkpointer 规则）
+    good_secrets = dict(SECRET_KEY="k" * 64, ADMIN_PASSWORD="S3cure-Initial-Pass!")
     Settings(APP_ENV="development", AGENT_CHECKPOINT_DSN="memory").validate_startup()
     Settings(
-        APP_ENV="production", AGENT_RUNTIME_ENABLED=False, AGENT_CHECKPOINT_DSN="memory"
+        APP_ENV="production", AGENT_RUNTIME_ENABLED=False, AGENT_CHECKPOINT_DSN="memory",
+        **good_secrets,
     ).validate_startup()
     Settings(
         APP_ENV="production",
         AGENT_CHECKPOINT_DSN="sqlite:///./data/agent_checkpoints.db",
+        **good_secrets,
     ).validate_startup()
     Settings(
         APP_ENV="production",
         AGENT_CHECKPOINT_DSN="postgresql://u:p@h:5432/db",
+        **good_secrets,
     ).validate_startup()
 
 
