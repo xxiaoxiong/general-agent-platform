@@ -197,6 +197,16 @@ async def test_model_config(
     if not provider:
         raise HTTPException(status_code=404, detail="模型供应商不存在")
     report = await ModelService.test_model_config(provider, config)
+    # P2-03：真实探测结果回写能力验证状态（§4.4 verification status）
+    from datetime import datetime
+
+    config.capability_status = "verified" if report["passed"] else "failed"
+    config.capability_verified_at = datetime.utcnow()
+    config.capability_probe_message = (
+        f"tool_calling: {report['tool_calling_message']} / "
+        f"streaming: {report['streaming_message']}"
+    )[:2000]
+    await db.commit()
     if not report["passed"]:
         raise HTTPException(status_code=422, detail={
             "message": "模型能力探测未通过：未验证到原生 Tool Calling",

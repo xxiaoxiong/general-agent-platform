@@ -1588,15 +1588,36 @@ class AgentRuntimeService:
         from sqlalchemy import select
         from app.models.model_provider import ModelConfig, ModelProvider
 
-        if not model_config_id:
-            raise ModelCapabilityError("Agent 未配置模型（model_config_id 为空）")
         async with AsyncSessionLocal() as db:
-            mc = (await db.execute(select(ModelConfig).where(ModelConfig.id == model_config_id))).scalar_one_or_none()
-            if mc is None:
-                raise ModelCapabilityError(f"模型配置 {model_config_id} 不存在")
-            provider = (await db.execute(select(ModelProvider).where(ModelProvider.id == mc.provider_id))).scalar_one_or_none()
-            if provider is None:
-                raise ModelCapabilityError(f"模型供应商不存在（model_config_id={model_config_id}）")
+            if model_config_id:
+                mc = (await db.execute(select(ModelConfig).where(ModelConfig.id == model_config_id))).scalar_one_or_none()
+                if mc is None:
+                    raise ModelCapabilityError(f"模型配置 {model_config_id} 不存在")
+                provider = (await db.execute(select(ModelProvider).where(ModelProvider.id == mc.provider_id))).scalar_one_or_none()
+                if provider is None:
+                    raise ModelCapabilityError(f"模型供应商不存在（model_config_id={model_config_id}）")
+            else:
+                # P2-03 Model Router：未绑定模型时按能力约束选模（默认模型策略），
+                # 无兼容模型明确报错，绝不静默切换到不支持 Tool Calling 的模型
+                from app.assistant.model_router import candidate_from_row, select_model
+
+                rows = (await db.execute(
+                    select(ModelConfig, ModelProvider)
+                    .join(ModelProvider, ModelProvider.id == ModelConfig.provider_id)
+                    .where(ModelConfig.is_active == True, ModelConfig.model_type == "chat",  # noqa: E712
+                           ModelProvider.is_active == True)  # noqa: E712
+                )).all()
+                candidates = [candidate_from_row(mc, p) for mc, p in rows]
+                chosen = select_model(candidates, requirements=("tool_calling",))
+                mc = next(mc for mc, _p in rows if mc.id == chosen.id)
+                provider = next(p for _mc, p in rows if p.id == mc.provider_id)
+
+            # P2-03：能力矩阵检查（不兼容模型在执行前明确报错，AG-10）
+            from app.assistant.model_router import candidate_from_row, check_model_requirements
+
+            check_model_requirements(
+                candidate_from_row(mc, provider), requirements=("tool_calling",)
+            )
             return (
                 {"name": provider.name, "base_url": provider.base_url, "api_key": provider.api_key,
                  "extra_config": provider.extra_config or {}},

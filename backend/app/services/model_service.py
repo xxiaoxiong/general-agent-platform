@@ -11,13 +11,17 @@ class ModelService:
 
     @staticmethod
     def _get_client(provider: ModelProvider) -> AsyncOpenAI:
-        return AsyncOpenAI(
-            api_key=provider.api_key or "ollama",
+        # P2-03: ModelClientFactory 统一客户端生命周期（连接复用，
+        # 修复每次调用新建 httpx.AsyncClient 的连接泄漏）
+        from app.assistant.model_clients import ModelClientFactory
+
+        verify = bool(settings.AGENT_CA_BUNDLE or settings.AGENT_TLS_VERIFY)
+        return ModelClientFactory.get_openai_client(
             base_url=provider.base_url,
-            http_client=httpx.AsyncClient(
-                verify=(settings.AGENT_CA_BUNDLE or settings.AGENT_TLS_VERIFY),
-                timeout=120,
-            ),
+            api_key=provider.api_key or "ollama",
+            timeout=120,
+            verify=verify,
+            ca_bundle=settings.AGENT_CA_BUNDLE or None,
         )
 
     @staticmethod
