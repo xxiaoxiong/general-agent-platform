@@ -123,6 +123,7 @@ class Settings(BaseSettings):
     AGENT_FILES_ROOT: str = "./data/agent_files"  # 工具文件工作区根目录
     AGENT_MAX_FILE_SIZE_MB: int = 10            # 单文件大小上限
     AGENT_DISABLED_SKILLS: str = ""             # 逗号分隔禁用的 skill 名
+    AGENT_SKILLS_DIR: str = ""                  # 外部技能目录（<name>/SKILL.md，组织范围）
     AGENT_EVENT_RETENTION_DAYS: int = 30        # 运行记录保留天数
     AGENT_EVENT_CLEANUP_INTERVAL: float = 3600.0  # 事件保留清理执行间隔（秒，仅清理终态超期 Run）
 
