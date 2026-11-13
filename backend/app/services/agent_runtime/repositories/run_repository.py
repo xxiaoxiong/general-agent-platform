@@ -100,6 +100,7 @@ class RunRepository:
         request_hash: Optional[str] = None,
         input_payload: Optional[Dict[str, Any]] = None,
         agent_config_snapshot: Optional[Dict[str, Any]] = None,
+        agent_version_id: Optional[int] = None,
     ) -> Tuple[AgentRun, bool]:
         """创建 Run。返回 (run, created)。
 
@@ -115,6 +116,7 @@ class RunRepository:
         run = AgentRun(
             id=run_id,
             agent_id=agent_id,
+            agent_version_id=agent_version_id,
             session_id=session_id,
             user_id=user_id,
             thread_id=thread_id,

@@ -41,6 +41,28 @@ class Agent(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class AgentVersion(Base):
+    """Agent 不可变发布版本（P2-01）。
+
+    发布即快照：system instructions / model policy / capability IDs / toolset /
+    skills / subagent profiles / resource bindings / memory policy / budget /
+    security policy 全部固化在 ``snapshot``；Run 创建时绑定具体版本，
+    执行期只读，不随 Agent 行后续修改而变化。
+    """
+    __tablename__ = "agent_versions"
+
+    __table_args__ = (
+        UniqueConstraint("agent_id", "version_no", name="uq_agent_versions_no"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False, index=True)
+    version_no = Column(Integer, nullable=False)
+    snapshot = Column(JSON, nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    published_at = Column(DateTime, default=datetime.utcnow)
+
+
 class AgentSession(Base):
     """Agent 对话会话"""
     __tablename__ = "agent_sessions"
@@ -98,6 +120,8 @@ class AgentRun(Base):
 
     id = Column(String(36), primary_key=True)          # run_id (uuid4 hex)
     agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False, index=True)
+    # P2-01：Run 绑定的不可变发布版本（老数据为空 = 无版本绑定的存量 Run）
+    agent_version_id = Column(Integer, ForeignKey("agent_versions.id"), nullable=True, index=True)
     session_id = Column(Integer, ForeignKey("agent_sessions.id"), nullable=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     thread_id = Column(String(128), nullable=False, index=True)

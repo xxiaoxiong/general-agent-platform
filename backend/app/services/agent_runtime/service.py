@@ -801,12 +801,18 @@ class AgentRuntimeService:
                 )
 
             # 4) Run 创建（幂等唯一约束兜底并发；thread_id 随解析后的 Session 生成）
+            # P2-01：Run 必须绑定不可变发布版本（无版本时自动发布 v1），
+            # 执行期只读该版本快照，不随 Agent 行后续修改变化
+            from app.assistant.versions import ensure_version
+
+            version = await ensure_version(db, agent_config["id"], created_by=user_id)
             thread_id = make_thread_id(
                 agent_config["id"], resolved_session_id, uuid.uuid4().hex
             )
             row, created = await repo.create_run(
                 run_id=uuid.uuid4().hex,
                 agent_id=agent_config["id"],
+                agent_version_id=version.id if version is not None else None,
                 session_id=resolved_session_id,
                 user_id=user_id,
                 thread_id=thread_id,
