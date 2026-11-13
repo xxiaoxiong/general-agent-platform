@@ -29,6 +29,9 @@ _SENSITIVE_KEY_PARTS = (
 
 _REDACTED = "***REDACTED***"
 
+# P1-04：大文件 / 大工具输出不写入 Trace —— 超长字符串统一截断
+_MAX_CAPTURE_CHARS = 2000
+
 _client = None
 _client_init_failed = False
 
@@ -39,7 +42,7 @@ def is_enabled() -> bool:
 
 
 def mask_sensitive(data: Any) -> Any:
-    """P1-04：递归脱敏敏感字段（API Key / Token / 密码 / Cookie 等）。"""
+    """P1-04：递归脱敏敏感字段 + 截断超长内容（大输出不写入 Trace）。"""
     if isinstance(data, dict):
         out: Dict[str, Any] = {}
         for k, v in data.items():
@@ -50,6 +53,8 @@ def mask_sensitive(data: Any) -> Any:
         return out
     if isinstance(data, (list, tuple)):
         return [mask_sensitive(v) for v in data]
+    if isinstance(data, str) and len(data) > _MAX_CAPTURE_CHARS:
+        return data[:_MAX_CAPTURE_CHARS] + f"...[truncated {len(data) - _MAX_CAPTURE_CHARS} chars]"
     return data
 
 

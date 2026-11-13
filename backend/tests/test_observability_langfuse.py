@@ -50,6 +50,14 @@ class TestMasking:
         assert out["items"][0]["password"] == "***REDACTED***"
         assert out["items"][1] == "plain"
 
+    def test_long_content_truncated(self):
+        """P1-04：大输出不写入 Trace —— 超长字符串截断。"""
+        big = "x" * 5000
+        out = lt.mask_sensitive({"content": big})
+        assert len(out["content"]) < 5000
+        assert "truncated" in out["content"]
+        assert lt.mask_sensitive("short") == "short"
+
 
 class TestTraceId:
     def test_trace_id_deterministic_per_run(self):
