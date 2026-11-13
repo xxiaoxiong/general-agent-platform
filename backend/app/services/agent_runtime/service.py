@@ -1607,12 +1607,37 @@ class AgentRuntimeService:
     def _resolve_tool_specs(self, agent_config: Dict[str, Any]) -> List[Dict[str, Any]]:
         from app.services.tools import get_tool_by_name
 
-        specs = []
+        names: List[str] = []
+        disabled: set = set()
+        # P2-02 能力包解析：capability_ids → 工具集（fail-closed，模型不可自行授权）；
+        # 未配置 capability_ids 的存量 Agent 保持显式 tools 语义；
+        # 显式 enabled=False 的工具优先级高于能力包默认（Agent 级显式收窄）
+        cap_ids = agent_config.get("capability_ids")
+        if cap_ids:
+            from app.assistant.capability import resolve_capabilities
+
+            resolved = resolve_capabilities(
+                cap_ids,
+                {
+                    "database_connection": agent_config.get("database_connection_id"),
+                    "knowledge_base": agent_config.get("knowledge_base_id"),
+                },
+            )
+            names.extend(resolved.tools)
         for item in (agent_config.get("tools") or []):
             name = item["name"] if isinstance(item, dict) else item
             enabled = item.get("enabled", True) if isinstance(item, dict) else True
             if not enabled:
+                disabled.add(name)
                 continue
+            names.append(name)
+
+        specs = []
+        seen = set()
+        for name in names:
+            if name in seen or name in disabled:
+                continue
+            seen.add(name)
             spec = get_tool_by_name(name)
             if spec:
                 specs.append(spec)
