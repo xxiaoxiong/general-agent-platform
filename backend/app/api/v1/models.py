@@ -178,6 +178,33 @@ async def update_model_config(
     return ModelConfigOut.model_validate(config)
 
 
+@router.post("/configs/{config_id}/test")
+async def test_model_config(
+    config_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_superuser),
+):
+    """模型配置能力测试（P0-06）：真实 Tool Calling + Streaming 探测。
+
+    不兼容（无原生工具调用）的模型在此被发现并明确报错，不得默认放行。
+    """
+    result = await db.execute(select(ModelConfig).where(ModelConfig.id == config_id))
+    config = result.scalar_one_or_none()
+    if not config:
+        raise HTTPException(status_code=404, detail="模型配置不存在")
+    result = await db.execute(select(ModelProvider).where(ModelProvider.id == config.provider_id))
+    provider = result.scalar_one_or_none()
+    if not provider:
+        raise HTTPException(status_code=404, detail="模型供应商不存在")
+    report = await ModelService.test_model_config(provider, config)
+    if not report["passed"]:
+        raise HTTPException(status_code=422, detail={
+            "message": "模型能力探测未通过：未验证到原生 Tool Calling",
+            "report": report,
+        })
+    return report
+
+
 @router.delete("/configs/{config_id}")
 async def delete_model_config(
     config_id: int,
