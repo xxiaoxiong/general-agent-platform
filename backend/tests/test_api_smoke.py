@@ -512,3 +512,76 @@ class TestReconcileAuthz:
         )
         assert r.status_code not in (401, 403), \
             f"超管应通过 Reconciliation 授权门禁: {r.status_code}"
+
+
+# ── A22：Agent 列表用户隔离（P0-03）────────────────────────────────────────
+
+class TestAgentListIsolation:
+    def test_list_agents_isolated_by_owner(self, client, db_setup):
+        """列表不得泄露他人 Agent：普通用户只见自己的 + 公开（owner 为空）的"""
+        import os
+
+        from app.models.agent import Agent
+        from app.models.user import User
+
+        engine = create_engine(os.environ["DATABASE_SYNC_URL"])
+        with Session(engine) as s:
+            public = Agent(
+                name="公开 Agent", description="public", system_prompt="t",
+                tools=[], is_active=True, owner_id=None,
+            )
+            admin = User(
+                username="iso_admin", email="iso_admin@test.dev",
+                hashed_password="x", is_active=True, is_superuser=True,
+            )
+            s.add_all([public, admin])
+            s.commit()
+            public_id, admin_id = public.id, admin.id
+
+        own_id = db_setup["agent_id"]
+        u2 = _auth(db_setup["user2_id"])
+
+        # 用户 2：看不到用户 1 的 Agent，能看到公开 Agent
+        r = client.get("/api/v1/agents", headers=u2)
+        assert r.status_code == 200
+        ids = {a["id"] for a in r.json()["items"]}
+        assert own_id not in ids, f"他人 Agent 泄露到列表: {ids}"
+        assert public_id in ids
+        assert r.json()["total"] == len(ids), "total 与 items 必须同口径过滤"
+
+        # 用户 1：能看到自己的 + 公开的
+        r = client.get("/api/v1/agents", headers=_auth(db_setup["user1_id"]))
+        ids = {a["id"] for a in r.json()["items"]}
+        assert own_id in ids and public_id in ids
+
+        # 超管：可见全部
+        r = client.get("/api/v1/agents", headers=_auth(admin_id))
+        ids = {a["id"] for a in r.json()["items"]}
+        assert own_id in ids and public_id in ids
+
+
+# ── A23：全局异常响应脱敏（P0-03）──────────────────────────────────────────
+
+class TestExceptionMasking:
+    def test_global_handler_hides_exception_detail(self):
+        """500 响应只含安全错误码 + request_id，不得回显 str(exc)"""
+        import asyncio
+        import json as _json
+
+        from starlette.requests import Request
+
+        from app.main import global_exception_handler
+
+        scope = {
+            "type": "http", "method": "GET", "path": "/api/v1/boom",
+            "query_string": b"", "headers": [], "scheme": "http",
+            "server": ("testserver", 80), "client": ("127.0.0.1", 1),
+        }
+        secret = "DB_PASSWORD=hunter2-internal"
+        resp = asyncio.run(global_exception_handler(Request(scope), RuntimeError(secret)))
+
+        assert resp.status_code == 500
+        body = _json.loads(resp.body)
+        assert "request_id" in body and body["request_id"], body
+        assert "detail" not in body, f"detail 字段泄露: {body}"
+        assert secret not in resp.body.decode(), "异常原文不得出现在响应中"

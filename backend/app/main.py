@@ -1,6 +1,8 @@
 import os
 import asyncio
+import logging
 from contextlib import asynccontextmanager
+from uuid import uuid4
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -181,9 +183,16 @@ app.add_middleware(
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    # P0-03：详细异常只进入服务端日志，响应仅返回安全错误码与 request_id
+    # AgentLogger 不支持 exc_info，这里用同名 stdlib logger 保留完整堆栈
+    request_id = uuid4().hex
+    logging.getLogger("ai_plat.main").error(
+        "unhandled exception request_id=%s path=%s: %s",
+        request_id, request.url.path, exc, exc_info=True,
+    )
     return JSONResponse(
         status_code=500,
-        content={"code": 500, "message": "服务器内部错误", "detail": str(exc)},
+        content={"code": 500, "message": "服务器内部错误", "request_id": request_id},
     )
 
 

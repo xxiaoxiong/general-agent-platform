@@ -7,7 +7,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, and_, or_
 from sqlalchemy.orm.attributes import flag_modified
 from pydantic import BaseModel
 
@@ -145,10 +145,15 @@ async def list_agents(
     current_user: User = Depends(get_current_user),
 ):
     offset = (page - 1) * page_size
-    total_res = await db.execute(select(func.count(Agent.id)).where(Agent.is_active == True))
+    # 用户隔离（A22）：列表与计数同口径过滤
+    # 超级管理员可见全部；普通用户仅可见自己的 + 公开（owner_id 为空）的 Agent
+    visibility = Agent.is_active == True
+    if not current_user.is_superuser:
+        visibility = and_(visibility, or_(Agent.owner_id == current_user.id, Agent.owner_id.is_(None)))
+    total_res = await db.execute(select(func.count(Agent.id)).where(visibility))
     total = total_res.scalar()
     res = await db.execute(
-        select(Agent).where(Agent.is_active == True)
+        select(Agent).where(visibility)
         .order_by(Agent.created_at.desc())
         .offset(offset).limit(page_size)
     )
