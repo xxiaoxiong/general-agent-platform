@@ -1038,7 +1038,13 @@ class AgentRuntimeService:
                     }
 
                 config = make_run_config(run.thread_id, run.run_id, scope.user_id)
-                config["recursion_limit"] = ctx.budget.max_steps * 3 + 10
+                # 递归预算换算：LangGraph 把每个中间件钩子计为一步递归（每个模型轮
+                # 约消耗 10~14 步：before/after model 钩子 + model + tools + 工具钩子），
+                # 过小的系数会让长任务误触发 GraphRecursionError。预算上限本身由
+                # ModelCallLimit/ToolCallLimit 与 ctx.budget 独立执行，这里只是兜底。
+                config["recursion_limit"] = (
+                    ctx.budget.max_steps * 12 + 40 if ctx.budget.max_steps > 0 else 10000
+                )
                 # FR-10：模型调用按一次请求计数（Runnable 生命周期回调，不按 Chunk）
                 config["callbacks"] = [ModelUsageCallback(ctx)]
                 run_config = config

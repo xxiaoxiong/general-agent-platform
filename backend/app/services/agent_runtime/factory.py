@@ -38,6 +38,49 @@ from .tools.policy import ToolPolicy
 # 需要 HITL 审批的工具 -> interrupt_on 配置
 from langchain.agents.middleware.human_in_the_loop import InterruptOnConfig
 
+# ── P0-05：DeepAgents 原生工具安全 ─────────────────────────────────────────
+# 原生文件工具真名（deepagents FsToolName）：delete 为独立工具；
+# execute 仅在真实 Sandbox 可用时暴露，否则从工具面移除（A05：不暴露执行能力）。
+FS_NATIVE_TOOLS: tuple = ("ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep")
+
+
+def build_fs_tools(policy: ToolPolicy) -> List[str]:
+    """原生工具面白名单：无外部 Sandbox 时不含 execute。
+
+    restricted（进程内限制）不是安全沙箱；仅 external 或开发逃生开关
+    （allow_unsafe_python）时才暴露 execute，与 ToolPolicy.check_exec_allowed 同口径。
+    """
+    tools = list(FS_NATIVE_TOOLS)
+    if policy.sandbox_mode == "external" or policy.allow_unsafe_python:
+        tools.append("execute")
+    return tools
+
+
+def build_fs_permissions(policy: ToolPolicy) -> List[Any]:
+    """原生文件工具统一授权（A04）：FilesystemPermission allow/deny/interrupt 规则。
+
+    - 敏感凭据类文件（.env / 私钥 / credentials / secrets）读写一律 deny，
+      独立于 Backend 路由隔离做纵深防御（delete 命中 deny-write 同样被拒）；
+    - 其余路径默认 allow：实际读写只会落在用户/Agent/Session 隔离工作区
+      （/workspace/ FilesystemBackend root）与会话虚拟文件（StateBackend）；
+    - delete 等危险操作的审批由 interrupt_on（ToolPolicy.hitl_tools）承担，
+      不依赖风险登记表冒充保护。
+    """
+    from deepagents.middleware.filesystem import FilesystemPermission
+
+    return [
+        FilesystemPermission(
+            operations=["read", "write"],
+            paths=[
+                "/**/.env", "/**/.env.*",
+                "/**/id_rsa*", "/**/id_ed25519*", "/**/.ssh/**",
+                "/**/*.pem", "/**/*.key",
+                "/**/credentials*", "/**/secrets/**",
+            ],
+            mode="deny",
+        ),
+    ]
+
 
 def build_interrupt_config(policy: ToolPolicy) -> Dict[str, Any]:
     if not policy.enable_hitl:
@@ -73,8 +116,14 @@ def build_agent(
 
     adapter = ToolAdapterFactory(ctx, policy, bus)
     langchain_tools = adapter.build(tool_specs)
+
+    # P0-05：原生文件工具面收窄（无 Sandbox 不含 execute）；主代理与子代理同口径
+    from deepagents.middleware.filesystem import FilesystemMiddleware
+
+    fs_middleware = FilesystemMiddleware(tools=build_fs_tools(policy))
     subagents = [
-        {**sa, "tools": _subagent_tools(sa, adapter)}
+        {**sa, "tools": _subagent_tools(sa, adapter),
+         "middleware": [FilesystemMiddleware(tools=build_fs_tools(policy))]}
         for sa in build_subagents(policy)
     ]
 
@@ -86,7 +135,8 @@ def build_agent(
     # exit_behavior="error"：超限抛出明确异常，由 service 映射为
     # limit_exceeded 状态（任务书 P0-A：超限返回明确 failed/limit_exceeded）
     # 预算 <=0 = 不限制：不挂对应 Limit 中间件（防真死循环仍由重复调用防护兜底）
-    middleware = [TodoListMiddleware()]
+    # FilesystemMiddleware 替换基栈同名中间件（按名替换、保留顺序），继承 permissions
+    middleware = [fs_middleware, TodoListMiddleware()]
     if ctx.budget.max_tool_calls > 0:
         middleware.append(
             ToolCallLimitMiddleware(run_limit=ctx.budget.max_tool_calls, exit_behavior="error")
@@ -106,6 +156,7 @@ def build_agent(
         subagents=subagents or None,
         skills=skill_sources,
         backend=build_backend(ctx.scope.user_id, ctx.agent_id, ctx.session_id),
+        permissions=build_fs_permissions(policy),
         interrupt_on=interrupt_config or None,
         checkpointer=checkpointer,
         store=store,
