@@ -25,6 +25,10 @@ async def lifespan(app: FastAPI):
     # ── 启动期配置校验（P0-01）：非法配置直接拒绝启动 ──
     settings.validate_startup()
 
+    # ── OTel instrumentation（P1-02）：OTEL_ENABLED=false 时 no-op ──
+    from app.observability.otel_tracing import init_otel
+    init_otel(app)
+
     # ── 启动期初始化 Checkpointer 并做健康检查（P0-01）：
     #    初始化失败抛错即拒绝启动，绝不静默降级 Memory ──
     if settings.AGENT_RUNTIME_ENABLED:

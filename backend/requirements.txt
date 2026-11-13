@@ -55,6 +55,10 @@ aiosqlite==0.22.1
 langfuse==5.2.0
 opentelemetry-api==1.45.2
 opentelemetry-sdk==1.45.2
+opentelemetry-instrumentation-fastapi==0.66b2
+opentelemetry-instrumentation-sqlalchemy==0.66b2
+opentelemetry-instrumentation-httpx==0.66b2
+opentelemetry-instrumentation-redis==0.66b2
 
 # Vector DB
 chromadb==1.5.9
