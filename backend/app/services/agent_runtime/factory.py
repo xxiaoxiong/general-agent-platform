@@ -132,6 +132,12 @@ def build_agent(
 
     interrupt_config = build_interrupt_config(policy)
 
+    # P2-04：长期记忆 —— MemoryMiddleware 从 /memory/AGENTS.md（StoreBackend，
+    # 跨 Session 持久化、按用户隔离）加载记忆并支持 edit_file 更新；
+    # memory_policy.use_memory_context=false 的 Agent 不挂载
+    memory_policy = (ctx.agent_config.get("memory_policy") or {})
+    memory_sources = ["/memory/AGENTS.md"] if memory_policy.get("use_memory_context", True) else None
+
     # exit_behavior="error"：超限抛出明确异常，由 service 映射为
     # limit_exceeded 状态（任务书 P0-A：超限返回明确 failed/limit_exceeded）
     # 预算 <=0 = 不限制：不挂对应 Limit 中间件（防真死循环仍由重复调用防护兜底）
@@ -155,7 +161,8 @@ def build_agent(
         middleware=middleware,
         subagents=subagents or None,
         skills=skill_sources,
-        backend=build_backend(ctx.scope.user_id, ctx.agent_id, ctx.session_id),
+        memory=memory_sources,
+        backend=build_backend(ctx.scope.user_id, ctx.agent_id, ctx.session_id, store=store),
         permissions=build_fs_permissions(policy),
         interrupt_on=interrupt_config or None,
         checkpointer=checkpointer,
