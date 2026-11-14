@@ -58,7 +58,6 @@ class RunCreate(BaseModel):
     conversation_id: Optional[int] = None  # 缺省自动创建会话
     assistant_id: Optional[int] = None     # 缺省 = 会话绑定的助手 / 默认助手
     use_memory: bool = True
-    stream: bool = True
 
 
 class ApprovalDecisionIn(BaseModel):

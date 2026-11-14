@@ -15,6 +15,7 @@ from app.api.v1 import auth, users, models, knowledge, workflows, app_market, au
 from app.api.v2 import assistants as v2_assistants
 from app.api.v2 import capabilities as v2_capabilities
 from app.api.v2 import conversations as v2_conversations
+from app.api.v2 import runs as v2_runs
 from app.api.v2 import workspace as v2_workspace
 
 logger = get_logger("main")
@@ -225,6 +226,7 @@ app.include_router(v2_workspace.router, prefix=API_V2_PREFIX)
 app.include_router(v2_capabilities.router, prefix=API_V2_PREFIX)
 app.include_router(v2_assistants.router, prefix=API_V2_PREFIX)
 app.include_router(v2_conversations.router, prefix=API_V2_PREFIX)
+app.include_router(v2_runs.router, prefix=API_V2_PREFIX)
 
 
 @app.get("/api/health")
