@@ -192,15 +192,24 @@ async def execute_with_retry(
     import asyncio as _asyncio
 
     max_retries = max(0, int(getattr(settings, "AGENT_TOOL_MAX_RETRIES", 2)))
+    per_call_timeout = max(1.0, float(getattr(settings, "AGENT_TOOL_TIMEOUT_SECONDS", 120.0)))
+
+    async def _call_once() -> Any:
+        # P4-05：单次工具执行超时（挂死工具不再拖到整轮 run_timeout）
+        return await _asyncio.wait_for(
+            executor.execute(name, args, raise_on_error=True),
+            timeout=per_call_timeout,
+        )
+
     if contract.retry_policy != RETRY_SAFE or max_retries == 0:
-        return await executor.execute(name, args, raise_on_error=True)
+        return await _call_once()
 
     backoff = max(0.0, float(getattr(settings, "AGENT_TOOL_RETRY_BACKOFF_SECONDS", 0.5)))
     attempt = 0
     while True:
         attempt += 1
         try:
-            result = await executor.execute(name, args, raise_on_error=True)
+            result = await _call_once()
         except _NO_RETRY_ERRORS:
             raise
         except Exception as e:  # noqa: BLE001 瞬态/未知异常：按策略重试

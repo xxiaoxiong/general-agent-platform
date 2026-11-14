@@ -132,6 +132,7 @@ class Settings(BaseSettings):
     # ── P4-03：工具瞬态失败重试（按风险策略；非幂等绝不盲目重放）──────────
     AGENT_TOOL_MAX_RETRIES: int = 2             # 运行内瞬态失败重试上限（0=不重试）
     AGENT_TOOL_RETRY_BACKOFF_SECONDS: float = 0.5  # 重试退避基数（线性退避 attempt*基数）
+    AGENT_TOOL_TIMEOUT_SECONDS: float = 120.0   # 单次工具执行超时（超时按瞬态失败处理）
 
     # ── Durable Execution（Phase 2）：Worker 租约协调 ────────────────────
     AGENT_RUNTIME_WORKER_ID: str = ""           # Worker 标识（空=自动生成 hostname-pid-随机）

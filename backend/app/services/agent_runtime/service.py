@@ -992,6 +992,9 @@ class AgentRuntimeService:
             log_fields["model_id"] = model_config.get("name")
 
             scope = RunScope(user_id=user_id or run.user_id)
+            # P4-05/06：Run 级预算优先取 AgentVersion 快照的 execution_budget
+            # （P2-01 版本绑定语义），缺省回落全局 settings
+            _budget_cfg = agent_config.get("execution_budget") or {}
             ctx = RuntimeContext(
                 scope=scope,
                 run_id=run.run_id,
@@ -1003,10 +1006,14 @@ class AgentRuntimeService:
                 agent_config=agent_config,
                 memory_context=mem_ctx,
                 budget=ExecutionBudget(
-                    max_steps=getattr(settings, "AGENT_MAX_STEPS", 100),
-                    max_tool_calls=getattr(settings, "AGENT_MAX_TOOL_CALLS", 200),
-                    max_model_calls=getattr(settings, "AGENT_MAX_MODEL_CALLS", 100),
-                    run_timeout_seconds=getattr(settings, "AGENT_RUN_TIMEOUT", 600.0),
+                    max_steps=_budget_cfg.get(
+                        "max_steps", getattr(settings, "AGENT_MAX_STEPS", 100)),
+                    max_tool_calls=_budget_cfg.get(
+                        "max_tool_calls", getattr(settings, "AGENT_MAX_TOOL_CALLS", 200)),
+                    max_model_calls=_budget_cfg.get(
+                        "max_model_calls", getattr(settings, "AGENT_MAX_MODEL_CALLS", 100)),
+                    run_timeout_seconds=float(_budget_cfg.get(
+                        "run_timeout_seconds", getattr(settings, "AGENT_RUN_TIMEOUT", 600.0))),
                 ),
                 enable_hitl=getattr(settings, "AGENT_ENABLE_HITL", True),
                 sandbox_mode=getattr(settings, "AGENT_SANDBOX_MODE", "restricted"),

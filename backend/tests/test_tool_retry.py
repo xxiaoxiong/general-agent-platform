@@ -170,6 +170,40 @@ class TestToolRetryByPolicy:
             )
         assert ex.calls == 1
 
+    @pytest.mark.asyncio
+    async def test_per_call_timeout_treated_as_transient(self, bus, monkeypatch):
+        """P4-05：单次工具超时按瞬态失败（safe_retry 重试；非安全策略不重发）。"""
+        import app.core.config as config_mod
+        monkeypatch.setattr(config_mod.settings, "AGENT_TOOL_TIMEOUT_SECONDS", 0.05,
+                            raising=False)
+
+        class Hanging(ToolExecutor):
+            def __init__(self):
+                super().__init__(None, {})
+                self.calls = 0
+
+            async def execute(self, tool_name, tool_input, *, raise_on_error=False):
+                self.calls += 1
+                await asyncio.sleep(10)
+
+        # safe_retry（只读）：超时重试至耗尽后 raise TimeoutError
+        ex = Hanging()
+        with pytest.raises(asyncio.TimeoutError):
+            await execute_with_retry(
+                "http_get", {}, ex, bus=bus, run_id="r1", contract=READ_ONLY_CONTRACT,
+            )
+        assert ex.calls == 3  # 1 次 + 2 次重试
+        assert len(_events_of(bus, RUN_RETRYING)) == 2
+
+        # 非安全策略：超时只执行一次（结果未知不盲目重发）
+        ex2 = Hanging()
+        with pytest.raises(asyncio.TimeoutError):
+            await execute_with_retry(
+                "http_post", {}, ex2, bus=bus, run_id="r1",
+                contract=NON_IDEMPOTENT_CONTRACT,
+            )
+        assert ex2.calls == 1
+
 
 class TestRunRecoveringEvent:
     @pytest.mark.asyncio
