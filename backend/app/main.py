@@ -38,9 +38,8 @@ async def lifespan(app: FastAPI):
 
     # ── 启动期初始化 Checkpointer 并做健康检查（P0-01）：
     #    初始化失败抛错即拒绝启动，绝不静默降级 Memory ──
-    if settings.AGENT_RUNTIME_ENABLED:
-        from app.services.agent_runtime.persistence import CheckpointerFactory
-        await CheckpointerFactory.get().get_checkpointer()
+    from app.services.agent_runtime.persistence import CheckpointerFactory
+    await CheckpointerFactory.get().get_checkpointer()
 
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     os.makedirs(settings.CHROMA_PERSIST_DIR, exist_ok=True)
@@ -54,17 +53,11 @@ async def lifespan(app: FastAPI):
     await init_redis()
     await _seed_initial_data()
 
-    # ── 清理过期检查点 ──
-    from app.services.agent.checkpoint import CheckpointManager
-    CheckpointManager.cleanup_old_checkpoints(max_age_hours=24)
-
     # ── Durable Execution Worker：领取 pending / Lease 过期的孤儿 Run ──
-    runtime_worker = None
-    if settings.AGENT_RUNTIME_ENABLED:
-        from app.services.agent_runtime.worker import get_run_worker
+    from app.services.agent_runtime.worker import get_run_worker
 
-        runtime_worker = get_run_worker()
-        await runtime_worker.start()
+    runtime_worker = get_run_worker()
+    await runtime_worker.start()
 
     logger.info("所有子系统初始化完成")
     yield

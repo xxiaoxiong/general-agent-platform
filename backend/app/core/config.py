@@ -101,7 +101,6 @@ class Settings(BaseSettings):
     CHECKPOINT_DIR: str = "./data/checkpoints"  # 断点存储目录
 
     # ── DeepAgents Runtime（阶段一新内核）────────────────────────────────────
-    AGENT_RUNTIME_ENABLED: bool = True          # 回滚开关：False 时走旧引擎路径
     AGENT_MAX_STEPS: int = 100                  # 图执行最大步数（0=不限制）
     AGENT_MAX_TOOL_CALLS: int = 200             # 工具调用总次数预算（0=不限制）
     AGENT_MAX_MODEL_CALLS: int = 100            # 模型调用次数预算（0=不限制）
@@ -165,16 +164,15 @@ class Settings(BaseSettings):
         生产环境禁止 Durable Runtime 使用 Memory Checkpointer——Memory 是进程内
         单例，多 Worker / 重启后 Graph State 无法恢复。
         """
-        if self.is_production and self.AGENT_RUNTIME_ENABLED:
+        if self.is_production:
             dsn = (self.AGENT_CHECKPOINT_DSN or "").strip().lower()
             if dsn in ("", "memory"):
                 raise RuntimeError(
-                    "配置非法，拒绝启动：APP_ENV=production 且 AGENT_RUNTIME_ENABLED=true 时"
+                    "配置非法，拒绝启动：APP_ENV=production 时"
                     "禁止使用 Memory Checkpointer（AGENT_CHECKPOINT_DSN=memory）。"
                     "请配置持久化后端（postgresql://... 或 sqlite:///...），"
                     "多 Worker 部署必须使用 PostgreSQL 以共享 Graph State。"
                 )
-        if self.is_production:
             self._validate_production_secrets()
 
     def _validate_production_secrets(self) -> None:
