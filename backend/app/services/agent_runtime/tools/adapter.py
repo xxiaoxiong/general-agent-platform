@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 import uuid
 from typing import Annotated, Any, Callable, Coroutine, Dict, List, Optional, Type
@@ -113,6 +114,46 @@ _NET_TARGET_PARAMS: Dict[str, tuple] = {
     "webhook_notify": ("webhook_url",),
     "send_email_tool": ("smtp_host",),   # SMTP 目标按 URL 形式过同一策略
 }
+
+# P4-04（AG-06）：进入模型上下文的单次工具输出上限（字符）。
+# 超限输出整体卸载到会话工作区（tool-outputs/），上下文只留预览 + 文件路径。
+_TOOL_CONTEXT_LIMIT = 8_000
+_TOOL_PREVIEW_CHARS = 2_000
+
+
+def limit_for_context(
+    text: str,
+    *,
+    ctx: "RuntimeContext",
+    tool_name: str,
+) -> str:
+    """P4-04：大输出受限进上下文（AG-06）。
+
+    - 未超限：原样返回；
+    - 超限：完整输出卸载到会话工作区 ``tool-outputs/{tool}-{hash}.txt``
+      （用户/Agent/会话隔离），回传预览 + 卸载路径，模型按需用 read_file 读取。
+    账本 result_payload 仍存完整文本的脱敏截断（事件侧另有 2000 上限）。
+    """
+    if len(text) <= _TOOL_CONTEXT_LIMIT:
+        return text
+    try:
+        from ..backends import workspace_root
+
+        root = workspace_root(ctx.scope.user_id, ctx.agent_id, ctx.session_id or 0)
+        out_dir = os.path.join(root, "tool-outputs")
+        os.makedirs(out_dir, exist_ok=True)
+        digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+        fname = f"{tool_name}-{digest}.txt"
+        with open(os.path.join(out_dir, fname), "w", encoding="utf-8") as f:
+            f.write(text)
+        rel = f"tool-outputs/{fname}"
+        preview = text[:_TOOL_PREVIEW_CHARS]
+        return (
+            f"{preview}\n\n...[输出过长已卸载：共 {len(text)} 字符。"
+            f"完整内容见工作区文件 {rel}，可用 read_file 读取]"
+        )
+    except Exception:  # noqa: BLE001 卸载失败不得阻断工具结果交付
+        return text[:_TOOL_CONTEXT_LIMIT] + f"...[输出已截断，共 {len(text)} 字符]"
 
 
 class ToolLedgerError(PersistenceError, GraphBubbleUp):
@@ -431,7 +472,8 @@ class ToolAdapterFactory:
                     self.ctx.to_log_fields(), tool=name, status="completed",
                     duration_ms=float(duration_ms),
                 )
-                return text
+                # P4-04（AG-06）：大输出卸载，上下文只留预览 + 路径
+                return limit_for_context(text, ctx=self.ctx, tool_name=name)
 
             if tr.status == STATUS_FAILED:
                 # 业务错误不得伪装成功字符串（§7.2 C）：标记 failed 并回传失败文本
