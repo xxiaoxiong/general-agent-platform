@@ -312,6 +312,8 @@ const streamingStatus = ref('思考中...')
 const showThinking = ref(true)
 const messagesRef = ref<HTMLElement>()
 let abortController: AbortController | null = null
+// §8.4：保存 X-Run-Id，停止时调用后端真实取消（不停止订阅而已）
+let activeRunId: string | null = null
 
 const memoryDialogVisible = ref(false)
 const memories = ref<any[]>([])
@@ -553,6 +555,9 @@ async function sendMessage() {
 
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
 
+    // §8.4 1：保存 X-Run-Id（取消/断线恢复用）
+    activeRunId = response.headers.get('X-Run-Id')
+
     await consumeSse(response, streamingIdx, sessionIdForThisRequest)
 
     // 更新会话列表（反映新的消息数）
@@ -579,14 +584,31 @@ async function sendMessage() {
   } finally {
     streaming.value = false
     abortController = null
+    activeRunId = null
     await scrollToBottom()
   }
 }
 
 function stopGeneration() {
+  // §8.4 3：停止 = 后端真实取消 + 断开 SSE（取消意图先记录，Worker 确认后终态）
+  const runId = activeRunId
   if (abortController) {
     abortController.abort()
+    abortController = null
   }
+  if (runId) {
+    fetch(`/api/v1/agents/runs/${runId}/cancel`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${localStorage.getItem('access_token')}`,
+      },
+      body: JSON.stringify({}),
+    }).catch(() => {
+      ElMessage.warning('取消请求失败，任务可能仍在执行')
+    })
+  }
+  activeRunId = null
 }
 
 // ── HITL 审批（DeepAgents 中断 → 批准/拒绝 → 恢复）────────────────────────
@@ -654,7 +676,10 @@ async function consumeSse(response: Response, streamingIdx: number, sessionIdFor
         }
 
         await scrollToBottom()
-      } catch { /* ignore parse errors */ }
+      } catch (parseErr) {
+        // §8.4 7：JSON 解析失败记录诊断信息，不中断流（A15）
+        console.warn('[sse] 事件解析失败，已跳过:', (parseErr as Error).message, line.slice(0, 120))
+      }
     }
   }
 
