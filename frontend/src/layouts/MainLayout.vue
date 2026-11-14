@@ -16,9 +16,14 @@
         @select="handleMenuSelect"
       >
         <!-- 工作台 -->
+        <el-menu-item index="/workspace">
+          <el-icon><ChatDotRound /></el-icon>
+          <template #title>智能体工作台</template>
+        </el-menu-item>
+
         <el-menu-item index="/dashboard">
           <el-icon><Odometer /></el-icon>
-          <template #title>工作台</template>
+          <template #title>概览</template>
         </el-menu-item>
 
         <!-- 分组：AI 能力 -->

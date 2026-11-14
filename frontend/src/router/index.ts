@@ -17,7 +17,13 @@ const router = createRouter({
       children: [
         {
           path: '',
-          redirect: '/dashboard',
+          redirect: '/workspace',
+        },
+        {
+          path: 'workspace',
+          name: 'Workspace',
+          component: () => import('@/views/workspace/WorkspaceHome.vue'),
+          meta: { title: '智能体工作台', icon: 'ChatDotRound' },
         },
         {
           path: 'dashboard',
