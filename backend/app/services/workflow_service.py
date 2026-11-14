@@ -527,7 +527,6 @@ class WorkflowEngine:
         """在工作流中调用 Agent（统一走 DeepAgents Runtime）"""
         from sqlalchemy import select
         from app.models.agent import Agent
-        from app.core.config import settings as _settings
 
         agent_id = config.get("agent_id")
         input_template = config.get("input", "{{input}}")
@@ -557,6 +556,8 @@ class WorkflowEngine:
             "max_iterations": agent.max_iterations,
             "temperature": agent.temperature,
             "tools": agent.tools or [],
+            # P3-07：能力包随配置进入 Runtime（工作流 Agent 节点与对话同口径）
+            "capability_ids": getattr(agent, "capability_ids", None) or [],
             "knowledge_base_id": agent.knowledge_base_id,
         }
 
@@ -565,28 +566,19 @@ class WorkflowEngine:
         final_content = ""
 
         try:
-            if _settings.AGENT_RUNTIME_ENABLED:
-                from app.services.agent_runtime import get_runtime_service
+            # P3-07：Workflow Agent 节点统一走 Durable Runtime（旧引擎分支删除）
+            from app.services.agent_runtime import get_runtime_service
 
-                scope_user = context.get("user_id") or agent.owner_id or 0
-                result = await get_runtime_service().run_to_completion(
-                    agent_config=agent_config,
-                    messages=messages,
-                    user_id=scope_user,
-                )
-                steps = result["steps"]
-                final_content = result["content"]
-                if result["status"] != "completed":
-                    return {"status": "error", "error": f"运行状态: {result['status']}", "steps": steps}
-            else:
-                from app.services.agent import AgentEngine
-
-                async for event in AgentEngine.run_stream(agent_config, messages, db):
-                    if event["type"] == "done":
-                        break
-                    steps.append(event)
-                    if event["type"] == "final":
-                        final_content = event["content"]
+            scope_user = context.get("user_id") or agent.owner_id or 0
+            result = await get_runtime_service().run_to_completion(
+                agent_config=agent_config,
+                messages=messages,
+                user_id=scope_user,
+            )
+            steps = result["steps"]
+            final_content = result["content"]
+            if result["status"] != "completed":
+                return {"status": "error", "error": f"运行状态: {result['status']}", "steps": steps}
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
