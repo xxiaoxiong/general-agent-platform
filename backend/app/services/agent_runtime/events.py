@@ -46,6 +46,12 @@ RUN_FAILED = "run_failed"
 RUN_CANCELLED = "run_cancelled"
 RUN_SUSPENDED = "run_suspended"
 PLAN_UPDATED = "plan_updated"
+# P4-02：Verification（§7.1 verification.started / verification.completed）
+VERIFICATION_STARTED = "verification_started"
+VERIFICATION_COMPLETED = "verification_completed"
+# P4-03：Retry / Recovery（§7.1 run.retrying / run.recovering）
+RUN_RETRYING = "run_retrying"
+RUN_RECOVERING = "run_recovering"
 
 # 流边界事件：消费者收到即结束本次事件流（Run 可能稍后由其他 Worker 恢复，
 # 恢复后的执行产生新的事件流）。任务书 §12.2：SSE 消费者必须能终止。

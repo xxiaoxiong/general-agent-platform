@@ -44,6 +44,8 @@ from .events import (
     RUN_CANCELLED,
     RUN_COMPLETED,
     RUN_FAILED,
+    RUN_RECOVERING,
+    RUN_RETRYING,
     RUN_STARTED,
     RUN_SUSPENDED,
     RUN_WAITING_APPROVAL,
@@ -52,6 +54,8 @@ from .events import (
     TOOL_COMPLETED,
     TOOL_FAILED,
     TOOL_STARTED,
+    VERIFICATION_COMPLETED,
+    VERIFICATION_STARTED,
     TERMINAL_EVENTS,
     EventBus,
     LegacyEventAdapter,
@@ -965,6 +969,7 @@ class AgentRuntimeService:
     ) -> None:
         bus = run.bus
         ctx: Optional[RuntimeContext] = None
+        verification: Optional[Dict[str, Any]] = None  # P4-02：验证结果（异常路径保持 None）
         log_fields: Dict[str, Any] = {
             "request_id": run.run_id,
             "trace_id": run.run_id,
@@ -1087,6 +1092,11 @@ class AgentRuntimeService:
                     except asyncio.TimeoutError:
                         raise _RunLimitExceeded(f"运行超时（>{ctx.budget.run_timeout_seconds}s）")
 
+                    # P4-01/02：完成条件验证 + 有条件补充执行（§9，主执行已产出结果）
+                    verification = await self._verify_and_fix(
+                        ctx, run, agent, run_config, bus, messages,
+                    )
+
             # 结束分支
             if run.status == STATUS_RUNNING:
                 # FR-09：run.final_text 唯一权威收集在执行侧（_consume_stream 累积
@@ -1101,6 +1111,9 @@ class AgentRuntimeService:
                     "steps": ctx.steps,
                     "elapsed_seconds": round(ctx.elapsed(), 2),
                 }
+                if verification is not None:
+                    # P4-02：验证结果随 Run 交付（完成条件证据，不覆盖最终回答）
+                    run.summary["verification"] = verification
                 run.transition(STATUS_COMPLETED)
                 await self._commit(
                     run,
@@ -1450,6 +1463,122 @@ class AgentRuntimeService:
             type=RUN_FAILED, run_id=run.run_id,
             data={"error": error, "status": status},
         ))
+
+    async def _verify_and_fix(
+        self,
+        ctx: RuntimeContext,
+        run: RunHandle,
+        agent: Any,
+        run_config: Dict[str, Any],
+        bus: EventBus,
+        messages: Optional[List[Dict[str, Any]]],
+    ) -> Optional[Dict[str, Any]]:
+        """P4-01/02：任务契约 + 完成条件验证 + 有条件补充执行（§9）。
+
+        - 契约与验证全部确定性（零模型调用，简单问答不加验证负担）；
+        - 验证失败产生结构化事件（verification.started/completed），
+          不允许模型说"已完成"就通过；
+        - 复杂任务验证不通过 → 按 AGENT_VERIFICATION_MAX_ROUNDS 轮补充执行
+          （run.retrying 事件），仍不通过则把验证结论随 Run 交付（不伪造成功）；
+        - 验证自身异常绝不影响主结果交付（记录日志后返回 None）。
+        """
+        if not getattr(settings, "AGENT_VERIFICATION_ENABLED", True):
+            return None
+        if run.status != STATUS_RUNNING:
+            return None
+        try:
+            from sqlalchemy import select
+
+            from app.assistant.task_contract import build_task_contract
+            from app.assistant.verification import (
+                STATUS_PASSED,
+                ToolEvidence,
+                verify_task,
+            )
+            from app.models.agent import AgentToolExecution
+
+            # 证据收集：工具账本（副作用/查询/执行的客观事实）
+            async with AsyncSessionLocal() as db:
+                rows = (await db.execute(
+                    select(AgentToolExecution).where(
+                        AgentToolExecution.run_id == run.run_id
+                    ).order_by(AgentToolExecution.id)
+                )).scalars().all()
+            evidence = [
+                ToolEvidence(
+                    tool_name=r.tool_name,
+                    status=r.status,
+                    external_operation_id=r.external_operation_id,
+                    output=str(r.result_payload or ""),
+                )
+                for r in rows
+            ]
+            tool_names = [e.tool_name for e in evidence]
+            goal = _last_user_input(messages or [])
+            contract = build_task_contract(
+                goal,
+                capability_ids=ctx.agent_config.get("capability_ids"),
+                tool_names=tool_names,
+            )
+
+            await bus.publish(RuntimeEvent(
+                type=VERIFICATION_STARTED, run_id=run.run_id,
+                data=contract.to_dict(),
+            ))
+            result = verify_task(contract, "".join(run.final_text_parts), evidence)
+
+            # 部分通过/不通过 → 补充执行（有限轮次；简单问答不补执行）
+            max_rounds = max(0, int(getattr(settings, "AGENT_VERIFICATION_MAX_ROUNDS", 1)))
+            rounds = 0
+            while (
+                result.status != STATUS_PASSED
+                and contract.is_complex
+                and rounds < max_rounds
+                and run.status == STATUS_RUNNING
+            ):
+                rounds += 1
+                await bus.publish(RuntimeEvent(
+                    type=RUN_RETRYING, run_id=run.run_id,
+                    data={
+                        "reason": "verification_fix",
+                        "round": rounds,
+                        "failed_checks": [c.to_dict() for c in result.failed_checks],
+                    },
+                ))
+                feedback = result.feedback_text()
+                # 补充执行的 config 必须只含 thread_id（+recursion_limit/callbacks）：
+                # 实证（消融实验）发现 configurable 同时携带 run_id 与 user_id 时，
+                # LangGraph 对后续 astream 静默跳过执行（0 chunk、模型不调用、无异常），
+                # 只含其一或仅 thread_id 均正常。thread_id 是 checkpoint 恢复的唯一
+                # 必需键；callbacks 用新实例（Langfuse handler 单次使用语义）。
+                fix_config = {
+                    "configurable": {"thread_id": run.thread_id},
+                    "recursion_limit": run_config.get("recursion_limit", 1000),
+                    "callbacks": [ModelUsageCallback(ctx)],
+                }
+                await self._consume_stream(
+                    agent,
+                    {
+                        "messages": messages_to_langchain(
+                            [{"role": "user", "content": feedback}],
+                            namespace=run.thread_id,
+                            reset=False,
+                        ),
+                    },
+                    fix_config, ctx, run, bus,
+                )
+                result = verify_task(contract, "".join(run.final_text_parts), evidence)
+
+            data = result.to_event_data()
+            data["fix_rounds"] = rounds
+            await bus.publish(RuntimeEvent(
+                type=VERIFICATION_COMPLETED, run_id=run.run_id, data=data,
+            ))
+            return data
+        except Exception:  # noqa: BLE001
+            # 验证是质量增强，不得让验证自身故障毁掉主执行结果
+            logger.exception("run %s 验证执行异常（主结果照常交付）", run.run_id)
+            return None
 
     async def _load_prior_final_text(self, run_id: str) -> List[str]:
         """FR-09：从持久化事件日志重建本 Run 已产生的最终文本片段（MODEL_DELTA），

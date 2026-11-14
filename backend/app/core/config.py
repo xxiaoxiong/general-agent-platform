@@ -126,6 +126,9 @@ class Settings(BaseSettings):
     AGENT_SKILLS_DIR: str = ""                  # 外部技能目录（<name>/SKILL.md，组织范围）
     AGENT_EVENT_RETENTION_DAYS: int = 30        # 运行记录保留天数
     AGENT_EVENT_CLEANUP_INTERVAL: float = 3600.0  # 事件保留清理执行间隔（秒，仅清理终态超期 Run）
+    # ── P4-01/02：Task Contract + Verification ────────────────────────────
+    AGENT_VERIFICATION_ENABLED: bool = True     # 复杂任务完成条件验证（确定性，不调模型）
+    AGENT_VERIFICATION_MAX_ROUNDS: int = 1      # 验证不通过的补充执行轮数（0=只验证不补充）
 
     # ── Durable Execution（Phase 2）：Worker 租约协调 ────────────────────
     AGENT_RUNTIME_WORKER_ID: str = ""           # Worker 标识（空=自动生成 hostname-pid-随机）
