@@ -1580,6 +1580,8 @@ class AgentRuntimeService:
                 "max_iterations": agent.max_iterations,
                 "temperature": agent.temperature,
                 "tools": agent.tools or [],
+                # P3-01：能力包绑定随配置进入运行时（_resolve_tool_specs 消费）
+                "capability_ids": getattr(agent, "capability_ids", None) or [],
                 "knowledge_base_id": agent.knowledge_base_id,
                 "database_connection_id": agent.database_connection_id,
             }

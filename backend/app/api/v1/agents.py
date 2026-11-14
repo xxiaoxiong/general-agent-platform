@@ -927,6 +927,7 @@ def _agent_to_dict(a: Agent) -> dict:
         "max_iterations": a.max_iterations,
         "temperature": a.temperature,
         "tools": a.tools or [],
+        "capability_ids": getattr(a, "capability_ids", None) or [],
         "knowledge_base_id": a.knowledge_base_id,
         "database_connection_id": a.database_connection_id,
         "is_active": a.is_active,

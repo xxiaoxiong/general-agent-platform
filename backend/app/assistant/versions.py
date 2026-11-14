@@ -44,8 +44,12 @@ def build_snapshot(
             "max_iterations": agent.max_iterations or 10,
             "max_tokens": agent.max_tokens or 4096,
         },
-        # capability IDs + toolset
-        "capability_ids": list(capability_ids or DEFAULT_CAPABILITY_IDS),
+        # capability IDs + toolset（P3-01：优先 Agent 行 capability_ids）
+        "capability_ids": list(
+            capability_ids
+            or getattr(agent, "capability_ids", None)
+            or DEFAULT_CAPABILITY_IDS
+        ),
         "tools": list(agent.tools or []),
         "toolset_version": 1,
         # skill references / subagent profiles（P2-05/P2-06 注册表接管后填充）

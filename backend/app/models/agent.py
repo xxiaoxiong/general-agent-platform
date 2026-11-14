@@ -28,6 +28,10 @@ class Agent(Base):
     # 工具列表（JSON 数组，存储工具配置）
     tools = Column(JSON, default=list)
 
+    # P3-01：能力包绑定（capability_ids，空=按显式 tools 语义）与默认助手标记
+    capability_ids = Column(JSON, default=list)
+    is_default = Column(Boolean, default=False)
+
     # 知识库关联（可选）
     knowledge_base_id = Column(Integer, ForeignKey("knowledge_bases.id"), nullable=True)
 

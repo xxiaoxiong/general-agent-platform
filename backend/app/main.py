@@ -12,6 +12,8 @@ from app.core.database import init_db
 from app.core.redis import init_redis, close_redis
 from app.core.logging import setup_logging, get_logger
 from app.api.v1 import auth, users, models, knowledge, workflows, app_market, audit, prompts, agents, databases
+from app.api.v2 import capabilities as v2_capabilities
+from app.api.v2 import workspace as v2_workspace
 
 logger = get_logger("main")
 
@@ -214,6 +216,11 @@ app.include_router(audit.router, prefix=API_PREFIX)
 app.include_router(prompts.router, prefix=API_PREFIX)
 app.include_router(agents.router, prefix=API_PREFIX)
 app.include_router(databases.router, prefix=API_PREFIX)
+
+# API v2（产品工作台契约，任务书 §7）：迁移期与 v1 并存
+API_V2_PREFIX = "/api/v2"
+app.include_router(v2_workspace.router, prefix=API_V2_PREFIX)
+app.include_router(v2_capabilities.router, prefix=API_V2_PREFIX)
 
 
 @app.get("/api/health")
