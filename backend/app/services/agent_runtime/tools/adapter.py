@@ -56,6 +56,7 @@ from ..events import (
     TOOL_COMPLETED,
     TOOL_FAILED,
     TOOL_STARTED,
+    RUN_RETRYING,
     EventBus,
     RuntimeEvent,
     redact_secrets,
@@ -74,6 +75,7 @@ from .classification import (
     CLASS_READ_ONLY,
     REPLAY_BLOCK,
     REPLAY_CACHED,
+    RETRY_SAFE,
     SideEffectContract,
     get_side_effect_contract,
     replay_action,
@@ -120,6 +122,71 @@ class ToolLedgerError(PersistenceError, GraphBubbleUp):
     GraphBubbleUp 一律重新抛出），保证关键持久化失败不会被降级为
     工具错误消息继续带病执行（R-12 / 任务书 §0.7）。
     """
+
+
+# 确定性本地错误（未触达外部副作用）→ 不重试（重试无意义）
+# 账本/执行权/状态机异常 → 不重试（必须由外层感知并中止）
+_NO_RETRY_ERRORS = _DEFINITIVE_ERRORS + (PersistenceError, RunLeaseLost, IllegalTransition)
+
+
+async def execute_with_retry(
+    name: str,
+    args: Dict[str, Any],
+    executor: ToolExecutor,
+    *,
+    bus: "EventBus",
+    run_id: str,
+    contract: SideEffectContract,
+) -> Any:
+    """P4-03：工具瞬态失败按风险策略有限重试（§9 工具失败按风险策略处理）。
+
+    - ``safe_retry``（read_only 无副作用）：瞬态失败（retryable 结果或网络类
+      未知异常）有限重试，线性退避；
+    - ``idempotent_key`` / ``none``：**运行内不自动重试**——结果未知的写操作
+      不盲目重发；idempotent_key 工具的重试走账本重放层（REPLAY_RETRY），
+      复用同一幂等键由下游去重（T-05 基线语义）；
+    - 确定性本地错误（参数/策略/账本/执行权）不重试，直接上抛；
+    - 每次重试发出 ``run.retrying`` 结构化事件（§7.1）。
+    """
+    import asyncio as _asyncio
+
+    max_retries = max(0, int(getattr(settings, "AGENT_TOOL_MAX_RETRIES", 2)))
+    if contract.retry_policy != RETRY_SAFE or max_retries == 0:
+        return await executor.execute(name, args, raise_on_error=True)
+
+    backoff = max(0.0, float(getattr(settings, "AGENT_TOOL_RETRY_BACKOFF_SECONDS", 0.5)))
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            result = await executor.execute(name, args, raise_on_error=True)
+        except _NO_RETRY_ERRORS:
+            raise
+        except Exception as e:  # noqa: BLE001 瞬态/未知异常：按策略重试
+            if attempt > max_retries:
+                raise
+            await bus.publish(RuntimeEvent(
+                type=RUN_RETRYING, run_id=run_id,
+                data={
+                    "tool": name, "attempt": attempt, "max_retries": max_retries,
+                    "reason": redact_secrets(str(e))[:200],
+                },
+            ))
+            await _asyncio.sleep(backoff * attempt)
+            continue
+
+        tr = normalize(result)
+        if tr.status == STATUS_FAILED and getattr(tr, "retryable", False) and attempt <= max_retries:
+            await bus.publish(RuntimeEvent(
+                type=RUN_RETRYING, run_id=run_id,
+                data={
+                    "tool": name, "attempt": attempt, "max_retries": max_retries,
+                    "reason": redact_secrets(tr.error or tr.text)[:200],
+                },
+            ))
+            await _asyncio.sleep(backoff * attempt)
+            continue
+        return result
 
 
 def build_args_model(name: str, spec: Dict[str, Any]) -> Type[BaseModel]:
@@ -329,6 +396,7 @@ class ToolAdapterFactory:
             args["headers"] = headers
 
         # 6) 执行（在非 async 线程池跑 sync handler，不阻塞事件循环）
+        #    P4-03：瞬态失败按风险策略有限重试（非幂等 retry_policy=none 不重试）
         try:
             executor = ToolExecutor(
                 self.ctx.db_info.get("db") if self.ctx.db_info else None,
@@ -336,7 +404,11 @@ class ToolAdapterFactory:
             )
             # db / agent handler 需要真实 db session：由 service 注入
             executor.db = self.ctx.db_info.get("session") if self.ctx.db_info else None
-            result = await executor.execute(name, args, raise_on_error=True)
+            result = await execute_with_retry(
+                name, args, executor,
+                bus=self.bus, run_id=self.ctx.run_id,
+                contract=get_side_effect_contract(name),
+            )
             tr: ToolResult = normalize(result)
             duration_ms = int((time.monotonic() - started) * 1000)
 

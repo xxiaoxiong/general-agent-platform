@@ -26,6 +26,7 @@ from app.core.database import AsyncSessionLocal
 
 from .events import (
     APPROVAL_REQUIRED,
+    RUN_RECOVERING,
     RUN_WAITING_APPROVAL,
     LegacyEventAdapter,
     RuntimeEvent,
@@ -259,6 +260,16 @@ class RunWorker:
         # 人工重启策略或创建新 Run（转 needs_reconciliation）。
         is_resume = job.resume is not None
         mode, reason, actions, _recovery_meta = await self.service._recovery_check(row)
+        # P4-03：恢复执行发 run.recovering 结构化事件（§7.1）：
+        # 首次执行（attempt<=1 且非续跑）不发；恢复/接管/续跑发事件供时间线展示
+        if is_resume or mode == RECOVERY_CONTINUE or (row.attempt or 0) > 1:
+            try:
+                await handle.bus.publish(RuntimeEvent(
+                    type=RUN_RECOVERING, run_id=handle.run_id,
+                    data={"mode": mode, "reason": reason or "", "resume": is_resume},
+                ))
+            except Exception:  # noqa: BLE001 事件失败不影响恢复驱动
+                logger.warning("run %s run.recovering 事件发布失败", handle.run_id)
         if is_resume and mode in (RECOVERY_FRESH, RECOVERY_NEEDS_RECONCILIATION):
             await self._pause_run(
                 handle, STATUS_NEEDS_RECONCILIATION,
