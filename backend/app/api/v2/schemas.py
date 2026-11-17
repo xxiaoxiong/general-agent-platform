@@ -58,6 +58,8 @@ class RunCreate(BaseModel):
     conversation_id: Optional[int] = None  # 缺省自动创建会话
     assistant_id: Optional[int] = None     # 缺省 = 会话绑定的助手 / 默认助手
     use_memory: bool = True
+    # 权限模块（审批模式）：manual=高危工具执行前人工审批；auto=自动放行不再询问
+    approval_mode: str = "manual"
 
 
 class ApprovalDecisionIn(BaseModel):

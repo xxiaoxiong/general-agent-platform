@@ -59,24 +59,33 @@ def build_fs_tools(policy: ToolPolicy) -> List[str]:
 def build_fs_permissions(policy: ToolPolicy) -> List[Any]:
     """原生文件工具统一授权（A04）：FilesystemPermission allow/deny/interrupt 规则。
 
-    - 敏感凭据类文件（.env / 私钥 / credentials / secrets）读写一律 deny，
-      独立于 Backend 路由隔离做纵深防御（delete 命中 deny-write 同样被拒）；
-    - 其余路径默认 allow：实际读写只会落在用户/Agent/Session 隔离工作区
-      （/workspace/ FilesystemBackend root）与会话虚拟文件（StateBackend）；
+    - 敏感凭据类文件（.env / 私钥 / credentials / secrets）**读取**一律 deny
+      （任意路径深度，与 Backend 路由隔离做纵深防御）；
+    - **写保护只锚定 /workspace/**（FilesystemBackend 真实落盘根目录，真实
+      凭据文件只可能出现在这里）：deepagents 的 delete 权限检查对无锚点
+      （anchor="/"）的 deny-write 模式一律保守阻断，若把 /​**/ 形式放进
+      write 规则，删除任何"疑似目录/不存在的文件"都会被误杀并报出误导性
+      错误（实测：删除普通 .css 文件被拒并列出 .env 等规则）。StateBackend
+      虚拟文件是会话临时状态，无真实凭据可保护；
     - delete 等危险操作的审批由 interrupt_on（ToolPolicy.hitl_tools）承担，
       不依赖风险登记表冒充保护。
     """
     from deepagents.middleware.filesystem import FilesystemPermission
 
+    sensitive = [
+        "/**/.env", "/**/.env.*",
+        "/**/id_rsa*", "/**/id_ed25519*", "/**/.ssh/**",
+        "/**/*.pem", "/**/*.key",
+        "/**/credentials*", "/**/secrets/**",
+    ]
     return [
+        # 读保护：任意路径深度（read 按路径精确匹配，不影响 delete）
+        FilesystemPermission(operations=["read"], paths=sensitive, mode="deny"),
+        # 写保护：仅锚定真实落盘工作区（带字面前缀，delete 检查可精确推理）
         FilesystemPermission(
-            operations=["read", "write"],
-            paths=[
-                "/**/.env", "/**/.env.*",
-                "/**/id_rsa*", "/**/id_ed25519*", "/**/.ssh/**",
-                "/**/*.pem", "/**/*.key",
-                "/**/credentials*", "/**/secrets/**",
-            ],
+            operations=["write"],
+            paths=[p.replace("/**/", "/workspace/**/", 1) if p.startswith("/**/") else p
+                   for p in sensitive],
             mode="deny",
         ),
     ]
@@ -192,7 +201,10 @@ def _compose_system_prompt(ctx: RuntimeContext) -> str:
         parts.append("## 参考记忆\n" + ctx.memory_context)
     parts.append(
         "## 执行约束\n"
+        "- 始终使用用户提问所用的语言回答（用户用中文则用中文）。\n"
         "- 工具调用前先确认参数完整；工具失败时给出明确状态，不要假装成功。\n"
+        "- write_todos 每轮调用一次即可，不要与其他工具并行发起多个 write_todos。\n"
+        "- 同一文件的写入/编辑/读取请串行进行，不要在同一步并行操作同一路径。\n"
         "- 涉及外部副作用（HTTP POST/邮件/Webhook）的操作会在执行前要求人工审批。\n"
         "- 不要输出与任务无关的内容；最终回答直接给出结论。"
     )

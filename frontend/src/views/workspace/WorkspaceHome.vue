@@ -1,6 +1,6 @@
 <template>
   <div class="workspace-home">
-    <!-- 左侧：最近对话 + 我的智能助手 -->
+    <!-- 左侧：最近对话 + 我的智能助手（执行中可自由切换） -->
     <aside class="ws-sidebar">
       <el-button type="primary" class="new-chat-btn" @click="newConversation">
         <el-icon><Plus /></el-icon> 新建对话
@@ -12,9 +12,10 @@
           v-for="c in conversations"
           :key="c.id"
           class="conv-item"
-          :class="{ active: currentConversation?.id === c.id }"
+          :class="{ active: currentConversation?.id === c.id, 'is-running': runningConvIds.includes(c.id) }"
           @click="selectConversation(c)"
         >
+          <span v-if="runningConvIds.includes(c.id)" class="conv-run-dot"></span>
           <span class="conv-title">{{ c.title || '新对话' }}</span>
           <el-icon class="conv-delete" @click.stop="removeConversation(c)"><Delete /></el-icon>
         </div>
@@ -43,10 +44,14 @@
     <main class="ws-main">
       <div class="ws-header">
         <span class="ws-assistant-name">{{ currentAssistant?.name || '通用助手' }}</span>
-        <span v-if="currentRunId" class="ws-run-id">run: {{ currentRunId.slice(0, 8) }}</span>
       </div>
 
-      <div ref="messagesRef" class="ws-messages">
+      <div
+        ref="messagesRef"
+        class="ws-messages"
+        @scroll.passive="onMessagesScroll"
+        @wheel.passive="onWheelScroll"
+      >
         <div v-if="!messages.length" class="ws-empty">
           <h2>有什么可以帮你？</h2>
           <p>直接输入问题开始对话，或试试：</p>
@@ -63,16 +68,49 @@
             <div class="msg-bubble">{{ m.content }}</div>
           </div>
 
-          <!-- 助手消息 -->
+          <!-- 助手消息：文本段 / 工具小步骤按事件顺序实时穿插在对话流尾部 -->
           <div v-else class="msg-row msg-assistant">
             <div class="msg-content">
-              <RunTimeline
-                v-if="m.runId && m.timelineEvents?.length"
-                :events="m.timelineEvents"
-                :status="m.runStatus || 'running'"
-              />
-              <div v-if="m.content" class="msg-text" v-html="renderMarkdown(m.content)"></div>
-              <div v-else-if="m.streaming" class="msg-text msg-thinking">{{ m.statusText || '思考中…' }}</div>
+              <template v-for="(b, bi) in displayBlocks(m, idx)" :key="bi">
+                <div v-if="b.kind === 'text'" class="msg-text" v-html="renderMarkdown(b.text)"></div>
+
+                <ToolStep v-else-if="b.kind === 'tool'" :tool="b" />
+
+                <div v-else-if="b.kind === 'plan'" class="plan-inline">
+                  <div class="plan-inline-title">任务计划</div>
+                  <div v-for="(t, ti) in planItems(b.todos)" :key="ti" class="plan-inline-item">
+                    <span class="plan-mark" :class="'st-' + (t.status || '')">{{ planMark(t.status) }}</span>
+                    <span :class="{ 'plan-done': t.status === 'completed' }">{{ t.content }}</span>
+                  </div>
+                </div>
+
+                <!-- 完成后的连续工具步骤折叠为摘要（不刷屏），可展开回看 -->
+                <div v-else-if="b.kind === 'group'" class="tool-group">
+                  <div class="tool-group-head" @click="toggleGroup(b.key)">
+                    <span class="tool-state-mark">✓</span>
+                    <span>{{ b.items.length }} 个工具调用<span v-if="groupFailCount(b)">（{{ groupFailCount(b) }} 个失败）</span></span>
+                    <el-icon class="row-chevron"><component :is="b.open ? 'ArrowDown' : 'ArrowRight'" /></el-icon>
+                  </div>
+                  <template v-if="b.open">
+                    <ToolStep v-for="it in b.items" :key="it.key" :tool="it" />
+                  </template>
+                </div>
+              </template>
+
+              <!-- 打字光标：仅"正在生成文本"时出现；工具执行期间用状态行表示 -->
+              <div v-if="m.streaming && m.lastActivity === 'text'" class="typing-cursor-line">
+                <span class="typing-cursor"></span>
+              </div>
+
+              <!-- 实时状态行：明确告知当前在做什么；久无进展时给出等待提示（不是卡死） -->
+              <div v-if="m.streaming" class="live-status">
+                <span class="mini-spin"></span>
+                <span>{{ m.liveStatus || '正在处理…' }}</span>
+                <span v-if="staleSeconds(m) >= 8" class="stale-hint">
+                  · 已 {{ staleSeconds(m) }}s 无新进展，仍在执行
+                </span>
+              </div>
+
               <div v-if="m.error" class="msg-error">{{ m.error }}</div>
               <ApprovalPanel
                 v-if="m.runId && m.pendingActions?.length"
@@ -85,9 +123,22 @@
         </template>
       </div>
 
-      <!-- 输入区 -->
+      <!-- 输入区（执行中可继续浏览/切换；当前会话运行时可停止） -->
       <div class="ws-composer">
+        <div class="composer-perm">
+          <span class="perm-label">审批模式</span>
+          <el-radio-group v-model="approvalMode" size="small">
+            <el-radio-button value="manual">手动审批</el-radio-button>
+            <el-radio-button value="auto">自动审批</el-radio-button>
+          </el-radio-group>
+          <span class="perm-hint">
+            {{ approvalMode === 'manual'
+              ? '高危工具（执行代码 / 外发消息 / 删除等）执行前需人工批准'
+              : '高危工具自动放行，执行过程不再逐次询问' }}
+          </span>
+        </div>
         <div v-if="streaming" class="composer-running">
+          <span class="mini-spin"></span>
           <span>{{ streamingStatus }}</span>
           <el-button size="small" type="danger" plain @click="stopGeneration">
             <el-icon><VideoPause /></el-icon> 停止
@@ -98,7 +149,6 @@
             v-model="inputText"
             type="textarea"
             :rows="2"
-            :disabled="streaming"
             placeholder="输入消息，Enter 发送（Shift+Enter 换行）"
             @keydown.enter.exact.prevent="sendMessage"
           />
@@ -150,49 +200,103 @@
  * 统一智能体工作台（任务书 §2.2）：
  * - 登录后直接对话（默认助手，UX-01）；
  * - 自然语言创建助手（UX-02/03）；
- * - Run Timeline 展示任务进度（UX-05）；
+ * - 流式执行体验：工具小步骤实时穿插追加在对话流尾部，每步可点开详情；
+ * - 执行中可自由切换会话/页面：任务后台继续跑，会话独立状态互不干扰（UX-10）；
  * - 取消走后端 /runs/{id}/cancel（UX-07）；
  * - 断线重连 + Last-Event-ID 续传（UX-08）；
- * - 审批按 action_id 决策（UX-09）；
- * - 会话切换不串状态（UX-10）。
+ * - 审批按 action_id 决策（UX-09）。
  */
-import { nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { Delete, Plus, VideoPause } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { marked } from 'marked'
+import DOMPurify from 'dompurify'
 import {
   assistantApi, conversationApi, consumeRunEvents, runApi, workspaceApi,
-  type Assistant, type Conversation, type RunEventEnvelope,
+  type Assistant, type Conversation,
 } from '@/api/v2'
-import RunTimeline from '@/features/run/RunTimeline.vue'
+import {
+  applyRunEvent, finalizeRunMessage, hasVisibleText,
+  type MsgBlock, type RunStreamMessage, type ToolBlock,
+} from '@/features/run/blocks'
+import ToolStep from '@/features/run/ToolStep.vue'
 import ApprovalPanel from '@/features/run/ApprovalPanel.vue'
 
-interface ChatMessage {
+interface ChatMessage extends RunStreamMessage {
   role: 'user' | 'assistant'
   content: string
-  streaming?: boolean
-  statusText?: string
-  error?: string
   runId?: string
-  timelineEvents?: RunEventEnvelope[]
-  runStatus?: string
-  pendingActions?: any[]
 }
 
-const messages = ref<ChatMessage[]>([])
+/** 折叠后的连续工具步骤组（完成后折叠防刷屏） */
+interface ToolGroupItem {
+  kind: 'group'
+  key: string
+  items: ToolBlock[]
+  open: boolean
+}
+type DisplayItem = MsgBlock | ToolGroupItem
+
+interface ActiveRun {
+  abort: AbortController
+  stopped: boolean
+  msg: ChatMessage
+}
+
+// 每会话独立消息存储：切换会话不打断后台运行，回来即见最新进度
+const convMessages = reactive(new Map<number, ChatMessage[]>())
+const messages = computed<ChatMessage[]>(() =>
+  currentConversation.value ? convArr(currentConversation.value.id) : [],
+)
 const messagesRef = ref<HTMLElement>()
 const inputText = ref('')
-const streaming = ref(false)
-const streamingStatus = ref('')
+
+// 当前会话是否有活跃 Run（各会话互不影响，可并行执行）
+// 注意：entry 含 AbortController 等类实例且需要引用相等比较，必须用普通 Map；
+// 响应式仅体现在 runningConvIds（供模板/计算属性跟踪）
+const activeRuns = new Map<number, ActiveRun>()
+const runningConvIds = ref<number[]>([])
+
+function setActiveRun(convId: number, entry: ActiveRun) {
+  activeRuns.set(convId, entry)
+  if (!runningConvIds.value.includes(convId)) {
+    runningConvIds.value = [...runningConvIds.value, convId]
+  }
+}
+
+function clearActiveRun(convId: number, entry?: ActiveRun) {
+  const cur = activeRuns.get(convId)
+  if (entry && cur !== entry) return
+  activeRuns.delete(convId)
+  runningConvIds.value = runningConvIds.value.filter((x) => x !== convId)
+}
+
+const streaming = computed(() =>
+  !!currentConversation.value && runningConvIds.value.includes(currentConversation.value.id))
+const streamingStatus = computed(() => {
+  const entry = currentConversation.value && activeRuns.get(currentConversation.value.id)
+  return entry?.msg.liveStatus || '任务执行中…'
+})
 
 const conversations = ref<Conversation[]>([])
 const currentConversation = ref<Conversation | null>(null)
 const assistants = ref<Assistant[]>([])
 const currentAssistant = ref<Assistant | null>(null)
 
-// Run 生命周期（§8.4）：保存 X-Run-Id / 最后事件序号，断线后恢复
-const currentRunId = ref<string | null>(null)
-let abortController: AbortController | null = null
-let activeRunToken = 0 // 会话切换防串扰
+// 权限模块：审批模式（manual=高危工具人工审批；auto=自动放行不询问），随 Run 创建下发
+const approvalMode = ref<'manual' | 'auto'>(
+  localStorage.getItem('approval_mode') === 'auto' ? 'auto' : 'manual',
+)
+watch(approvalMode, (v) => localStorage.setItem('approval_mode', v))
+
+// 停滞检测：长时间无新事件时明确提示"仍在执行"，避免误以为卡死
+const clock = ref(Date.now())
+let clockTimer: number | undefined
+
+function staleSeconds(m: ChatMessage): number {
+  if (!m.streaming || !m.lastEventAt) return 0
+  return Math.max(0, Math.floor((clock.value - m.lastEventAt) / 1000))
+}
 
 const showBuilder = ref(false)
 const builderText = ref('')
@@ -200,21 +304,151 @@ const draft = ref<any>(null)
 const drafting = ref(false)
 const creating = ref(false)
 
-function renderMarkdown(text: string): string {
-  // 轻量渲染：转义 + 换行（避免 v-html 注入，先转义）
-  const escaped = text
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-  return escaped.replace(/\n/g, '<br/>')
+// Markdown 渲染（marked + DOMPurify）：回答主体是用户的核心产物，必须完整渲染
+// marked v12 renderer 收 token 对象；兼容旧式 (code, lang) 双签名
+function renderCodeBlock(code: string, lang?: string) {
+  const langClass = lang ? ` class="language-${lang}"` : ''
+  const escaped = code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  return `<div class="code-block-wrapper"><button class="copy-btn" onclick="(function(btn){var code=btn.nextElementSibling.querySelector('code');navigator.clipboard.writeText(code.innerText).then(function(){btn.textContent='已复制';setTimeout(function(){btn.textContent='复制'},1500)}).catch(function(){btn.textContent='失败'});})(this)">复制</button><pre><code${langClass}>${escaped}</code></pre></div>`
 }
 
+marked.use({
+  breaks: true,
+  gfm: true,
+  renderer: {
+    code(arg1: any, arg2?: string) {
+      if (arg1 && typeof arg1 === 'object') {
+        return renderCodeBlock(String(arg1.text || ''), arg1.lang || undefined)
+      }
+      return renderCodeBlock(String(arg1 || ''), arg2)
+    },
+    link(href: string, title: string | null, text: string) {
+      const titleAttr = title ? ` title="${title}"` : ''
+      return `<a href="${href}" target="_blank" rel="noopener noreferrer"${titleAttr}>${text}</a>`
+    },
+  } as any,
+})
+
+function renderMarkdown(text: string): string {
+  if (!text) return ''
+  const raw = marked.parse(text) as string
+  return DOMPurify.sanitize(raw)
+}
+
+/**
+ * 粘底跟随（滚动条体验）：
+ * - 任务开始 / 发送 / 切换会话：回到对话末端并持续跟随最新内容（无需手动下拉）；
+ * - 用户上翻查看历史：停止跟随（绝不强行跳底）；
+ * - 用户滚回底部：自动恢复跟随。
+ * 旧实现按"距底 <160px"判定跟随——一次大段渲染（批量增量/工具块插入）就会
+ * 超出阈值导致从此不再自动滚动。粘底标志表达的是"用户意图"，与内容涨幅无关。
+ */
+const stickToBottom = ref(true)
+/** 最近一次钉底时的 scrollTop：内容撑开不改变 scrollTop，用户上翻才会 */
+let lastPinnedTop = -1
+
+function onMessagesScroll() {
+  const el = messagesRef.value
+  if (!el) return
+  stickToBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+}
+
+/** 滚轮上翻 = 明确的"离开底部"意图，同步解除粘底（scroll 事件派发晚于微任务，存在竞态） */
+function onWheelScroll(e: WheelEvent) {
+  if (e.deltaY < 0) stickToBottom.value = false
+}
+
+/** 跟随最新内容（仅粘底状态下生效，不打断阅读历史） */
 async function scrollToBottom() {
   await nextTick()
-  messagesRef.value?.scrollTo({ top: messagesRef.value.scrollHeight })
+  const el = messagesRef.value
+  if (!el || !stickToBottom.value) return
+  // 粘底判定必须放在滚动前一刻：若在 nextTick 之前检查，上翻瞬间在途的
+  // 跟随调用会把用户强行拽回底部（并经 scroll 事件把粘底标志重新武装）
+  // 双保险：scrollTop 被拽离最近钉底位置 = 用户上翻（内容撑开不会改 scrollTop）
+  if (lastPinnedTop >= 0 && el.scrollTop < lastPinnedTop - 40) {
+    stickToBottom.value = false
+    return
+  }
+  el.scrollTop = el.scrollHeight
+  lastPinnedTop = el.scrollTop
+}
+
+/** 强制回到底部并恢复跟随（切换会话/发送消息/任务开始等明确意图） */
+async function forceScrollToBottom() {
+  stickToBottom.value = true
+  await nextTick()
+  const el = messagesRef.value
+  if (el) {
+    el.scrollTop = el.scrollHeight
+    lastPinnedTop = el.scrollTop
+  }
+}
+
+// ── 块流展示（工具步骤实时穿插；完成后连续步骤折叠防刷屏）──────────────────
+
+const groupOpen = reactive<Record<string, boolean>>({})
+
+function toggleGroup(key: string) {
+  groupOpen[key] = !groupOpen[key]
+}
+
+function groupFailCount(g: ToolGroupItem): number {
+  return g.items.filter((i) => i.state === 'failed').length
+}
+
+/** markdown 渲染后无可见内容（只剩注释/标记/不可见字符）的文本块视为空块 */
+function rendersEmpty(md: string): boolean {
+  const tmp = document.createElement('div')
+  tmp.innerHTML = renderMarkdown(md)
+  const text = (tmp.textContent || '').replace(new RegExp('[\\s\\u00ad\\u200b-\\u200f\\u2060\\ufeff]', 'g'), '')
+  return !text && !tmp.querySelector('img, pre, table, hr')
+}
+
+/** 计划清单可见条目（无内容条目不渲染，防白板） */
+function planItems(todos: any[]): any[] {
+  return (todos || []).filter((t) => hasVisibleText(String(t?.content ?? '')))
+}
+
+function displayBlocks(m: ChatMessage, msgIdx: number): DisplayItem[] {
+  // 空白文本块（模型偶发的纯空白/零宽增量）与空计划块不渲染，避免"白板区块"
+  const blocks = m.blocks.filter((b) => {
+    if (b.kind === 'text') return hasVisibleText(b.text) && !rendersEmpty(b.text)
+    if (b.kind === 'plan') return planItems(b.todos).length > 0
+    return true
+  })
+  if (m.streaming) return blocks // 执行中逐步实时展示，不折叠
+  const out: DisplayItem[] = []
+  let i = 0
+  while (i < blocks.length) {
+    const b = blocks[i]
+    if (b.kind === 'tool') {
+      let j = i
+      while (j < blocks.length && blocks[j].kind === 'tool') j++
+      const group = blocks.slice(i, j) as ToolBlock[]
+      if (group.length > 3) {
+        const key = `${msgIdx}-${i}`
+        out.push({ kind: 'group', key, items: group, open: !!groupOpen[key] })
+      } else {
+        out.push(...group)
+      }
+      i = j
+    } else {
+      out.push(b)
+      i++
+    }
+  }
+  return out
+}
+
+function planMark(status: string) {
+  return { completed: '[x]', in_progress: '[>]' }[status] || '[ ]'
 }
 
 // ── 初始化 ────────────────────────────────────────────────────────────────────
 
 onMounted(async () => {
+  clockTimer = window.setInterval(() => { clock.value = Date.now() }, 1000)
   const boot = await workspaceApi.bootstrap()
   currentAssistant.value = boot.default_assistant
   assistants.value = [boot.default_assistant]
@@ -227,57 +461,104 @@ onMounted(async () => {
   await loadConversations()
 })
 
+onUnmounted(() => {
+  if (clockTimer) clearInterval(clockTimer)
+  for (const entry of activeRuns.values()) {
+    entry.stopped = true
+    entry.abort.abort()
+  }
+  runningConvIds.value = []
+})
+
 async function loadConversations() {
   const res = await conversationApi.list()
   conversations.value = res.items || []
 }
 
-// ── 会话管理（UX-10：切换不串状态）────────────────────────────────────────────
+// ── 会话管理（执行中自由切换；后台运行互不干扰）──────────────────────────────
+
+function convArr(convId: number): ChatMessage[] {
+  if (!convMessages.has(convId)) convMessages.set(convId, [])
+  return convMessages.get(convId)!
+}
+
+function pushMsg(convId: number, msg: ChatMessage): ChatMessage {
+  const arr = convArr(convId)
+  arr.push(msg)
+  return arr[arr.length - 1] // 返回响应式代理，后续变更才能触发视图更新
+}
 
 async function newConversation() {
-  if (streaming.value) {
-    ElMessage.warning('请等待当前回答完成后再新建对话')
-    return
-  }
   const c = await conversationApi.create({ assistant_id: currentAssistant.value?.id })
   conversations.value.unshift(c)
   currentConversation.value = c
-  messages.value = []
-  currentRunId.value = null
+  convMessages.set(c.id, [])
 }
 
 async function selectConversation(c: Conversation) {
-  if (streaming.value) {
-    ElMessage.warning('请等待当前回答完成后再切换会话')
+  currentConversation.value = c
+  if (convMessages.has(c.id)) {
+    await forceScrollToBottom()
     return
   }
-  currentConversation.value = c
-  currentRunId.value = null
+  const arr = convArr(c.id)
   try {
     const res = await conversationApi.messages(c.id)
-    messages.value = (res.items || []).map((m: any) => ({
-      role: m.role === 'user' ? 'user' : 'assistant',
-      content: m.content || '',
-    }))
-    await scrollToBottom()
+    const raw: any[] = res.items || []
+    for (const m of raw) {
+      if (m.role === 'user') {
+        arr.push({ role: 'user', content: m.content || '', blocks: [] })
+        continue
+      }
+      const content = m.content || ''
+      const runId = m.source_run_id || undefined
+      // 历史助手消息：块流由事件回放重建（文本/工具按发生顺序穿插）；
+      // 无事件流时直接以内容作为文本块
+      if (!runId) {
+        arr.push({
+          role: 'assistant', content,
+          blocks: content.trim() ? [{ kind: 'text', text: content }] : [],
+          runStatus: 'completed', pendingActions: [],
+        })
+      } else {
+        const msg = pushMsg(c.id, {
+          role: 'assistant', content, blocks: [], runId,
+          streaming: true, runStatus: '', pendingActions: [],
+          lastActivity: 'other', lastEventAt: Date.now(),
+          liveStatus: '正在恢复执行进度…',
+        })
+        consumeRunEvents(runId, {
+          afterSeq: 0,
+          onEvent: (envelope) => applyRunEvent(msg, envelope),
+          onDone: (reason) => finalizeRunMessage(msg, reason, msg.content),
+        }).catch(() => {
+          msg.streaming = false
+          msg.liveStatus = ''
+        })
+      }
+    }
+    await forceScrollToBottom()
   } catch { /* ignore */ }
 }
 
 async function removeConversation(c: Conversation) {
   await ElMessageBox.confirm('确定删除此对话？', '确认', { type: 'warning' })
+  const entry = activeRuns.get(c.id)
+  if (entry) {
+    entry.stopped = true
+    entry.abort.abort()
+    clearActiveRun(c.id)
+    if (entry.msg.runId) runApi.cancel(entry.msg.runId, '会话已删除').catch(() => {})
+  }
   await conversationApi.delete(c.id)
   conversations.value = conversations.value.filter((x) => x.id !== c.id)
+  convMessages.delete(c.id)
   if (currentConversation.value?.id === c.id) {
     currentConversation.value = null
-    messages.value = []
   }
 }
 
 function selectAssistant(a: Assistant) {
-  if (streaming.value) {
-    ElMessage.warning('请等待当前回答完成后再切换助手')
-    return
-  }
   currentAssistant.value = a
 }
 
@@ -296,132 +577,77 @@ async function sendMessage() {
     const c = await conversationApi.create({ assistant_id: currentAssistant.value?.id })
     conversations.value.unshift(c)
     currentConversation.value = c
+    convMessages.set(c.id, [])
   }
+  const convId = currentConversation.value.id
 
   inputText.value = ''
-  messages.value.push({ role: 'user', content: text })
+  pushMsg(convId, { role: 'user', content: text, blocks: [] })
+  const aMsg = pushMsg(convId, {
+    role: 'assistant', content: '', blocks: [], streaming: true,
+    lastActivity: 'other', lastEventAt: Date.now(),
+    liveStatus: '正在创建任务…', runStatus: 'pending', pendingActions: [],
+  })
+  await forceScrollToBottom()
 
-  const token = ++activeRunToken
-  const conversationIdForThisRun = currentConversation.value.id
-
-  const assistantMsg: ChatMessage = {
-    role: 'assistant', content: '', streaming: true, statusText: '正在创建任务…',
-    timelineEvents: [], runStatus: 'pending', pendingActions: [],
-  }
-  messages.value.push(assistantMsg)
-  const msgIdx = messages.value.length - 1
-  streaming.value = true
-  streamingStatus.value = '正在创建任务…'
-  await scrollToBottom()
-
-  abortController = new AbortController()
+  const entry: ActiveRun = { abort: new AbortController(), stopped: false, msg: aMsg }
+  setActiveRun(convId, entry)
 
   try {
     const created = await runApi.create({
       message: text,
-      conversation_id: conversationIdForThisRun,
+      conversation_id: convId,
       assistant_id: currentAssistant.value?.id,
+      approval_mode: approvalMode.value,
     })
-    if (token !== activeRunToken) return // 会话已切换，丢弃
-    currentRunId.value = created.run_id
-    messages.value[msgIdx].runId = created.run_id
+    if (entry.stopped) return
+    aMsg.runId = created.run_id
 
-    await consumeRunEvents(created.run_id, {
-      signal: abortController.signal,
+    consumeRunEvents(created.run_id, {
+      signal: entry.abort.signal,
       afterSeq: 0,
       onEvent: (envelope) => {
-        if (token !== activeRunToken) return
-        applyEvent(msgIdx, envelope)
+        if (entry.stopped) return
+        applyRunEvent(aMsg, envelope)
+        if (currentConversation.value?.id === convId) scrollToBottom()
       },
       onReconnecting: (attempt) => {
-        if (token !== activeRunToken) return
-        streamingStatus.value = `连接中断，正在重连（第 ${attempt} 次）…`
+        if (entry.stopped) return
+        aMsg.liveStatus = `连接中断，正在重连（第 ${attempt} 次）…`
       },
       onDone: (reason) => {
-        if (token !== activeRunToken) return
-        finalizeMessage(msgIdx, reason)
+        if (entry.stopped) return
+        finishRun(convId, entry, reason)
       },
-    })
-    await loadConversations()
+    }).catch(() => { /* 网络异常已由 onDone 兜底 */ })
   } catch (e: any) {
-    if (token !== activeRunToken) return
-    messages.value[msgIdx] = {
-      ...messages.value[msgIdx],
-      streaming: false,
-      error: `执行出错: ${e.message}`,
-    }
+    if (entry.stopped) return
+    aMsg.streaming = false
+    aMsg.liveStatus = ''
+    aMsg.error = `执行出错: ${e.message}`
+    clearActiveRun(convId, entry)
     ElMessage.error('请求失败: ' + e.message)
-  } finally {
-    if (token === activeRunToken) {
-      streaming.value = false
-      abortController = null
-      await scrollToBottom()
-    }
   }
 }
 
-function applyEvent(msgIdx: number, envelope: RunEventEnvelope) {
-  const msg = messages.value[msgIdx]
-  if (!msg) return
-  msg.timelineEvents = [...(msg.timelineEvents || []), envelope]
-
-  switch (envelope.event) {
-    case 'run.started':
-      msg.statusText = '任务已开始'
-      streamingStatus.value = '任务执行中…'
-      break
-    case 'plan.updated':
-      streamingStatus.value = '正在规划任务…'
-      break
-    case 'tool.started':
-      streamingStatus.value = `调用工具: ${envelope.data?.tool_name || ''}`
-      break
-    case 'tool.completed':
-      streamingStatus.value = '获取工具结果…'
-      break
-    case 'assistant.delta':
-      // v2 主协议：模型增量直接进最终回答区（不展示原始推理）
-      msg.content = (msg.content || '') + (envelope.data?.text || '')
-      msg.statusText = '正在生成回答…'
-      streamingStatus.value = '正在生成回答…'
-      break
-    case 'approval.required':
-      msg.pendingActions = envelope.data?.actions || []
-      msg.statusText = '等待人工审批'
-      streamingStatus.value = '等待人工审批…'
-      break
-    case 'run.status_changed':
-      msg.runStatus = envelope.data?.status || msg.runStatus
-      break
-    case 'run.failed':
-      msg.error = envelope.data?.error || '运行失败'
-      break
-  }
-  scrollToBottom()
+function finishRun(convId: number, entry: ActiveRun, reason: string) {
+  finalizeRunMessage(entry.msg, reason, entry.msg.content)
+  clearActiveRun(convId, entry)
+  loadConversations().catch(() => {}) // 标题已规范化生成，刷新会话列表
+  if (currentConversation.value?.id === convId) scrollToBottom()
 }
 
-function finalizeMessage(msgIdx: number, reason: string) {
-  const msg = messages.value[msgIdx]
-  if (!msg) return
-  msg.streaming = false
-  msg.runStatus = reason.startsWith('reconnect_failed') ? (msg.runStatus || 'failed') : reason
-  if (reason === 'run.completed' && !msg.content) {
-    msg.content = '（任务已完成）'
-  }
-  if (reason.startsWith('reconnect_failed')) {
-    msg.error = `连接中断且重连失败：${reason.replace('reconnect_failed: ', '')}。可刷新页面恢复任务进度。`
-  }
-  streaming.value = false
-  scrollToBottom()
-}
-
-/** UX-07：停止 = 后端真实取消（不停止订阅而已）+ 断开 SSE */
+/** UX-07：停止 = 后端真实取消（不停止订阅而已）+ 立即本地终结 */
 async function stopGeneration() {
-  const runId = currentRunId.value
-  if (abortController) {
-    abortController.abort()
-    abortController = null
-  }
+  const convId = currentConversation.value?.id
+  if (!convId) return
+  const entry = activeRuns.get(convId)
+  if (!entry) return
+  entry.stopped = true
+  entry.abort.abort()
+  clearActiveRun(convId, entry)
+  finalizeRunMessage(entry.msg, 'run.cancelled', entry.msg.content)
+  const runId = entry.msg.runId
   if (runId) {
     try {
       const res = await runApi.cancel(runId, '用户主动停止')
@@ -430,39 +656,36 @@ async function stopGeneration() {
       ElMessage.warning('取消请求失败，任务可能继续执行')
     }
   }
-  streaming.value = false
 }
 
 function onApprovalDecided(type: 'approve' | 'reject') {
-  // 审批后恢复执行：继续消费事件流（run 重新进入 running）
-  const msgIdx = messages.value.findIndex((m) => m.pendingActions?.length)
-  if (msgIdx < 0) return
-  const msg = messages.value[msgIdx]
-  msg.pendingActions = []
-  msg.streaming = true
-  streaming.value = true
-  streamingStatus.value = type === 'approve' ? '已批准，恢复执行…' : '已拒绝，恢复执行…'
-  abortController = new AbortController()
-  const token = activeRunToken
+  const convId = currentConversation.value?.id
+  if (!convId) return
+  const arr = convArr(convId)
+  const aMsg = arr.find((m) => m.role === 'assistant' && m.pendingActions?.length)
+  if (!aMsg?.runId) return
+  aMsg.pendingActions = []
+  aMsg.streaming = true
+  aMsg.lastActivity = 'other'
+  aMsg.lastEventAt = Date.now()
+  aMsg.liveStatus = type === 'approve' ? '已批准，恢复执行…' : '已拒绝，恢复执行…'
 
-  consumeRunEvents(msg.runId!, {
-    signal: abortController.signal,
-    afterSeq: msg.timelineEvents?.length
-      ? msg.timelineEvents[msg.timelineEvents.length - 1].sequence
-      : 0,
+  const entry: ActiveRun = { abort: new AbortController(), stopped: false, msg: aMsg }
+  setActiveRun(convId, entry)
+
+  consumeRunEvents(aMsg.runId, {
+    signal: entry.abort.signal,
+    afterSeq: aMsg.lastSeq || 0,
     onEvent: (envelope) => {
-      if (token !== activeRunToken) return
-      applyEvent(msgIdx, envelope)
+      if (entry.stopped) return
+      applyRunEvent(aMsg, envelope)
+      if (currentConversation.value?.id === convId) scrollToBottom()
     },
     onDone: (reason) => {
-      if (token !== activeRunToken) return
-      finalizeMessage(msgIdx, reason)
+      if (entry.stopped) return
+      finishRun(convId, entry, reason)
     },
-  }).finally(() => {
-    if (token === activeRunToken) {
-      streaming.value = false
-    }
-  })
+  }).catch(() => { /* 网络异常已由 onDone 兜底 */ })
 }
 
 // ── 自然语言 Builder（UX-02/03）──────────────────────────────────────────────
@@ -496,7 +719,7 @@ async function createFromDraft() {
     showBuilder.value = false
     draft.value = null
     builderText.value = ''
-    ElMessage.success('助手已创建并可立即使用')
+    ElMessage.success('助手已创建并立即可用')
   } finally {
     creating.value = false
   }
@@ -525,6 +748,7 @@ async function createFromDraft() {
 .conv-item {
   display: flex;
   align-items: center;
+  gap: 6px;
   padding: 7px 10px;
   border-radius: 6px;
   cursor: pointer;
@@ -537,6 +761,12 @@ async function createFromDraft() {
 .conv-delete { opacity: 0; color: #c0c4cc; }
 .conv-item:hover .conv-delete { opacity: 1; }
 .conv-delete:hover { color: #f56c6c; }
+/* 后台运行中的会话指示（切换不打断执行） */
+.conv-run-dot {
+  width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+  background: #409eff; animation: pulse 1.2s infinite ease-in-out;
+}
+@keyframes pulse { 0%, 100% { opacity: 0.35; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1); } }
 .sidebar-empty { color: #c0c4cc; font-size: 12px; }
 .assistant-item {
   display: flex;
@@ -561,7 +791,6 @@ async function createFromDraft() {
   gap: 12px;
 }
 .ws-assistant-name { font-weight: 600; }
-.ws-run-id { color: #c0c4cc; font-size: 12px; font-family: monospace; }
 
 .ws-messages { flex: 1; overflow-y: auto; padding: 20px; }
 .ws-empty { text-align: center; color: #909399; margin-top: 10vh; }
@@ -590,17 +819,123 @@ async function createFromDraft() {
   border-radius: 12px;
   padding: 10px 14px;
   white-space: pre-wrap;
+  word-break: break-word;
 }
 .msg-assistant { justify-content: flex-start; }
-.msg-content { max-width: 80%; width: 100%; }
+.msg-content { max-width: 86%; width: 100%; }
 .msg-text {
   background: #f5f7fa;
   border-radius: 12px;
-  padding: 10px 14px;
-  white-space: pre-wrap;
-  line-height: 1.6;
+  padding: 12px 16px;
+  line-height: 1.7;
+  word-break: break-word;
+  font-size: 14px;
+  color: #303133;
 }
-.msg-thinking { color: #909399; font-style: italic; }
+/* Markdown 排版（回答是核心产物，完整渲染） */
+.msg-text :deep(h1), .msg-text :deep(h2), .msg-text :deep(h3) {
+  font-weight: 600; color: #0d0d0d; margin: 12px 0 6px;
+}
+.msg-text :deep(h1) { font-size: 19px; }
+.msg-text :deep(h2) { font-size: 17px; }
+.msg-text :deep(h3) { font-size: 15px; }
+.msg-text :deep(p) { margin: 6px 0; }
+.msg-text :deep(ul), .msg-text :deep(ol) { padding-left: 22px; margin: 6px 0; }
+.msg-text :deep(li) { margin: 3px 0; }
+.msg-text :deep(code) {
+  background: #e8eaef; color: #c7254e;
+  padding: 2px 6px; border-radius: 4px; font-family: 'Consolas', monospace; font-size: 13px;
+}
+.msg-text :deep(.code-block-wrapper) { position: relative; margin: 10px 0; }
+.msg-text :deep(.copy-btn) {
+  position: absolute; top: 6px; right: 8px;
+  background: rgba(255,255,255,0.12); color: #d4d4d4;
+  border: 1px solid rgba(255,255,255,0.2); border-radius: 4px;
+  padding: 2px 10px; font-size: 12px; cursor: pointer; z-index: 1; line-height: 1.6;
+}
+.msg-text :deep(.copy-btn:hover) { background: rgba(255,255,255,0.22); color: #fff; }
+.msg-text :deep(pre) {
+  background: #1e1e1e; border-radius: 8px;
+  padding: 12px 14px; overflow-x: auto; margin: 0; font-size: 13px;
+}
+.msg-text :deep(pre code) { background: none; padding: 0; color: #d4d4d4; font-family: 'Consolas', 'Monaco', monospace; }
+.msg-text :deep(blockquote) {
+  border-left: 3px solid #409eff; margin: 8px 0; padding: 4px 12px;
+  color: #606266; background: #ecf5ff33; border-radius: 0 6px 6px 0;
+}
+.msg-text :deep(table) {
+  border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 13px;
+  border: 1px solid #e4e7ed; border-radius: 8px; overflow: hidden;
+}
+.msg-text :deep(th), .msg-text :deep(td) { border: 1px solid #e4e7ed; padding: 7px 12px; text-align: left; }
+.msg-text :deep(th) { background: #eef1f6; font-weight: 600; }
+.msg-text :deep(a) { color: #409eff; text-decoration: none; word-break: break-all; }
+.msg-text :deep(a:hover) { text-decoration: underline; }
+.msg-text :deep(img) { max-width: 100%; border-radius: 8px; margin: 8px 0; }
+.msg-text :deep(hr) { border: none; border-top: 1px solid #e4e7ed; margin: 12px 0; }
+
+/* 计划块（穿插在流中的紧凑清单） */
+.plan-inline {
+  border-left: 3px solid #409eff;
+  background: #f5f7fa;
+  border-radius: 0 8px 8px 0;
+  padding: 8px 12px;
+  margin: 6px 0;
+}
+.plan-inline-title { font-size: 12px; color: #909399; margin-bottom: 2px; }
+.plan-inline-item { padding: 2px 0; color: #606266; font-size: 13px; }
+.plan-mark { font-family: monospace; margin-right: 6px; color: #909399; }
+.plan-mark.st-completed { color: #67c23a; }
+.plan-mark.st-in_progress { color: #409eff; }
+.plan-done { color: #a0a4ab; text-decoration: line-through; }
+
+/* 工具步骤组（完成后折叠摘要，防刷屏） */
+.tool-group {
+  border: 1px solid #e4e7ed;
+  border-radius: 8px;
+  background: #fafbfc;
+  padding: 4px 8px;
+  margin: 6px 0;
+}
+.tool-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  color: #606266;
+}
+.tool-group-head:hover { background: #eef1f5; border-radius: 6px; }
+.tool-state-mark { color: #67c23a; width: 14px; text-align: center; }
+.row-chevron { color: #c0c4cc; font-size: 11px; }
+
+/* 流式打字光标：仅文本生成中出现 */
+.typing-cursor-line { margin-top: -6px; padding-left: 4px; }
+.typing-cursor {
+  display: inline-block; width: 2px; height: 1.1em;
+  background: #409eff; vertical-align: text-bottom;
+  animation: cursorBlink 0.8s infinite;
+}
+@keyframes cursorBlink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+/* 实时状态行：明确"正在做什么/仍在执行"，替代孤立光标 */
+.live-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 4px 2px;
+  color: #909399;
+  font-size: 12px;
+}
+.mini-spin {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  background: #409eff; animation: pulse 1.2s infinite ease-in-out;
+}
+.stale-hint { color: #e6a23c; }
+
 .msg-error {
   color: #f56c6c;
   background: #fef0f0;
@@ -612,10 +947,20 @@ async function createFromDraft() {
 
 /* 输入区 */
 .ws-composer { border-top: 1px solid #e4e7ed; padding: 12px 20px; }
+/* 权限模块：审批模式选择（手动审批 / 自动审批） */
+.composer-perm {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.perm-label { font-size: 12px; color: #909399; flex-shrink: 0; }
+.perm-hint { font-size: 12px; color: #c0c4cc; }
 .composer-running {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
   margin-bottom: 8px;
   color: #409eff;
   font-size: 13px;

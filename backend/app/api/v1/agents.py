@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, or_
+from sqlalchemy.orm import defer
 from sqlalchemy.orm.attributes import flag_modified
 from pydantic import BaseModel
 
@@ -15,7 +16,7 @@ from app.core.database import get_db, AsyncSessionLocal
 from app.core.config import settings
 from app.api.deps import get_current_user, get_current_superuser
 from app.models.user import User
-from app.models.agent import Agent, AgentSession
+from app.models.agent import Agent, AgentSession, session_message_count_expr
 from app.services.agent_runtime import get_runtime_service
 from app.services.agent_runtime.service import (
     ApprovalConflict,
@@ -233,14 +234,17 @@ async def list_sessions(
     current_user: User = Depends(get_current_user),
 ):
     await _get_or_404(db, agent_id, current_user)
+    # 列表裁掉 messages 大列（撑爆 sort buffer 报 1038），条数库内计算
+    msg_count = session_message_count_expr(db.get_bind().dialect.name)
     res = await db.execute(
-        select(AgentSession)
+        select(AgentSession, msg_count.label("message_count"))
+        .options(defer(AgentSession.messages))
         .where(AgentSession.agent_id == agent_id, AgentSession.user_id == current_user.id)
         .order_by(AgentSession.updated_at.desc())
         .limit(50)
     )
-    sessions = res.scalars().all()
-    return {"items": [_session_to_dict(s) for s in sessions]}
+    sessions = res.all()
+    return {"items": [_session_to_dict(s, message_count=mc) for s, mc in sessions]}
 
 
 @router.post("/{agent_id}/sessions")
@@ -846,12 +850,14 @@ def _agent_to_dict(a: Agent) -> dict:
     }
 
 
-def _session_to_dict(s: AgentSession) -> dict:
+def _session_to_dict(s: AgentSession, message_count: Optional[int] = None) -> dict:
     return {
         "id": s.id,
         "agent_id": s.agent_id,
         "title": s.title,
-        "message_count": len(s.messages or []),
+        "message_count": (
+            len(s.messages or []) if message_count is None else int(message_count)
+        ),
         "created_at": s.created_at.isoformat() if s.created_at else None,
         "updated_at": s.updated_at.isoformat() if s.updated_at else None,
     }

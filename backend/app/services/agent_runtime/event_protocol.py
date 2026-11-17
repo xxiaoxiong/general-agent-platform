@@ -195,12 +195,18 @@ async def replay_events_v2(
     - 运行未终结时轮询新事件直至终止事件/终态合成（§12.2：消费者必然终止）。
     """
     from .repositories import EventRepository, RunRepository
+    from .events import wait_wakeup
     from .lifecycle import TERMINAL_STATUSES, STATUS_WAITING_APPROVAL, STATUS_NEEDS_RECONCILIATION
 
     from app.core.database import AsyncSessionLocal
 
     db_seq = int(after_seq or 0)
-    poll = max(0.05, float(getattr(settings, "AGENT_RUNTIME_POLL_INTERVAL", 1.0)))
+    # SSE 事件下发要"实时"：轮询兜底间隔独立于 Worker 扫描间隔（AGENT_RUNTIME_POLL_INTERVAL），
+    # 同进程场景由 EventBus 唤醒立即取事件，轮询仅是跨进程兜底
+    poll = max(0.05, float(getattr(settings, "AGENT_SSE_POLL_INTERVAL", 0.3)))
+    # resume 竞态宽限：等待 Claim（waiting_approval->running）的最长时长，
+    # 超时说明恢复未实际发生（如决策校验失败），退回合成终止事件防消费端挂死
+    resume_grace_deadline: Optional[float] = None
 
     def _visible(envelope: Dict[str, Any]) -> bool:
         return after_seq is None or int(envelope.get("sequence") or 0) > after_seq
@@ -234,6 +240,23 @@ async def replay_events_v2(
         if run_row.status in TERMINAL_STATUSES or run_row.status in (
             STATUS_WAITING_APPROVAL, STATUS_NEEDS_RECONCILIATION,
         ):
+            last_seq = int(getattr(run_row, "last_event_seq", 0) or 0)
+            resuming = after_seq is not None and last_seq > 0 and db_seq >= last_seq
+            if resuming and run_row.status in (
+                STATUS_WAITING_APPROVAL, STATUS_NEEDS_RECONCILIATION,
+            ):
+                # resume 后重新订阅的消费者：已消费过边界事件（db_seq >= last_event_seq），
+                # 此处 run 状态可能仍是 Claim 前的 waiting_approval（POST /resume 先返回、
+                # Claim 异步进行）。不得合成终止事件（否则消费端立即收尾、UI 卡在"待审批"），
+                # 继续轮询等待恢复产生的新事件（§12.2 边界语义只终止"见证边界"的那次流）。
+                import time as _time
+
+                if resume_grace_deadline is None:
+                    resume_grace_deadline = _time.monotonic() + 60.0
+                if _time.monotonic() < resume_grace_deadline:
+                    await wait_wakeup(run_id, poll)
+                    continue
+                # 宽限期外仍未恢复：按边界状态合成终止事件（防消费端挂死）
             # 事件日志缺失/已清理：按状态合成终止事件
             envelope = synthetic_terminal_from_status(
                 run_id, run_row.status, error=run_row.error
@@ -242,4 +265,4 @@ async def replay_events_v2(
             if _visible(envelope):
                 yield envelope
             return
-        await asyncio.sleep(poll)
+        await wait_wakeup(run_id, poll)

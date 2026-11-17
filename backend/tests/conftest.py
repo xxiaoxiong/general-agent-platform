@@ -10,6 +10,9 @@ _TEST_DIR = tempfile.mkdtemp(prefix="ai_general_plat_test_")
 
 os.environ.setdefault("DATABASE_URL", f"sqlite+aiosqlite:///{_TEST_DIR}/test.db")
 os.environ.setdefault("DATABASE_SYNC_URL", f"sqlite:///{_TEST_DIR}/test.db")
+# 强制关闭 DEBUG（真实 env 优先于 .env 文件）：DEBUG=true 会让 engine echo=True，
+# SQL 日志写到 stdout，污染多进程测试子进程的协议行解析（CLAIM:/OK: 等）
+os.environ.setdefault("DEBUG", "false")
 os.environ.setdefault("AGENT_CHECKPOINT_DSN", "memory")
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-pytest")
 os.environ.setdefault("AGENT_FILES_ROOT", os.path.join(_TEST_DIR, "agent_files"))

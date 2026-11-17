@@ -40,12 +40,22 @@ def assistant_to_dict(a: Agent, version: Optional[AgentVersion] = None) -> Dict[
     return out
 
 
-def conversation_to_dict(s: AgentSession) -> Dict[str, Any]:
+def conversation_to_dict(
+    s: AgentSession, message_count: Optional[int] = None
+) -> Dict[str, Any]:
+    """会话输出。
+
+    ``message_count`` 由列表查询用 SQL（JSON 函数）计算后传入，避免为计数
+    把 messages 大列取回——列表 ORDER BY 时大 JSON 参与排序会撑爆
+    MySQL sort buffer（错误 1038）；不传时从已加载实体读取。
+    """
     return {
         "id": s.id,
         "assistant_id": s.agent_id,
         "title": s.title or "新对话",
-        "message_count": len(s.messages or []),
+        "message_count": (
+            len(s.messages or []) if message_count is None else int(message_count)
+        ),
         "active_run_id": s.active_run_id,
         "created_at": s.created_at.isoformat() if s.created_at else None,
         "updated_at": s.updated_at.isoformat() if s.updated_at else None,

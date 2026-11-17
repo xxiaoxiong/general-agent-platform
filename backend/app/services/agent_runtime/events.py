@@ -305,6 +305,38 @@ def sse_format(data: Dict[str, Any]) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
 
 
+# ── SSE 消费者唤醒（事件持久化后立即下发，消除轮询间隔延迟）─────────────────
+# 内存通知只对同进程（API + RunWorker 同事件循环）的 SSE 消费者生效；
+# 跨进程场景退化为原有轮询兜底，正确性不受影响。
+_WAKEUP_WAITERS: Dict[str, List[Any]] = {}
+
+
+def notify_wakeup(run_id: str) -> None:
+    """事件持久化后唤醒该 run 的 SSE 轮询消费者（无等待者时为空操作）。"""
+    for waiter in tuple(_WAKEUP_WAITERS.get(run_id, ())):
+        waiter.set()
+
+
+async def wait_wakeup(run_id: str, timeout: float) -> None:
+    """等待 run 新事件通知；超时返回（轮询兜底，跨进程仍正确）。"""
+    import asyncio
+
+    ev = asyncio.Event()
+    waiters = _WAKEUP_WAITERS.setdefault(run_id, [])
+    waiters.append(ev)
+    try:
+        await asyncio.wait_for(ev.wait(), timeout)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        try:
+            waiters.remove(ev)
+        except ValueError:
+            pass
+        if not waiters:
+            _WAKEUP_WAITERS.pop(run_id, None)
+
+
 class EventBus:
     """run 级事件总线：异步队列 + 订阅广播（当前单订阅者场景直接出队）。
 
@@ -327,7 +359,7 @@ class EventBus:
     """
 
     def __init__(self, maxsize: int = 1000, *, persist: bool = False,
-                 delta_batch_size: int = 32):
+                 delta_batch_size: int = 32, delta_flush_interval: Optional[float] = None):
         import asyncio
 
         self._queue: "asyncio.Queue[RuntimeEvent]" = asyncio.Queue(maxsize=maxsize)
@@ -341,6 +373,14 @@ class EventBus:
         # MODEL_DELTA 批量缓冲（P1-06 §14.5）：攒够 delta_batch_size 或事件边界一次事务写入
         self._delta_buffer: List[RuntimeEvent] = []
         self.delta_batch_size = max(1, int(delta_batch_size))
+        # 时间兜底（流式体验）：SSE 事实来源是 DB，增量落库不能只按条数攒批
+        # （32 个 token ≈ 1s 一坨），超过 delta_flush_interval 秒即刷，保证前端逐段流出
+        if delta_flush_interval is None:
+            from app.core.config import settings
+
+            delta_flush_interval = getattr(settings, "AGENT_DELTA_FLUSH_INTERVAL", 0.2)
+        self.delta_flush_interval = max(0.0, float(delta_flush_interval))
+        self._delta_first_ts: float = 0.0
 
     def bind_run(self, *, thread_id: str, agent_id: Optional[int], trace_id: str = "") -> None:
         """绑定 run 级上下文（由 RunHandle 构造时调用）。"""
@@ -393,10 +433,14 @@ class EventBus:
         if self.persist and ev.run_id:
             if ev.type == MODEL_DELTA:
                 # P1-06 §14.5：MODEL_DELTA 批量持久化（不每 Token 一个事务）。
-                # 先入缓冲并立即通知本地消费者（live SSE 逐 Token），攒够批量或
-                # 遇到非增量事件边界时一次事务写入 DB（序号写入时分配）。
+                # 先入缓冲并立即通知本地消费者（live SSE 逐 Token），攒够批量
+                # （条数上限或 AGENT_DELTA_FLUSH_INTERVAL 时间上限）或遇到非增量
+                # 事件边界时一次事务写入 DB（序号写入时分配）。
                 self._delta_buffer.append(ev)
-                if len(self._delta_buffer) >= self.delta_batch_size:
+                if self._delta_first_ts == 0.0:
+                    self._delta_first_ts = time.monotonic()
+                if (len(self._delta_buffer) >= self.delta_batch_size
+                        or time.monotonic() - self._delta_first_ts >= self.delta_flush_interval):
                     await self.flush_deltas()
                 self._notify(ev)
                 return
@@ -419,6 +463,9 @@ class EventBus:
                 self._queue.put_nowait(ev)
             except Exception:
                 pass
+        # 同进程 SSE 消费者立即醒来取事件（消除轮询间隔延迟）
+        if ev.run_id:
+            notify_wakeup(ev.run_id)
 
     async def flush_deltas(self) -> None:
         """把缓冲的 MODEL_DELTA 一次事务持久化（P1-06 §14.5：单 commit = 单事务）。
@@ -430,9 +477,12 @@ class EventBus:
             return
         buf = self._delta_buffer
         self._delta_buffer = []
+        self._delta_first_ts = 0.0
         seqs = await self._persist_many(buf)
         for ev, seq in zip(buf, seqs):
             ev.sequence = seq
+        if buf and buf[0].run_id:
+            notify_wakeup(buf[0].run_id)
 
     @staticmethod
     async def _persist_many(events: List[RuntimeEvent]) -> List[int]:

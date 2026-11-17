@@ -26,8 +26,10 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      // 开发代理目标必须与 start-backend.bat 的端口一致（8002）；
+      // Docker 部署走 nginx.conf 代理（backend:8000），不受此配置影响
       '/api': {
-        target: 'http://127.0.0.1:8000',
+        target: 'http://127.0.0.1:8002',
         changeOrigin: true,
       },
     },

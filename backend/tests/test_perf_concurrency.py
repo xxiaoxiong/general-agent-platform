@@ -265,3 +265,99 @@ class TestLatencyBaseline:
                 ok += 1
         print(f"\n[PERF] 恢复路径成功率: {ok}/3 (无中断常规完成率)")
         assert ok == 3
+
+
+class TestTimeoutSemantics:
+    """超时两层语义回归：内层请求超时（模型流停滞）不得误报"运行超时"。"""
+
+    @staticmethod
+    def _patch(monkeypatch, always_stall: bool = False):
+        import app.services.agent_runtime.factory as factory_mod
+        import app.services.agent_runtime.service as svc_mod
+        from langchain_core.language_models.chat_models import BaseChatModel
+        from langchain_core.messages import AIMessage, AIMessageChunk
+        from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+
+        class Stall(BaseChatModel):
+            calls: int = 0
+
+            @property
+            def _llm_type(self):
+                return "fake-stall"
+
+            def bind_tools(self, tools, **kwargs):
+                return self
+
+            def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+                self.calls += 1
+                if always_stall or self.calls == 1:
+                    raise asyncio.TimeoutError()
+                return ChatResult(generations=[ChatGeneration(
+                    message=AIMessage(content="RECOVERED-完整回答"))])
+
+            async def _astream(self, messages, stop=None, run_manager=None, **kwargs):
+                self.calls += 1
+                if always_stall or self.calls == 1:
+                    yield ChatGenerationChunk(message=AIMessageChunk(content="半截"))
+                    raise asyncio.TimeoutError()
+                yield ChatGenerationChunk(message=AIMessageChunk(content="RECOVERED-完整回答"))
+
+        async def fake_load_model(self, mid):
+            return (
+                {"name": "p", "base_url": "http://x", "api_key": "n", "extra_config": {}},
+                {"name": "f", "max_tokens": None, "supports_streaming": True,
+                 "supports_function_call": True, "extra_params": {}},
+            )
+
+        monkeypatch.setattr(svc_mod.AgentRuntimeService, "_load_model", fake_load_model)
+        monkeypatch.setattr(factory_mod, "build_chat_model", lambda *a, **k: Stall())
+
+    @pytest.mark.asyncio
+    async def test_model_stream_timeout_resumes_from_checkpoint(self, monkeypatch):
+        """模型流停滞（内层超时）-> 断点重试成功，半截文本不重复、不误报运行超时。"""
+        self._patch(monkeypatch, always_stall=False)
+        from app.core.database import AsyncSessionLocal
+        from app.models.agent import AgentRun, AgentRunEvent
+        from app.services.agent_runtime import get_runtime_service
+        from sqlalchemy import select
+
+        svc = get_runtime_service()
+        r = await svc.run_to_completion(
+            agent_config={"id": 991100, "tools": [], "capability_ids": ["general"],
+                          "system_prompt": "t", "temperature": "0.1"},
+            messages=[{"role": "user", "content": "会卡一次"}], user_id=1,
+        )
+        assert r["status"] == "completed", r
+        assert "RECOVERED-完整回答" in (r.get("content") or "")
+        assert "半截" not in (r.get("content") or ""), "断点重试后不得残留半截文本"
+        async with AsyncSessionLocal() as db:
+            evs = (await db.execute(
+                select(AgentRunEvent).where(AgentRunEvent.run_id == r["run_id"])
+            )).scalars().all()
+            retrying = [e for e in evs if e.event_type == "run_retrying"]
+            assert retrying, "应发布 run_retrying 断点标记"
+            assert retrying[0].payload.get("keep_chars") == 0
+
+    @pytest.mark.asyncio
+    async def test_model_stream_timeout_exhausted_reports_real_error(self, monkeypatch):
+        """重试耗尽：如实上报"模型请求超时"，不得谎报"运行超时（>Ns）"。"""
+        self._patch(monkeypatch, always_stall=True)
+        from app.core.database import AsyncSessionLocal
+        from app.models.agent import AgentRun
+        from app.services.agent_runtime import get_runtime_service
+        from sqlalchemy import select
+
+        svc = get_runtime_service()
+        r = await svc.run_to_completion(
+            agent_config={"id": 991200, "tools": [], "capability_ids": ["general"],
+                          "system_prompt": "t", "temperature": "0.1"},
+            messages=[{"role": "user", "content": "一直卡"}], user_id=1,
+        )
+        assert r["status"] == "failed", r
+        async with AsyncSessionLocal() as db:
+            row = (await db.execute(
+                select(AgentRun).where(AgentRun.id == r["run_id"])
+            )).scalar_one()
+            err = row.error or ""
+        assert "请求超时" in err, err
+        assert "运行超时" not in err, f"内层请求超时不得误报运行超时: {err}"

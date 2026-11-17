@@ -85,10 +85,17 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required (>=12 chars, change on first login)}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
-      CORS_ORIGINS: ${CORS_ORIGINS:-'["http://localhost:5173","http://localhost:3000","http://localhost:80"]'}
+      # 注意：默认值内的单引号属于 YAML 引用，不能放进 ${} 插值内部，
+      # 否则会作为字面量混入 JSON 导致 json.loads 失败（启动崩溃）
+      CORS_ORIGINS: '${CORS_ORIGINS:-["http://localhost:5173","http://localhost:3000","http://localhost:80"]}'
       # Durable Execution：多 Worker 共享 PostgreSQL Checkpointer（禁止 memory）
-      AGENT_RUNTIME_ENABLED: "true"
       AGENT_CHECKPOINT_DSN: postgresql://${POSTGRES_USER:-ai_cp}:${POSTGRES_PASSWORD}@checkpoint_pg:5432/${POSTGRES_DB:-agent_checkpoints}
+      # 跨线程长期记忆 Store（Phase 5 统一记忆事实来源，与 Checkpointer 同库）
+      AGENT_STORE_DSN: postgresql://${POSTGRES_USER:-ai_cp}:${POSTGRES_PASSWORD}@checkpoint_pg:5432/${POSTGRES_DB:-agent_checkpoints}
+      # 运行超时/断点重试（可在 docker/.env 覆盖；大任务需要充足预算）
+      AGENT_RUN_TIMEOUT: ${AGENT_RUN_TIMEOUT:-1800.0}
+      AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT: ${AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT:-false}
+      AGENT_INNER_TIMEOUT_RETRIES: ${AGENT_INNER_TIMEOUT_RETRIES:-1}
       UVICORN_WORKERS: "2"
     volumes:
       - app_data:/app/data

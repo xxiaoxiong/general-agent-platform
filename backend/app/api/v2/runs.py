@@ -166,6 +166,11 @@ async def create_run(
         raise HTTPException(status_code=404, detail="助手不存在")
 
     agent_config = await _load_agent_config(db, agent, use_memory=body.use_memory)
+    # 权限模块：审批模式随 Run 创建写入配置（并落入 agent_config_snapshot，
+    # 崩溃恢复/断点续跑后仍保持原模式）；非法取值一律回落 manual（安全默认）
+    agent_config["approval_mode"] = (
+        body.approval_mode if body.approval_mode in ("manual", "auto") else "manual"
+    )
     # ensure_version 可能写入 agent_versions（flush 持写锁）：先提交释放，
     # 避免与 start_run_with_session 的独立会话写入互相阻塞（SQLite 必需）
     await db.commit()

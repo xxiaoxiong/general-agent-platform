@@ -364,7 +364,7 @@ class ToolAdapterFactory:
             await self.bus.publish(RuntimeEvent(
                 type=TOOL_FAILED,
                 run_id=self.ctx.run_id,
-                data={"tool": name, "error": f"策略拒绝: {e}"},
+                data={"tool": name, "tool_call_id": tool_call_id, "error": f"策略拒绝: {e}"},
             ))
             telemetry.record_tool(
                 self.ctx.to_log_fields(), tool=name, status="rejected", error=str(e),
@@ -375,7 +375,7 @@ class ToolAdapterFactory:
         await self.bus.publish(RuntimeEvent(
             type=TOOL_STARTED,
             run_id=self.ctx.run_id,
-            data={"tool": name, "input": redact_sensitive(args)},
+            data={"tool": name, "tool_call_id": tool_call_id, "input": redact_sensitive(args)},
         ))
         self.ctx.tool_calls += 1
         reason = self.ctx.budget.exhausted_reason(
@@ -385,7 +385,7 @@ class ToolAdapterFactory:
             await self.bus.publish(RuntimeEvent(
                 type=TOOL_FAILED,
                 run_id=self.ctx.run_id,
-                data={"tool": name, "error": reason},
+                data={"tool": name, "tool_call_id": tool_call_id, "error": reason},
             ))
             raise BudgetExceededError(f"执行预算超限: {reason}")
 
@@ -475,7 +475,7 @@ class ToolAdapterFactory:
                 await self.bus.publish(RuntimeEvent(
                     type=TOOL_COMPLETED,
                     run_id=self.ctx.run_id,
-                    data={"tool": name, "output": text[:2000]},
+                    data={"tool": name, "tool_call_id": tool_call_id, "output": text[:2000]},
                 ))
                 telemetry.record_tool(
                     self.ctx.to_log_fields(), tool=name, status="completed",
@@ -492,7 +492,7 @@ class ToolAdapterFactory:
                 await self.bus.publish(RuntimeEvent(
                     type=TOOL_FAILED,
                     run_id=self.ctx.run_id,
-                    data={"tool": name, "error": err_text[:500]},
+                    data={"tool": name, "tool_call_id": tool_call_id, "error": err_text[:500]},
                 ))
                 telemetry.record_tool(
                     self.ctx.to_log_fields(), tool=name, status="failed",
@@ -506,7 +506,7 @@ class ToolAdapterFactory:
             await self.bus.publish(RuntimeEvent(
                 type=TOOL_FAILED,
                 run_id=self.ctx.run_id,
-                data={"tool": name, "error": err_text[:500]},
+                data={"tool": name, "tool_call_id": tool_call_id, "error": err_text[:500]},
             ))
             telemetry.record_tool(
                 self.ctx.to_log_fields(), tool=name, status="unknown",
@@ -534,7 +534,7 @@ class ToolAdapterFactory:
             await self.bus.publish(RuntimeEvent(
                 type=TOOL_FAILED,
                 run_id=self.ctx.run_id,
-                data={"tool": name, "error": err_text[:500]},
+                data={"tool": name, "tool_call_id": tool_call_id, "error": err_text[:500]},
             ))
             telemetry.record_tool(
                 self.ctx.to_log_fields(), tool=name, status=status,
@@ -551,7 +551,8 @@ class ToolAdapterFactory:
         await self.bus.publish(RuntimeEvent(
             type=TOOL_COMPLETED,
             run_id=self.ctx.run_id,
-            data={"tool": name, "output": text[:2000], "replay": "cached"},
+            data={"tool": name, "tool_call_id": getattr(rec, "tool_call_id", "") or "",
+                  "output": text[:2000], "replay": "cached"},
         ))
         telemetry.record_tool(self.ctx.to_log_fields(), tool=name, status="cached", duration_ms=0.0)
         return text
@@ -563,6 +564,7 @@ class ToolAdapterFactory:
             run_id=self.ctx.run_id,
             data={
                 "tool": name,
+                "tool_call_id": getattr(rec, "tool_call_id", "") or "",
                 "error": f"结果未知（{rec.status}），阻止自动重放",
             },
         ))

@@ -104,10 +104,10 @@ class Settings(BaseSettings):
     AGENT_MAX_STEPS: int = 100                  # 图执行最大步数（0=不限制）
     AGENT_MAX_TOOL_CALLS: int = 200             # 工具调用总次数预算（0=不限制）
     AGENT_MAX_MODEL_CALLS: int = 100            # 模型调用次数预算（0=不限制）
-    AGENT_RUN_TIMEOUT: float = 600.0            # 单次运行墙钟超时（秒）
+    AGENT_RUN_TIMEOUT: float = 1800.0           # 单次运行墙钟超时（秒）；大任务（多步工具/代码生成）需要充足预算
     # P1-05 §13：HITL 等待时间是否计入 Run Timeout。True=计入（deadline 绝对、含等待）；
     # False=不计入（HITL 恢复时按等待时长顺延 deadline，只耗执行时间不耗人工等待）。
-    AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT: bool = True
+    AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT: bool = False
     AGENT_CHECKPOINT_DSN: str = "memory"        # memory | sqlite:///./data/agent_checkpoints.db | postgresql+asyncpg://...
     AGENT_STORE_DSN: str = ""                   # 跨线程记忆 Store（空=不启用）
     AGENT_ENABLE_HITL: bool = True              # 人工审批（高危工具 interrupt_on）
@@ -132,12 +132,16 @@ class Settings(BaseSettings):
     AGENT_TOOL_MAX_RETRIES: int = 2             # 运行内瞬态失败重试上限（0=不重试）
     AGENT_TOOL_RETRY_BACKOFF_SECONDS: float = 0.5  # 重试退避基数（线性退避 attempt*基数）
     AGENT_TOOL_TIMEOUT_SECONDS: float = 120.0   # 单次工具执行超时（超时按瞬态失败处理）
+    AGENT_INNER_TIMEOUT_RETRIES: int = 1        # 单步内层请求超时（模型流停滞等）从断点重试次数
 
     # ── Durable Execution（Phase 2）：Worker 租约协调 ────────────────────
     AGENT_RUNTIME_WORKER_ID: str = ""           # Worker 标识（空=自动生成 hostname-pid-随机）
     AGENT_RUNTIME_LEASE_SECONDS: int = 60       # Run 租约时长；过期后可被其他 Worker 接管
     AGENT_RUNTIME_HEARTBEAT_INTERVAL: float = 15.0  # 续租间隔（应小于租约的 1/2）
     AGENT_RUNTIME_POLL_INTERVAL: float = 1.0    # 扫描待执行/孤儿 Run 的间隔
+    AGENT_SSE_POLL_INTERVAL: float = 0.3        # SSE 事件下发轮询兜底间隔（同进程由事件唤醒立即推送）
+    AGENT_DELTA_FLUSH_INTERVAL: float = 0.2     # MODEL_DELTA 落库时间上限（秒）：SSE 只读 DB，
+                                                # 增量攒批不能只按条数（32 条≈1s），必须按时间兜底才够"流式"
     AGENT_RUNTIME_SHUTDOWN_GRACE: float = 30.0  # 优雅关闭时等待在途 Run 的秒数
 
     # ── 可观测性（Phase 1）：Langfuse / OpenTelemetry ─────────────────────

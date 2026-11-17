@@ -96,7 +96,14 @@ export const conversationApi = {
 // ── Runs ──────────────────────────────────────────────────────────────────────
 
 export const runApi = {
-  create: (data: { message: string; conversation_id?: number; assistant_id?: number; use_memory?: boolean }) =>
+  create: (data: {
+    message: string
+    conversation_id?: number
+    assistant_id?: number
+    use_memory?: boolean
+    /** 权限模块：manual=高危工具人工审批；auto=自动放行 */
+    approval_mode?: 'manual' | 'auto'
+  }) =>
     request2.post<any, { run_id: string; conversation_id: number; status: string; events_url: string }>(
       '/runs', data,
     ),

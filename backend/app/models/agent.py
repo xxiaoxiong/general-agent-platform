@@ -1,7 +1,7 @@
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, BigInteger, String, Text, Boolean, DateTime,
-    ForeignKey, JSON, UniqueConstraint, Index,
+    ForeignKey, JSON, UniqueConstraint, Index, func,
 )
 from app.models.base import Base
 
@@ -70,6 +70,11 @@ class AgentVersion(Base):
 class AgentSession(Base):
     """Agent 对话会话"""
     __tablename__ = "agent_sessions"
+    __table_args__ = (
+        # 会话列表 WHERE user_id=? ORDER BY updated_at DESC 走索引序扫描，
+        # 消除 filesort（大 messages JSON 参与排序会撑爆 sort buffer 报 1038）
+        Index("ix_agent_sessions_user_updated", "user_id", "updated_at"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False)
@@ -87,6 +92,17 @@ class AgentSession(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+def session_message_count_expr(dialect_name: str):
+    """会话消息条数表达式（列表查询专用）。
+
+    列表查询裁掉 messages 大列（全量 JSON 参与 ORDER BY filesort 会撑爆
+    MySQL sort buffer 报 1038），条数改由 JSON 函数在库内计算：
+    MySQL 用 JSON_LENGTH，SQLite/PostgreSQL 用 json_array_length。
+    """
+    fn = func.json_length if dialect_name == "mysql" else func.json_array_length
+    return func.coalesce(fn(AgentSession.messages), 0)
 
 
 class SessionResultOutbox(Base):

@@ -11,10 +11,11 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from app.api.deps import get_current_user
 from app.core.database import get_db
-from app.models.agent import Agent, AgentSession
+from app.models.agent import Agent, AgentSession, session_message_count_expr
 from app.models.user import User
 
 from .schemas import ConversationCreate
@@ -44,19 +45,26 @@ async def list_conversations(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """会话列表（仅当前用户；可按助手过滤）。"""
+    """会话列表（仅当前用户；可按助手过滤）。
+
+    列表裁掉 messages 大列（长会话 JSON 达 MB 级，参与 ORDER BY filesort
+    会撑爆 MySQL sort buffer 报 1038），消息条数改由 JSON 函数库内计算。
+    """
     cond = AgentSession.user_id == current_user.id
     if assistant_id is not None:
         cond = and_(cond, AgentSession.agent_id == assistant_id)
     total = (await db.execute(select(func.count(AgentSession.id)).where(cond))).scalar()
+    msg_count = session_message_count_expr(db.get_bind().dialect.name)
     res = await db.execute(
-        select(AgentSession).where(cond)
+        select(AgentSession, msg_count.label("message_count"))
+        .options(defer(AgentSession.messages))
+        .where(cond)
         .order_by(AgentSession.updated_at.desc())
         .offset((page - 1) * page_size).limit(page_size)
     )
-    sessions = res.scalars().all()
+    sessions = res.all()
     return {
-        "items": [conversation_to_dict(s) for s in sessions],
+        "items": [conversation_to_dict(s, message_count=mc) for s, mc in sessions],
         "total": total, "page": page, "page_size": page_size,
     }
 

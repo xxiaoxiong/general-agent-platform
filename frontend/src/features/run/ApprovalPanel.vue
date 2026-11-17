@@ -4,7 +4,6 @@
     <div v-for="(action, i) in actions" :key="i" class="approval-action">
       <div class="action-tool">{{ action.tool || action.tool_name || '操作' }}</div>
       <div v-if="action.summary" class="action-summary">{{ action.summary }}</div>
-      <div v-if="action.action_id" class="action-id">action_id: {{ action.action_id }}</div>
     </div>
     <div class="approval-btns">
       <el-button type="primary" size="small" :loading="deciding" @click="decide('approve')">
