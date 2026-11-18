@@ -207,6 +207,8 @@ async def replay_events_v2(
     # resume 竞态宽限：等待 Claim（waiting_approval->running）的最长时长，
     # 超时说明恢复未实际发生（如决策校验失败），退回合成终止事件防消费端挂死
     resume_grace_deadline: Optional[float] = None
+    # 终止事件合成宽限：终态刚提交而终止事件行未落库的间隙只等一轮唤醒
+    synth_graced = False
 
     def _visible(envelope: Dict[str, Any]) -> bool:
         return after_seq is None or int(envelope.get("sequence") or 0) > after_seq
@@ -257,6 +259,13 @@ async def replay_events_v2(
                     await wait_wakeup(run_id, poll)
                     continue
                 # 宽限期外仍未恢复：按边界状态合成终止事件（防消费端挂死）
+            # 终态已提交但终止事件行尚未落库的间隙：先给一轮唤醒窗口等待真实
+            # 终止事件（§12.2 终止事件必须带最终回答/最终状态），仍缺失才
+            # 按状态合成兜底（合成事件缺 final_text，仅防消费端挂死）
+            if not synth_graced:
+                synth_graced = True
+                await wait_wakeup(run_id, poll)
+                continue
             # 事件日志缺失/已清理：按状态合成终止事件
             envelope = synthetic_terminal_from_status(
                 run_id, run_row.status, error=run_row.error

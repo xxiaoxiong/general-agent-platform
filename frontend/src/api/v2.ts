@@ -47,6 +47,9 @@ export interface RunInfo {
   pending_actions?: any[]
   created_at: string | null
   finished_at: string | null
+  /** Langfuse Trace 关联（未配置 Langfuse 时缺省，前端隐藏入口） */
+  langfuse_trace_id?: string | null
+  langfuse_trace_url?: string | null
 }
 
 /** 通用工作区文件预览元数据（右侧临时预览区块） */

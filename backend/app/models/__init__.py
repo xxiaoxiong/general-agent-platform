@@ -6,6 +6,7 @@ from app.models.app_market import AppTemplate, AppInstance
 from app.models.audit import AuditLog
 from app.models.agent import Agent, AgentSession, AgentRun, AgentApproval
 from app.models.database_connection import DatabaseConnection
+from app.models.evolution import AgentEvaluation, EvolutionReport, EvolutionChangeLog
 
 __all__ = [
     "User", "Role", "Permission", "UserRole", "RolePermission",
@@ -16,4 +17,5 @@ __all__ = [
     "AuditLog",
     "Agent", "AgentSession",
     "DatabaseConnection",
+    "AgentEvaluation", "EvolutionReport", "EvolutionChangeLog",
 ]

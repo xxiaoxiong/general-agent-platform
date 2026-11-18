@@ -28,7 +28,14 @@ from langgraph.types import Command
 from app.core.config import settings
 from app.models.agent import AgentRun as AgentRunRow, AgentSession
 from app.core.database import AsyncSessionLocal
-from app.observability.langfuse_tracing import make_callback_handler, platform_span
+from app.observability.langfuse_tracing import (
+    enrich_run_trace,
+    flush_traces,
+    make_callback_handler,
+    platform_span,
+    run_context,
+    trace_url,
+)
 
 from .context import (
     ExecutionBudget,
@@ -110,6 +117,9 @@ from .worker import (
 )
 
 logger = logging.getLogger("agent_runtime")
+
+# Langfuse Trace 富化等后台 best-effort 任务的强引用（防 GC 提前回收）
+_BG_TASKS: set = set()
 
 
 # ── 审批决策异常（FR-04：冲突/非法决策显式拒绝，API 层可映射 HTTP 4xx） ──
@@ -577,6 +587,12 @@ class AgentRuntimeService:
                 "created_at": row.created_at.isoformat() if row.created_at else None,
                 "finished_at": row.finished_at.isoformat() if row.finished_at else None,
             }
+            # Langfuse Trace 关联（确定性派生；未配置时为 None，前端隐藏入口）
+            from app.observability.langfuse_tracing import is_enabled as _lf_enabled
+            if _lf_enabled():
+                from app.observability.langfuse_tracing import run_trace_id as _lf_trace_id
+                result["langfuse_trace_id"] = _lf_trace_id(row.id)
+                result["langfuse_trace_url"] = trace_url(row.id)
         # Registry 仅补充执行热数据（未决动作），状态真相仍是 DB
         handle = self.registry.get(run_id)
         if handle is not None:
@@ -1102,7 +1118,17 @@ class AgentRuntimeService:
                 if not run.final_text_parts:
                     run.final_text_parts = await self._load_prior_final_text(run.run_id)
 
-                with platform_span(
+                with run_context(
+                    run.run_id,
+                    user_id=scope.user_id,
+                    session_id=run.session_id,
+                    trace_name=str(agent_config.get("name") or f"agent-{run.agent_id}"),
+                    metadata={
+                        "agent_id": run.agent_id,
+                        "model_id": log_fields["model_id"],
+                        "thread_id": run.thread_id,
+                    },
+                ), platform_span(
                     "agent_run", run_id=run.run_id,
                     attributes={
                         "thread_id": run.thread_id, "agent_id": run.agent_id,
@@ -1953,6 +1979,68 @@ class AgentRuntimeService:
             raise
         except Exception as e:
             raise PersistenceError(f"run {run.run_id} 状态持久化失败: {e}") from e
+
+        if finished:
+            # Run 终态富化 Langfuse Trace（单一漏斗：completed/cancelled/failed/
+            # limit_exceeded 全部经此）；后台 best-effort 执行——HTTP 写入不得
+            # 阻塞终态事件落库时序（否则 SSE 回放会抢先合成终止事件）
+            task = asyncio.create_task(self._enrich_run_trace(
+                run, status=status, error=error,
+                final_text=final_text, summary=summary,
+            ))
+            _BG_TASKS.add(task)
+            task.add_done_callback(_BG_TASKS.discard)
+
+    async def _enrich_run_trace(
+        self,
+        run: RunHandle,
+        *,
+        status: str,
+        error: Optional[str] = None,
+        final_text: Optional[str] = None,
+        summary: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """把 Run 终态（名称/用户/会话/输入/输出/状态/预算）写回 Langfuse Trace。"""
+        try:
+            from sqlalchemy import select
+            from app.models.agent import Agent
+
+            agent_name = ""
+            task: Any = None
+            async with AsyncSessionLocal() as db:
+                row = (await db.execute(
+                    select(AgentRunRow.input_payload, Agent.name)
+                    .join(Agent, Agent.id == AgentRunRow.agent_id, isouter=True)
+                    .where(AgentRunRow.id == run.run_id)
+                )).first()
+                if row is not None:
+                    task = row[0]
+                    agent_name = row[1] or ""
+            await enrich_run_trace(
+                run.run_id,
+                name=agent_name or f"agent-{run.agent_id}",
+                user_id=run.user_id,
+                session_id=run.session_id,
+                task=task,
+                final_text=final_text if final_text is not None else (run.final_text or None),
+                metadata={
+                    "run_id": run.run_id,
+                    "thread_id": run.thread_id,
+                    "agent_id": run.agent_id,
+                    "status": status,
+                    "error": (error or "")[:500] or None,
+                    "attempt": run.attempt,
+                    "summary": summary or run.summary or {},
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("run %s Trace 富化失败（忽略，不影响执行）: %s", run.run_id, e)
+        finally:
+            # 终态后立即冲刷 span 批量缓冲：Run 一结束完整链路即在 Langfuse 可见
+            # （不依赖 SDK 周期导出/服务端摄取节奏）。
+            # to_thread：flush 是同步阻塞 HTTP，不得卡事件循环（实测会拖垮
+            # 并发会话清理时序）；本任务已在后台，阻塞线程无害。
+            await asyncio.to_thread(flush_traces)
 
     async def _recovery_check(
         self, row: Any

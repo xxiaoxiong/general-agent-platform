@@ -150,6 +150,17 @@ class Settings(BaseSettings):
     LANGFUSE_BASE_URL: str = "https://cloud.langfuse.com"
     LANGFUSE_TRACING_SAMPLE_RATE: float = 1.0   # 0.0~1.0 采样率（P1-04）
     LANGFUSE_RELEASE: str = ""                  # 版本关联（缺省用 APP_VERSION）
+    LANGFUSE_PUBLIC_URL: str = ""               # 浏览器可达的 Langfuse 地址（Trace 跳转链接）；
+                                                # 缺省回落 LANGFUSE_BASE_URL（容器内外地址不同时需单独配置）
+    LANGFUSE_PROJECT_ID: str = ""               # Trace 页面路由需要的项目 ID（/project/{id}/traces/...）；
+                                                # 缺省经 Public API 自动发现并缓存
+
+    # ── 自进化闭环（评估引擎 + 优化建议）──────────────────────────────────
+    EVOLUTION_ENABLED: bool = True              # 总开关（关闭时不启动周期评估）
+    EVOLUTION_EVAL_INTERVAL_SECONDS: int = 300  # 周期评估扫描间隔
+    EVOLUTION_EVAL_BATCH_SIZE: int = 10         # 每轮最多评估的 Run 数
+    EVOLUTION_JUDGE_MODEL_CONFIG_ID: int = 0    # LLM-as-judge 模型（0=复用 Run 的模型配置）
+    EVOLUTION_VALIDATION_MIN_RUNS: int = 5      # 变更验证所需的新评估样本数
     OTEL_ENABLED: bool = False                  # OpenTelemetry 导出（P1-02）
     OTEL_EXPORTER_OTLP_ENDPOINT: str = ""       # 如 http://localhost:4317
     OTEL_SERVICE_NAME: str = "ai-generalplat"

@@ -103,6 +103,12 @@ const router = createRouter({
           component: () => import('@/views/system/AuditLog.vue'),
           meta: { title: '审计日志', icon: 'Document', requiresSuperuser: true },
         },
+        {
+          path: 'system/evolution',
+          name: 'SystemEvolution',
+          component: () => import('@/views/system/Evolution.vue'),
+          meta: { title: 'Agent自进化', icon: 'TrendCharts', requiresSuperuser: true },
+        },
       ],
     },
     {

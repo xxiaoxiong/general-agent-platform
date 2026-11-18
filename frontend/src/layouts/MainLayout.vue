@@ -71,6 +71,10 @@
             <el-icon><Document /></el-icon>
             <template #title>审计日志</template>
           </el-menu-item>
+          <el-menu-item index="/system/evolution">
+            <el-icon><TrendCharts /></el-icon>
+            <template #title>Agent自进化</template>
+          </el-menu-item>
         </template>
       </el-menu>
     </el-aside>

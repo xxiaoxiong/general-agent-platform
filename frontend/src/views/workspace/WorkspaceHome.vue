@@ -130,6 +130,13 @@
                 :actions="m.pendingActions"
                 @decided="onApprovalDecided"
               />
+              <!-- Langfuse Trace 入口：按 run_id 确定性关联，查看完整执行链路 -->
+              <button
+                v-if="m.runId && !m.streaming"
+                type="button"
+                class="trace-link"
+                @click="openTrace(m.runId)"
+              >查看执行 Trace（Langfuse）</button>
             </div>
           </div>
         </template>
@@ -968,6 +975,20 @@ function finishRun(convId: number, entry: ActiveRun, reason: string) {
   if (currentConversation.value?.id === convId) scrollToBottom()
 }
 
+/** Langfuse Trace 入口：run_id → trace 跳转链接（后端确定性派生） */
+async function openTrace(runId: string) {
+  try {
+    const info = await runApi.get(runId)
+    if (info.langfuse_trace_url) {
+      window.open(info.langfuse_trace_url, '_blank')
+    } else {
+      ElMessage.warning('未配置 Langfuse 或 Trace 暂不可用')
+    }
+  } catch {
+    ElMessage.error('获取 Trace 链接失败')
+  }
+}
+
 /** UX-07：停止 = 后端真实取消（不停止订阅而已）+ 立即本地终结 */
 async function stopGeneration() {
   const convId = currentConversation.value?.id
@@ -1263,6 +1284,19 @@ function onApprovalDecided(type: 'approve' | 'reject') {
   margin-top: 6px;
   font-size: 13px;
 }
+
+.trace-link {
+  margin-top: 6px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: #909399;
+  font-size: 12px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.trace-link:hover { color: #409eff; }
 
 /* 输入区（Trae 式）：单个圆角容器，底部工具栏 */
 .ws-composer { border-top: 1px solid #e4e7ed; padding: 12px 20px 16px; }

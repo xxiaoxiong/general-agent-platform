@@ -16,6 +16,7 @@ from app.api.deps import get_current_superuser
 from app.core.database import get_db
 from app.models.agent import AgentRun, AgentRunEvent, AgentToolExecution
 from app.models.user import User
+from app.observability.langfuse_tracing import build_trace_web_url
 
 router = APIRouter(prefix="/admin", tags=["admin-v2"])
 
@@ -62,5 +63,8 @@ async def observability_overview(
                  "waiting_approval": waiting},
         "tool_executions": {"by_status": {s: c for s, c in tool_rows}},
         "events": {"total": event_count},
-        "links": {"langfuse": "/langfuse", "grafana": "/grafana"},
+        "links": {
+            "langfuse": build_trace_web_url(),
+            "grafana": "/grafana",
+        },
     }

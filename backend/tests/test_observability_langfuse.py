@@ -72,6 +72,79 @@ class TestTraceId:
         assert len(t1) == 32 and int(t1, 16) >= 0
 
 
+class TestTraceWebUrl:
+    """Trace 页面路由是 /project/{pid}/traces/{tid}，缺 projectId 段在 UI 上 404。"""
+
+    def test_project_id_from_settings(self, monkeypatch):
+        monkeypatch.setattr(lt.settings, "LANGFUSE_PROJECT_ID", "p1")
+        monkeypatch.setattr(lt.settings, "LANGFUSE_PUBLIC_URL", "http://ui.test")
+        assert lt.build_trace_web_url("t1") == "http://ui.test/project/p1/traces/t1"
+        # trace_id 为空 → Trace 列表页
+        assert lt.build_trace_web_url() == "http://ui.test/project/p1/traces"
+
+    def test_project_id_discovered_and_cached(self, monkeypatch):
+        monkeypatch.setattr(lt.settings, "LANGFUSE_PROJECT_ID", "")
+        monkeypatch.setattr(lt.settings, "LANGFUSE_PUBLIC_KEY", "pk")
+        monkeypatch.setattr(lt.settings, "LANGFUSE_SECRET_KEY", "sk")
+        monkeypatch.setattr(lt.settings, "LANGFUSE_BASE_URL", "http://lf.test")
+        monkeypatch.setattr(lt.settings, "LANGFUSE_PUBLIC_URL", "")
+        calls = []
+
+        class _Resp:
+            status_code, text = 200, ""
+
+            def json(self):
+                return {"data": [{"id": "pid-1"}]}
+
+            def raise_for_status(self):
+                pass
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, url, **kwargs):
+                calls.append(url)
+                return _Resp()
+
+        monkeypatch.setattr(lt.httpx, "Client", _Client)
+        assert lt.langfuse_project_id() == "pid-1"
+        assert lt.build_trace_web_url("t1") == "http://lf.test/project/pid-1/traces/t1"
+        assert lt.langfuse_project_id() == "pid-1"
+        assert len(calls) == 1, "项目 ID 发现结果必须缓存（每次调用打 API 不可接受）"
+
+    def test_discovery_failure_degrades(self, monkeypatch):
+        monkeypatch.setattr(lt.settings, "LANGFUSE_PROJECT_ID", "")
+        monkeypatch.setattr(lt.settings, "LANGFUSE_PUBLIC_KEY", "pk")
+        monkeypatch.setattr(lt.settings, "LANGFUSE_SECRET_KEY", "sk")
+        monkeypatch.setattr(lt.settings, "LANGFUSE_BASE_URL", "http://lf.test")
+        monkeypatch.setattr(lt.settings, "LANGFUSE_PUBLIC_URL", "http://ui.test")
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, url, **kwargs):
+                raise RuntimeError("down")
+
+        monkeypatch.setattr(lt.httpx, "Client", _Client)
+        assert lt.langfuse_project_id() == ""
+        # 降级：链接仍返回（旧式路径），不抛异常
+        assert lt.build_trace_web_url("t1") == "http://ui.test/project/traces/t1"
+
+
 class _FakeSpan:
     def __init__(self):
         self.updates = []

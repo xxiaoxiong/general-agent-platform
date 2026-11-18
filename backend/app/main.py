@@ -17,6 +17,7 @@ from app.api.v2 import artifacts as v2_artifacts
 from app.api.v2 import assistants as v2_assistants
 from app.api.v2 import capabilities as v2_capabilities
 from app.api.v2 import conversations as v2_conversations
+from app.api.v2 import evolution as v2_evolution
 from app.api.v2 import files as v2_files
 from app.api.v2 import runs as v2_runs
 from app.api.v2 import workspace as v2_workspace
@@ -60,10 +61,27 @@ async def lifespan(app: FastAPI):
     runtime_worker = get_run_worker()
     await runtime_worker.start()
 
+    # ── 自进化闭环：周期评估（确定性指标 + LLM-as-judge）────────────────
+    evolution_task = None
+    if getattr(settings, "EVOLUTION_ENABLED", True):
+        import asyncio as _asyncio
+        from app.services.evolution.evaluator import evaluator_loop
+
+        evolution_stop = _asyncio.Event()
+        evolution_task = _asyncio.create_task(
+            evaluator_loop(evolution_stop), name="evolution-evaluator")
+
     logger.info("所有子系统初始化完成")
     yield
 
     # ── 关闭时清理 ──
+    if evolution_task is not None and not evolution_task.done():
+        evolution_stop.set()
+        evolution_task.cancel()
+        try:
+            await evolution_task
+        except Exception:  # noqa: BLE001
+            pass
     if runtime_worker is not None:
         await runtime_worker.stop()
     from app.services.agent_runtime.persistence import CheckpointerFactory
@@ -226,6 +244,7 @@ app.include_router(v2_files.router, prefix=API_V2_PREFIX)
 app.include_router(v2_runs.router, prefix=API_V2_PREFIX)
 app.include_router(v2_artifacts.router, prefix=API_V2_PREFIX)
 app.include_router(v2_admin.router, prefix=API_V2_PREFIX)
+app.include_router(v2_evolution.router, prefix=API_V2_PREFIX)
 
 
 @app.get("/api/health")
