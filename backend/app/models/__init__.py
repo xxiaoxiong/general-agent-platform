@@ -9,6 +9,7 @@ from app.models.database_connection import DatabaseConnection
 from app.models.evolution import AgentEvaluation, EvolutionReport, EvolutionChangeLog
 from app.models.skill import Skill
 from app.models.mcp_server import MCPServer
+from app.models.evaluation import EvalDataset, EvalDatasetItem, EvalRun, EvalRunItem
 
 __all__ = [
     "User", "Role", "Permission", "UserRole", "RolePermission",
@@ -21,4 +22,5 @@ __all__ = [
     "DatabaseConnection",
     "AgentEvaluation", "EvolutionReport", "EvolutionChangeLog",
     "Skill", "MCPServer",
+    "EvalDataset", "EvalDatasetItem", "EvalRun", "EvalRunItem",
 ]

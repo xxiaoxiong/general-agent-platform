@@ -104,10 +104,10 @@ const router = createRouter({
           meta: { title: '审计日志', icon: 'Document', requiresSuperuser: true },
         },
         {
-          path: 'system/evolution',
-          name: 'SystemEvolution',
-          component: () => import('@/views/system/Evolution.vue'),
-          meta: { title: 'Agent自进化', icon: 'TrendCharts', requiresSuperuser: true },
+          path: 'system/evaluation',
+          name: 'SystemEvaluation',
+          component: () => import('@/views/system/Evaluation.vue'),
+          meta: { title: 'Agent测评', icon: 'TrendCharts', requiresSuperuser: true },
         },
         {
           path: 'system/skills',

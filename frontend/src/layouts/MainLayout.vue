@@ -71,9 +71,9 @@
             <el-icon><Document /></el-icon>
             <template #title>审计日志</template>
           </el-menu-item>
-          <el-menu-item index="/system/evolution">
+          <el-menu-item index="/system/evaluation">
             <el-icon><TrendCharts /></el-icon>
-            <template #title>Agent自进化</template>
+            <template #title>Agent测评</template>
           </el-menu-item>
           <el-menu-item index="/system/skills">
             <el-icon><MagicStick /></el-icon>
