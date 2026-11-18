@@ -39,8 +39,6 @@ export const modelApi = {
   createConfig: (data: any) => request.post<any, ModelConfig>('/models/configs', data),
   updateConfig: (id: number, data: any) => request.put<any, ModelConfig>(`/models/configs/${id}`, data),
   deleteConfig: (id: number) => request.delete(`/models/configs/${id}`),
-
-  chat: (data: any) => request.post<any, any>('/models/chat', data),
 }
 
 // ─── Knowledge ────────────────────────────────────────────────────────────────
@@ -95,28 +93,6 @@ export const appApi = {
 // ─── Audit ────────────────────────────────────────────────────────────────────
 export const auditApi = {
   list: (params?: any) => request.get<any, PageResponse<AuditLog>>('/audit', { params }),
-}
-
-// ─── Agents ───────────────────────────────────────────────────────────────────
-export const agentApi = {
-  list: (params?: any) => request.get<any, any>('/agents', { params }),
-  create: (data: any) => request.post<any, any>('/agents', data),
-  get: (id: number) => request.get<any, any>(`/agents/${id}`),
-  update: (id: number, data: any) => request.put<any, any>(`/agents/${id}`, data),
-  delete: (id: number) => request.delete(`/agents/${id}`),
-  listTools: () => request.get<any, any>('/agents/tools'),
-  listSessions: (agentId: number) => request.get<any, any>(`/agents/${agentId}/sessions`),
-  createSession: (agentId: number) => request.post<any, any>(`/agents/${agentId}/sessions`),
-  deleteSession: (agentId: number, sessionId: number) =>
-    request.delete(`/agents/${agentId}/sessions/${sessionId}`),
-  getSessionMessages: (agentId: number, sessionId: number) =>
-    request.get<any, any>(`/agents/${agentId}/sessions/${sessionId}/messages`),
-  chat: (agentId: number, data: any) => request.post<any, any>(`/agents/${agentId}/chat`, data),
-  listMemories: (params?: { agent_id?: number }) => request.get<any, any>('/agents/memories', { params }),
-  addMemory: (data: { content: string; agent_id?: number; importance?: number; tags?: string }) =>
-    request.post<any, any>('/agents/memories', data),
-  deleteMemory: (id: number) => request.delete(`/agents/memories/${id}`),
-  clearMemories: (params?: { agent_id?: number }) => request.delete('/agents/memories', { params }),
 }
 
 // ─── Database Connections ─────────────────────────────────────────────────────

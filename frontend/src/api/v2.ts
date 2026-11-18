@@ -70,18 +70,6 @@ export const workspaceApi = {
   capabilities: () => request2.get<any, { items: any[] }>('/capabilities'),
 }
 
-// ── Assistants（Builder 草稿 → 确认 → 创建）───────────────────────────────────
-
-export const assistantApi = {
-  list: (params?: any) => request2.get<any, { items: Assistant[]; total: number }>('/assistants', { params }),
-  draft: (description: string, name?: string) =>
-    request2.post<any, any>('/assistants/draft', { description, name }),
-  create: (data: any) => request2.post<any, Assistant>('/assistants', data),
-  get: (id: number) => request2.get<any, Assistant>(`/assistants/${id}`),
-  patch: (id: number, data: any) => request2.patch<any, Assistant>(`/assistants/${id}`, data),
-  publish: (id: number) => request2.post<any, any>(`/assistants/${id}/publish`),
-}
-
 // ── Conversations ─────────────────────────────────────────────────────────────
 
 export const conversationApi = {
@@ -91,6 +79,17 @@ export const conversationApi = {
     request2.post<any, Conversation>('/conversations', data),
   messages: (id: number) => request2.get<any, { items: any[] }>(`/conversations/${id}/messages`),
   delete: (id: number) => request2.delete(`/conversations/${id}`),
+  /** 上传会话附件（写入会话工作区 uploads/，二进制文档同步抽取文本副本） */
+  uploadFile: (id: number, file: File) => {
+    const form = new FormData()
+    form.append('file', file)
+    return request2.post<any, { name: string; path: string; text_path: string | null; size: number }>(
+      `/conversations/${id}/files`, form,
+      { headers: { 'Content-Type': 'multipart/form-data' } },
+    )
+  },
+  deleteFile: (id: number, filename: string) =>
+    request2.delete(`/conversations/${id}/files/${encodeURIComponent(filename)}`),
 }
 
 // ── Runs ──────────────────────────────────────────────────────────────────────
@@ -103,6 +102,10 @@ export const runApi = {
     use_memory?: boolean
     /** 权限模块：manual=高危工具人工审批；auto=自动放行 */
     approval_mode?: 'manual' | 'auto'
+    /** 手动选模型（仅本次 Run 生效；缺省 = 助手默认模型） */
+    model_config_id?: number
+    /** 会话附件（上传接口返回的项） */
+    attachments?: Array<{ name: string; path: string; text_path?: string | null }>
   }) =>
     request2.post<any, { run_id: string; conversation_id: number; status: string; events_url: string }>(
       '/runs', data,

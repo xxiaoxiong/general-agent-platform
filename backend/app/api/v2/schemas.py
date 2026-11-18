@@ -60,6 +60,10 @@ class RunCreate(BaseModel):
     use_memory: bool = True
     # 权限模块（审批模式）：manual=高危工具执行前人工审批；auto=自动放行不再询问
     approval_mode: str = "manual"
+    # 会话内手动选模型：仅本次 Run 覆盖助手默认模型（None=助手默认）
+    model_config_id: Optional[int] = None
+    # 会话附件（uploads/ 下的相对路径），随用户消息注入读取注记
+    attachments: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class ApprovalDecisionIn(BaseModel):

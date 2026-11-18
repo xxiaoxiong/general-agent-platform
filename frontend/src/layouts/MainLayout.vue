@@ -15,10 +15,10 @@
         class="sidebar-menu"
         @select="handleMenuSelect"
       >
-        <!-- 工作台 -->
+        <!-- 常用入口 -->
         <el-menu-item index="/workspace">
           <el-icon><ChatDotRound /></el-icon>
-          <template #title>智能体工作台</template>
+          <template #title>智能体对话</template>
         </el-menu-item>
 
         <el-menu-item index="/dashboard">
@@ -26,13 +26,13 @@
           <template #title>概览</template>
         </el-menu-item>
 
-        <!-- 分组：AI 能力 -->
-        <div v-if="!isCollapsed" class="menu-group-label">AI 能力</div>
+        <!-- 分组：资源与能力 -->
+        <div v-if="!isCollapsed" class="menu-group-label">资源与能力</div>
         <div v-else class="menu-divider" />
 
-        <el-menu-item index="/models/chat">
-          <el-icon><ChatDotRound /></el-icon>
-          <template #title>AI 对话</template>
+        <el-menu-item index="/knowledge">
+          <el-icon><Collection /></el-icon>
+          <template #title>知识库</template>
         </el-menu-item>
 
         <el-sub-menu index="prompts">
@@ -49,28 +49,10 @@
           <template #title>模型配置</template>
         </el-menu-item>
 
-        <!-- 分组：知识与智能体 -->
-        <div v-if="!isCollapsed" class="menu-group-label">知识与智能体</div>
-        <div v-else class="menu-divider" />
-
-        <el-menu-item index="/knowledge">
-          <el-icon><Collection /></el-icon>
-          <template #title>知识库</template>
-        </el-menu-item>
-
-        <el-menu-item index="/agents">
-          <el-icon><Promotion /></el-icon>
-          <template #title>Agent 智能体</template>
-        </el-menu-item>
-
         <el-menu-item index="/databases">
           <el-icon><Coin /></el-icon>
           <template #title>数据库管理</template>
         </el-menu-item>
-
-        <!-- 分组：自动化 -->
-        <div v-if="!isCollapsed" class="menu-group-label">自动化</div>
-        <div v-else class="menu-divider" />
 
         <el-menu-item index="/workflows">
           <el-icon><Share /></el-icon>

@@ -126,13 +126,17 @@ def build_agent(
     adapter = ToolAdapterFactory(ctx, policy, bus)
     langchain_tools = adapter.build(tool_specs)
 
-    # P0-05：原生文件工具面收窄（无 Sandbox 不含 execute）；主代理与子代理同口径
+    # P0-05：原生文件工具面收窄（无 Sandbox 不含 execute）；主代理与子代理同口径。
+    # 注意：自定义 FilesystemMiddleware 按名替换基栈同名中间件时只继承 permissions，
+    # **不继承 backend** —— 必须显式传入，否则落到默认 StateBackend（会话虚拟文件），
+    # 文件工具看不到真实磁盘工作区（上传附件 / tool-outputs 卸载文件都读不到）
     from deepagents.middleware.filesystem import FilesystemMiddleware
 
-    fs_middleware = FilesystemMiddleware(tools=build_fs_tools(policy))
+    backend = build_backend(ctx.scope.user_id, ctx.agent_id, ctx.session_id, store=store)
+    fs_middleware = FilesystemMiddleware(tools=build_fs_tools(policy), backend=backend)
     subagents = [
         {**sa, "tools": _subagent_tools(sa, adapter),
-         "middleware": [FilesystemMiddleware(tools=build_fs_tools(policy))]}
+         "middleware": [FilesystemMiddleware(tools=build_fs_tools(policy), backend=backend)]}
         for sa in build_subagents(policy)
     ]
 
@@ -171,7 +175,7 @@ def build_agent(
         subagents=subagents or None,
         skills=skill_sources,
         memory=memory_sources,
-        backend=build_backend(ctx.scope.user_id, ctx.agent_id, ctx.session_id, store=store),
+        backend=backend,
         permissions=build_fs_permissions(policy),
         interrupt_on=interrupt_config or None,
         checkpointer=checkpointer,

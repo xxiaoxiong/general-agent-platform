@@ -1,6 +1,6 @@
 <template>
   <div class="workspace-home">
-    <!-- 左侧：最近对话 + 我的智能助手（执行中可自由切换） -->
+    <!-- 左侧：最近对话 -->
     <aside class="ws-sidebar">
       <el-button type="primary" class="new-chat-btn" @click="newConversation">
         <el-icon><Plus /></el-icon> 新建对话
@@ -20,23 +20,6 @@
           <el-icon class="conv-delete" @click.stop="removeConversation(c)"><Delete /></el-icon>
         </div>
         <div v-if="!conversations.length" class="sidebar-empty">暂无对话</div>
-      </div>
-
-      <div class="sidebar-section">
-        <div class="sidebar-title">我的智能助手</div>
-        <div
-          v-for="a in assistants"
-          :key="a.id"
-          class="assistant-item"
-          :class="{ active: currentAssistant?.id === a.id }"
-          @click="selectAssistant(a)"
-        >
-          <span>{{ a.icon }} {{ a.name }}</span>
-          <el-tag v-if="a.is_default" size="small" type="info">默认</el-tag>
-        </div>
-        <el-button text type="primary" size="small" @click="showBuilder = true">
-          + 创建助手
-        </el-button>
       </div>
     </aside>
 
@@ -63,9 +46,16 @@
         </div>
 
         <template v-for="(m, idx) in messages" :key="idx">
-          <!-- 用户消息 -->
-          <div v-if="m.role === 'user'" class="msg-row msg-user">
-            <div class="msg-bubble">{{ m.content }}</div>
+          <!-- 用户消息（id 供右侧提问圆点导航锚点跳转） -->
+          <div v-if="m.role === 'user'" :id="`q-${idx}`" class="msg-row msg-user">
+            <div class="msg-bubble">
+              <div v-if="m.files?.length" class="msg-files">
+                <span v-for="f in m.files" :key="f" class="msg-file-tag">
+                  <el-icon><Paperclip /></el-icon> {{ f }}
+                </span>
+              </div>
+              {{ m.content }}
+            </div>
           </div>
 
           <!-- 助手消息：文本段 / 工具小步骤按事件顺序实时穿插在对话流尾部 -->
@@ -123,9 +113,33 @@
         </template>
       </div>
 
+      <!-- 提问锚点导航：右侧纵向圆点，点击跳转对应提问，悬浮气泡预览提问内容 -->
+      <div v-if="questionAnchors.length" class="q-nav">
+        <el-tooltip
+          v-for="q in questionAnchors"
+          :key="q.idx"
+          :content="q.preview"
+          placement="left"
+          :show-after="80"
+          popper-class="q-nav-popper"
+        >
+          <button type="button" class="q-nav-dot" @click="jumpToQuestion(q.idx)"></button>
+        </el-tooltip>
+      </div>
+
       <!-- 输入区（执行中可继续浏览/切换；当前会话运行时可停止） -->
       <div class="ws-composer">
         <div class="composer-perm">
+          <span class="perm-label">模型</span>
+          <el-select v-model="selectedModelId" class="model-select" size="small">
+            <el-option label="默认模型" :value="0" />
+            <el-option
+              v-for="m in modelOptions"
+              :key="m.id"
+              :label="m.display_name || m.name"
+              :value="m.id"
+            />
+          </el-select>
           <span class="perm-label">审批模式</span>
           <el-radio-group v-model="approvalMode" size="small">
             <el-radio-button value="manual">手动审批</el-radio-button>
@@ -137,6 +151,14 @@
               : '高危工具自动放行，执行过程不再逐次询问' }}
           </span>
         </div>
+        <!-- 待发送附件（文件已上传到会话工作区，发送时告知模型读取） -->
+        <div v-if="attachments.length" class="attach-strip">
+          <span v-for="(a, i) in attachments" :key="a.path" class="attach-chip">
+            <el-icon><Paperclip /></el-icon>
+            <span class="attach-name">{{ a.name }}</span>
+            <el-icon class="attach-remove" @click="removeAttachment(i)"><Close /></el-icon>
+          </span>
+        </div>
         <div v-if="streaming" class="composer-running">
           <span class="mini-spin"></span>
           <span>{{ streamingStatus }}</span>
@@ -145,6 +167,16 @@
           </el-button>
         </div>
         <div class="composer-input">
+          <el-upload
+            class="attach-upload"
+            :show-file-list="false"
+            :http-request="handleUpload"
+            multiple
+          >
+            <el-button class="attach-btn" text title="上传文件">
+              <el-icon size="18"><Paperclip /></el-icon>
+            </el-button>
+          </el-upload>
           <el-input
             v-model="inputText"
             type="textarea"
@@ -162,44 +194,13 @@
         </div>
       </div>
     </main>
-
-    <!-- 创建助手（自然语言 Builder，UX-02/03） -->
-    <el-dialog v-model="showBuilder" title="创建智能助手" width="560px">
-      <div class="builder-desc">
-        描述你想要的助手，系统会自动生成配置草稿（名称、能力、指令），确认后立即可用。
-      </div>
-      <el-input
-        v-model="builderText"
-        type="textarea"
-        :rows="4"
-        placeholder="例如：帮我创建一个行业研究助手，能够搜索最新资料、分析数据、核实信息来源，并生成结构化研究报告。"
-      />
-      <div v-if="draft" class="builder-draft">
-        <el-divider content-position="left">草稿预览</el-divider>
-        <p><b>名称：</b>{{ draft.name }}</p>
-        <p><b>能力包：</b>{{ (draft.capability_ids || []).join('、') || 'general' }}</p>
-        <p><b>角色指令：</b></p>
-        <pre class="draft-prompt">{{ draft.system_prompt }}</pre>
-        <div v-if="draft.risk_notes?.length" class="draft-risk">
-          <div v-for="(note, i) in draft.risk_notes" :key="i">⚠ {{ note }}</div>
-        </div>
-      </div>
-      <template #footer>
-        <el-button @click="showBuilder = false">取消</el-button>
-        <el-button :loading="drafting" @click="generateDraft">生成草稿</el-button>
-        <el-button type="primary" :disabled="!draft" :loading="creating" @click="createFromDraft">
-          确认创建并使用
-        </el-button>
-      </template>
-    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
 /**
- * 统一智能体工作台（任务书 §2.2）：
+ * 统一智能体对话（任务书 §2.2）：
  * - 登录后直接对话（默认助手，UX-01）；
- * - 自然语言创建助手（UX-02/03）；
  * - 流式执行体验：工具小步骤实时穿插追加在对话流尾部，每步可点开详情；
  * - 执行中可自由切换会话/页面：任务后台继续跑，会话独立状态互不干扰（UX-10）；
  * - 取消走后端 /runs/{id}/cancel（UX-07）；
@@ -207,12 +208,13 @@
  * - 审批按 action_id 决策（UX-09）。
  */
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { Delete, Plus, VideoPause } from '@element-plus/icons-vue'
+import { Delete, Paperclip, Plus, VideoPause } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
+import { modelApi } from '@/api'
 import {
-  assistantApi, conversationApi, consumeRunEvents, runApi, workspaceApi,
+  conversationApi, consumeRunEvents, runApi, workspaceApi,
   type Assistant, type Conversation,
 } from '@/api/v2'
 import {
@@ -226,6 +228,8 @@ interface ChatMessage extends RunStreamMessage {
   role: 'user' | 'assistant'
   content: string
   runId?: string
+  /** 用户消息携带的附件名（历史回放时从附件注记恢复） */
+  files?: string[]
 }
 
 /** 折叠后的连续工具步骤组（完成后折叠防刷屏） */
@@ -280,7 +284,7 @@ const streamingStatus = computed(() => {
 
 const conversations = ref<Conversation[]>([])
 const currentConversation = ref<Conversation | null>(null)
-const assistants = ref<Assistant[]>([])
+/** 当前对话使用的助手：固定为 bootstrap 下发的默认助手（不再提供助手管理入口） */
 const currentAssistant = ref<Assistant | null>(null)
 
 // 权限模块：审批模式（manual=高危工具人工审批；auto=自动放行不询问），随 Run 创建下发
@@ -288,6 +292,13 @@ const approvalMode = ref<'manual' | 'auto'>(
   localStorage.getItem('approval_mode') === 'auto' ? 'auto' : 'manual',
 )
 watch(approvalMode, (v) => localStorage.setItem('approval_mode', v))
+
+// 模型选择（手动选模型仅本次 Run 生效；0 = 助手默认模型）
+const modelOptions = ref<any[]>([])
+const selectedModelId = ref<number>(0)
+
+// 待发送附件（上传即写入会话工作区，随消息告知模型读取；切换会话即清空）
+const attachments = ref<Array<{ name: string; path: string; text_path: string | null; size: number }>>([])
 
 // 停滞检测：长时间无新事件时明确提示"仍在执行"，避免误以为卡死
 const clock = ref(Date.now())
@@ -297,12 +308,6 @@ function staleSeconds(m: ChatMessage): number {
   if (!m.streaming || !m.lastEventAt) return 0
   return Math.max(0, Math.floor((clock.value - m.lastEventAt) / 1000))
 }
-
-const showBuilder = ref(false)
-const builderText = ref('')
-const draft = ref<any>(null)
-const drafting = ref(false)
-const creating = ref(false)
 
 // Markdown 渲染（marked + DOMPurify）：回答主体是用户的核心产物，必须完整渲染
 // marked v12 renderer 收 token 对象；兼容旧式 (code, lang) 双签名
@@ -385,6 +390,32 @@ async function forceScrollToBottom() {
   }
 }
 
+// ── 提问锚点导航（右侧纵向圆点：点击跳转对应提问，悬浮气泡预览内容）────────
+
+const questionAnchors = computed(() =>
+  messages.value
+    .map((m, idx) => ({ m, idx }))
+    .filter(({ m }) => m.role === 'user')
+    .map(({ m, idx }) => ({ idx, preview: questionPreview(m.content) })),
+)
+
+function questionPreview(text: string): string {
+  const t = (text || '').replace(/\s+/g, ' ').trim()
+  return t.length > 80 ? `${t.slice(0, 80)}…` : t
+}
+
+function jumpToQuestion(idx: number) {
+  const el = messagesRef.value
+  const target = el?.querySelector<HTMLElement>(`#q-${idx}`)
+  if (!el || !target) return
+  // 跳到历史提问 = 阅读意图：解除粘底，避免流式更新把视图拽回底部
+  stickToBottom.value = false
+  // 直接赋值定位：长会话（数万 px）下元素级 scrollTo({behavior:'smooth'})
+  // 不产生滚动（实测无效），瞬时跳转对长距离导航也更利落
+  el.scrollTop =
+    el.scrollTop + target.getBoundingClientRect().top - el.getBoundingClientRect().top - 12
+}
+
 // ── 块流展示（工具步骤实时穿插；完成后连续步骤折叠防刷屏）──────────────────
 
 const groupOpen = reactive<Record<string, boolean>>({})
@@ -451,13 +482,9 @@ onMounted(async () => {
   clockTimer = window.setInterval(() => { clock.value = Date.now() }, 1000)
   const boot = await workspaceApi.bootstrap()
   currentAssistant.value = boot.default_assistant
-  assistants.value = [boot.default_assistant]
-  try {
-    const res = await assistantApi.list()
-    assistants.value = res.items || []
-    const def = assistants.value.find((a) => a.is_default)
-    if (def) currentAssistant.value = def
-  } catch { /* bootstrap 的默认助手兜底 */ }
+  modelApi.listConfigs({ model_type: 'chat' }).then((list) => {
+    modelOptions.value = (list || []).filter((m: any) => m.is_active)
+  }).catch(() => { /* 模型列表加载失败不阻断对话 */ })
   await loadConversations()
 })
 
@@ -493,10 +520,22 @@ async function newConversation() {
   conversations.value.unshift(c)
   currentConversation.value = c
   convMessages.set(c.id, [])
+  attachments.value = []
+}
+
+/** 无会话时（上传附件 / 首条消息）自动创建会话 */
+async function ensureConversation(): Promise<Conversation> {
+  if (currentConversation.value) return currentConversation.value
+  const c = await conversationApi.create({ assistant_id: currentAssistant.value?.id })
+  conversations.value.unshift(c)
+  currentConversation.value = c
+  convMessages.set(c.id, [])
+  return c
 }
 
 async function selectConversation(c: Conversation) {
   currentConversation.value = c
+  attachments.value = []
   if (convMessages.has(c.id)) {
     await forceScrollToBottom()
     return
@@ -507,7 +546,8 @@ async function selectConversation(c: Conversation) {
     const raw: any[] = res.items || []
     for (const m of raw) {
       if (m.role === 'user') {
-        arr.push({ role: 'user', content: m.content || '', blocks: [] })
+        const { text, files } = splitAttachmentNote(m.content || '')
+        arr.push({ role: 'user', content: text, blocks: [], files })
         continue
       }
       const content = m.content || ''
@@ -558,8 +598,36 @@ async function removeConversation(c: Conversation) {
   }
 }
 
-function selectAssistant(a: Assistant) {
-  currentAssistant.value = a
+// ── 会话附件（上传即入会话工作区；发送时随消息告知模型读取）────────────────
+
+/** 剥离用户消息尾部的附件注记块（后端注入），还原正文与附件名列表 */
+function splitAttachmentNote(content: string): { text: string; files: string[] } {
+  const marker = '\n\n[附件]'
+  const idx = content.indexOf(marker)
+  if (idx < 0) return { text: content, files: [] }
+  const files = content
+    .slice(idx + marker.length)
+    .split('\n')
+    .map((l) => l.replace(/^-\s*/, '').replace(/（.*$/, '').replace(/^\/?workspace\//, '').trim())
+    .filter(Boolean)
+    .map((p) => p.replace(/^uploads\//, ''))
+  return { text: content.slice(0, idx), files }
+}
+
+async function handleUpload(req: { file: File }) {
+  try {
+    const conv = await ensureConversation()
+    const res = await conversationApi.uploadFile(conv.id, req.file)
+    attachments.value.push(res)
+  } catch { /* 错误提示已由请求层统一弹出 */ }
+}
+
+async function removeAttachment(i: number) {
+  const a = attachments.value[i]
+  attachments.value.splice(i, 1)
+  if (currentConversation.value && a) {
+    conversationApi.deleteFile(currentConversation.value.id, a.name).catch(() => {})
+  }
 }
 
 // ── 发送与事件流消费（§7.1 v2 协议 + §8.4 重连）──────────────────────────────
@@ -573,16 +641,17 @@ async function sendMessage() {
   const text = inputText.value.trim()
   if (!text || streaming.value) return
 
-  if (!currentConversation.value) {
-    const c = await conversationApi.create({ assistant_id: currentAssistant.value?.id })
-    conversations.value.unshift(c)
-    currentConversation.value = c
-    convMessages.set(c.id, [])
-  }
-  const convId = currentConversation.value.id
+  const conv = await ensureConversation()
+  const convId = conv.id
+  const sentFiles = attachments.value.map((a) => ({ ...a }))
+  const sentModelId = selectedModelId.value
 
   inputText.value = ''
-  pushMsg(convId, { role: 'user', content: text, blocks: [] })
+  attachments.value = []
+  pushMsg(convId, {
+    role: 'user', content: text, blocks: [],
+    files: sentFiles.map((a) => a.name),
+  })
   const aMsg = pushMsg(convId, {
     role: 'assistant', content: '', blocks: [], streaming: true,
     lastActivity: 'other', lastEventAt: Date.now(),
@@ -599,6 +668,8 @@ async function sendMessage() {
       conversation_id: convId,
       assistant_id: currentAssistant.value?.id,
       approval_mode: approvalMode.value,
+      model_config_id: sentModelId || undefined,
+      attachments: sentFiles,
     })
     if (entry.stopped) return
     aMsg.runId = created.run_id
@@ -687,43 +758,6 @@ function onApprovalDecided(type: 'approve' | 'reject') {
     },
   }).catch(() => { /* 网络异常已由 onDone 兜底 */ })
 }
-
-// ── 自然语言 Builder（UX-02/03）──────────────────────────────────────────────
-
-async function generateDraft() {
-  if (!builderText.value.trim()) {
-    ElMessage.warning('请先描述你想要的助手')
-    return
-  }
-  drafting.value = true
-  try {
-    draft.value = await assistantApi.draft(builderText.value.trim())
-  } finally {
-    drafting.value = false
-  }
-}
-
-async function createFromDraft() {
-  if (!draft.value) return
-  creating.value = true
-  try {
-    const created = await assistantApi.create({
-      name: draft.value.name,
-      description: draft.value.description,
-      system_prompt: draft.value.system_prompt,
-      capability_ids: draft.value.capability_ids,
-      tools: draft.value.tools || [],
-    })
-    assistants.value.unshift(created)
-    currentAssistant.value = created
-    showBuilder.value = false
-    draft.value = null
-    builderText.value = ''
-    ElMessage.success('助手已创建并立即可用')
-  } finally {
-    creating.value = false
-  }
-}
 </script>
 
 <style scoped>
@@ -768,21 +802,9 @@ async function createFromDraft() {
 }
 @keyframes pulse { 0%, 100% { opacity: 0.35; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1); } }
 .sidebar-empty { color: #c0c4cc; font-size: 12px; }
-.assistant-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 7px 10px;
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 13px;
-  color: #606266;
-}
-.assistant-item:hover { background: #f5f7fa; }
-.assistant-item.active { background: #ecf5ff; color: #409eff; }
 
 /* 主区 */
-.ws-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.ws-main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
 .ws-header {
   padding: 10px 20px;
   border-bottom: 1px solid #e4e7ed;
@@ -792,7 +814,37 @@ async function createFromDraft() {
 }
 .ws-assistant-name { font-weight: 600; }
 
-.ws-messages { flex: 1; overflow-y: auto; padding: 20px; }
+/* 右侧预留提问圆点导航宽度，避免内容压到圆点下 */
+.ws-messages { flex: 1; overflow-y: auto; padding: 20px 36px 20px 20px; }
+
+/* 提问锚点导航：右侧纵向小圆点，点击快速跳转对应提问 */
+.q-nav {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  max-height: 68%;
+  overflow-y: auto;
+  scrollbar-width: none;
+  z-index: 2;
+}
+.q-nav::-webkit-scrollbar { display: none; }
+.q-nav-dot {
+  width: 8px;
+  height: 8px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: #dcdfe6;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s ease, transform 0.15s ease;
+}
+.q-nav-dot:hover { background: #409eff; transform: scale(1.35); }
 .ws-empty { text-align: center; color: #909399; margin-top: 10vh; }
 .ws-examples {
   display: flex;
@@ -968,16 +1020,54 @@ async function createFromDraft() {
 .composer-input { display: flex; gap: 10px; align-items: flex-end; }
 .composer-input :deep(.el-textarea__inner) { resize: none; }
 
-/* Builder */
-.builder-desc { color: #909399; font-size: 13px; margin-bottom: 12px; }
-.builder-draft pre.draft-prompt {
-  background: #f5f7fa;
-  padding: 10px;
-  border-radius: 6px;
-  white-space: pre-wrap;
-  font-size: 12px;
-  max-height: 160px;
-  overflow-y: auto;
+/* 模型选择 / 附件上传 */
+.model-select { width: 160px; }
+.attach-upload { display: flex; align-items: flex-end; }
+.attach-btn { padding: 6px; margin-bottom: 1px; }
+.attach-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
 }
-.draft-risk { color: #e6a23c; font-size: 12px; margin-top: 8px; }
+.attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border: 1px solid #dcdfe6;
+  border-radius: 12px;
+  font-size: 12px;
+  color: #606266;
+  background: #f5f7fa;
+}
+.attach-chip .attach-name {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attach-remove { cursor: pointer; color: #c0c4cc; }
+.attach-remove:hover { color: #f56c6c; }
+/* 消息气泡内附件标签 */
+.msg-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.msg-file-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.18);
+  font-size: 12px;
+}
+</style>
+
+<style>
+/* 提问预览气泡（el-tooltip popper 默认挂到 body，scoped 样式够不到，需全局块） */
+.q-nav-popper { max-width: 320px; word-break: break-word; }
 </style>

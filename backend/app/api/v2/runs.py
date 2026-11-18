@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
@@ -114,6 +114,28 @@ async def _drain_legacy_stream(stream) -> None:
         logger.exception("v2 后台事件流排空异常")
 
 
+def _attachment_note(attachments: List[Dict[str, Any]]) -> str:
+    """附件读取注记（随用户消息持久化）：告知模型文件已入会话工作区可用 read_file 读取。
+
+    路径白名单：仅 ``uploads/`` 前缀且无 ``..`` 段，防注记被注入任意路径；
+    注记使用 ``/workspace/uploads/`` 前缀（文件工具的虚拟盘路由），
+    无前缀路径会被 StateBackend 兜底导致 read_file 找不到文件。
+    """
+    lines = []
+    for a in attachments or []:
+        path = str(a.get("path") or "").replace("\\", "/")
+        if not path.startswith("uploads/") or ".." in path.split("/"):
+            continue
+        line = f"- /workspace/{path}"
+        text_path = str(a.get("text_path") or "").replace("\\", "/")
+        if text_path.startswith("uploads/") and ".." not in text_path.split("/"):
+            line += f"（文本副本：/workspace/{text_path}）"
+        lines.append(line)
+    if not lines:
+        return ""
+    return "\n\n[附件]（文件已存入会话工作区，可用 read_file 读取）\n" + "\n".join(lines)
+
+
 # ── Run 生命周期 ──────────────────────────────────────────────────────────────
 
 @router.post("")
@@ -166,6 +188,9 @@ async def create_run(
         raise HTTPException(status_code=404, detail="助手不存在")
 
     agent_config = await _load_agent_config(db, agent, use_memory=body.use_memory)
+    # 会话内手动选模型：仅本次 Run 覆盖助手默认模型（不落版本快照）
+    if body.model_config_id:
+        agent_config["model_config_id"] = body.model_config_id
     # 权限模块：审批模式随 Run 创建写入配置（并落入 agent_config_snapshot，
     # 崩溃恢复/断点续跑后仍保持原模式）；非法取值一律回落 manual（安全默认）
     agent_config["approval_mode"] = (
@@ -175,7 +200,10 @@ async def create_run(
     # 避免与 start_run_with_session 的独立会话写入互相阻塞（SQLite 必需）
     await db.commit()
     db_info = await _load_db_info(agent_config.get("database_connection_id"))
-    user_message = {"role": "user", "content": body.message}
+    # 附件读取注记随消息持久化（多轮对话中模型始终可见文件位置）；
+    # 前端展示时剥离该注记块
+    note = _attachment_note(body.attachments)
+    user_message = {"role": "user", "content": body.message + note}
     messages = (list(session.messages or []) if session is not None else []) + [user_message]
 
     # 3) 幂等预查（P1-01）
