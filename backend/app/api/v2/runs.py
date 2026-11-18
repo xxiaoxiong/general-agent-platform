@@ -133,7 +133,11 @@ def _attachment_note(attachments: List[Dict[str, Any]]) -> str:
         lines.append(line)
     if not lines:
         return ""
-    return "\n\n[附件]（文件已存入会话工作区，可用 read_file 读取）\n" + "\n".join(lines)
+    return (
+        "\n\n[附件]（文件已存入会话工作区。回答前请务必先用 read_file 逐个读取以下文件——"
+        "图片文件 read_file 后可直接看到图片内容——读完再基于内容回答；"
+        "在未读取前不要猜测内容、不要让用户重新上传）\n" + "\n".join(lines)
+    )
 
 
 # ── Run 生命周期 ──────────────────────────────────────────────────────────────

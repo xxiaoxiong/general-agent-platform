@@ -49,6 +49,28 @@ export interface RunInfo {
   finished_at: string | null
 }
 
+/** 通用工作区文件预览元数据（右侧临时预览区块） */
+export interface FilePreview {
+  name: string
+  path: string
+  /** 渲染分支：image / pdf / markdown / code / text / table / office / binary */
+  kind: string
+  size: number
+  mime: string
+  /** 代码高亮语言提示 */
+  language?: string
+  /** 文本 / 代码 / Markdown / Office 抽取文本 */
+  text?: string
+  /** 表格二维数组（csv / xlsx） */
+  rows?: string[][]
+  truncated?: boolean
+}
+
+/** 预览内容 = 元数据 + 图片/PDF 的本地 objectURL（前端解析后附加） */
+export interface PreviewContent extends FilePreview {
+  objectUrl?: string
+}
+
 /** v2 事件信封（§7.1） */
 export interface RunEventEnvelope {
   event: string
@@ -90,6 +112,19 @@ export const conversationApi = {
   },
   deleteFile: (id: number, filename: string) =>
     request2.delete(`/conversations/${id}/files/${encodeURIComponent(filename)}`),
+  /** 下载已上传附件（图片预览用；返回 Blob） */
+  fileBlob: (id: number, filename: string) =>
+    request2.get<any, Blob>(
+      `/conversations/${id}/files/${encodeURIComponent(filename)}`, { responseType: 'blob' },
+    ),
+  /** 通用工作区文件预览元数据（path 可为 uploads/xx 或 Agent 产物相对路径） */
+  filePreview: (id: number, path: string) =>
+    request2.get<any, FilePreview>(`/conversations/${id}/file-preview`, { params: { path } }),
+  /** 通用工作区文件字节（图片 / PDF 预览、二进制下载） */
+  fileBytes: (id: number, path: string) =>
+    request2.get<any, Blob>(`/conversations/${id}/file-bytes`, {
+      params: { path }, responseType: 'blob',
+    }),
 }
 
 // ── Runs ──────────────────────────────────────────────────────────────────────

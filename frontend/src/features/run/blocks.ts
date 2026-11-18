@@ -26,6 +26,8 @@ export interface ToolBlock {
   error?: string
   startedAt?: number
   durationMs?: number
+  /** 文件类工具的完整工作区路径（read/write/edit），点击行内文件名打开右侧预览 */
+  filePath?: string
 }
 
 export type MsgBlock = TextBlock | ToolBlock | PlanBlock
@@ -43,6 +45,11 @@ export interface RunStreamMessage {
   runStatus?: string
   pendingActions?: any[]
   finalText?: string
+  /** 运行起始/最近事件时间戳（事件 timestamp，供任务耗时计算） */
+  runStartedAt?: number
+  lastEventTs?: number
+  /** 任务耗时（run.started -> 最近事件），终态后固化展示 */
+  runDurationMs?: number
 }
 
 /** 从工具入参提取目标摘要（文件路径/搜索模式/URL 等），让步骤行有意义 */
@@ -59,6 +66,14 @@ export function extractTarget(name: string, input: any): string {
   if (!raw) return ''
   const oneLine = raw.replace(/\s+/g, ' ')
   return oneLine.length > 48 ? oneLine.slice(0, 48) + '…' : oneLine
+}
+
+/** 文件类工具（read/write/edit）从入参取完整工作区路径，供点击行内文件名预览 */
+const FILE_PATH_TOOLS = new Set(['read_file', 'write_file', 'edit_file'])
+export function extractFilePath(name: string, input: any): string {
+  if (!FILE_PATH_TOOLS.has(name) || !input || typeof input !== 'object') return ''
+  const raw = input.path ?? input.file_path ?? input.filePath ?? ''
+  return typeof raw === 'string' ? raw.trim() : ''
 }
 
 // 空白 + 零宽/不可见字符（ZWSP/BOM/软连字符等）：模型偶发输出这类字符，
@@ -100,6 +115,9 @@ function gapFillText(msg: RunStreamMessage, finalText: string) {
 /** v2 事件 -> 块流状态（实时与历史回放共用同一归约器） */
 export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void {
   msg.lastEventAt = Date.now()
+  // 事件真实时间戳：供任务耗时（run 起点 -> 最近事件）计算，历史回放也准确
+  const evTs = Date.parse(ev.timestamp) || Date.now()
+  msg.lastEventTs = evTs
   if (typeof ev.sequence === 'number' && ev.sequence > (msg.lastSeq || 0)) {
     msg.lastSeq = ev.sequence
   }
@@ -109,6 +127,7 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
   switch (ev.event) {
     case 'run.started':
       msg.runStatus = 'running'
+      msg.runStartedAt = evTs
       msg.liveStatus = '任务已开始…'
       msg.lastActivity = 'other'
       break
@@ -134,6 +153,7 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
         state: 'running',
         input: data.input,
         startedAt: Date.parse(ev.timestamp) || Date.now(),
+        filePath: extractFilePath(String(data.tool_name || ''), data.input),
       })
       msg.liveStatus = `正在执行 ${data.tool_name || '工具'}…`
       msg.lastActivity = 'tool'
@@ -160,6 +180,7 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
           state: failed ? 'failed' : 'done',
           input: data.input,
           startedAt: Date.parse(ev.timestamp) || undefined,
+          filePath: extractFilePath(String(data.tool_name || ''), data.input),
         }
         blocks.push(blk)
       } else {
@@ -252,6 +273,10 @@ export function finalizeRunMessage(
 ): void {
   msg.streaming = false
   msg.liveStatus = ''
+  // 任务耗时固化（run.started -> 最近事件时间戳）
+  if (msg.runStartedAt && msg.lastEventTs && msg.lastEventTs >= msg.runStartedAt) {
+    msg.runDurationMs = msg.lastEventTs - msg.runStartedAt
+  }
   const map: Record<string, string> = {
     'run.completed': 'completed', 'run.failed': 'failed',
     'run.cancelled': 'cancelled', 'run.suspended': 'suspended',

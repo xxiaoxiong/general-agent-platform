@@ -34,6 +34,7 @@
         class="ws-messages"
         @scroll.passive="onMessagesScroll"
         @wheel.passive="onWheelScroll"
+        @click="onCopyClick"
       >
         <div v-if="!messages.length" class="ws-empty">
           <h2>有什么可以帮你？</h2>
@@ -50,9 +51,26 @@
           <div v-if="m.role === 'user'" :id="`q-${idx}`" class="msg-row msg-user">
             <div class="msg-bubble">
               <div v-if="m.files?.length" class="msg-files">
-                <span v-for="f in m.files" :key="f" class="msg-file-tag">
-                  <el-icon><Paperclip /></el-icon> {{ f }}
-                </span>
+                <template v-for="f in m.files" :key="f.name">
+                  <!-- 图片附件：缩略图点击看大图 -->
+                  <el-image
+                    v-if="f.previewUrl"
+                    class="msg-thumb"
+                    :src="f.previewUrl"
+                    :preview-src-list="[f.previewUrl]"
+                    fit="cover"
+                    preview-teleported
+                    hide-on-click-modal
+                  />
+                  <a
+                    v-else
+                    class="msg-file-tag"
+                    :title="f.name"
+                    @click="openPreview('uploads/' + f.name, f.name)"
+                  >
+                    <el-icon><Paperclip /></el-icon> {{ f.name }}
+                  </a>
+                </template>
               </div>
               {{ m.content }}
             </div>
@@ -61,10 +79,14 @@
           <!-- 助手消息：文本段 / 工具小步骤按事件顺序实时穿插在对话流尾部 -->
           <div v-else class="msg-row msg-assistant">
             <div class="msg-content">
+              <!-- 任务耗时（对齐 Trae）：运行中实时累加，终态固化 -->
+              <div v-if="taskTimeText(m)" class="task-time">
+                {{ m.streaming ? '已运行 ' : '任务耗时 ' }}{{ taskTimeText(m) }}
+              </div>
               <template v-for="(b, bi) in displayBlocks(m, idx)" :key="bi">
                 <div v-if="b.kind === 'text'" class="msg-text" v-html="renderMarkdown(b.text)"></div>
 
-                <ToolStep v-else-if="b.kind === 'tool'" :tool="b" />
+                <ToolStep v-else-if="b.kind === 'tool'" :tool="b" @preview="openPreview" />
 
                 <div v-else-if="b.kind === 'plan'" class="plan-inline">
                   <div class="plan-inline-title">任务计划</div>
@@ -78,11 +100,11 @@
                 <div v-else-if="b.kind === 'group'" class="tool-group">
                   <div class="tool-group-head" @click="toggleGroup(b.key)">
                     <span class="tool-state-mark">✓</span>
-                    <span>{{ b.items.length }} 个工具调用<span v-if="groupFailCount(b)">（{{ groupFailCount(b) }} 个失败）</span></span>
+                    <span>{{ groupSummary(b) }}<span v-if="groupFailCount(b)">（{{ groupFailCount(b) }} 个失败）</span></span>
                     <el-icon class="row-chevron"><component :is="b.open ? 'ArrowDown' : 'ArrowRight'" /></el-icon>
                   </div>
                   <template v-if="b.open">
-                    <ToolStep v-for="it in b.items" :key="it.key" :tool="it" />
+                    <ToolStep v-for="it in b.items" :key="it.key" :tool="it" @preview="openPreview" />
                   </template>
                 </div>
               </template>
@@ -127,38 +149,8 @@
         </el-tooltip>
       </div>
 
-      <!-- 输入区（执行中可继续浏览/切换；当前会话运行时可停止） -->
+      <!-- 输入区（Trae 式：单个圆角容器 = 附件 + 文本 + 底部工具栏） -->
       <div class="ws-composer">
-        <div class="composer-perm">
-          <span class="perm-label">模型</span>
-          <el-select v-model="selectedModelId" class="model-select" size="small">
-            <el-option label="默认模型" :value="0" />
-            <el-option
-              v-for="m in modelOptions"
-              :key="m.id"
-              :label="m.display_name || m.name"
-              :value="m.id"
-            />
-          </el-select>
-          <span class="perm-label">审批模式</span>
-          <el-radio-group v-model="approvalMode" size="small">
-            <el-radio-button value="manual">手动审批</el-radio-button>
-            <el-radio-button value="auto">自动审批</el-radio-button>
-          </el-radio-group>
-          <span class="perm-hint">
-            {{ approvalMode === 'manual'
-              ? '高危工具（执行代码 / 外发消息 / 删除等）执行前需人工批准'
-              : '高危工具自动放行，执行过程不再逐次询问' }}
-          </span>
-        </div>
-        <!-- 待发送附件（文件已上传到会话工作区，发送时告知模型读取） -->
-        <div v-if="attachments.length" class="attach-strip">
-          <span v-for="(a, i) in attachments" :key="a.path" class="attach-chip">
-            <el-icon><Paperclip /></el-icon>
-            <span class="attach-name">{{ a.name }}</span>
-            <el-icon class="attach-remove" @click="removeAttachment(i)"><Close /></el-icon>
-          </span>
-        </div>
         <div v-if="streaming" class="composer-running">
           <span class="mini-spin"></span>
           <span>{{ streamingStatus }}</span>
@@ -166,34 +158,120 @@
             <el-icon><VideoPause /></el-icon> 停止
           </el-button>
         </div>
-        <div class="composer-input">
-          <el-upload
-            class="attach-upload"
-            :show-file-list="false"
-            :http-request="handleUpload"
-            multiple
-          >
-            <el-button class="attach-btn" text title="上传文件">
-              <el-icon size="18"><Paperclip /></el-icon>
-            </el-button>
-          </el-upload>
+        <div class="composer-box">
+          <!-- 待发送附件（图片缩略图点击看大图，右上角叉号移除） -->
+          <div v-if="attachments.length" class="attach-strip">
+            <div v-for="(a, i) in attachments" :key="a.path" class="attach-item">
+              <el-image
+                v-if="a.previewUrl"
+                class="attach-thumb"
+                :src="a.previewUrl"
+                :preview-src-list="[a.previewUrl]"
+                fit="cover"
+                preview-teleported
+                hide-on-click-modal
+              />
+              <span v-else class="attach-chip">
+                <el-icon><Paperclip /></el-icon>
+                <span class="attach-name">{{ a.name }}</span>
+                <el-icon class="attach-remove" @click="removeAttachment(i)"><Close /></el-icon>
+              </span>
+              <button
+                v-if="a.previewUrl"
+                type="button"
+                class="attach-x"
+                title="取消"
+                @click.stop="removeAttachment(i)"
+              >×</button>
+            </div>
+          </div>
           <el-input
             v-model="inputText"
+            class="composer-textarea"
             type="textarea"
-            :rows="2"
+            :autosize="{ minRows: 2, maxRows: 12 }"
             placeholder="输入消息，Enter 发送（Shift+Enter 换行）"
             @keydown.enter.exact.prevent="sendMessage"
           />
-          <el-button
-            type="primary"
-            :disabled="streaming || !inputText.trim()"
-            @click="sendMessage"
-          >
-            发送
-          </el-button>
+          <!-- 底部工具栏：左 = 上传/审批模式，右 = 模型选择/发送 -->
+          <div class="composer-bar">
+            <div class="bar-left">
+              <el-upload
+                class="attach-upload"
+                :show-file-list="false"
+                :http-request="handleUpload"
+                multiple
+              >
+                <el-button class="bar-btn" text title="上传文件">
+                  <el-icon size="18"><Paperclip /></el-icon>
+                </el-button>
+              </el-upload>
+              <el-dropdown trigger="click" @command="onApprovalCommand">
+                <el-button class="bar-btn bar-trigger" text>
+                  <el-icon size="14"><Lock /></el-icon>
+                  <span class="bar-label">{{ approvalMode === 'manual' ? '手动审批' : '自动审批' }}</span>
+                  <el-icon size="11" class="bar-caret"><ArrowDown /></el-icon>
+                </el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="manual">
+                      <span class="item-check">{{ approvalMode === 'manual' ? '✓' : '' }}</span>手动审批（高危工具需确认）
+                    </el-dropdown-item>
+                    <el-dropdown-item command="auto">
+                      <span class="item-check">{{ approvalMode === 'auto' ? '✓' : '' }}</span>自动审批（高危工具自动放行）
+                    </el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+            </div>
+            <div class="bar-right">
+              <el-dropdown trigger="click" @command="onModelCommand">
+                <el-button class="bar-btn bar-trigger" text>
+                  <el-icon size="14"><Cpu /></el-icon>
+                  <span class="bar-label">{{ selectedModelLabel }}</span>
+                  <el-icon size="11" class="bar-caret"><ArrowDown /></el-icon>
+                </el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="0">
+                      <span class="item-check">{{ !selectedModelId ? '✓' : '' }}</span>默认模型
+                    </el-dropdown-item>
+                    <el-dropdown-item
+                      v-for="m in modelOptions"
+                      :key="m.id"
+                      :command="String(m.id)"
+                    >
+                      <span class="item-check">{{ selectedModelId === m.id ? '✓' : '' }}</span>{{ m.display_name || m.name }}
+                    </el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+              <button
+                class="send-btn"
+                type="button"
+                title="发送"
+                :disabled="streaming || !inputText.trim()"
+                @click="sendMessage"
+              >
+                <el-icon size="16"><Top /></el-icon>
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </main>
+
+    <!-- 右侧临时文件预览区块（点文件名打开，Esc / × 关闭） -->
+    <FilePreviewPanel
+      v-if="preview"
+      :data="preview.data"
+      :name="preview.name"
+      :loading="preview.loading"
+      :error="preview.error"
+      @close="closePreview"
+      @download="downloadPreview"
+      @open-original="(p: string) => openPreview(p)"
+    />
   </div>
 </template>
 
@@ -215,7 +293,7 @@ import DOMPurify from 'dompurify'
 import { modelApi } from '@/api'
 import {
   conversationApi, consumeRunEvents, runApi, workspaceApi,
-  type Assistant, type Conversation,
+  type Assistant, type Conversation, type PreviewContent,
 } from '@/api/v2'
 import {
   applyRunEvent, finalizeRunMessage, hasVisibleText,
@@ -223,13 +301,14 @@ import {
 } from '@/features/run/blocks'
 import ToolStep from '@/features/run/ToolStep.vue'
 import ApprovalPanel from '@/features/run/ApprovalPanel.vue'
+import FilePreviewPanel from '@/features/preview/FilePreviewPanel.vue'
 
 interface ChatMessage extends RunStreamMessage {
   role: 'user' | 'assistant'
   content: string
   runId?: string
-  /** 用户消息携带的附件名（历史回放时从附件注记恢复） */
-  files?: string[]
+  /** 用户消息携带的附件（历史回放时从附件注记恢复；图片带本地预览 URL） */
+  files?: Array<{ name: string; previewUrl?: string }>
 }
 
 /** 折叠后的连续工具步骤组（完成后折叠防刷屏） */
@@ -296,9 +375,23 @@ watch(approvalMode, (v) => localStorage.setItem('approval_mode', v))
 // 模型选择（手动选模型仅本次 Run 生效；0 = 助手默认模型）
 const modelOptions = ref<any[]>([])
 const selectedModelId = ref<number>(0)
+const selectedModelLabel = computed(() => {
+  const m = modelOptions.value.find((x) => x.id === selectedModelId.value)
+  return m ? (m.display_name || m.name) : '默认模型'
+})
+function onModelCommand(cmd: string) {
+  selectedModelId.value = Number(cmd) || 0
+}
+function onApprovalCommand(cmd: string) {
+  approvalMode.value = cmd === 'auto' ? 'auto' : 'manual'
+}
 
 // 待发送附件（上传即写入会话工作区，随消息告知模型读取；切换会话即清空）
-const attachments = ref<Array<{ name: string; path: string; text_path: string | null; size: number }>>([])
+const attachments = ref<Array<{
+  name: string; path: string; text_path: string | null; size: number
+  /** 图片本地预览 URL（URL.createObjectURL） */
+  previewUrl?: string
+}>>([])
 
 // 停滞检测：长时间无新事件时明确提示"仍在执行"，避免误以为卡死
 const clock = ref(Date.now())
@@ -309,12 +402,49 @@ function staleSeconds(m: ChatMessage): number {
   return Math.max(0, Math.floor((clock.value - m.lastEventAt) / 1000))
 }
 
+// ── 任务耗时（对齐 Trae「任务耗时 7m 4s」）────────────────────────────────────
+
+function formatDuration(ms: number): string {
+  const s = Math.round(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  const rs = s % 60
+  return rs ? `${m}m ${rs}s` : `${m}m`
+}
+
+/** 任务耗时文本：运行中实时累加，终态固化；无 run 起点则空 */
+function taskTimeText(m: ChatMessage): string {
+  if (m.runDurationMs && m.runDurationMs > 0) return formatDuration(m.runDurationMs)
+  if (m.streaming && m.runStartedAt && m.runStartedAt > 0) {
+    return formatDuration(Math.max(0, clock.value - m.runStartedAt))
+  }
+  return ''
+}
+
 // Markdown 渲染（marked + DOMPurify）：回答主体是用户的核心产物，必须完整渲染
 // marked v12 renderer 收 token 对象；兼容旧式 (code, lang) 双签名
+// 注意：复制按钮不用内联 onclick —— DOMPurify 会剥离事件处理器导致复制失效，
+// 改为 class 标记 + 容器事件委托（onCopyClick）处理。
 function renderCodeBlock(code: string, lang?: string) {
   const langClass = lang ? ` class="language-${lang}"` : ''
   const escaped = code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-  return `<div class="code-block-wrapper"><button class="copy-btn" onclick="(function(btn){var code=btn.nextElementSibling.querySelector('code');navigator.clipboard.writeText(code.innerText).then(function(){btn.textContent='已复制';setTimeout(function(){btn.textContent='复制'},1500)}).catch(function(){btn.textContent='失败'});})(this)">复制</button><pre><code${langClass}>${escaped}</code></pre></div>`
+  return `<div class="code-block-wrapper"><button class="copy-btn" type="button">复制</button><pre><code${langClass}>${escaped}</code></pre></div>`
+}
+
+/** 代码块复制（事件委托）：v-html 内联 onclick 会被 DOMPurify 剥离，故用委托 */
+function onCopyClick(e: MouseEvent) {
+  const btn = (e.target as HTMLElement | null)?.closest?.('.copy-btn') as HTMLElement | null
+  if (!btn) return
+  const code = btn.closest('.code-block-wrapper')?.querySelector('code')?.textContent || ''
+  const flash = (t: string) => {
+    btn.textContent = t
+    window.setTimeout(() => { btn.textContent = '复制' }, 1500)
+  }
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(code).then(() => flash('已复制')).catch(() => flash('复制失败'))
+  } else {
+    flash('复制失败')
+  }
 }
 
 marked.use({
@@ -428,6 +558,36 @@ function groupFailCount(g: ToolGroupItem): number {
   return g.items.filter((i) => i.state === 'failed').length
 }
 
+/**
+ * 工具分组摘要（对齐 Trae）：按类别计数，如「已读取 3 个文件，执行 1 条命令」，
+ * 比抽象的「N 个工具调用」更直观反映执行过程。
+ */
+function groupSummary(g: ToolGroupItem): string {
+  const read = ['read_file']
+  const search = ['ls', 'glob', 'grep']
+  const exec = ['execute', 'python_exec']
+  const write = ['write_file', 'edit_file']
+  const net = ['web_search', 'http_request']
+  const del = ['delete_file', 'delete']
+  const count = (names: string[]) => g.items.filter((i) => names.includes(i.name)).length
+  const parts: string[] = []
+  const nRead = count(read)
+  const nSearch = count(search)
+  const nExec = count(exec)
+  const nWrite = count(write)
+  const nNet = count(net)
+  const nDel = count(del)
+  if (nRead) parts.push(`已读取 ${nRead} 个文件`)
+  if (nSearch) parts.push(`搜索 ${nSearch} 次`)
+  if (nExec) parts.push(`执行 ${nExec} 条命令`)
+  if (nWrite) parts.push(`已编辑 ${nWrite} 个文件`)
+  if (nNet) parts.push(`网络请求 ${nNet} 次`)
+  if (nDel) parts.push(`删除 ${nDel} 个文件`)
+  const known = nRead + nSearch + nExec + nWrite + nNet + nDel
+  if (known < g.items.length) parts.push(`${g.items.length - known} 个其他操作`)
+  return parts.join('，') || `${g.items.length} 个工具调用`
+}
+
 /** markdown 渲染后无可见内容（只剩注释/标记/不可见字符）的文本块视为空块 */
 function rendersEmpty(md: string): boolean {
   const tmp = document.createElement('div')
@@ -480,6 +640,7 @@ function planMark(status: string) {
 
 onMounted(async () => {
   clockTimer = window.setInterval(() => { clock.value = Date.now() }, 1000)
+  window.addEventListener('keydown', onGlobalKeydown)
   const boot = await workspaceApi.bootstrap()
   currentAssistant.value = boot.default_assistant
   modelApi.listConfigs({ model_type: 'chat' }).then((list) => {
@@ -490,6 +651,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   if (clockTimer) clearInterval(clockTimer)
+  window.removeEventListener('keydown', onGlobalKeydown)
   for (const entry of activeRuns.values()) {
     entry.stopped = true
     entry.abort.abort()
@@ -547,7 +709,15 @@ async function selectConversation(c: Conversation) {
     for (const m of raw) {
       if (m.role === 'user') {
         const { text, files } = splitAttachmentNote(m.content || '')
-        arr.push({ role: 'user', content: text, blocks: [], files })
+        const msg = pushMsg(c.id, { role: 'user', content: text, blocks: [], files })
+        // 图片附件懒加载预览（不阻塞历史渲染；经响应式代理赋值触发视图刷新）
+        files.forEach((f, fi) => {
+          if (isImageName(f.name)) {
+            loadFilePreview(c.id, f.name).then((url) => {
+              if (url && msg.files) msg.files[fi].previewUrl = url
+            })
+          }
+        })
         continue
       }
       const content = m.content || ''
@@ -600,8 +770,16 @@ async function removeConversation(c: Conversation) {
 
 // ── 会话附件（上传即入会话工作区；发送时随消息告知模型读取）────────────────
 
-/** 剥离用户消息尾部的附件注记块（后端注入），还原正文与附件名列表 */
-function splitAttachmentNote(content: string): { text: string; files: string[] } {
+/** 图片扩展名（生成缩略图预览用） */
+function isImageName(name: string): boolean {
+  return /\.(png|jpe?g|gif|bmp|webp|svg)$/i.test(name)
+}
+
+/** 剥离用户消息尾部的附件注记块（后端注入），还原正文与附件列表 */
+function splitAttachmentNote(content: string): {
+  text: string
+  files: Array<{ name: string; previewUrl?: string }>
+} {
   const marker = '\n\n[附件]'
   const idx = content.indexOf(marker)
   if (idx < 0) return { text: content, files: [] }
@@ -610,15 +788,26 @@ function splitAttachmentNote(content: string): { text: string; files: string[] }
     .split('\n')
     .map((l) => l.replace(/^-\s*/, '').replace(/（.*$/, '').replace(/^\/?workspace\//, '').trim())
     .filter(Boolean)
-    .map((p) => p.replace(/^uploads\//, ''))
+    .map((p) => ({ name: p.replace(/^uploads\//, '') }))
   return { text: content.slice(0, idx), files }
+}
+
+/** 历史图片附件懒加载预览（Blob -> objectURL） */
+async function loadFilePreview(conversationId: number, name: string): Promise<string | undefined> {
+  try {
+    const blob = await conversationApi.fileBlob(conversationId, name)
+    return URL.createObjectURL(blob)
+  } catch { return undefined }
 }
 
 async function handleUpload(req: { file: File }) {
   try {
     const conv = await ensureConversation()
     const res = await conversationApi.uploadFile(conv.id, req.file)
-    attachments.value.push(res)
+    attachments.value.push({
+      ...res,
+      previewUrl: isImageName(res.name) ? URL.createObjectURL(req.file) : undefined,
+    })
   } catch { /* 错误提示已由请求层统一弹出 */ }
 }
 
@@ -627,6 +816,77 @@ async function removeAttachment(i: number) {
   attachments.value.splice(i, 1)
   if (currentConversation.value && a) {
     conversationApi.deleteFile(currentConversation.value.id, a.name).catch(() => {})
+  }
+}
+
+// ── 右侧临时文件预览区块（对齐 Trae：点文件名 → 右侧预览，可关闭）──────────
+
+interface PreviewState {
+  name: string
+  path: string
+  loading: boolean
+  error: string
+  data: PreviewContent | null
+}
+const preview = ref<PreviewState | null>(null)
+
+/** 打开右侧预览（path 为工作区相对路径；name 为展示名） */
+async function openPreview(path: string, name?: string) {
+  const conv = currentConversation.value
+  if (!conv || !path) return
+  const display = name || path.replace(/\\/g, '/').split('/').filter(Boolean).pop() || path
+  preview.value = { name: display, path, loading: true, error: '', data: null }
+  try {
+    const meta = await conversationApi.filePreview(conv.id, path)
+    let objectUrl: string | undefined
+    if (meta.kind === 'image' || meta.kind === 'pdf') {
+      const blob = await conversationApi.fileBytes(conv.id, path)
+      objectUrl = URL.createObjectURL(blob)
+    }
+    preview.value = {
+      name: meta.name || display, path: meta.path || path,
+      loading: false, error: '', data: { ...meta, objectUrl },
+    }
+  } catch (e: any) {
+    preview.value = {
+      name: display, path, loading: false,
+      error: e?.response?.data?.detail || e?.message || '预览失败', data: null,
+    }
+  }
+}
+
+/** 关闭预览（回收 objectURL，防内存泄漏） */
+function closePreview() {
+  const url = preview.value?.data?.objectUrl
+  if (url) URL.revokeObjectURL(url)
+  preview.value = null
+}
+
+/** 下载当前预览文件 */
+async function downloadPreview() {
+  const conv = currentConversation.value
+  const st = preview.value
+  if (!conv || !st) return
+  try {
+    const blob = await conversationApi.fileBytes(conv.id, st.path)
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = st.name
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  } catch {
+    ElMessage.error('下载失败')
+  }
+}
+
+/** Esc 关闭预览（仅预览打开时拦截） */
+function onGlobalKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && preview.value) {
+    e.preventDefault()
+    closePreview()
   }
 }
 
@@ -650,7 +910,7 @@ async function sendMessage() {
   attachments.value = []
   pushMsg(convId, {
     role: 'user', content: text, blocks: [],
-    files: sentFiles.map((a) => a.name),
+    files: sentFiles.map((a) => ({ name: a.name, previewUrl: a.previewUrl })),
   })
   const aMsg = pushMsg(convId, {
     role: 'assistant', content: '', blocks: [], streaming: true,
@@ -875,6 +1135,13 @@ function onApprovalDecided(type: 'approve' | 'reject') {
 }
 .msg-assistant { justify-content: flex-start; }
 .msg-content { max-width: 86%; width: 100%; }
+/* 任务耗时（Trae 式）：消息顶部小字，弱化不抢正文 */
+.task-time {
+  font-size: 11px;
+  color: #b0b3b8;
+  margin: 0 0 4px 2px;
+  letter-spacing: 0.2px;
+}
 .msg-text {
   background: #f5f7fa;
   border-radius: 12px;
@@ -997,18 +1264,8 @@ function onApprovalDecided(type: 'approve' | 'reject') {
   font-size: 13px;
 }
 
-/* 输入区 */
-.ws-composer { border-top: 1px solid #e4e7ed; padding: 12px 20px; }
-/* 权限模块：审批模式选择（手动审批 / 自动审批） */
-.composer-perm {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 8px;
-  flex-wrap: wrap;
-}
-.perm-label { font-size: 12px; color: #909399; flex-shrink: 0; }
-.perm-hint { font-size: 12px; color: #c0c4cc; }
+/* 输入区（Trae 式）：单个圆角容器，底部工具栏 */
+.ws-composer { border-top: 1px solid #e4e7ed; padding: 12px 20px 16px; }
 .composer-running {
   display: flex;
   align-items: center;
@@ -1017,13 +1274,58 @@ function onApprovalDecided(type: 'approve' | 'reject') {
   color: #409eff;
   font-size: 13px;
 }
-.composer-input { display: flex; gap: 10px; align-items: flex-end; }
-.composer-input :deep(.el-textarea__inner) { resize: none; }
-
-/* 模型选择 / 附件上传 */
-.model-select { width: 160px; }
-.attach-upload { display: flex; align-items: flex-end; }
-.attach-btn { padding: 6px; margin-bottom: 1px; }
+.composer-box {
+  border: 1px solid #dcdfe6;
+  border-radius: 14px;
+  background: #fff;
+  padding: 10px 12px 8px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.composer-box:focus-within {
+  border-color: #409eff;
+  box-shadow: 0 0 0 2px rgba(64, 158, 255, 0.12);
+}
+.composer-textarea :deep(.el-textarea__inner) {
+  border: none;
+  box-shadow: none;
+  background: transparent;
+  resize: none;
+  padding: 2px 2px 6px;
+}
+.composer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.bar-left, .bar-right { display: flex; align-items: center; gap: 2px; }
+.bar-btn {
+  color: #606266;
+  padding: 5px 8px;
+  height: 28px;
+}
+.bar-btn:hover { color: #409eff; }
+.bar-trigger { gap: 4px; }
+.bar-label { font-size: 12px; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar-caret { color: #909399; margin-left: 1px; }
+.item-check { display: inline-block; width: 14px; color: #409eff; }
+/* 发送键：Trae 式圆形箭头 */
+.send-btn {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: #409eff;
+  color: #fff;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+.send-btn:hover:not(:disabled) { background: #337ecc; }
+.send-btn:disabled { background: #c0c4cc; cursor: not-allowed; }
 .attach-strip {
   display: flex;
   flex-wrap: wrap;
@@ -1049,7 +1351,34 @@ function onApprovalDecided(type: 'approve' | 'reject') {
 }
 .attach-remove { cursor: pointer; color: #c0c4cc; }
 .attach-remove:hover { color: #f56c6c; }
-/* 消息气泡内附件标签 */
+/* 图片附件：缩略图 + 右上角小叉号取消 */
+.attach-item { position: relative; display: inline-flex; }
+.attach-thumb {
+  width: 56px;
+  height: 56px;
+  border-radius: 8px;
+  border: 1px solid #e4e7ed;
+  cursor: zoom-in;
+  display: block;
+}
+.attach-x {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 11px;
+  line-height: 16px;
+  cursor: pointer;
+  z-index: 1;
+}
+.attach-x:hover { background: #f56c6c; }
+/* 消息气泡内附件标签 / 图片缩略图 */
 .msg-files {
   display: flex;
   flex-wrap: wrap;
@@ -1064,6 +1393,21 @@ function onApprovalDecided(type: 'approve' | 'reject') {
   border-radius: 10px;
   background: rgba(255, 255, 255, 0.18);
   font-size: 12px;
+  color: inherit;
+  text-decoration: none;
+  cursor: pointer;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.msg-file-tag:hover { background: rgba(255, 255, 255, 0.32); text-decoration: underline; }
+.msg-thumb {
+  width: 72px;
+  height: 72px;
+  border-radius: 8px;
+  cursor: zoom-in;
+  display: block;
 }
 </style>
 
