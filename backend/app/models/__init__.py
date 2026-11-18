@@ -7,6 +7,8 @@ from app.models.audit import AuditLog
 from app.models.agent import Agent, AgentSession, AgentRun, AgentApproval
 from app.models.database_connection import DatabaseConnection
 from app.models.evolution import AgentEvaluation, EvolutionReport, EvolutionChangeLog
+from app.models.skill import Skill
+from app.models.mcp_server import MCPServer
 
 __all__ = [
     "User", "Role", "Permission", "UserRole", "RolePermission",
@@ -18,4 +20,5 @@ __all__ = [
     "Agent", "AgentSession",
     "DatabaseConnection",
     "AgentEvaluation", "EvolutionReport", "EvolutionChangeLog",
+    "Skill", "MCPServer",
 ]

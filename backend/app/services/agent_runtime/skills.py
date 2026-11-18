@@ -168,3 +168,58 @@ class SkillRegistry:
                 for s in self.list_skills()
             ]
         }
+
+
+# ── 管理面（DB）技能接入 ──────────────────────────────────────────────────────
+
+def ensure_skill_frontmatter(body: str, *, name: str, description: str = "",
+                             version: str = "1.0") -> str:
+    """保证 SKILL.md 含合法 frontmatter（name 以入参为准，缺则补、错则修）。"""
+    body = body or ""
+    fm = _parse_frontmatter(body)
+    if fm:
+        # 已有 frontmatter：仅当缺 name/version/description 时在首个 --- 块内补齐
+        need_fix = (fm.get("name") != name) or ("version" not in fm) or ("description" not in fm)
+        if not need_fix:
+            return body
+        lines = [f"name: {name}"]
+        if description or fm.get("description"):
+            lines.append(f"description: {fm.get('description') or description}")
+        lines.append(f"version: {fm.get('version') or version}")
+        rest = _FRONTMATTER_RE.sub("", body, count=1).lstrip("\n")
+        return "---\n" + "\n".join(lines) + "\n---\n\n" + rest
+    return (
+        f"---\nname: {name}\ndescription: {description}\nversion: {version}\n---\n\n"
+        f"{body}"
+    )
+
+
+def _binding_allows(agent_ids: Any, agent_id: Optional[int]) -> bool:
+    """Agent 级绑定判定：None = 全局；[] = 不注入；列表 = 仅指定 Agent。"""
+    if agent_ids is None:
+        return True
+    if not isinstance(agent_ids, (list, tuple)):
+        return False
+    return agent_id is not None and agent_id in agent_ids
+
+
+def db_files_payload(rows: List[Any], agent_id: Optional[int]) -> Dict[str, Any]:
+    """管理面（DB）技能 → StateBackend 注入格式（同 files_payload）。
+
+    过滤：enabled 且通过 Agent 级绑定判定；同名技能 DB 优先（后写覆盖前写）。
+    rows 为 Skill ORM 行（或含同名属性的兼容对象）。
+    """
+    from deepagents.backends.utils import create_file_data
+
+    files: Dict[str, Any] = {}
+    for row in rows:
+        if not getattr(row, "enabled", True):
+            continue
+        if not _binding_allows(getattr(row, "agent_ids", None), agent_id):
+            continue
+        name = getattr(row, "name", "") or ""
+        body = getattr(row, "body", "") or ""
+        if not name or not body:
+            continue
+        files[f"/skills/{name}/SKILL.md"] = create_file_data(content=body)
+    return files

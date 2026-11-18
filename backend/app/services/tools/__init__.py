@@ -15,6 +15,8 @@ from typing import Dict, Any, List
 
 from .result import ToolResult, normalize
 
+from app.services.mcp.registry import MCP_TOOL_PREFIX, parse_mcp_tool_name
+
 from . import (
     datetime_tools,
     math_tools,
@@ -105,6 +107,10 @@ class ToolExecutor:
                     await _AGENT_HANDLERS[tool_name](self.db, self.agent_config, tool_input)
                 )
 
+            # MCP 工具（mcp__<server>__<tool>）：外部 MCP 服务调用
+            if tool_name.startswith(MCP_TOOL_PREFIX):
+                return await self._mcp_tool(tool_name, tool_input)
+
             # 自定义 HTTP 工具
             custom = next(
                 (t for t in self.agent_config.get("custom_tools", []) if t["name"] == tool_name),
@@ -144,6 +150,37 @@ class ToolExecutor:
                 retryable=resp.status_code >= 500,
             )
         return ToolResult.succeeded(body)
+
+    async def _mcp_tool(self, tool_name: str, params: dict) -> ToolResult:
+        """MCP 工具执行：按运行时映射调用外部 MCP 服务（未绑定/未授权即拒绝）。
+
+        连接映射由服务端装配期写入 ``agent_config["mcp_runtime"]``（见
+        app/services/mcp/registry.load_mcp_runtime）；fail-closed——映射缺失
+        一律拒绝，不得回退到任意默认连接。
+        """
+        from app.services.mcp.client import (
+            McpClientError,
+            McpConnectionConfig,
+            call_tool,
+        )
+
+        parsed = parse_mcp_tool_name(tool_name)
+        if not parsed:
+            return ToolResult.failed(f"错误：非法 MCP 工具名 '{tool_name}'")
+        server_name, tool = parsed
+        runtime = (self.agent_config.get("mcp_runtime") or {}).get(server_name)
+        if not runtime:
+            return ToolResult.failed(
+                f"错误：MCP 工具 '{tool_name}' 未绑定/未授权给当前 Agent（fail-closed 拒绝）"
+            )
+        cfg = McpConnectionConfig(**(runtime.get("connection") or {}))
+        try:
+            result = await call_tool(cfg, tool, params)
+        except McpClientError as e:
+            return ToolResult.failed(f"MCP 工具 '{tool_name}' 调用失败: {e}")
+        if result.is_error:
+            return ToolResult.failed(f"MCP 工具 '{tool_name}' 远端返回错误: {result.text}")
+        return ToolResult.succeeded(result.text)
 
 
 def get_tool_by_name(name: str) -> Dict | None:

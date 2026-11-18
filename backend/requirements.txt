@@ -79,3 +79,8 @@ aiofiles==25.1.0
 # Testing
 pytest==9.2.0
 pytest-asyncio==1.4.1.post1
+
+# 社区典型 MCP 服务器（MCP 官方 python-sdk 参考实现，预装即开即用；
+# 其他 MCP 服务器经 MCP 管理模块按需接入 stdio / streamable_http）
+mcp-server-time>=0.1.0
+mcp-server-fetch>=0.1.0

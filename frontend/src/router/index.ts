@@ -109,6 +109,18 @@ const router = createRouter({
           component: () => import('@/views/system/Evolution.vue'),
           meta: { title: 'Agent自进化', icon: 'TrendCharts', requiresSuperuser: true },
         },
+        {
+          path: 'system/skills',
+          name: 'SystemSkills',
+          component: () => import('@/views/system/SkillManage.vue'),
+          meta: { title: '技能管理', icon: 'MagicStick', requiresSuperuser: true },
+        },
+        {
+          path: 'system/mcp',
+          name: 'SystemMcp',
+          component: () => import('@/views/system/McpManage.vue'),
+          meta: { title: 'MCP服务', icon: 'Connection', requiresSuperuser: true },
+        },
       ],
     },
     {

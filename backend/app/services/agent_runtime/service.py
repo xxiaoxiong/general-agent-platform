@@ -1020,6 +1020,16 @@ class AgentRuntimeService:
             mem_ctx = use_memory_context or agent_config.pop("_memory_context", "")
             extra_db_info = db_info if db_info is not None else agent_config.pop("_db_info", None)
 
+            # 扩展性治理：MCP 工具面装配（fail-closed，未绑定/未启用不注入）
+            # 并显式登记风险（未登记工具会被 ToolPolicy 拒绝执行）
+            mcp_specs, mcp_runtime = await self._load_mcp_runtime(run.agent_id, agent_config)
+            if mcp_specs:
+                agent_config["mcp_tool_specs"] = mcp_specs
+                agent_config["mcp_runtime"] = mcp_runtime
+                from app.services.mcp.registry import register_mcp_tool_risks
+
+                register_mcp_tool_risks(mcp_runtime)
+
             provider, model_config = await self._load_model(agent_config.get("model_config_id"))
             log_fields["model_id"] = model_config.get("name")
 
@@ -1071,6 +1081,11 @@ class AgentRuntimeService:
 
             tool_specs = self._resolve_tool_specs(agent_config)
             policy = ToolPolicy.from_settings({s["name"] for s in tool_specs}, enable_hitl=ctx.enable_hitl)
+            # MCP 工具 HITL 审批面：requires_approval 的 MCP 工具进入 interrupt_on 集合
+            for _mcp_entry in (agent_config.get("mcp_runtime") or {}).values():
+                for _tname, _tmeta in ((_mcp_entry.get("tools") or {}).items()):
+                    if _tmeta.get("requires_approval"):
+                        policy.hitl_tools.add(_tname)
 
             # 工具 db 会话：独立 session，避免污染请求生命周期
             async with AsyncSessionLocal() as tool_db:
@@ -1089,7 +1104,7 @@ class AgentRuntimeService:
                 await bus.publish(RuntimeEvent(type=RUN_STARTED, run_id=run.run_id))
                 telemetry.record_run(log_fields, status="running")
 
-                skill_files = self._skill_files()
+                skill_files = await self._skill_files(tool_db, run.agent_id)
                 if resume is not None:
                     payload: Any = Command(resume=resume)
                 elif messages is None:
@@ -1904,13 +1919,32 @@ class AgentRuntimeService:
             spec = get_tool_by_name(name)
             if spec:
                 specs.append(spec)
+        # MCP 工具面（装配期写入，见 _load_mcp_runtime）：与内置工具同口径进入
+        # 工具面/事件桥接/授权集合
+        specs.extend(agent_config.get("mcp_tool_specs") or [])
         return specs
 
-    def _skill_files(self) -> Dict[str, Any]:
-        from .skills import SkillRegistry
+    async def _load_mcp_runtime(
+        self, agent_id: Optional[int], agent_config: Dict[str, Any]
+    ) -> tuple:
+        """MCP 工具装配（短会话查询，不复用 Run 级 tool_db）。"""
+        from app.services.mcp.registry import load_mcp_runtime
+
+        async with AsyncSessionLocal() as db:
+            return await load_mcp_runtime(db, agent_id, agent_config)
+
+    async def _skill_files(self, db, agent_id: Optional[int]) -> Dict[str, Any]:
+        """技能注入：内置/目录技能（全局）+ 管理面 DB 技能（Agent 级绑定过滤）。"""
+        from sqlalchemy import select
+
+        from app.models.skill import Skill
+
+        from .skills import SkillRegistry, db_files_payload
 
         registry = SkillRegistry.from_settings()
         files = registry.files_payload()
+        rows = (await db.execute(select(Skill))).scalars().all()
+        files.update(db_files_payload(rows, agent_id))
         return {"files": files} if files else {}
 
     def _db_hint(self, db_info: Dict[str, Any]) -> str:

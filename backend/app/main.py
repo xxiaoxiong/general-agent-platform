@@ -19,7 +19,9 @@ from app.api.v2 import capabilities as v2_capabilities
 from app.api.v2 import conversations as v2_conversations
 from app.api.v2 import evolution as v2_evolution
 from app.api.v2 import files as v2_files
+from app.api.v2 import mcp as v2_mcp
 from app.api.v2 import runs as v2_runs
+from app.api.v2 import skills as v2_skills
 from app.api.v2 import workspace as v2_workspace
 
 logger = get_logger("main")
@@ -245,6 +247,8 @@ app.include_router(v2_runs.router, prefix=API_V2_PREFIX)
 app.include_router(v2_artifacts.router, prefix=API_V2_PREFIX)
 app.include_router(v2_admin.router, prefix=API_V2_PREFIX)
 app.include_router(v2_evolution.router, prefix=API_V2_PREFIX)
+app.include_router(v2_skills.router, prefix=API_V2_PREFIX)
+app.include_router(v2_mcp.router, prefix=API_V2_PREFIX)
 
 
 @app.get("/api/health")

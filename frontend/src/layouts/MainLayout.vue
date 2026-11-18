@@ -75,6 +75,14 @@
             <el-icon><TrendCharts /></el-icon>
             <template #title>Agent自进化</template>
           </el-menu-item>
+          <el-menu-item index="/system/skills">
+            <el-icon><MagicStick /></el-icon>
+            <template #title>技能管理</template>
+          </el-menu-item>
+          <el-menu-item index="/system/mcp">
+            <el-icon><Connection /></el-icon>
+            <template #title>MCP服务</template>
+          </el-menu-item>
         </template>
       </el-menu>
     </el-aside>
