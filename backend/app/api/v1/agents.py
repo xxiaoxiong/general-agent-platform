@@ -7,7 +7,8 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, and_, or_
+from sqlalchemy.orm import defer
 from sqlalchemy.orm.attributes import flag_modified
 from pydantic import BaseModel
 
@@ -15,8 +16,7 @@ from app.core.database import get_db, AsyncSessionLocal
 from app.core.config import settings
 from app.api.deps import get_current_user, get_current_superuser
 from app.models.user import User
-from app.models.agent import Agent, AgentSession
-from app.services.agent import AgentEngine
+from app.models.agent import Agent, AgentSession, session_message_count_expr
 from app.services.agent_runtime import get_runtime_service
 from app.services.agent_runtime.service import (
     ApprovalConflict,
@@ -80,10 +80,12 @@ async def list_memories(
     memory_type: Optional[str] = None,
     current_user: User = Depends(get_current_user),
 ):
-    from app.services.agent.memory_manager import MemoryManager
-    items = await MemoryManager.list_memories(
-        current_user.id, agent_id=agent_id, memory_type=memory_type
+    from app.services.memory_service import MemoryService
+    items = await MemoryService.list_memories(
+        current_user.id, agent_id=agent_id
     )
+    if memory_type:
+        items = [m for m in items if memory_type in (m.get("tags") or "")]
     return {"items": items, "total": len(items)}
 
 
@@ -92,17 +94,14 @@ async def add_memory(
     body: MemoryAddRequest,
     current_user: User = Depends(get_current_user),
 ):
-    from app.services.agent.memory_manager import MemoryManager
-    mem_id = await MemoryManager.add_memory(
+    from app.services.memory_service import MemoryService
+    mem_id = await MemoryService.add_memory(
         user_id=current_user.id,
         content=body.content,
-        memory_type=body.memory_type,
         agent_id=body.agent_id,
-        importance=body.importance,
-        tags=body.tags,
-        is_pinned=body.is_pinned,
+        tags=body.memory_type or "",
     )
-    return {"id": mem_id, "message": "记忆已保存"}
+    return {"id": mem_id, "message": "已保存"}
 
 
 @router.delete("/memories/{memory_id}")
@@ -110,8 +109,8 @@ async def delete_memory(
     memory_id: int,
     current_user: User = Depends(get_current_user),
 ):
-    from app.services.agent.memory_manager import MemoryManager
-    ok = await MemoryManager.delete_memory(memory_id, current_user.id)
+    from app.services.memory_service import MemoryService
+    ok = await MemoryService.delete_memory(memory_id, current_user.id)
     if not ok:
         raise HTTPException(status_code=404, detail="记忆不存在")
     return {"message": "已删除"}
@@ -122,8 +121,8 @@ async def clear_memories(
     agent_id: Optional[int] = None,
     current_user: User = Depends(get_current_user),
 ):
-    from app.services.agent.memory_manager import MemoryManager
-    count = await MemoryManager.clear_memories(current_user.id, agent_id=agent_id)
+    from app.services.memory_service import MemoryService
+    count = await MemoryService.clear_memories(current_user.id, agent_id=agent_id)
     return {"message": f"已清除 {count} 条记忆"}
 
 
@@ -145,10 +144,15 @@ async def list_agents(
     current_user: User = Depends(get_current_user),
 ):
     offset = (page - 1) * page_size
-    total_res = await db.execute(select(func.count(Agent.id)).where(Agent.is_active == True))
+    # 用户隔离（A22）：列表与计数同口径过滤
+    # 超级管理员可见全部；普通用户仅可见自己的 + 公开（owner_id 为空）的 Agent
+    visibility = Agent.is_active == True
+    if not current_user.is_superuser:
+        visibility = and_(visibility, or_(Agent.owner_id == current_user.id, Agent.owner_id.is_(None)))
+    total_res = await db.execute(select(func.count(Agent.id)).where(visibility))
     total = total_res.scalar()
     res = await db.execute(
-        select(Agent).where(Agent.is_active == True)
+        select(Agent).where(visibility)
         .order_by(Agent.created_at.desc())
         .offset(offset).limit(page_size)
     )
@@ -230,14 +234,17 @@ async def list_sessions(
     current_user: User = Depends(get_current_user),
 ):
     await _get_or_404(db, agent_id, current_user)
+    # 列表裁掉 messages 大列（撑爆 sort buffer 报 1038），条数库内计算
+    msg_count = session_message_count_expr(db.get_bind().dialect.name)
     res = await db.execute(
-        select(AgentSession)
+        select(AgentSession, msg_count.label("message_count"))
+        .options(defer(AgentSession.messages))
         .where(AgentSession.agent_id == agent_id, AgentSession.user_id == current_user.id)
         .order_by(AgentSession.updated_at.desc())
         .limit(50)
     )
-    sessions = res.scalars().all()
-    return {"items": [_session_to_dict(s) for s in sessions]}
+    sessions = res.all()
+    return {"items": [_session_to_dict(s, message_count=mc) for s, mc in sessions]}
 
 
 @router.post("/{agent_id}/sessions")
@@ -314,7 +321,7 @@ async def agent_chat(
     # - 同 Key 同摘要：复用原 Run，不重复执行、不重复追加用户消息；
     #   流式接口保持 SSE 协议（持久化事件回放 + done 终止），不改为普通 JSON（FR-01）
     # - 同 Key 不同摘要：IdempotencyConflict → 409（FR-02）
-    if idempotency_key and settings.AGENT_RUNTIME_ENABLED:
+    if idempotency_key:
         try:
             existing = await get_runtime_service().lookup_idempotent(
                 current_user.id,
@@ -371,30 +378,14 @@ async def agent_chat(
             raise HTTPException(status_code=404, detail="会话不存在")
 
     user_message = {"role": "user", "content": body.message}
-    if settings.AGENT_RUNTIME_ENABLED:
-        # P1-01/FR-08.1：新 Session 创建、用户消息追加与 Run 创建由 Runtime
-        # 在同一业务事务内原子提交——幂等重试不重复追加用户消息，并发幂等
-        # 请求不产生孤立 Session（Run 唯一约束冲突随事务回滚）
-        messages = list(session.messages or []) if session is not None else []
-        messages.append(user_message)
-    else:
-        # 旧引擎路径（非 Durable）：维持原 API 层会话管理
-        if not session:
-            session = AgentSession(agent_id=agent_id, user_id=current_user.id, messages=[])
-            db.add(session)
-            await db.flush()
-            # 先提交释放写锁：执行期间运行时会写 agent_runs 等表，
-            # 长事务持有写锁会与运行时持久化互相阻塞（SQLite 必需，MySQL/PG 亦更健康）
-            await db.commit()
-
-        # 追加用户消息
-        messages = list(session.messages or [])
-        messages.append(user_message)
-
-        # FR-08.1：用户消息必须在 Run 创建前可靠保存（失败则不启动运行，
-        # 不得等整轮 Agent 完成后才首次持久化）
-        new_title = body.message[:50] if (not session.title or session.title == "新对话") else None
-        await _save_session(session.id, messages, new_title, raise_on_error=True)
+    # P1-01/FR-08.1：新 Session 创建、用户消息追加与 Run 创建由 Runtime
+    # 在同一业务事务内原子提交——幂等重试不重复追加用户消息，并发幂等
+    # 请求不产生孤立 Session（Run 唯一约束冲突随事务回滚）
+    messages = list(session.messages or []) if session is not None else []
+    messages.append(user_message)
+    if session is not None and (not session.title or session.title == "新对话"):
+        session.title = body.message[:50]
+        await db.commit()
 
     # 数据库连接信息注入：让 Agent 知道它连接的是哪个数据库
     if agent_config.get("database_connection_id"):
@@ -444,93 +435,24 @@ async def agent_chat(
         except Exception as e:
             logger.warning(f"加载数据库连接信息失败: {e}")
 
-    # 跨会话记忆：检索相关历史记忆并注入 agent_config
-    if body.use_memory:
-        from app.services.agent.memory_manager import MemoryManager
-        memories = await MemoryManager.search_memories(
-            user_id=current_user.id,
-            query=body.message,
-            agent_id=agent_id,
-            top_k=5,
-        )
-        if memories:
-            mem_context = MemoryManager.format_memories_for_prompt(memories)
-            agent_config = dict(agent_config)
-            agent_config["_memory_context"] = mem_context
+    # P2-04（A07 解除）：运行时长期记忆统一走 Store MemoryMiddleware
+    # （/memory/AGENTS.md，用户 namespace 隔离）；旧 SQLite 记忆注入已删除
+    agent_config = dict(agent_config)
+    agent_config["memory_policy"] = {"use_memory_context": bool(body.use_memory)}
 
     # 非流式
     resolved_session_id = body.session_id
     result_run_id = None
     if not body.stream:
         # 非流式：收集所有步骤后返回
-        steps = []
-        final_content = ""
-        if settings.AGENT_RUNTIME_ENABLED:
-            try:
-                result = await get_runtime_service().run_to_completion(
-                    agent_config=agent_config,
-                    messages=messages,
-                    user_id=current_user.id,
-                    session_id=body.session_id,
-                    idempotency_key=idempotency_key,
-                    use_memory_context=agent_config.get("_memory_context", ""),
-                    db_info=agent_config.get("_db_info"),
-                    endpoint="chat",
-                    user_message=user_message,
-                )
-            except IdempotencyConflict as e:
-                raise HTTPException(status_code=409, detail=str(e))
-            except SessionBusy as e:
-                raise HTTPException(status_code=409, detail=str(e))
-            resolved_session_id = result.get("session_id") or body.session_id
-            result_run_id = result.get("run_id")
-            steps = result["steps"]
-            final_content = result["content"]
-            if result["status"] != "completed":
-                steps = steps + [{"type": "error", "content": f"运行状态: {result['status']}"}]
-        else:
-            async for event in AgentEngine.run_stream(agent_config, messages, db):
-                if event["type"] == "done":
-                    break
-                steps.append(event)
-                if event["type"] == "final":
-                    final_content = event["content"]
-
-        if not settings.AGENT_RUNTIME_ENABLED:
-            # 旧引擎路径：仍由 API 层写回会话；Runtime 路径由服务统一写回（FR-08.2）
-            messages.append({"role": "assistant", "content": final_content, "steps": steps})
-            await _save_session(session.id, messages)
-
-        # 跨会话记忆：从本轮对话中提取并保存记忆
-        if body.use_memory:
-            from app.services.agent.memory_manager import MemoryManager
-            await MemoryManager.extract_and_save_memories(
-                user_id=current_user.id,
-                messages=[{"role": "user", "content": body.message}],
-                agent_id=agent_id,
-            )
-
-        return {
-            "session_id": resolved_session_id if settings.AGENT_RUNTIME_ENABLED else session.id,
-            "steps": steps,
-            "content": final_content,
-            "run_id": result_run_id,
-        }
-
-    # 流式 SSE
-    runtime_stream = None
-    run_id = None
-    if settings.AGENT_RUNTIME_ENABLED:
-        # 先启动运行拿到 run_id，供响应头 X-Run-Id（重连/状态查询用）；
-        # session_id 由服务在业务事务内解析（新会话在此创建）
         try:
-            run_id, resolved_session_id, runtime_stream = await get_runtime_service().start_run_with_session(
+            result = await get_runtime_service().run_to_completion(
                 agent_config=agent_config,
                 messages=messages,
                 user_id=current_user.id,
                 session_id=body.session_id,
                 idempotency_key=idempotency_key,
-                use_memory_context=agent_config.get("_memory_context", ""),
+                use_memory_context="",
                 db_info=agent_config.get("_db_info"),
                 endpoint="chat",
                 user_message=user_message,
@@ -539,45 +461,51 @@ async def agent_chat(
             raise HTTPException(status_code=409, detail=str(e))
         except SessionBusy as e:
             raise HTTPException(status_code=409, detail=str(e))
+        resolved_session_id = result.get("session_id") or body.session_id
+        result_run_id = result.get("run_id")
+        steps = result["steps"]
+        final_content = result["content"]
+        if result["status"] != "completed":
+            steps = steps + [{"type": "error", "content": f"运行状态: {result['status']}"}]
+
+        return {
+            "session_id": resolved_session_id,
+            "steps": steps,
+            "content": final_content,
+            "run_id": result_run_id,
+        }
+
+    # 流式 SSE
+    # 先启动运行拿到 run_id，供响应头 X-Run-Id（重连/状态查询用）；
+    # session_id 由服务在业务事务内解析（新会话在此创建）
+    try:
+        run_id, resolved_session_id, runtime_stream = await get_runtime_service().start_run_with_session(
+            agent_config=agent_config,
+            messages=messages,
+            user_id=current_user.id,
+            session_id=body.session_id,
+            idempotency_key=idempotency_key,
+            use_memory_context="",
+            db_info=agent_config.get("_db_info"),
+            endpoint="chat",
+            user_message=user_message,
+        )
+    except IdempotencyConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except SessionBusy as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
     async def event_stream():
         collected_steps = []
         final_content = ""
 
-        if settings.AGENT_RUNTIME_ENABLED:
-            stream = runtime_stream
-        else:
-            stream = AgentEngine.run_stream(agent_config, messages, db)
-
-        async for event in stream:
+        async for event in runtime_stream:
             collected_steps.append(event)
             if event["type"] == "final":
                 final_content = event["content"]
 
             if event["type"] == "done":
-                if not settings.AGENT_RUNTIME_ENABLED:
-                    # 旧引擎路径：仍由 API 层写回会话（独立数据库会话，避免引擎
-                    # 工具执行对原 db session 的污染）；Runtime 路径由服务统一写回
-                    # （FR-08.2，客户端断线也不丢失）
-                    messages.append({
-                        "role": "assistant",
-                        "content": final_content,
-                        "steps": [s for s in collected_steps if s["type"] != "done"],
-                    })
-                    await _save_session(session.id, messages)
-
-                # 跨会话记忆
-                if body.use_memory:
-                    try:
-                        from app.services.agent.memory_manager import MemoryManager
-                        await MemoryManager.extract_and_save_memories(
-                            user_id=current_user.id,
-                            messages=[{"role": "user", "content": body.message}],
-                            agent_id=agent_id,
-                        )
-                    except Exception:
-                        pass
-
+                # Runtime 路径由服务统一写回会话（FR-08.2，客户端断线也不丢失）
                 # 最后 yield done 事件
                 data = json.dumps(event, ensure_ascii=False)
                 yield f"data: {data}\n\n"
@@ -589,9 +517,7 @@ async def agent_chat(
     headers = {
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
-        "X-Session-Id": str(
-            resolved_session_id if settings.AGENT_RUNTIME_ENABLED else session.id
-        ),
+        "X-Session-Id": str(resolved_session_id),
     }
     if run_id:
         headers["X-Run-Id"] = run_id
@@ -652,30 +578,22 @@ async def invoke_agent(
     final_content = ""
     run_status = "completed"
     run_id = None
-    if settings.AGENT_RUNTIME_ENABLED:
-        try:
-            result = await get_runtime_service().run_to_completion(
-                agent_config=agent_config,
-                messages=messages,
-                user_id=current_user.id,
-                idempotency_key=idempotency_key,
-                use_memory_context="",
-                db_info=agent_config.get("_db_info"),
-                endpoint="invoke",
-            )
-        except IdempotencyConflict as e:
-            raise HTTPException(status_code=409, detail=str(e))
-        steps = result["steps"]
-        final_content = result["content"]
-        run_status = result["status"]
-        run_id = result.get("run_id")
-    else:
-        async for event in AgentEngine.run_stream(agent_config, messages, db):
-            if event["type"] == "done":
-                break
-            steps.append(event)
-            if event["type"] == "final":
-                final_content = event["content"]
+    try:
+        result = await get_runtime_service().run_to_completion(
+            agent_config=agent_config,
+            messages=messages,
+            user_id=current_user.id,
+            idempotency_key=idempotency_key,
+            use_memory_context="",
+            db_info=agent_config.get("_db_info"),
+            endpoint="invoke",
+        )
+    except IdempotencyConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    steps = result["steps"]
+    final_content = result["content"]
+    run_status = result["status"]
+    run_id = result.get("run_id")
 
     return {
         "status": "ok" if run_status == "completed" else run_status,
@@ -760,6 +678,11 @@ async def stream_run_events(
         raise HTTPException(status_code=404, detail="运行不存在")
     if last_event_id and last_event_id.strip().isdigit():
         after_seq = int(last_event_id.strip())
+    if after_seq is not None:
+        # P1-05：SSE 断线重连计数（after_seq / Last-Event-ID 续传）
+        from app.observability import metrics
+
+        metrics.inc_sse_reconnect()
 
     async def event_stream():
         async for event in get_runtime_service().replay_events(run_id, after_seq):
@@ -917,6 +840,7 @@ def _agent_to_dict(a: Agent) -> dict:
         "max_iterations": a.max_iterations,
         "temperature": a.temperature,
         "tools": a.tools or [],
+        "capability_ids": getattr(a, "capability_ids", None) or [],
         "knowledge_base_id": a.knowledge_base_id,
         "database_connection_id": a.database_connection_id,
         "is_active": a.is_active,
@@ -926,12 +850,14 @@ def _agent_to_dict(a: Agent) -> dict:
     }
 
 
-def _session_to_dict(s: AgentSession) -> dict:
+def _session_to_dict(s: AgentSession, message_count: Optional[int] = None) -> dict:
     return {
         "id": s.id,
         "agent_id": s.agent_id,
         "title": s.title,
-        "message_count": len(s.messages or []),
+        "message_count": (
+            len(s.messages or []) if message_count is None else int(message_count)
+        ),
         "created_at": s.created_at.isoformat() if s.created_at else None,
         "updated_at": s.updated_at.isoformat() if s.updated_at else None,
     }
@@ -941,12 +867,55 @@ def _session_to_dict(s: AgentSession) -> dict:
 
 @router.get("/monitor/performance")
 async def get_performance_stats(
+    hours: int = 24,
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """获取 Agent 引擎性能统计"""
-    from app.services.agent.trace import get_global_monitor
-    monitor = get_global_monitor()
-    return monitor.get_summary()
+    """Agent 运行性能统计（A11：新 Durable Runtime 口径）。
+
+    数据源为 agent_runs / agent_tool_executions / agent_run_events（运行事实），
+    旧引擎 Trace 统计已随 Phase 5 移除。超管看全量，普通用户仅自己的运行。
+    """
+    from datetime import datetime, timedelta
+
+    from sqlalchemy import func
+
+    from app.models.agent import AgentRun, AgentRunEvent, AgentToolExecution
+
+    since = datetime.utcnow() - timedelta(hours=max(1, min(hours, 24 * 30)))
+    run_scope = [AgentRun.created_at >= since]
+    if not current_user.is_superuser:
+        run_scope.append(AgentRun.user_id == current_user.id)
+
+    run_rows = (await db.execute(
+        select(AgentRun.status, func.count(AgentRun.id))
+        .where(*run_scope).group_by(AgentRun.status)
+    )).all()
+    duration_stats = (await db.execute(
+        select(
+            func.avg(func.julianday(AgentRun.finished_at) - func.julianday(AgentRun.created_at)),
+            func.max(func.julianday(AgentRun.finished_at) - func.julianday(AgentRun.created_at)),
+        ).where(*run_scope, AgentRun.finished_at.isnot(None))
+    )).one()
+    tool_rows = (await db.execute(
+        select(AgentToolExecution.status, func.count(AgentToolExecution.id))
+        .where(AgentToolExecution.created_at >= since)
+        .group_by(AgentToolExecution.status)
+    )).all()
+    event_count = (await db.execute(
+        select(func.count(AgentRunEvent.id)).where(AgentRunEvent.created_at >= since)
+    )).scalar() or 0
+
+    return {
+        "window_hours": hours,
+        "runs": {
+            "by_status": {s: c for s, c in run_rows},
+            "avg_duration_seconds": round((duration_stats[0] or 0) * 86400, 2),
+            "max_duration_seconds": round((duration_stats[1] or 0) * 86400, 2),
+        },
+        "tool_executions": {"by_status": {s: c for s, c in tool_rows}},
+        "events": {"total": event_count},
+    }
 
 
 @router.get("/monitor/inference")

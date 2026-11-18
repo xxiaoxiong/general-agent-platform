@@ -38,6 +38,58 @@ from .tools.policy import ToolPolicy
 # 需要 HITL 审批的工具 -> interrupt_on 配置
 from langchain.agents.middleware.human_in_the_loop import InterruptOnConfig
 
+# ── P0-05：DeepAgents 原生工具安全 ─────────────────────────────────────────
+# 原生文件工具真名（deepagents FsToolName）：delete 为独立工具；
+# execute 仅在真实 Sandbox 可用时暴露，否则从工具面移除（A05：不暴露执行能力）。
+FS_NATIVE_TOOLS: tuple = ("ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep")
+
+
+def build_fs_tools(policy: ToolPolicy) -> List[str]:
+    """原生工具面白名单：无外部 Sandbox 时不含 execute。
+
+    restricted（进程内限制）不是安全沙箱；仅 external 或开发逃生开关
+    （allow_unsafe_python）时才暴露 execute，与 ToolPolicy.check_exec_allowed 同口径。
+    """
+    tools = list(FS_NATIVE_TOOLS)
+    if policy.sandbox_mode == "external" or policy.allow_unsafe_python:
+        tools.append("execute")
+    return tools
+
+
+def build_fs_permissions(policy: ToolPolicy) -> List[Any]:
+    """原生文件工具统一授权（A04）：FilesystemPermission allow/deny/interrupt 规则。
+
+    - 敏感凭据类文件（.env / 私钥 / credentials / secrets）**读取**一律 deny
+      （任意路径深度，与 Backend 路由隔离做纵深防御）；
+    - **写保护只锚定 /workspace/**（FilesystemBackend 真实落盘根目录，真实
+      凭据文件只可能出现在这里）：deepagents 的 delete 权限检查对无锚点
+      （anchor="/"）的 deny-write 模式一律保守阻断，若把 /​**/ 形式放进
+      write 规则，删除任何"疑似目录/不存在的文件"都会被误杀并报出误导性
+      错误（实测：删除普通 .css 文件被拒并列出 .env 等规则）。StateBackend
+      虚拟文件是会话临时状态，无真实凭据可保护；
+    - delete 等危险操作的审批由 interrupt_on（ToolPolicy.hitl_tools）承担，
+      不依赖风险登记表冒充保护。
+    """
+    from deepagents.middleware.filesystem import FilesystemPermission
+
+    sensitive = [
+        "/**/.env", "/**/.env.*",
+        "/**/id_rsa*", "/**/id_ed25519*", "/**/.ssh/**",
+        "/**/*.pem", "/**/*.key",
+        "/**/credentials*", "/**/secrets/**",
+    ]
+    return [
+        # 读保护：任意路径深度（read 按路径精确匹配，不影响 delete）
+        FilesystemPermission(operations=["read"], paths=sensitive, mode="deny"),
+        # 写保护：仅锚定真实落盘工作区（带字面前缀，delete 检查可精确推理）
+        FilesystemPermission(
+            operations=["write"],
+            paths=[p.replace("/**/", "/workspace/**/", 1) if p.startswith("/**/") else p
+                   for p in sensitive],
+            mode="deny",
+        ),
+    ]
+
 
 def build_interrupt_config(policy: ToolPolicy) -> Dict[str, Any]:
     if not policy.enable_hitl:
@@ -73,8 +125,18 @@ def build_agent(
 
     adapter = ToolAdapterFactory(ctx, policy, bus)
     langchain_tools = adapter.build(tool_specs)
+
+    # P0-05：原生文件工具面收窄（无 Sandbox 不含 execute）；主代理与子代理同口径。
+    # 注意：自定义 FilesystemMiddleware 按名替换基栈同名中间件时只继承 permissions，
+    # **不继承 backend** —— 必须显式传入，否则落到默认 StateBackend（会话虚拟文件），
+    # 文件工具看不到真实磁盘工作区（上传附件 / tool-outputs 卸载文件都读不到）
+    from deepagents.middleware.filesystem import FilesystemMiddleware
+
+    backend = build_backend(ctx.scope.user_id, ctx.agent_id, ctx.session_id, store=store)
+    fs_middleware = FilesystemMiddleware(tools=build_fs_tools(policy), backend=backend)
     subagents = [
-        {**sa, "tools": _subagent_tools(sa, adapter)}
+        {**sa, "tools": _subagent_tools(sa, adapter),
+         "middleware": [FilesystemMiddleware(tools=build_fs_tools(policy), backend=backend)]}
         for sa in build_subagents(policy)
     ]
 
@@ -83,10 +145,17 @@ def build_agent(
 
     interrupt_config = build_interrupt_config(policy)
 
+    # P2-04：长期记忆 —— MemoryMiddleware 从 /memory/AGENTS.md（StoreBackend，
+    # 跨 Session 持久化、按用户隔离）加载记忆并支持 edit_file 更新；
+    # memory_policy.use_memory_context=false 的 Agent 不挂载
+    memory_policy = (ctx.agent_config.get("memory_policy") or {})
+    memory_sources = ["/memory/AGENTS.md"] if memory_policy.get("use_memory_context", True) else None
+
     # exit_behavior="error"：超限抛出明确异常，由 service 映射为
     # limit_exceeded 状态（任务书 P0-A：超限返回明确 failed/limit_exceeded）
     # 预算 <=0 = 不限制：不挂对应 Limit 中间件（防真死循环仍由重复调用防护兜底）
-    middleware = [TodoListMiddleware()]
+    # FilesystemMiddleware 替换基栈同名中间件（按名替换、保留顺序），继承 permissions
+    middleware = [fs_middleware, TodoListMiddleware()]
     if ctx.budget.max_tool_calls > 0:
         middleware.append(
             ToolCallLimitMiddleware(run_limit=ctx.budget.max_tool_calls, exit_behavior="error")
@@ -105,7 +174,9 @@ def build_agent(
         middleware=middleware,
         subagents=subagents or None,
         skills=skill_sources,
-        backend=build_backend(ctx.scope.user_id, ctx.agent_id, ctx.session_id),
+        memory=memory_sources,
+        backend=backend,
+        permissions=build_fs_permissions(policy),
         interrupt_on=interrupt_config or None,
         checkpointer=checkpointer,
         store=store,
@@ -134,7 +205,12 @@ def _compose_system_prompt(ctx: RuntimeContext) -> str:
         parts.append("## 参考记忆\n" + ctx.memory_context)
     parts.append(
         "## 执行约束\n"
+        "- 始终使用用户提问所用的语言回答（用户用中文则用中文）。\n"
+        "- 用户消息带 [附件] 时，必须先用 read_file 逐个读取附件再回答；图片附件 read_file 后"
+        "可直接看到图片内容，读完再描述/分析；不要跳过读取、不要让用户重新上传。\n"
         "- 工具调用前先确认参数完整；工具失败时给出明确状态，不要假装成功。\n"
+        "- write_todos 每轮调用一次即可，不要与其他工具并行发起多个 write_todos。\n"
+        "- 同一文件的写入/编辑/读取请串行进行，不要在同一步并行操作同一路径。\n"
         "- 涉及外部副作用（HTTP POST/邮件/Webhook）的操作会在执行前要求人工审批。\n"
         "- 不要输出与任务无关的内容；最终回答直接给出结论。"
     )

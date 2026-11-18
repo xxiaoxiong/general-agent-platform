@@ -50,6 +50,17 @@ google-genai==3.0.0
 greenlet==3.5.6
 aiosqlite==0.22.1
 
+# 可观测性（Phase 1）：Langfuse Python SDK v5（langchain-core>=1 要求已满足）
+# 依赖 OTel SDK 1.45.x；升级前先跑 tests/test_observability_langfuse.py
+langfuse==5.2.0
+opentelemetry-api==1.45.2
+opentelemetry-sdk==1.45.2
+opentelemetry-instrumentation-fastapi==0.66b2
+opentelemetry-instrumentation-sqlalchemy==0.66b2
+opentelemetry-instrumentation-httpx==0.66b2
+opentelemetry-instrumentation-redis==0.66b2
+prometheus-client==0.26.0
+
 # Vector DB
 chromadb==1.5.9
 

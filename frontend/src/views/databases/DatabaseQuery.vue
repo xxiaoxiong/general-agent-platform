@@ -167,8 +167,8 @@ async function runNLQuery() {
       }
       schemaContext = tableDetails.join('\n')
     }
-    // 简单本地 SQL 生成提示（后续可对接 Agent）
-    ElMessage.info('自然语言查询功能需要在智能体对话中使用，请将此数据库连接配置到 Agent 工具中')
+    // 简单本地 SQL 生成提示（后续可对接智能体）
+    ElMessage.info('自然语言查询可在智能体对话中直接使用')
     nlGeneratedSQL.value = `-- 请在智能体对话中提问：${nlQuestion.value}\n-- 表结构：\n-- ${schemaContext.replace(/\n/g, '\n-- ')}`
   } catch (e: any) {
     ElMessage.error(e?.message || '生成失败')

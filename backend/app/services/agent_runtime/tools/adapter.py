@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 import uuid
 from typing import Annotated, Any, Callable, Coroutine, Dict, List, Optional, Type
@@ -56,6 +57,7 @@ from ..events import (
     TOOL_COMPLETED,
     TOOL_FAILED,
     TOOL_STARTED,
+    RUN_RETRYING,
     EventBus,
     RuntimeEvent,
     redact_secrets,
@@ -74,6 +76,7 @@ from .classification import (
     CLASS_READ_ONLY,
     REPLAY_BLOCK,
     REPLAY_CACHED,
+    RETRY_SAFE,
     SideEffectContract,
     get_side_effect_contract,
     replay_action,
@@ -112,6 +115,46 @@ _NET_TARGET_PARAMS: Dict[str, tuple] = {
     "send_email_tool": ("smtp_host",),   # SMTP 目标按 URL 形式过同一策略
 }
 
+# P4-04（AG-06）：进入模型上下文的单次工具输出上限（字符）。
+# 超限输出整体卸载到会话工作区（tool-outputs/），上下文只留预览 + 文件路径。
+_TOOL_CONTEXT_LIMIT = 8_000
+_TOOL_PREVIEW_CHARS = 2_000
+
+
+def limit_for_context(
+    text: str,
+    *,
+    ctx: "RuntimeContext",
+    tool_name: str,
+) -> str:
+    """P4-04：大输出受限进上下文（AG-06）。
+
+    - 未超限：原样返回；
+    - 超限：完整输出卸载到会话工作区 ``tool-outputs/{tool}-{hash}.txt``
+      （用户/Agent/会话隔离），回传预览 + 卸载路径，模型按需用 read_file 读取。
+    账本 result_payload 仍存完整文本的脱敏截断（事件侧另有 2000 上限）。
+    """
+    if len(text) <= _TOOL_CONTEXT_LIMIT:
+        return text
+    try:
+        from ..backends import workspace_root
+
+        root = workspace_root(ctx.scope.user_id, ctx.agent_id, ctx.session_id or 0)
+        out_dir = os.path.join(root, "tool-outputs")
+        os.makedirs(out_dir, exist_ok=True)
+        digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+        fname = f"{tool_name}-{digest}.txt"
+        with open(os.path.join(out_dir, fname), "w", encoding="utf-8") as f:
+            f.write(text)
+        rel = f"tool-outputs/{fname}"
+        preview = text[:_TOOL_PREVIEW_CHARS]
+        return (
+            f"{preview}\n\n...[输出过长已卸载：共 {len(text)} 字符。"
+            f"完整内容见工作区文件 {rel}，可用 read_file 读取]"
+        )
+    except Exception:  # noqa: BLE001 卸载失败不得阻断工具结果交付
+        return text[:_TOOL_CONTEXT_LIMIT] + f"...[输出已截断，共 {len(text)} 字符]"
+
 
 class ToolLedgerError(PersistenceError, GraphBubbleUp):
     """工具执行账本持久化失败：中止本次 Run。
@@ -120,6 +163,80 @@ class ToolLedgerError(PersistenceError, GraphBubbleUp):
     GraphBubbleUp 一律重新抛出），保证关键持久化失败不会被降级为
     工具错误消息继续带病执行（R-12 / 任务书 §0.7）。
     """
+
+
+# 确定性本地错误（未触达外部副作用）→ 不重试（重试无意义）
+# 账本/执行权/状态机异常 → 不重试（必须由外层感知并中止）
+_NO_RETRY_ERRORS = _DEFINITIVE_ERRORS + (PersistenceError, RunLeaseLost, IllegalTransition)
+
+
+async def execute_with_retry(
+    name: str,
+    args: Dict[str, Any],
+    executor: ToolExecutor,
+    *,
+    bus: "EventBus",
+    run_id: str,
+    contract: SideEffectContract,
+) -> Any:
+    """P4-03：工具瞬态失败按风险策略有限重试（§9 工具失败按风险策略处理）。
+
+    - ``safe_retry``（read_only 无副作用）：瞬态失败（retryable 结果或网络类
+      未知异常）有限重试，线性退避；
+    - ``idempotent_key`` / ``none``：**运行内不自动重试**——结果未知的写操作
+      不盲目重发；idempotent_key 工具的重试走账本重放层（REPLAY_RETRY），
+      复用同一幂等键由下游去重（T-05 基线语义）；
+    - 确定性本地错误（参数/策略/账本/执行权）不重试，直接上抛；
+    - 每次重试发出 ``run.retrying`` 结构化事件（§7.1）。
+    """
+    import asyncio as _asyncio
+
+    max_retries = max(0, int(getattr(settings, "AGENT_TOOL_MAX_RETRIES", 2)))
+    per_call_timeout = max(1.0, float(getattr(settings, "AGENT_TOOL_TIMEOUT_SECONDS", 120.0)))
+
+    async def _call_once() -> Any:
+        # P4-05：单次工具执行超时（挂死工具不再拖到整轮 run_timeout）
+        return await _asyncio.wait_for(
+            executor.execute(name, args, raise_on_error=True),
+            timeout=per_call_timeout,
+        )
+
+    if contract.retry_policy != RETRY_SAFE or max_retries == 0:
+        return await _call_once()
+
+    backoff = max(0.0, float(getattr(settings, "AGENT_TOOL_RETRY_BACKOFF_SECONDS", 0.5)))
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            result = await _call_once()
+        except _NO_RETRY_ERRORS:
+            raise
+        except Exception as e:  # noqa: BLE001 瞬态/未知异常：按策略重试
+            if attempt > max_retries:
+                raise
+            await bus.publish(RuntimeEvent(
+                type=RUN_RETRYING, run_id=run_id,
+                data={
+                    "tool": name, "attempt": attempt, "max_retries": max_retries,
+                    "reason": redact_secrets(str(e))[:200],
+                },
+            ))
+            await _asyncio.sleep(backoff * attempt)
+            continue
+
+        tr = normalize(result)
+        if tr.status == STATUS_FAILED and getattr(tr, "retryable", False) and attempt <= max_retries:
+            await bus.publish(RuntimeEvent(
+                type=RUN_RETRYING, run_id=run_id,
+                data={
+                    "tool": name, "attempt": attempt, "max_retries": max_retries,
+                    "reason": redact_secrets(tr.error or tr.text)[:200],
+                },
+            ))
+            await _asyncio.sleep(backoff * attempt)
+            continue
+        return result
 
 
 def build_args_model(name: str, spec: Dict[str, Any]) -> Type[BaseModel]:
@@ -247,7 +364,7 @@ class ToolAdapterFactory:
             await self.bus.publish(RuntimeEvent(
                 type=TOOL_FAILED,
                 run_id=self.ctx.run_id,
-                data={"tool": name, "error": f"策略拒绝: {e}"},
+                data={"tool": name, "tool_call_id": tool_call_id, "error": f"策略拒绝: {e}"},
             ))
             telemetry.record_tool(
                 self.ctx.to_log_fields(), tool=name, status="rejected", error=str(e),
@@ -258,7 +375,7 @@ class ToolAdapterFactory:
         await self.bus.publish(RuntimeEvent(
             type=TOOL_STARTED,
             run_id=self.ctx.run_id,
-            data={"tool": name, "input": redact_sensitive(args)},
+            data={"tool": name, "tool_call_id": tool_call_id, "input": redact_sensitive(args)},
         ))
         self.ctx.tool_calls += 1
         reason = self.ctx.budget.exhausted_reason(
@@ -268,7 +385,7 @@ class ToolAdapterFactory:
             await self.bus.publish(RuntimeEvent(
                 type=TOOL_FAILED,
                 run_id=self.ctx.run_id,
-                data={"tool": name, "error": reason},
+                data={"tool": name, "tool_call_id": tool_call_id, "error": reason},
             ))
             raise BudgetExceededError(f"执行预算超限: {reason}")
 
@@ -329,6 +446,7 @@ class ToolAdapterFactory:
             args["headers"] = headers
 
         # 6) 执行（在非 async 线程池跑 sync handler，不阻塞事件循环）
+        #    P4-03：瞬态失败按风险策略有限重试（非幂等 retry_policy=none 不重试）
         try:
             executor = ToolExecutor(
                 self.ctx.db_info.get("db") if self.ctx.db_info else None,
@@ -336,7 +454,11 @@ class ToolAdapterFactory:
             )
             # db / agent handler 需要真实 db session：由 service 注入
             executor.db = self.ctx.db_info.get("session") if self.ctx.db_info else None
-            result = await executor.execute(name, args, raise_on_error=True)
+            result = await execute_with_retry(
+                name, args, executor,
+                bus=self.bus, run_id=self.ctx.run_id,
+                contract=get_side_effect_contract(name),
+            )
             tr: ToolResult = normalize(result)
             duration_ms = int((time.monotonic() - started) * 1000)
 
@@ -353,13 +475,14 @@ class ToolAdapterFactory:
                 await self.bus.publish(RuntimeEvent(
                     type=TOOL_COMPLETED,
                     run_id=self.ctx.run_id,
-                    data={"tool": name, "output": text[:2000]},
+                    data={"tool": name, "tool_call_id": tool_call_id, "output": text[:2000]},
                 ))
                 telemetry.record_tool(
                     self.ctx.to_log_fields(), tool=name, status="completed",
                     duration_ms=float(duration_ms),
                 )
-                return text
+                # P4-04（AG-06）：大输出卸载，上下文只留预览 + 路径
+                return limit_for_context(text, ctx=self.ctx, tool_name=name)
 
             if tr.status == STATUS_FAILED:
                 # 业务错误不得伪装成功字符串（§7.2 C）：标记 failed 并回传失败文本
@@ -369,7 +492,7 @@ class ToolAdapterFactory:
                 await self.bus.publish(RuntimeEvent(
                     type=TOOL_FAILED,
                     run_id=self.ctx.run_id,
-                    data={"tool": name, "error": err_text[:500]},
+                    data={"tool": name, "tool_call_id": tool_call_id, "error": err_text[:500]},
                 ))
                 telemetry.record_tool(
                     self.ctx.to_log_fields(), tool=name, status="failed",
@@ -383,7 +506,7 @@ class ToolAdapterFactory:
             await self.bus.publish(RuntimeEvent(
                 type=TOOL_FAILED,
                 run_id=self.ctx.run_id,
-                data={"tool": name, "error": err_text[:500]},
+                data={"tool": name, "tool_call_id": tool_call_id, "error": err_text[:500]},
             ))
             telemetry.record_tool(
                 self.ctx.to_log_fields(), tool=name, status="unknown",
@@ -411,7 +534,7 @@ class ToolAdapterFactory:
             await self.bus.publish(RuntimeEvent(
                 type=TOOL_FAILED,
                 run_id=self.ctx.run_id,
-                data={"tool": name, "error": err_text[:500]},
+                data={"tool": name, "tool_call_id": tool_call_id, "error": err_text[:500]},
             ))
             telemetry.record_tool(
                 self.ctx.to_log_fields(), tool=name, status=status,
@@ -428,7 +551,8 @@ class ToolAdapterFactory:
         await self.bus.publish(RuntimeEvent(
             type=TOOL_COMPLETED,
             run_id=self.ctx.run_id,
-            data={"tool": name, "output": text[:2000], "replay": "cached"},
+            data={"tool": name, "tool_call_id": getattr(rec, "tool_call_id", "") or "",
+                  "output": text[:2000], "replay": "cached"},
         ))
         telemetry.record_tool(self.ctx.to_log_fields(), tool=name, status="cached", duration_ms=0.0)
         return text
@@ -440,6 +564,7 @@ class ToolAdapterFactory:
             run_id=self.ctx.run_id,
             data={
                 "tool": name,
+                "tool_call_id": getattr(rec, "tool_call_id", "") or "",
                 "error": f"结果未知（{rec.status}），阻止自动重放",
             },
         ))

@@ -65,12 +65,15 @@ def build_chat_model(
         kwargs["max_tokens"] = int(max_tokens)
 
     # TLS：verify=False 仅在显式配置 AGENT_TLS_VERIFY=false 时允许
-    import httpx
+    # P2-03：非默认 TLS 配置经 ModelClientFactory 复用连接（不再每构一建）
+    if not verify or ca_bundle:
+        from app.assistant.model_clients import ModelClientFactory
 
-    if not verify:
-        kwargs["http_client"] = httpx.AsyncClient(verify=False)
-    elif ca_bundle:
-        kwargs["http_client"] = httpx.AsyncClient(verify=ca_bundle)
+        kwargs["http_client"] = ModelClientFactory.get_httpx_client(
+            verify=verify,
+            ca_bundle=ca_bundle or None,
+            timeout=kwargs["timeout"],
+        )
 
     return ChatOpenAI(**kwargs)
 

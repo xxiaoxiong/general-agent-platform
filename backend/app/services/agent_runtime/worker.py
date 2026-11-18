@@ -18,6 +18,7 @@ import socket
 import time
 import uuid
 from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from app.core.config import settings
@@ -25,6 +26,7 @@ from app.core.database import AsyncSessionLocal
 
 from .events import (
     APPROVAL_REQUIRED,
+    RUN_RECOVERING,
     RUN_WAITING_APPROVAL,
     LegacyEventAdapter,
     RuntimeEvent,
@@ -180,33 +182,45 @@ class RunWorker:
 
     async def claim_run(self, run_id: str, *, paused: bool = False) -> Optional[Any]:
         """原子领取 Run，返回领取后的 agent_runs 行（含新 lease_version）；失败返回 None。"""
+        from app.observability.langfuse_tracing import platform_span
+        from app.observability import metrics
+
         try:
-            async with AsyncSessionLocal() as db:
-                repo = RunRepository(db)
-                if paused:
-                    lease_version = await repo.claim_paused(
-                        run_id, self.worker_id, self.lease_seconds
-                    )
-                else:
-                    lease_version = await repo.claim(
-                        run_id, self.worker_id, self.lease_seconds
-                    )
-                row = await repo.get_run(run_id) if lease_version is not None else None
-                if row is not None and row.session_id and not await SessionRepository(db).claim_execution(
-                    row.session_id, run_id, self.lease_seconds
-                ):
-                    # Session 执行权被其他活跃 Run 持有（P1-02 A：单 Session 单
-                    # 活跃 Run）：释放 Run 领取回到可领取状态，等待 Session
-                    # 空闲后由轮询重试，绝不并发驱动同一 Session
-                    await repo.release(run_id, self.worker_id, lease_version)
+            with platform_span("worker_claim", run_id=run_id,
+                               attributes={"worker_id": self.worker_id, "paused": paused}):
+                async with AsyncSessionLocal() as db:
+                    repo = RunRepository(db)
+                    if paused:
+                        lease_version = await repo.claim_paused(
+                            run_id, self.worker_id, self.lease_seconds
+                        )
+                    else:
+                        lease_version = await repo.claim(
+                            run_id, self.worker_id, self.lease_seconds
+                        )
+                    row = await repo.get_run(run_id) if lease_version is not None else None
+                    if row is not None and row.session_id and not await SessionRepository(db).claim_execution(
+                        row.session_id, run_id, self.lease_seconds
+                    ):
+                        # Session 执行权被其他活跃 Run 持有（P1-02 A：单 Session 单
+                        # 活跃 Run）：释放 Run 领取回到可领取状态，等待 Session
+                        # 空闲后由轮询重试，绝不并发驱动同一 Session
+                        await repo.release(run_id, self.worker_id, lease_version)
+                        await db.commit()
+                        logger.info(
+                            "run %s 未取得 session %s 执行权，放弃本次领取",
+                            run_id, row.session_id,
+                        )
+                        return None
                     await db.commit()
-                    logger.info(
-                        "run %s 未取得 session %s 执行权，放弃本次领取",
-                        run_id, row.session_id,
-                    )
-                    return None
-                await db.commit()
-            return row
+                if row is not None:
+                    # P1-05：排队等待（创建 → 领取）与恢复领取计数
+                    created = getattr(row, "created_at", None)
+                    if created is not None:
+                        metrics.observe_queue_wait((datetime.utcnow() - created).total_seconds())
+                    if paused:
+                        metrics.inc_recovery("claimed_paused")
+                return row
         except Exception:
             logger.exception("run %s 领取失败", run_id)
             return None
@@ -246,6 +260,16 @@ class RunWorker:
         # 人工重启策略或创建新 Run（转 needs_reconciliation）。
         is_resume = job.resume is not None
         mode, reason, actions, _recovery_meta = await self.service._recovery_check(row)
+        # P4-03：恢复执行发 run.recovering 结构化事件（§7.1）：
+        # 首次执行（attempt<=1 且非续跑）不发；恢复/接管/续跑发事件供时间线展示
+        if is_resume or mode == RECOVERY_CONTINUE or (row.attempt or 0) > 1:
+            try:
+                await handle.bus.publish(RuntimeEvent(
+                    type=RUN_RECOVERING, run_id=handle.run_id,
+                    data={"mode": mode, "reason": reason or "", "resume": is_resume},
+                ))
+            except Exception:  # noqa: BLE001 事件失败不影响恢复驱动
+                logger.warning("run %s run.recovering 事件发布失败", handle.run_id)
         if is_resume and mode in (RECOVERY_FRESH, RECOVERY_NEEDS_RECONCILIATION):
             await self._pause_run(
                 handle, STATUS_NEEDS_RECONCILIATION,
@@ -475,6 +499,13 @@ class RunWorker:
                 raise
             except Exception:
                 logger.exception("Worker 轮询失败")
+            # P1-05：活跃 Run 数（每轮刷新，指标故障不影响轮询）
+            try:
+                from app.observability import metrics
+
+                metrics.set_active_runs(len(self._active))
+            except Exception:  # noqa: BLE001
+                pass
             await asyncio.sleep(self.poll_interval)
 
     async def _cleanup_events(self) -> None:

@@ -2,6 +2,16 @@ from pydantic_settings import BaseSettings
 from typing import List, Optional
 import json
 
+# P0-04：生产环境拒绝的默认/弱凭据（大小写不敏感）
+_INSECURE_SECRET_KEYS = frozenset({
+    "change-me-in-production-min-32-chars-long!!",
+    "change-me-in-production-please-use-a-long-random-key",
+})
+_INSECURE_ADMIN_PASSWORDS = frozenset({
+    "admin@123456", "admin123", "admin123456", "password", "123456",
+    "password123", "changeme", "root", "test",
+})
+
 
 class Settings(BaseSettings):
     APP_NAME: str = "AI-GeneralPlat"
@@ -91,14 +101,13 @@ class Settings(BaseSettings):
     CHECKPOINT_DIR: str = "./data/checkpoints"  # 断点存储目录
 
     # ── DeepAgents Runtime（阶段一新内核）────────────────────────────────────
-    AGENT_RUNTIME_ENABLED: bool = True          # 回滚开关：False 时走旧引擎路径
     AGENT_MAX_STEPS: int = 100                  # 图执行最大步数（0=不限制）
     AGENT_MAX_TOOL_CALLS: int = 200             # 工具调用总次数预算（0=不限制）
     AGENT_MAX_MODEL_CALLS: int = 100            # 模型调用次数预算（0=不限制）
-    AGENT_RUN_TIMEOUT: float = 600.0            # 单次运行墙钟超时（秒）
+    AGENT_RUN_TIMEOUT: float = 1800.0           # 单次运行墙钟超时（秒）；大任务（多步工具/代码生成）需要充足预算
     # P1-05 §13：HITL 等待时间是否计入 Run Timeout。True=计入（deadline 绝对、含等待）；
     # False=不计入（HITL 恢复时按等待时长顺延 deadline，只耗执行时间不耗人工等待）。
-    AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT: bool = True
+    AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT: bool = False
     AGENT_CHECKPOINT_DSN: str = "memory"        # memory | sqlite:///./data/agent_checkpoints.db | postgresql+asyncpg://...
     AGENT_STORE_DSN: str = ""                   # 跨线程记忆 Store（空=不启用）
     AGENT_ENABLE_HITL: bool = True              # 人工审批（高危工具 interrupt_on）
@@ -113,15 +122,37 @@ class Settings(BaseSettings):
     AGENT_FILES_ROOT: str = "./data/agent_files"  # 工具文件工作区根目录
     AGENT_MAX_FILE_SIZE_MB: int = 10            # 单文件大小上限
     AGENT_DISABLED_SKILLS: str = ""             # 逗号分隔禁用的 skill 名
+    AGENT_SKILLS_DIR: str = ""                  # 外部技能目录（<name>/SKILL.md，组织范围）
     AGENT_EVENT_RETENTION_DAYS: int = 30        # 运行记录保留天数
     AGENT_EVENT_CLEANUP_INTERVAL: float = 3600.0  # 事件保留清理执行间隔（秒，仅清理终态超期 Run）
+    # ── P4-01/02：Task Contract + Verification ────────────────────────────
+    AGENT_VERIFICATION_ENABLED: bool = True     # 复杂任务完成条件验证（确定性，不调模型）
+    AGENT_VERIFICATION_MAX_ROUNDS: int = 1      # 验证不通过的补充执行轮数（0=只验证不补充）
+    # ── P4-03：工具瞬态失败重试（按风险策略；非幂等绝不盲目重放）──────────
+    AGENT_TOOL_MAX_RETRIES: int = 2             # 运行内瞬态失败重试上限（0=不重试）
+    AGENT_TOOL_RETRY_BACKOFF_SECONDS: float = 0.5  # 重试退避基数（线性退避 attempt*基数）
+    AGENT_TOOL_TIMEOUT_SECONDS: float = 120.0   # 单次工具执行超时（超时按瞬态失败处理）
+    AGENT_INNER_TIMEOUT_RETRIES: int = 1        # 单步内层请求超时（模型流停滞等）从断点重试次数
 
     # ── Durable Execution（Phase 2）：Worker 租约协调 ────────────────────
     AGENT_RUNTIME_WORKER_ID: str = ""           # Worker 标识（空=自动生成 hostname-pid-随机）
     AGENT_RUNTIME_LEASE_SECONDS: int = 60       # Run 租约时长；过期后可被其他 Worker 接管
     AGENT_RUNTIME_HEARTBEAT_INTERVAL: float = 15.0  # 续租间隔（应小于租约的 1/2）
     AGENT_RUNTIME_POLL_INTERVAL: float = 1.0    # 扫描待执行/孤儿 Run 的间隔
+    AGENT_SSE_POLL_INTERVAL: float = 0.3        # SSE 事件下发轮询兜底间隔（同进程由事件唤醒立即推送）
+    AGENT_DELTA_FLUSH_INTERVAL: float = 0.2     # MODEL_DELTA 落库时间上限（秒）：SSE 只读 DB，
+                                                # 增量攒批不能只按条数（32 条≈1s），必须按时间兜底才够"流式"
     AGENT_RUNTIME_SHUTDOWN_GRACE: float = 30.0  # 优雅关闭时等待在途 Run 的秒数
+
+    # ── 可观测性（Phase 1）：Langfuse / OpenTelemetry ─────────────────────
+    LANGFUSE_PUBLIC_KEY: str = ""               # 未配置时整条 Langfuse 链路为 no-op
+    LANGFUSE_SECRET_KEY: str = ""
+    LANGFUSE_BASE_URL: str = "https://cloud.langfuse.com"
+    LANGFUSE_TRACING_SAMPLE_RATE: float = 1.0   # 0.0~1.0 采样率（P1-04）
+    LANGFUSE_RELEASE: str = ""                  # 版本关联（缺省用 APP_VERSION）
+    OTEL_ENABLED: bool = False                  # OpenTelemetry 导出（P1-02）
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = ""       # 如 http://localhost:4317
+    OTEL_SERVICE_NAME: str = "ai-generalplat"
 
     @property
     def cors_origins_list(self) -> List[str]:
@@ -137,15 +168,33 @@ class Settings(BaseSettings):
         生产环境禁止 Durable Runtime 使用 Memory Checkpointer——Memory 是进程内
         单例，多 Worker / 重启后 Graph State 无法恢复。
         """
-        if self.is_production and self.AGENT_RUNTIME_ENABLED:
+        if self.is_production:
             dsn = (self.AGENT_CHECKPOINT_DSN or "").strip().lower()
             if dsn in ("", "memory"):
                 raise RuntimeError(
-                    "配置非法，拒绝启动：APP_ENV=production 且 AGENT_RUNTIME_ENABLED=true 时"
+                    "配置非法，拒绝启动：APP_ENV=production 时"
                     "禁止使用 Memory Checkpointer（AGENT_CHECKPOINT_DSN=memory）。"
                     "请配置持久化后端（postgresql://... 或 sqlite:///...），"
                     "多 Worker 部署必须使用 PostgreSQL 以共享 Graph State。"
                 )
+            self._validate_production_secrets()
+
+    def _validate_production_secrets(self) -> None:
+        """P0-04 部署安全：生产环境拒绝默认凭据，强制经环境变量/Secret 注入真实值。"""
+        secret = (self.SECRET_KEY or "").strip()
+        if secret.lower() in _INSECURE_SECRET_KEYS or "change-me" in secret.lower() or len(secret) < 32:
+            raise RuntimeError(
+                "配置非法，拒绝启动：APP_ENV=production 时 SECRET_KEY 必须为"
+                "至少 32 位的随机密钥，不得使用默认占位值。"
+                "请通过环境变量或 Secret 注入（如 openssl rand -hex 32 生成）。"
+            )
+        admin_pwd = (self.ADMIN_PASSWORD or "").strip()
+        if admin_pwd.lower() in _INSECURE_ADMIN_PASSWORDS or len(admin_pwd) < 12:
+            raise RuntimeError(
+                "配置非法，拒绝启动：APP_ENV=production 时 ADMIN_PASSWORD 必须"
+                "更换为至少 12 位的强初始口令，不得使用默认值 Admin@123456 等。"
+                "请通过环境变量或 Secret 注入，首次登录后立即修改。"
+            )
 
     class Config:
         env_file = ".env"

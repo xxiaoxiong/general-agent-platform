@@ -1,6 +1,8 @@
 import os
 import asyncio
+import logging
 from contextlib import asynccontextmanager
+from uuid import uuid4
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -10,6 +12,14 @@ from app.core.database import init_db
 from app.core.redis import init_redis, close_redis
 from app.core.logging import setup_logging, get_logger
 from app.api.v1 import auth, users, models, knowledge, workflows, app_market, audit, prompts, agents, databases
+from app.api.v2 import admin as v2_admin
+from app.api.v2 import artifacts as v2_artifacts
+from app.api.v2 import assistants as v2_assistants
+from app.api.v2 import capabilities as v2_capabilities
+from app.api.v2 import conversations as v2_conversations
+from app.api.v2 import files as v2_files
+from app.api.v2 import runs as v2_runs
+from app.api.v2 import workspace as v2_workspace
 
 logger = get_logger("main")
 
@@ -23,11 +33,14 @@ async def lifespan(app: FastAPI):
     # ── 启动期配置校验（P0-01）：非法配置直接拒绝启动 ──
     settings.validate_startup()
 
+    # ── OTel instrumentation（P1-02）：OTEL_ENABLED=false 时 no-op ──
+    from app.observability.otel_tracing import init_otel
+    init_otel(app)
+
     # ── 启动期初始化 Checkpointer 并做健康检查（P0-01）：
     #    初始化失败抛错即拒绝启动，绝不静默降级 Memory ──
-    if settings.AGENT_RUNTIME_ENABLED:
-        from app.services.agent_runtime.persistence import CheckpointerFactory
-        await CheckpointerFactory.get().get_checkpointer()
+    from app.services.agent_runtime.persistence import CheckpointerFactory
+    await CheckpointerFactory.get().get_checkpointer()
 
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     os.makedirs(settings.CHROMA_PERSIST_DIR, exist_ok=True)
@@ -41,17 +54,11 @@ async def lifespan(app: FastAPI):
     await init_redis()
     await _seed_initial_data()
 
-    # ── 清理过期检查点 ──
-    from app.services.agent.checkpoint import CheckpointManager
-    CheckpointManager.cleanup_old_checkpoints(max_age_hours=24)
-
     # ── Durable Execution Worker：领取 pending / Lease 过期的孤儿 Run ──
-    runtime_worker = None
-    if settings.AGENT_RUNTIME_ENABLED:
-        from app.services.agent_runtime.worker import get_run_worker
+    from app.services.agent_runtime.worker import get_run_worker
 
-        runtime_worker = get_run_worker()
-        await runtime_worker.start()
+    runtime_worker = get_run_worker()
+    await runtime_worker.start()
 
     logger.info("所有子系统初始化完成")
     yield
@@ -64,6 +71,9 @@ async def lifespan(app: FastAPI):
     from app.services.inference import ModelManager
     await ModelManager.get_instance().cleanup_idle(max_idle_seconds=0)
     await close_redis()
+    # P1-01：冲刷 Langfuse 批量缓冲（未配置时为 no-op）
+    from app.observability.langfuse_tracing import shutdown_langfuse
+    shutdown_langfuse()
     logger.info("服务已关闭")
 
 
@@ -181,9 +191,16 @@ app.add_middleware(
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    # P0-03：详细异常只进入服务端日志，响应仅返回安全错误码与 request_id
+    # AgentLogger 不支持 exc_info，这里用同名 stdlib logger 保留完整堆栈
+    request_id = uuid4().hex
+    logging.getLogger("ai_plat.main").error(
+        "unhandled exception request_id=%s path=%s: %s",
+        request_id, request.url.path, exc, exc_info=True,
+    )
     return JSONResponse(
         status_code=500,
-        content={"code": 500, "message": "服务器内部错误", "detail": str(exc)},
+        content={"code": 500, "message": "服务器内部错误", "request_id": request_id},
     )
 
 
@@ -199,7 +216,29 @@ app.include_router(prompts.router, prefix=API_PREFIX)
 app.include_router(agents.router, prefix=API_PREFIX)
 app.include_router(databases.router, prefix=API_PREFIX)
 
+# API v2（产品工作台契约，任务书 §7）：迁移期与 v1 并存
+API_V2_PREFIX = "/api/v2"
+app.include_router(v2_workspace.router, prefix=API_V2_PREFIX)
+app.include_router(v2_capabilities.router, prefix=API_V2_PREFIX)
+app.include_router(v2_assistants.router, prefix=API_V2_PREFIX)
+app.include_router(v2_conversations.router, prefix=API_V2_PREFIX)
+app.include_router(v2_files.router, prefix=API_V2_PREFIX)
+app.include_router(v2_runs.router, prefix=API_V2_PREFIX)
+app.include_router(v2_artifacts.router, prefix=API_V2_PREFIX)
+app.include_router(v2_admin.router, prefix=API_V2_PREFIX)
+
 
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok", "version": settings.APP_VERSION}
+
+
+@app.get("/metrics")
+async def prometheus_metrics():
+    """P1-05：Prometheus 抓取端点（独立注册表，未启用指标时返回空文本）。"""
+    from fastapi import Response
+
+    from app.observability.metrics import render
+
+    body, content_type = render()
+    return Response(content=body, media_type=content_type)

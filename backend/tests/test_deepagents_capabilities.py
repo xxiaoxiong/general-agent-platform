@@ -329,3 +329,152 @@ async def test_b2_platform_tool_events_not_duplicated(db_setup, monkeypatch):
         )).all()
     started = [p for t, p in evs if t == TOOL_STARTED and "calculator" in str(p)]
     assert len(started) == 1, f"calculator 的 tool_started 应恰 1 条（adapter 发出）: {len(started)}"
+
+
+# ══════════ C：P0-05 原生工具安全（工具面收窄 / FilesystemPermission / 隔离）═══
+
+
+def _policy(**kw):
+    from app.services.agent_runtime.tools.policy import ToolPolicy
+
+    base = dict(allowed_tools=set(), sandbox_mode="restricted")
+    base.update(kw)
+    return ToolPolicy(**base)
+
+
+def _build_sec(script, policy, monkeypatch, tmp_path, user_id=11, agent_id=22, session_id=33):
+    """走 factory.build_agent 生产装配路径（P0-05 验证口径）。"""
+    import app.services.agent_runtime.factory as factory_mod
+    from app.core.config import settings
+    from app.services.agent_runtime.context import RunScope, RuntimeContext
+    from app.services.agent_runtime.events import EventBus
+
+    monkeypatch.setattr(settings, "AGENT_FILES_ROOT", str(tmp_path), raising=False)
+    monkeypatch.setattr(
+        factory_mod, "build_chat_model",
+        lambda *a, **k: FakeChatModel(script=list(script)),
+    )
+    ctx = RuntimeContext(
+        scope=RunScope(user_id=user_id), run_id=f"sec-{uuid.uuid4().hex[:6]}",
+        thread_id="sec-thread", agent_id=agent_id, session_id=session_id,
+        agent_config={"system_prompt": "安全测试"},
+    )
+    return factory_mod.build_agent(
+        ctx, policy, EventBus(),
+        {"name": "fake", "base_url": "http://fake.local/v1", "api_key": "none"},
+        {"name": "fake-model", "supports_function_call": True},
+        [],
+    )
+
+
+def _tool_names(agent) -> set:
+    return set(agent.nodes["tools"].bound.tools_by_name.keys())
+
+
+async def _run_turns(agent):
+    return await agent.ainvoke(
+        {"messages": [HumanMessage(content="执行安全测试")]},
+        # factory 装配含多个中间件钩子（每钩消耗一步递归预算），3 个工具轮约需 40+ 步
+        config={"configurable": {"thread_id": f"sec-{uuid.uuid4().hex[:8]}"}, "recursion_limit": 100},
+    )
+
+
+def test_c1_execute_hidden_without_sandbox(monkeypatch, tmp_path):
+    """A05/A09：无外部 Sandbox 时工具面不含 execute；external 模式才暴露。"""
+    agent = _build_sec([AIMessage(content="完成")], _policy(), monkeypatch, tmp_path)
+    names = _tool_names(agent)
+    assert "execute" not in names, f"无 Sandbox 不得暴露 execute: {sorted(names)}"
+    for expect in ("ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep"):
+        assert expect in names, f"常规文件工具缺失: {expect}"
+
+    agent_ext = _build_sec(
+        [AIMessage(content="完成")], _policy(sandbox_mode="external"),
+        monkeypatch, tmp_path,
+    )
+    assert "execute" in _tool_names(agent_ext), "external 沙箱模式应暴露 execute"
+
+
+@pytest.mark.asyncio
+async def test_c2_execute_unavailable_even_if_model_calls_it(monkeypatch, tmp_path):
+    """模型强行调用 execute 时不得执行命令（工具不存在，返回错误而非伪装成功）。"""
+    marker = tmp_path / "exec_marker.txt"
+    agent = _build_sec([
+        _turn("execute", {"command": "echo pwned > marker.txt"}, "t1"),
+        AIMessage(content="完成"),
+    ], _policy(), monkeypatch, tmp_path)
+    result = await _run_turns(agent)
+    msgs = {m.tool_call_id: m for m in _tool_msgs(result)}
+    assert msgs["t1"].status == "error", f"execute 调用必须报错: {msgs['t1'].content}"
+    assert not marker.exists(), "execute 不得真实执行命令"
+
+
+@pytest.mark.asyncio
+async def test_c3_fs_permission_denies_sensitive_files(monkeypatch, tmp_path):
+    """权限拒绝：敏感凭据类文件写入/读取被 FilesystemPermission 拒绝。"""
+    agent = _build_sec([
+        _turn("write_file", {"file_path": "/workspace/.env", "content": "KEY=secret"}, "t1"),
+        _turn("write_file", {"file_path": "/workspace/normal.txt", "content": "OK-CONTENT"}, "t2"),
+        _turn("read_file", {"file_path": "/workspace/.env"}, "t3"),
+        AIMessage(content="完成"),
+    ], _policy(), monkeypatch, tmp_path)
+    result = await _run_turns(agent)
+    by_id = {m.tool_call_id: m for m in _tool_msgs(result)}
+    assert by_id["t1"].status == "error" and "permission denied" in str(by_id["t1"].content), \
+        f".env 写入应被拒绝: {by_id['t1'].content}"
+    assert by_id["t2"].status == "success", f"常规文件写入应放行: {by_id['t2'].content}"
+    assert by_id["t3"].status == "error", f".env 读取应被拒绝: {by_id['t3'].content}"
+
+
+@pytest.mark.asyncio
+async def test_c4_path_traversal_rejected(monkeypatch, tmp_path):
+    """路径穿越：../ 逃逸读取必须被拒，工作区外文件不可达。"""
+    outside = tmp_path.parent / "outside_secret.txt"
+    outside.write_text("OUTSIDE-SECRET", encoding="utf-8")
+    try:
+        agent = _build_sec([
+            _turn("read_file", {"file_path": "/workspace/../outside_secret.txt"}, "t1"),
+            AIMessage(content="完成"),
+        ], _policy(), monkeypatch, tmp_path)
+        result = await _run_turns(agent)
+        msg = {m.tool_call_id: m for m in _tool_msgs(result)}["t1"]
+        assert msg.status == "error", f"路径穿越必须报错: {msg.content}"
+        assert "OUTSIDE-SECRET" not in str(msg.content), "不得读出工作区外内容"
+    finally:
+        outside.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_c5_symlink_escape_rejected(monkeypatch, tmp_path):
+    """符号链接逃逸：工作区内链接指向外部文件，读取必须被拒。"""
+    outside = tmp_path.parent / "sym_target.txt"
+    outside.write_text("SYM-SECRET", encoding="utf-8")
+    root = tmp_path / "11" / "22" / "33"
+    root.mkdir(parents=True, exist_ok=True)
+    link = root / "link.txt"
+    try:
+        os.symlink(outside, link)
+    except (OSError, NotImplementedError):
+        pytest.skip("当前环境无符号链接权限（Windows 需开发者模式/管理员）")
+    try:
+        agent = _build_sec([
+            _turn("read_file", {"file_path": "/workspace/link.txt"}, "t1"),
+            AIMessage(content="完成"),
+        ], _policy(), monkeypatch, tmp_path)
+        result = await _run_turns(agent)
+        msg = {m.tool_call_id: m for m in _tool_msgs(result)}["t1"]
+        assert "SYM-SECRET" not in str(msg.content), f"符号链接逃逸必须被拒: {msg.content}"
+    finally:
+        outside.unlink(missing_ok=True)
+
+
+def test_c6_user_workspace_isolation(monkeypatch, tmp_path):
+    """用户隔离：不同 user 的 /workspace/ 映射到不同根目录，互不可见。"""
+    from app.core.config import settings
+    from app.services.agent_runtime.backends import build_backend, workspace_root
+
+    monkeypatch.setattr(settings, "AGENT_FILES_ROOT", str(tmp_path), raising=False)
+    root_a = workspace_root(11, 22, 33)
+    root_b = workspace_root(99, 22, 33)
+    assert root_a != root_b, "不同用户必须映射到不同工作区根目录"
+    assert root_a.startswith(str(tmp_path)) and root_b.startswith(str(tmp_path))
+    assert build_backend(11, 22, 33) is not build_backend(99, 22, 33)

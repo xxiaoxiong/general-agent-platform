@@ -28,6 +28,7 @@ from langgraph.types import Command
 from app.core.config import settings
 from app.models.agent import AgentRun as AgentRunRow, AgentSession
 from app.core.database import AsyncSessionLocal
+from app.observability.langfuse_tracing import make_callback_handler, platform_span
 
 from .context import (
     ExecutionBudget,
@@ -43,6 +44,8 @@ from .events import (
     RUN_CANCELLED,
     RUN_COMPLETED,
     RUN_FAILED,
+    RUN_RECOVERING,
+    RUN_RETRYING,
     RUN_STARTED,
     RUN_SUSPENDED,
     RUN_WAITING_APPROVAL,
@@ -51,11 +54,14 @@ from .events import (
     TOOL_COMPLETED,
     TOOL_FAILED,
     TOOL_STARTED,
+    VERIFICATION_COMPLETED,
+    VERIFICATION_STARTED,
     TERMINAL_EVENTS,
     EventBus,
     LegacyEventAdapter,
     RuntimeEvent,
     redact_sensitive,
+    wait_wakeup,
 )
 from .factory import build_agent
 from .lifecycle import (
@@ -144,6 +150,20 @@ def _extract_text(content: Any) -> str:
                 parts.append(str(block.get("text") or ""))
         return "".join(parts)
     return ""
+
+
+def _derive_title(content: str, *, max_len: int = 24) -> Optional[str]:
+    """从用户消息派生会话标题：取首个非空行，去掉 Markdown 噪音，限长。
+
+    之前直接用 content[:50]，导致会话列表里出现整段消息/多行碎片当标题。
+    """
+    if not content:
+        return None
+    for line in content.splitlines():
+        text = line.strip().lstrip("#>*-`").strip()
+        if text:
+            return text if len(text) <= max_len else text[:max_len] + "…"
+    return None
 
 
 def _action_from_req(req: Dict[str, Any], interrupt_id: str, idx: int) -> Dict[str, Any]:
@@ -415,7 +435,10 @@ class AgentRuntimeService:
         batch_action_ids = await self._current_batch_action_ids(run_id)
 
         # 审批决策必须先持久化成功（关键写入失败向上抛出，不得带病执行副作用）
-        await self._record_approval_decision(run_id, decisions, deciding_user_id)
+        with platform_span("hitl_approval", run_id=run_id,
+                           attributes={"deciding_user_id": deciding_user_id,
+                                       "decision_types": [str(d.get("type")) for d in decisions]}):
+            await self._record_approval_decision(run_id, decisions, deciding_user_id)
 
         # 图内恢复用决策（P1-03 A）：**只按当前 Interrupt 批次**的动作顺序构造。
         # langchain HITL batched 模式 decisions 数组与 action_requests 按位置对齐
@@ -793,16 +816,22 @@ class AgentRuntimeService:
                         "content": content,
                         "created_at": datetime.utcnow().isoformat(),
                     }],
-                    title=content[:50] if content else None,
+                    title=_derive_title(content),
                 )
 
             # 4) Run 创建（幂等唯一约束兜底并发；thread_id 随解析后的 Session 生成）
+            # P2-01：Run 必须绑定不可变发布版本（无版本时自动发布 v1），
+            # 执行期只读该版本快照，不随 Agent 行后续修改变化
+            from app.assistant.versions import ensure_version
+
+            version = await ensure_version(db, agent_config["id"], created_by=user_id)
             thread_id = make_thread_id(
                 agent_config["id"], resolved_session_id, uuid.uuid4().hex
             )
             row, created = await repo.create_run(
                 run_id=uuid.uuid4().hex,
                 agent_id=agent_config["id"],
+                agent_version_id=version.id if version is not None else None,
                 session_id=resolved_session_id,
                 user_id=user_id,
                 thread_id=thread_id,
@@ -899,7 +928,8 @@ class AgentRuntimeService:
         """
         adapter = LegacyEventAdapter(run_id)
         db_seq = 0
-        poll = max(0.05, float(getattr(settings, "AGENT_RUNTIME_POLL_INTERVAL", 1.0)))
+        # SSE 事件下发实时性：独立于 Worker 扫描间隔的短轮询 + 同进程事件唤醒
+        poll = max(0.05, float(getattr(settings, "AGENT_SSE_POLL_INTERVAL", 0.3)))
 
         def _visible(ev_dict: Dict[str, Any]) -> bool:
             return after_seq is None or int(ev_dict.get("seq") or 0) > after_seq
@@ -939,7 +969,7 @@ class AgentRuntimeService:
                     if _visible(old):
                         yield old
                 return
-            await asyncio.sleep(poll)
+            await wait_wakeup(run_id, poll)
 
     async def _drive(
         self,
@@ -955,6 +985,7 @@ class AgentRuntimeService:
     ) -> None:
         bus = run.bus
         ctx: Optional[RuntimeContext] = None
+        verification: Optional[Dict[str, Any]] = None  # P4-02：验证结果（异常路径保持 None）
         log_fields: Dict[str, Any] = {
             "request_id": run.run_id,
             "trace_id": run.run_id,
@@ -977,6 +1008,17 @@ class AgentRuntimeService:
             log_fields["model_id"] = model_config.get("name")
 
             scope = RunScope(user_id=user_id or run.user_id)
+            # 权限模块（审批模式）：Run 级 manual/auto 优先（创建时写入配置并
+            # 随 agent_config_snapshot 保留到恢复/续跑），auto = 高危工具自动放行
+            # 不触发 HITL 中断；缺省 manual（安全默认），且全局开关可强制关闭
+            _approval_mode = str(agent_config.get("approval_mode") or "manual")
+            enable_hitl = (
+                bool(getattr(settings, "AGENT_ENABLE_HITL", True))
+                and _approval_mode != "auto"
+            )
+            # P4-05/06：Run 级预算优先取 AgentVersion 快照的 execution_budget
+            # （P2-01 版本绑定语义），缺省回落全局 settings
+            _budget_cfg = agent_config.get("execution_budget") or {}
             ctx = RuntimeContext(
                 scope=scope,
                 run_id=run.run_id,
@@ -988,12 +1030,20 @@ class AgentRuntimeService:
                 agent_config=agent_config,
                 memory_context=mem_ctx,
                 budget=ExecutionBudget(
-                    max_steps=getattr(settings, "AGENT_MAX_STEPS", 100),
-                    max_tool_calls=getattr(settings, "AGENT_MAX_TOOL_CALLS", 200),
-                    max_model_calls=getattr(settings, "AGENT_MAX_MODEL_CALLS", 100),
-                    run_timeout_seconds=getattr(settings, "AGENT_RUN_TIMEOUT", 600.0),
+                    max_steps=_budget_cfg.get(
+                        "max_steps", getattr(settings, "AGENT_MAX_STEPS", 100)),
+                    max_tool_calls=_budget_cfg.get(
+                        "max_tool_calls", getattr(settings, "AGENT_MAX_TOOL_CALLS", 200)),
+                    max_model_calls=_budget_cfg.get(
+                        "max_model_calls", getattr(settings, "AGENT_MAX_MODEL_CALLS", 100)),
+                    run_timeout_seconds=float(max(
+                        # 运行超时取快照与全局配置的较大者：旧版本快照钉死的旧默认值
+                        # 不得掐死大任务，全局 AGENT_RUN_TIMEOUT 是运维口径的下限
+                        float(_budget_cfg.get("run_timeout_seconds", 0) or 0),
+                        float(getattr(settings, "AGENT_RUN_TIMEOUT", 600.0)),
+                    )),
                 ),
-                enable_hitl=getattr(settings, "AGENT_ENABLE_HITL", True),
+                enable_hitl=enable_hitl,
                 sandbox_mode=getattr(settings, "AGENT_SANDBOX_MODE", "restricted"),
                 allow_network=getattr(settings, "AGENT_ALLOW_NETWORK", True),
                 worker_id=run.worker_id,
@@ -1038,9 +1088,13 @@ class AgentRuntimeService:
                     }
 
                 config = make_run_config(run.thread_id, run.run_id, scope.user_id)
-                config["recursion_limit"] = ctx.budget.max_steps * 3 + 10
-                # FR-10：模型调用按一次请求计数（Runnable 生命周期回调，不按 Chunk）
-                config["callbacks"] = [ModelUsageCallback(ctx)]
+                # 递归预算换算：LangGraph 把每个中间件钩子计为一步递归（每个模型轮
+                # 约消耗 10~14 步：before/after model 钩子 + model + tools + 工具钩子），
+                # 过小的系数会让长任务误触发 GraphRecursionError。预算上限本身由
+                # ModelCallLimit/ToolCallLimit 与 ctx.budget 独立执行，这里只是兜底。
+                config["recursion_limit"] = (
+                    ctx.budget.max_steps * 12 + 40 if ctx.budget.max_steps > 0 else 10000
+                )
                 run_config = config
 
                 # FR-09：挂起/重启恢复后从事件日志重建已产生的最终文本片段，
@@ -1048,17 +1102,66 @@ class AgentRuntimeService:
                 if not run.final_text_parts:
                     run.final_text_parts = await self._load_prior_final_text(run.run_id)
 
-                try:
-                    # P1-05 §13：按绝对 deadline 计算剩余超时（重启不重新获得完整时间）
-                    _deadline = ctx.budget_deadline_at
-                    if _deadline is not None:
-                        _remaining = max(0.0, (_deadline - datetime.utcnow()).total_seconds())
-                    else:
-                        _remaining = ctx.budget.run_timeout_seconds
-                    async with asyncio.timeout(_remaining):
-                        await self._consume_stream(agent, payload, run_config, ctx, run, bus)
-                except asyncio.TimeoutError:
-                    raise _RunLimitExceeded(f"运行超时（>{ctx.budget.run_timeout_seconds}s）")
+                with platform_span(
+                    "agent_run", run_id=run.run_id,
+                    attributes={
+                        "thread_id": run.thread_id, "agent_id": run.agent_id,
+                        "session_id": run.session_id, "model_id": log_fields["model_id"],
+                    },
+                ):
+                    callbacks: List[Any] = [ModelUsageCallback(ctx)]
+                    lf_handler = make_callback_handler(run.run_id)
+                    if lf_handler is not None:
+                        callbacks.append(lf_handler)
+                    config["callbacks"] = callbacks
+
+                    # P1-05 §13：按绝对 deadline 计算剩余超时（重启不重新获得完整时间）。
+                    # 超时两层语义必须区分（Python 3.11 下 asyncio.TimeoutError 与内层
+                    # 请求超时同型，混捕会把"模型流卡死"误报成"运行超时"）：
+                    # - timeout 上下文到期 = 运行墙钟预算耗尽 -> limit_exceeded；
+                    # - 内层单次请求超时（模型 API 停滞无响应等）-> 从最近 checkpoint
+                    #   断点重试该步（不重做已成功步骤），重试耗尽如实上报真实原因。
+                    _attempts = 1 + max(0, int(getattr(settings, "AGENT_INNER_TIMEOUT_RETRIES", 1)))
+                    for _attempt in range(_attempts):
+                        _snap_parts = len(run.final_text_parts)
+                        try:
+                            _deadline = ctx.budget_deadline_at
+                            if _deadline is not None:
+                                _remaining = max(0.0, (_deadline - datetime.utcnow()).total_seconds())
+                            else:
+                                _remaining = ctx.budget.run_timeout_seconds
+                            async with asyncio.timeout(_remaining) as _to:
+                                await self._consume_stream(agent, payload, run_config, ctx, run, bus)
+                            break  # 正常完成
+                        except asyncio.TimeoutError as _te:
+                            if _to.expired():
+                                raise _RunLimitExceeded(
+                                    f"运行超时（>{ctx.budget.run_timeout_seconds}s）")
+                            if _attempt >= _attempts - 1:
+                                raise RuntimeError(
+                                    "模型请求超时（单次请求无响应，非运行总时长超限），"
+                                    "自动重试未恢复，任务中断"
+                                ) from _te
+                            # 断点重试：回滚未完成的增量文本并标记，
+                            # 前端/回放按 keep_chars 撤回半截文本，最终文本不重复
+                            _keep_chars = len("".join(run.final_text_parts[:_snap_parts]))
+                            del run.final_text_parts[_snap_parts:]
+                            logger.warning(
+                                "run %s 模型请求超时，从断点重试（第 %d 次）", run.run_id, _attempt + 1,
+                            )
+                            await bus.publish(RuntimeEvent(
+                                type=RUN_RETRYING, run_id=run.run_id,
+                                data={
+                                    "reason": "model_stream_timeout",
+                                    "attempt": _attempt + 1,
+                                    "keep_chars": _keep_chars,
+                                },
+                            ))
+
+                    # P4-01/02：完成条件验证 + 有条件补充执行（§9，主执行已产出结果）
+                    verification = await self._verify_and_fix(
+                        ctx, run, agent, run_config, bus, messages,
+                    )
 
             # 结束分支
             if run.status == STATUS_RUNNING:
@@ -1074,6 +1177,9 @@ class AgentRuntimeService:
                     "steps": ctx.steps,
                     "elapsed_seconds": round(ctx.elapsed(), 2),
                 }
+                if verification is not None:
+                    # P4-02：验证结果随 Run 交付（完成条件证据，不覆盖最终回答）
+                    run.summary["verification"] = verification
                 run.transition(STATUS_COMPLETED)
                 await self._commit(
                     run,
@@ -1156,6 +1262,9 @@ class AgentRuntimeService:
             # P0-02 E / LF-04：fencing 失败 —— 立即中止推进：
             # 不写 Session、不发布 RUN_COMPLETED / RUN_FAILED、不产生新副作用，
             # 保留数据库中当前有效 Worker 的状态；本地流以 run_suspended 边界终止
+            from app.observability import metrics as _metrics
+
+            _metrics.inc_lease_lost()
             logger.warning("run %s 执行权丢失（fencing 拒绝），中止推进：%s", run.run_id, e)
             try:
                 await bus.publish(RuntimeEvent(
@@ -1176,6 +1285,16 @@ class AgentRuntimeService:
                 error=run.error,
                 attributes=run.summary or {},
             )
+            # P1-05：Run 终态/耗时指标（防御式，不影响收尾）
+            try:
+                from app.observability import metrics as _metrics
+
+                _metrics.observe_run_finished(
+                    status=run.status or "unknown",
+                    duration_seconds=(ctx.elapsed() if ctx else 0.0),
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     # ── Run 级执行预算（P1-05 §13）：跨崩溃/HITL 恢复不重置 ─────────────
 
@@ -1268,6 +1387,9 @@ class AgentRuntimeService:
         platform_names |= {
             t.get("name") for t in (ctx.agent_config.get("custom_tools") or []) if isinstance(t, dict)
         }
+        # call_id -> 工具名：护栏拒绝的 ToolMessage（如并行 write_todos）name 为空，
+        # 从发起调用时的 tool_calls 名称回填，避免事件里工具名丢失
+        tool_names_by_call: Dict[str, str] = {}
         async for mode, chunk in agent.astream(
             payload, config=run_config, stream_mode=["updates", "messages"]
         ):
@@ -1304,7 +1426,8 @@ class AgentRuntimeService:
                         ))
                     for m in (node_update.get("messages") or []):
                         if isinstance(m, ToolMessage):
-                            mname = getattr(m, "name", "") or ""
+                            tcid = getattr(m, "tool_call_id", "") or ""
+                            mname = getattr(m, "name", "") or tool_names_by_call.get(tcid, "")
                             if mname in platform_names:
                                 continue  # 平台工具已由 adapter 发事件
                             is_err = getattr(m, "status", None) == "error"
@@ -1313,7 +1436,7 @@ class AgentRuntimeService:
                                 run_id=run.run_id,
                                 data={
                                     "tool": mname,
-                                    "tool_call_id": getattr(m, "tool_call_id", "") or "",
+                                    "tool_call_id": tcid,
                                     "internal": True,
                                     **(
                                         {"error": str(m.content)[:500]}
@@ -1327,6 +1450,9 @@ class AgentRuntimeService:
                         elif isinstance(m, AIMessage):
                             for tc in (getattr(m, "tool_calls", None) or []):
                                 tc_name = (tc.get("name") or "") if isinstance(tc, dict) else ""
+                                tc_id = (tc.get("id") or "") if isinstance(tc, dict) else ""
+                                if tc_id:
+                                    tool_names_by_call[tc_id] = tc_name
                                 if tc_name and tc_name not in platform_names:
                                     await bus.publish(RuntimeEvent(
                                         type=TOOL_STARTED,
@@ -1411,16 +1537,144 @@ class AgentRuntimeService:
             data={"error": error, "status": status},
         ))
 
+    async def _verify_and_fix(
+        self,
+        ctx: RuntimeContext,
+        run: RunHandle,
+        agent: Any,
+        run_config: Dict[str, Any],
+        bus: EventBus,
+        messages: Optional[List[Dict[str, Any]]],
+    ) -> Optional[Dict[str, Any]]:
+        """P4-01/02：任务契约 + 完成条件验证 + 有条件补充执行（§9）。
+
+        - 契约与验证全部确定性（零模型调用，简单问答不加验证负担）；
+        - 验证失败产生结构化事件（verification.started/completed），
+          不允许模型说"已完成"就通过；
+        - 复杂任务验证不通过 → 按 AGENT_VERIFICATION_MAX_ROUNDS 轮补充执行
+          （run.retrying 事件），仍不通过则把验证结论随 Run 交付（不伪造成功）；
+        - 验证自身异常绝不影响主结果交付（记录日志后返回 None）。
+        """
+        if not getattr(settings, "AGENT_VERIFICATION_ENABLED", True):
+            return None
+        if run.status != STATUS_RUNNING:
+            return None
+        try:
+            from sqlalchemy import select
+
+            from app.assistant.task_contract import build_task_contract
+            from app.assistant.verification import (
+                STATUS_PASSED,
+                ToolEvidence,
+                verify_task,
+            )
+            from app.models.agent import AgentToolExecution
+
+            # 证据收集：工具账本（副作用/查询/执行的客观事实）
+            async with AsyncSessionLocal() as db:
+                rows = (await db.execute(
+                    select(AgentToolExecution).where(
+                        AgentToolExecution.run_id == run.run_id
+                    ).order_by(AgentToolExecution.id)
+                )).scalars().all()
+            evidence = [
+                ToolEvidence(
+                    tool_name=r.tool_name,
+                    status=r.status,
+                    external_operation_id=r.external_operation_id,
+                    output=str(r.result_payload or ""),
+                )
+                for r in rows
+            ]
+            tool_names = [e.tool_name for e in evidence]
+            goal = _last_user_input(messages or [])
+            contract = build_task_contract(
+                goal,
+                capability_ids=ctx.agent_config.get("capability_ids"),
+                tool_names=tool_names,
+            )
+
+            await bus.publish(RuntimeEvent(
+                type=VERIFICATION_STARTED, run_id=run.run_id,
+                data=contract.to_dict(),
+            ))
+            result = verify_task(contract, "".join(run.final_text_parts), evidence)
+
+            # 部分通过/不通过 → 补充执行（有限轮次；简单问答不补执行）
+            max_rounds = max(0, int(getattr(settings, "AGENT_VERIFICATION_MAX_ROUNDS", 1)))
+            rounds = 0
+            while (
+                result.status != STATUS_PASSED
+                and contract.is_complex
+                and rounds < max_rounds
+                and run.status == STATUS_RUNNING
+            ):
+                rounds += 1
+                await bus.publish(RuntimeEvent(
+                    type=RUN_RETRYING, run_id=run.run_id,
+                    data={
+                        "reason": "verification_fix",
+                        "round": rounds,
+                        "failed_checks": [c.to_dict() for c in result.failed_checks],
+                    },
+                ))
+                feedback = result.feedback_text()
+                # 补充执行的 config 必须只含 thread_id（+recursion_limit/callbacks）：
+                # 实证（消融实验）发现 configurable 同时携带 run_id 与 user_id 时，
+                # LangGraph 对后续 astream 静默跳过执行（0 chunk、模型不调用、无异常），
+                # 只含其一或仅 thread_id 均正常。thread_id 是 checkpoint 恢复的唯一
+                # 必需键；callbacks 用新实例（Langfuse handler 单次使用语义）。
+                fix_config = {
+                    "configurable": {"thread_id": run.thread_id},
+                    "recursion_limit": run_config.get("recursion_limit", 1000),
+                    "callbacks": [ModelUsageCallback(ctx)],
+                }
+                await self._consume_stream(
+                    agent,
+                    {
+                        "messages": messages_to_langchain(
+                            [{"role": "user", "content": feedback}],
+                            namespace=run.thread_id,
+                            reset=False,
+                        ),
+                    },
+                    fix_config, ctx, run, bus,
+                )
+                result = verify_task(contract, "".join(run.final_text_parts), evidence)
+
+            data = result.to_event_data()
+            data["fix_rounds"] = rounds
+            await bus.publish(RuntimeEvent(
+                type=VERIFICATION_COMPLETED, run_id=run.run_id, data=data,
+            ))
+            return data
+        except Exception:  # noqa: BLE001
+            # 验证是质量增强，不得让验证自身故障毁掉主执行结果
+            logger.exception("run %s 验证执行异常（主结果照常交付）", run.run_id)
+            return None
+
     async def _load_prior_final_text(self, run_id: str) -> List[str]:
         """FR-09：从持久化事件日志重建本 Run 已产生的最终文本片段（MODEL_DELTA），
-        供挂起/重启恢复后的 _drive 调用继续累积，保证最终文本跨恢复完整。"""
+        供挂起/重启恢复后的 _drive 调用继续累积，保证最终文本跨恢复完整。
+        run_retrying 标记的断点重试按 keep_chars 撤回未完成增量（与执行侧回滚口径一致）。"""
         async with AsyncSessionLocal() as db:
             rows = await EventRepository(db).list_after(run_id, 0)
-        return [
-            r.payload.get("text", "")
-            for r in rows
-            if r.event_type == MODEL_DELTA and r.payload and r.payload.get("text")
-        ]
+        parts: List[str] = []
+        for r in rows:
+            if not r.payload:
+                continue
+            if r.event_type == MODEL_DELTA and r.payload.get("text"):
+                parts.append(r.payload["text"])
+            elif r.event_type == RUN_RETRYING and r.payload.get("keep_chars") is not None:
+                keep = int(r.payload["keep_chars"])
+                acc, cut = 0, len(parts)
+                for i, t in enumerate(parts):
+                    if acc + len(t) > keep:
+                        cut = i
+                        break
+                    acc += len(t)
+                del parts[cut:]
+        return parts
 
     async def _write_back_session(self, run: RunHandle) -> None:
         """FR-08.2 + P1-02 C：Assistant 最终结果经 Outbox 写回 Session。
@@ -1432,7 +1686,9 @@ class AgentRuntimeService:
         重启后可恢复），绝不改变 Run 终态。写回失败向上抛出（Completion 路径
         调用方先已持久化 Run 结果，失败态路径调用方仅记日志）。
         """
-        await self._deliver_outbox(run.run_id)
+        with platform_span("session_writeback", run_id=run.run_id,
+                           attributes={"session_id": run.session_id}):
+            await self._deliver_outbox(run.run_id)
 
     async def _deliver_outbox(self, run_id: str) -> None:
         """按 Outbox 记录执行一次 Session 写回（幂等、可重试）。"""
@@ -1538,6 +1794,8 @@ class AgentRuntimeService:
                 "max_iterations": agent.max_iterations,
                 "temperature": agent.temperature,
                 "tools": agent.tools or [],
+                # P3-01：能力包绑定随配置进入运行时（_resolve_tool_specs 消费）
+                "capability_ids": getattr(agent, "capability_ids", None) or [],
                 "knowledge_base_id": agent.knowledge_base_id,
                 "database_connection_id": agent.database_connection_id,
             }
@@ -1546,15 +1804,36 @@ class AgentRuntimeService:
         from sqlalchemy import select
         from app.models.model_provider import ModelConfig, ModelProvider
 
-        if not model_config_id:
-            raise ModelCapabilityError("Agent 未配置模型（model_config_id 为空）")
         async with AsyncSessionLocal() as db:
-            mc = (await db.execute(select(ModelConfig).where(ModelConfig.id == model_config_id))).scalar_one_or_none()
-            if mc is None:
-                raise ModelCapabilityError(f"模型配置 {model_config_id} 不存在")
-            provider = (await db.execute(select(ModelProvider).where(ModelProvider.id == mc.provider_id))).scalar_one_or_none()
-            if provider is None:
-                raise ModelCapabilityError(f"模型供应商不存在（model_config_id={model_config_id}）")
+            if model_config_id:
+                mc = (await db.execute(select(ModelConfig).where(ModelConfig.id == model_config_id))).scalar_one_or_none()
+                if mc is None:
+                    raise ModelCapabilityError(f"模型配置 {model_config_id} 不存在")
+                provider = (await db.execute(select(ModelProvider).where(ModelProvider.id == mc.provider_id))).scalar_one_or_none()
+                if provider is None:
+                    raise ModelCapabilityError(f"模型供应商不存在（model_config_id={model_config_id}）")
+            else:
+                # P2-03 Model Router：未绑定模型时按能力约束选模（默认模型策略），
+                # 无兼容模型明确报错，绝不静默切换到不支持 Tool Calling 的模型
+                from app.assistant.model_router import candidate_from_row, select_model
+
+                rows = (await db.execute(
+                    select(ModelConfig, ModelProvider)
+                    .join(ModelProvider, ModelProvider.id == ModelConfig.provider_id)
+                    .where(ModelConfig.is_active == True, ModelConfig.model_type == "chat",  # noqa: E712
+                           ModelProvider.is_active == True)  # noqa: E712
+                )).all()
+                candidates = [candidate_from_row(mc, p) for mc, p in rows]
+                chosen = select_model(candidates, requirements=("tool_calling",))
+                mc = next(mc for mc, _p in rows if mc.id == chosen.id)
+                provider = next(p for _mc, p in rows if p.id == mc.provider_id)
+
+            # P2-03：能力矩阵检查（不兼容模型在执行前明确报错，AG-10）
+            from app.assistant.model_router import candidate_from_row, check_model_requirements
+
+            check_model_requirements(
+                candidate_from_row(mc, provider), requirements=("tool_calling",)
+            )
             return (
                 {"name": provider.name, "base_url": provider.base_url, "api_key": provider.api_key,
                  "extra_config": provider.extra_config or {}},
@@ -1565,12 +1844,37 @@ class AgentRuntimeService:
     def _resolve_tool_specs(self, agent_config: Dict[str, Any]) -> List[Dict[str, Any]]:
         from app.services.tools import get_tool_by_name
 
-        specs = []
+        names: List[str] = []
+        disabled: set = set()
+        # P2-02 能力包解析：capability_ids → 工具集（fail-closed，模型不可自行授权）；
+        # 未配置 capability_ids 的存量 Agent 保持显式 tools 语义；
+        # 显式 enabled=False 的工具优先级高于能力包默认（Agent 级显式收窄）
+        cap_ids = agent_config.get("capability_ids")
+        if cap_ids:
+            from app.assistant.capability import resolve_capabilities
+
+            resolved = resolve_capabilities(
+                cap_ids,
+                {
+                    "database_connection": agent_config.get("database_connection_id"),
+                    "knowledge_base": agent_config.get("knowledge_base_id"),
+                },
+            )
+            names.extend(resolved.tools)
         for item in (agent_config.get("tools") or []):
             name = item["name"] if isinstance(item, dict) else item
             enabled = item.get("enabled", True) if isinstance(item, dict) else True
             if not enabled:
+                disabled.add(name)
                 continue
+            names.append(name)
+
+        specs = []
+        seen = set()
+        for name in names:
+            if name in seen or name in disabled:
+                continue
+            seen.add(name)
             spec = get_tool_by_name(name)
             if spec:
                 specs.append(spec)

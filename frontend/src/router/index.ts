@@ -17,25 +17,25 @@ const router = createRouter({
       children: [
         {
           path: '',
-          redirect: '/dashboard',
+          redirect: '/workspace',
+        },
+        {
+          path: 'workspace',
+          name: 'Workspace',
+          component: () => import('@/views/workspace/WorkspaceHome.vue'),
+          meta: { title: '智能体对话', icon: 'ChatDotRound' },
         },
         {
           path: 'dashboard',
           name: 'Dashboard',
           component: () => import('@/views/Dashboard.vue'),
-          meta: { title: '工作台', icon: 'Odometer' },
+          meta: { title: '概览', icon: 'Odometer' },
         },
         {
           path: 'models',
           name: 'Models',
           component: () => import('@/views/models/ModelList.vue'),
-          meta: { title: '模型管理', icon: 'Cpu' },
-        },
-        {
-          path: 'models/chat',
-          name: 'ModelChat',
-          component: () => import('@/views/models/ModelChat.vue'),
-          meta: { title: 'AI 对话', icon: 'ChatDotRound' },
+          meta: { title: '模型配置', icon: 'Cpu' },
         },
         {
           path: 'knowledge',
@@ -66,18 +66,6 @@ const router = createRouter({
           name: 'WorkflowRun',
           component: () => import('@/views/workflows/WorkflowRun.vue'),
           meta: { title: '运行工作流' },
-        },
-        {
-          path: 'agents',
-          name: 'AgentList',
-          component: () => import('@/views/agents/AgentList.vue'),
-          meta: { title: 'Agent 管理', icon: 'Promotion' },
-        },
-        {
-          path: 'agents/:id/chat',
-          name: 'AgentChat',
-          component: () => import('@/views/agents/AgentChat.vue'),
-          meta: { title: 'Agent 对话' },
         },
         {
           path: 'databases',

@@ -7,8 +7,8 @@
         <p>{{ currentDate }} · AI 通用能力大平台平台</p>
       </div>
       <div class="banner-right">
-        <el-button type="primary" class="banner-btn" @click="router.push('/agents')">
-          <el-icon><Promotion /></el-icon> 开始对话
+        <el-button type="primary" class="banner-btn" @click="router.push('/workspace')">
+          <el-icon><ChatDotRound /></el-icon> 开始对话
         </el-button>
       </div>
     </div>
@@ -107,8 +107,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
-import { modelApi, knowledgeApi, workflowApi, appApi, agentApi } from '@/api'
-import { Promotion } from '@element-plus/icons-vue'
+import { modelApi, knowledgeApi, workflowApi, appApi } from '@/api'
 import dayjs from 'dayjs'
 
 const router = useRouter()
@@ -128,19 +127,18 @@ function barWidth(val: number) {
 }
 
 const quickActions = [
-  { label: 'AI 对话', desc: '与模型直接对话', path: '/models/chat', icon: 'ChatDotRound', color: '#3b82f6' },
-  { label: 'Agent 智能体', desc: '自主规划执行任务', path: '/agents', icon: 'Promotion', color: '#10a37f' },
+  { label: '智能体对话', desc: '对话即用，自动调用能力', path: '/workspace', icon: 'Promotion', color: '#10a37f' },
   { label: '流程编排', desc: '可视化工作流设计', path: '/workflows', icon: 'Share', color: '#f59e0b' },
   { label: '知识库', desc: '企业知识管理', path: '/knowledge', icon: 'Collection', color: '#8b5cf6' },
   { label: '提示词工程', desc: '模板管理与调试', path: '/prompts', icon: 'EditPen', color: '#ec4899' },
   { label: '应用市场', desc: '一键部署应用', path: '/apps', icon: 'Grid', color: '#ef4444' },
-  { label: '模型管理', desc: '供应商与模型配置', path: '/models', icon: 'Cpu', color: '#6b7280' },
+  { label: '模型配置', desc: '供应商与模型配置', path: '/models', icon: 'Cpu', color: '#6b7280' },
   { label: '我的应用', desc: '已部署的应用实例', path: '/apps/instances', icon: 'Star', color: '#f97316' },
 ]
 
 const features = [
   { name: '多模型统一调度', desc: '支持国内外所有主流大模型，统一管控', icon: 'Cpu', color: '#3b82f6', path: '/models' },
-  { name: 'Agent 智能体', desc: '自主规划、工具调用、多轮推理', icon: 'Promotion', color: '#10a37f', path: '/agents' },
+  { name: '智能体对话', desc: '工具调用、多轮推理、任务执行', icon: 'Promotion', color: '#10a37f', path: '/workspace' },
   { name: '企业知识库', desc: '多格式文档上传，RAG 精准检索溯源', icon: 'Collection', color: '#8b5cf6', path: '/knowledge' },
   { name: '无代码流程编排', desc: '可视化拖拽，非技术人员即可上手', icon: 'Share', color: '#f59e0b', path: '/workflows' },
   // { name: '全场景应用市场', desc: '100+ 行业场景，一键启用', icon: 'Grid', color: '#ef4444', path: '/apps' },

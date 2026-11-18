@@ -159,3 +159,26 @@ def test_pre_phase2_mysql8_upgrades_to_head(mysql_dsn):
     assert {"agent_runs", "agent_run_events", "agent_tool_executions"} <= tables
     assert "lease_version" in cols_map.get("agent_runs", set())
     assert _has_unique(unique_map, "agent_tool_executions", "run_id", "tool_call_id")
+
+
+def test_app_instances_workflow_id_column_and_downgrade(mysql_dsn):
+    """验收 e8f9a0b1c2d3（A24）：app_instances.workflow_id 可升级、可回滚。
+
+    - upgrade head 后列存在（修复登录后 /apps/instances 1054 漂移）；
+    - downgrade 到 d7e8f9a0b1c2 后列消失；
+    - 再 upgrade head 列恢复（往返一致）。
+    """
+    _reset_db()
+    _run_alembic("upgrade", "head")
+
+    def _has_col() -> bool:
+        _tables, cols_map, _ = _inspect()
+        return "workflow_id" in cols_map.get("app_instances", set())
+
+    assert _has_col(), "upgrade head 后 app_instances 必须含 workflow_id"
+
+    _run_alembic("downgrade", "d7e8f9a0b1c2")
+    assert not _has_col(), "downgrade 后 app_instances.workflow_id 应被移除"
+
+    _run_alembic("upgrade", "head")
+    assert _has_col(), "再 upgrade 后 workflow_id 应恢复"
