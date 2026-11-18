@@ -1,14 +1,88 @@
-# 企业级 AI 通用能力大平台与业务落地平台 (v2.0)
+# General Agent Platform
 
-## 技术栈
+企业级 AI 通用能力大平台与业务落地平台（v2.0）—— 可私有化部署的通用 Agent 平台：多模型对话、Agent 智能体、企业知识库（RAG）、可视化流程编排、提示词工程、应用市场，以及 **Langfuse 全链路可观测** 与 **Agent 自进化闭环**。
 
-| 层 | 技术 |
+| | |
 |---|---|
 | 后端 | FastAPI + SQLAlchemy (async) + Alembic + MySQL + Redis + ChromaDB |
-| Agent 引擎 | ReAct 增强循环 + 滑动窗口上下文 + 结构化记忆 + 幻觉抑制 |
+| Agent 引擎 | LangChain / LangGraph 执行内核 + Durable Execution（PostgreSQL Checkpointer 断点续跑） |
 | 推理层 | OpenAI 兼容 API + 连接池 + 并发队列 + 30B 模型优化 |
 | 前端 | Vue 3 + Element Plus + Vite + TypeScript + Pinia |
+| 可观测 | Langfuse（Trace / 评估回写）+ OpenTelemetry + Prometheus / Grafana |
 | 部署 | Docker Compose |
+
+---
+
+## 界面预览
+
+### 登录与工作台
+
+| 登录 | 概览工作台 |
+|---|---|
+| ![登录](docs/screenshots/01-login.png) | ![概览](docs/screenshots/02-dashboard.png) |
+
+### 核心能力
+
+**智能体对话** — 流式对话、工具调用、多模型切换、人机协同审批：
+
+![智能体对话](docs/screenshots/03-workspace.png)
+
+**模型配置** — 多供应商接入（OpenAI 兼容）、连接测试、统一管控：
+
+![模型配置](docs/screenshots/04-models.png)
+
+**企业知识库** — 文档上传（PDF / Word / Excel / PPT / TXT）、向量化、RAG 语义检索：
+
+![知识库](docs/screenshots/05-knowledge.png)
+
+**可视化流程编排** — 拖拽节点设计自动化工作流（AI / 条件 / HTTP / 知识检索节点）：
+
+![流程编排](docs/screenshots/06-workflows.png)
+
+**提示词工程** — 模板管理 + 在线调试，沉淀团队最佳实践：
+
+![提示词工程](docs/screenshots/07-prompts.png)
+
+### Agent 自进化闭环
+
+基于执行过程客观数据的迭代支撑体系：确定性指标（工具错误率 / 重试 / 重复调用 / HITL 驳回 / 预算消耗）、LLM 六维裁判评估、进化报告与配置变更回滚、**开发迭代简报**（纯客观数据，可直接喂给开发 AI）。
+
+![Agent 自进化](docs/screenshots/08-evolution.png)
+
+开发简报——按窗口汇总执行概览 / 失败 Run / 工具统计 / HITL 数据 / 分版本趋势 / 评估数据 / 变更审计，一键导出 Markdown：
+
+![开发简报](docs/screenshots/09-dev-briefing.png)
+
+### Langfuse 全链路可观测
+
+每次 Agent 运行上报确定性 trace_id 的完整 Trace（模型调用、工具执行、中间件 span、token / 耗时），平台内一键跳转：
+
+![Langfuse Traces](docs/screenshots/10-langfuse-traces.png)
+
+Trace 详情内的完整执行过程 span 树（模型输入输出、工具调用、耗时与 token 开销）：
+
+![Langfuse Trace 详情](docs/screenshots/11-langfuse-trace-detail.png)
+
+---
+
+## 功能模块
+
+| 模块 | 功能 |
+|---|---|
+| 🔐 认证管理 | JWT 登录、Token 刷新、修改密码、RBAC 权限 |
+| 🤖 模型管理 | 多供应商接入（OpenAI 兼容）、模型配置、连接测试 |
+| 💬 AI 对话 | 流式对话、知识库 RAG 增强、多模型切换 |
+| 📚 知识库 | 文档上传（PDF/Word/Excel/PPT/TXT）、向量化、语义检索 |
+| ⚙️ 流程编排 | 可视化画布、多节点类型（AI/条件/HTTP/知识检索）、流程执行 |
+| 🏪 应用市场 | 内置 10+ 行业应用模板、一键部署、应用实例管理 |
+| 👥 用户管理 | 用户 CRUD、角色分配、启用/禁用 |
+| 📋 审计日志 | 操作记录、多维度过滤、详情查看 |
+| 🧠 Agent 智能体 | 增强 ReAct 引擎、结构化记忆、幻觉抑制、执行轨迹追踪、断点续跑 |
+| 📊 性能监控 | 推理延迟、工具成功率、token 吞吐、慢请求告警、Prometheus 指标 |
+| 🔍 可观测 | Langfuse Trace 上报与 Trace 链接、LLM 裁判评估回写 |
+| 🔄 Agent 自进化 | 确定性指标 + 评估聚合 + 进化报告 + 配置变更 / 回滚 + 开发简报 |
+
+---
 
 ## 本地开发启动
 
@@ -64,6 +138,16 @@ npm run dev
 - 用户名：`admin`
 - 密码：`Admin@123456`
 
+### 运行测试
+
+```bash
+# 后端全量回归（必须在 backend/ 目录下执行）
+cd backend && python -m pytest -q
+
+# 前端类型检查 + 构建
+cd frontend && npm run build
+```
+
 ---
 
 ## Docker Compose 一键部署
@@ -82,28 +166,14 @@ docker compose -f docker/docker-compose.yml down
 访问：http://localhost（前端），http://localhost:8000（后端 API）
 
 部署说明：
+- 启动前先准备 `docker/.env`（参考 `docker/.env.example`），所有凭据经环境变量注入。
 - 后端启动入口（`docker/backend-entrypoint.sh`）先执行一次 `alembic upgrade head`，
   迁移失败则服务不启动；随后以多 Worker 启动 Uvicorn。
 - Durable Execution 使用共享 PostgreSQL Checkpointer（`checkpoint_pg` 服务，
   宿主机端口 5433），多 Worker / 重启后可恢复 Graph State；生产环境禁止
   `AGENT_CHECKPOINT_DSN=memory`（启动即拒绝）。
-
----
-
-## 功能模块
-
-| 模块 | 功能 |
-|---|---|
-| 🔐 认证管理 | JWT 登录、Token 刷新、修改密码、RBAC 权限 |
-| 🤖 模型管理 | 多供应商接入（OpenAI 兼容）、模型配置、连接测试 |
-| 💬 AI 对话 | 流式对话、知识库 RAG 增强、多模型切换 |
-| 📚 知识库 | 文档上传（PDF/Word/Excel/PPT/TXT）、向量化、语义检索 |
-| ⚙️ 流程编排 | 可视化画布、多节点类型（AI/条件/HTTP/知识检索）、流程执行 |
-| 🏪 应用市场 | 内置 10+ 行业应用模板、一键部署、应用实例管理 |
-| 👥 用户管理 | 用户 CRUD、角色分配、启用/禁用 |
-| 📋 审计日志 | 操作记录、多维度过滤、详情查看 |
-| 🧠 **Agent 智能体** | 增强 ReAct 引擎、结构化记忆、幻觉抑制、执行轨迹追踪 |
-| 📊 **性能监控** | 推理延迟、工具成功率、token 吞吐、慢请求告警 |
+- 可选：Langfuse 自托管栈（`langfuse-deploy`）用于 Trace 可观测，配置
+  `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_PROJECT_ID` 后自动上报。
 
 ---
 
@@ -128,6 +198,16 @@ app/services/agent/               # Agent 智能体引擎包
 ├── trace.py                      # 执行轨迹 + 性能监控 + 意图漂移检测
 └── checkpoint.py                 # 断点续跑 + 错误恢复
 
+app/services/evolution/           # Agent 自进化闭环
+├── metrics.py                    # 确定性指标（工具错误率/重试/重复调用/HITL/预算）
+├── judge.py                      # LLM 六维裁判评估
+├── evolution_advisor.py          # 进化报告 + 配置变更/回滚 + 验证
+└── dev_briefing.py               # 开发迭代简报（纯客观数据汇总 → Markdown）
+
+app/observability/                # 可观测
+├── langfuse_tracing.py           # Langfuse Trace 构建/上报/Trace URL
+└── otel_tracing.py               # OpenTelemetry 导出
+
 app/services/inference/           # 推理层管理
 ├── model_manager.py              # 模型连接池 + 健康检查 + 热重载
 └── queue.py                      # 请求排队 + 并发控制 + 背压机制
@@ -148,68 +228,48 @@ app/services/inference/           # 推理层管理
 | 9 | 记忆持久化与结构化 | `memory_manager.py` — SQLite + fact/rule/skill 分类 |
 | 10 | 执行轨迹可追溯 | `trace.py` — 每步记录 + 性能统计 |
 
-### 新增 API 端点
-
-| 端点 | 方法 | 说明 |
-|---|---|---|
-| `/agents/memories` | GET/POST/DELETE | 结构化记忆管理（支持 memory_type 过滤） |
-| `/agents/monitor/performance` | GET | Agent 引擎性能统计 |
-| `/agents/monitor/inference` | GET | 推理队列 + 模型连接池状态 |
-| `/agents/monitor/reload` | POST | 热重载（清空连接池和工具缓存） |
-
-### 配置项
-
-详见 `.env.example`，新增配置分区：
-- **Agent 执行引擎** — 迭代上限、重试次数、工具超时、温度
-- **推理层** — 上下文窗口、KV Cache、并发限制
-- **上下文管理** — 滑动窗口轮数、摘要阈值、任务置顶
-- **记忆系统** — 短期/长期容量、冲突策略、自动蒸馏
-- **幻觉抑制** — 事实校验、来源引用、不确定性表达
-- **监控日志** — 轨迹记录、慢请求阈值
-- **稳定性** — 热重载、会话隔离、确定性模式、断点续跑
-
 ---
 
 ## 项目结构
 
 ```
-AI-GeneralPlat/
+general-agent-platform/
 ├── backend/                       # FastAPI 后端
 │   ├── app/
-│   │   ├── api/v1/               # API 路由
-│   │   ├── core/                 # 配置、数据库、安全、日志
-│   │   │   ├── config.py         # 全量配置（含 Agent/推理/记忆/监控）
-│   │   │   └── logging.py        # 结构化日志系统
-│   │   ├── models/               # SQLAlchemy 模型
-│   │   ├── schemas/              # Pydantic 模式
-│   │   └── services/             # 业务逻辑
-│   │       ├── agent/            # v2 Agent 智能体引擎包
-│   │       ├── inference/        # 推理层管理（连接池 + 队列）
-│   │       ├── tools/            # 工具注册表与执行器
-│   │       ├── model_service.py  # LLM 交互层
-│   │       ├── workflow_service.py
-│   │       └── ...
-│   ├── data/                     # 运行时数据
-│   │   ├── logs/                 # 结构化日志
-│   │   ├── memory/               # 记忆数据库
-│   │   └── checkpoints/          # 断点续跑
-│   ├── alembic/                  # 数据库迁移
-│   ├── .env                      # 环境变量（本地）
+│   │   ├── api/                   # API 路由（v1 + v2）
+│   │   ├── core/                  # 配置、数据库、安全、日志
+│   │   ├── models/                # SQLAlchemy 模型
+│   │   ├── schemas/               # Pydantic 模式
+│   │   ├── services/              # 业务逻辑
+│   │   │   ├── agent/             # Agent 智能体引擎包
+│   │   │   ├── evolution/         # 自进化闭环（指标/评估/报告/简报）
+│   │   │   ├── inference/         # 推理层管理（连接池 + 队列）
+│   │   │   └── tools/             # 工具注册表与执行器
+│   │   └── observability/         # Langfuse / OTel 可观测
+│   ├── alembic/                   # 数据库迁移
+│   ├── tests/                     # pytest 测试套件
 │   └── requirements.txt
-├── frontend/                     # Vue 3 前端
-│   ├── src/
-│   │   ├── api/                  # API 封装
-│   │   ├── layouts/              # 布局组件
-│   │   ├── router/               # 路由配置
-│   │   ├── stores/               # Pinia 状态
-│   │   ├── types/                # TypeScript 类型
-│   │   └── views/                # 页面组件
-│   └── vite.config.ts
+├── frontend/                      # Vue 3 前端
+│   └── src/
+│       ├── api/                   # API 封装
+│       ├── layouts/               # 布局组件
+│       ├── router/                # 路由配置
+│       ├── stores/                # Pinia 状态
+│       └── views/                 # 页面组件
 ├── docker/
-│   ├── backend-entrypoint.sh     # 迁移 + 多 Worker 启动入口
+│   ├── backend-entrypoint.sh      # 迁移 + 多 Worker 启动入口
 │   ├── backend.Dockerfile
 │   ├── frontend.Dockerfile
-│   ├── docker-compose.yml        # MySQL + Redis + checkpoint_pg + 后端 + 前端
-│   └── mysql/init.sql
-└── log/                          # 运行日志（不入库）
+│   ├── docker-compose.yml         # MySQL + Redis + checkpoint_pg + 后端 + 前端
+│   └── grafana/                   # Grafana 仪表盘
+├── docs/                          # 设计文档 / 任务书 / 交付说明 / 截图
+├── AGENTS.md                      # AI 编码代理协作指南
+└── log/                           # 运行日志（不入库）
 ```
+
+---
+
+## 相关文档
+
+- [AGENTS.md](AGENTS.md) — AI 编码代理协作指南（架构约定、常用命令、已知陷阱）
+- [docs/](docs/) — 需求与设计文档、各阶段交付说明、Agent Runtime 架构文档

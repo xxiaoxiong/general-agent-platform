@@ -4,7 +4,7 @@
     <el-aside :width="isCollapsed ? '64px' : '220px'" class="sidebar">
       <div class="logo" :class="{ collapsed: isCollapsed }">
         <el-icon size="24" color="#409eff"><Cpu /></el-icon>
-        <span v-if="!isCollapsed" class="logo-text">AI 通用能力大平台</span>
+        <span v-if="!isCollapsed" class="logo-text">General Agent Platform</span>
       </div>
       <el-menu
         :default-active="activeMenu"

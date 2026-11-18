@@ -14,7 +14,7 @@ _INSECURE_ADMIN_PASSWORDS = frozenset({
 
 
 class Settings(BaseSettings):
-    APP_NAME: str = "AI-GeneralPlat"
+    APP_NAME: str = "General Agent Platform"
     APP_VERSION: str = "2.0.0"
     APP_ENV: str = "development"            # development | staging | production
     DEBUG: bool = False
@@ -163,7 +163,7 @@ class Settings(BaseSettings):
     EVOLUTION_VALIDATION_MIN_RUNS: int = 5      # 变更验证所需的新评估样本数
     OTEL_ENABLED: bool = False                  # OpenTelemetry 导出（P1-02）
     OTEL_EXPORTER_OTLP_ENDPOINT: str = ""       # 如 http://localhost:4317
-    OTEL_SERVICE_NAME: str = "ai-generalplat"
+    OTEL_SERVICE_NAME: str = "general-agent-platform"
 
     @property
     def cors_origins_list(self) -> List[str]:

@@ -1,10 +1,10 @@
-# Provision Langfuse org/project/API keys on local Langfuse (localhost:3100)
-# for the AI-GeneralPlat backend. Usage: powershell -File provision_langfuse_keys.ps1
+﻿# Provision Langfuse org/project/API keys on local Langfuse (localhost:3100)
+# for the General Agent Platform backend. Usage: powershell -File provision_langfuse_keys.ps1
 param(
     [string]$BaseUrl = "http://localhost:3100",
-    [string]$Email = "admin@ai-generalplat.local",
+    [string]$Email = "admin@general-agent-platform.local",
     [string]$Password = "AgPlat-Langfuse-2026!",
-    [string]$ProjectName = "AI-GeneralPlat"
+    [string]$ProjectName = "general-agent-platform"
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,7 +42,7 @@ $projectId = $project.id
 Write-Host ("project: " + $projectId)
 
 # 5) API keys (secret shown only once, at creation)
-$key = Invoke-Trpc -Proc "projectApiKeys.create" -Json ('{"projectId":"' + $projectId + '","note":"ai-generalplat backend"}')
+$key = Invoke-Trpc -Proc "projectApiKeys.create" -Json ('{"projectId":"' + $projectId + '","note":"general-agent-platform backend"}')
 Write-Host ("PUBLIC_KEY=" + $key.publicKey)
 Write-Host ("SECRET_KEY=" + $key.secretKey)
 Write-Host "PROVISION_DONE"

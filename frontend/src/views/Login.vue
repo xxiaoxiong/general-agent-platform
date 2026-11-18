@@ -3,7 +3,7 @@
     <div class="login-card">
       <div class="login-header">
         <el-icon size="40" color="#409eff"><Cpu /></el-icon>
-        <h1>AI 通用能力大平台平台</h1>
+        <h1>General Agent Platform</h1>
         <p>企业级 AI 能力统一管控与落地平台</p>
       </div>
       <el-form :model="form" :rules="rules" ref="formRef" @submit.prevent="handleLogin">

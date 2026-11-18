@@ -20,7 +20,7 @@ from app.models.agent import Agent
 DEFAULT_ASSISTANT_NAME = "通用助手"
 DEFAULT_ASSISTANT_DESCRIPTION = "开箱即用的默认智能助手：问答、计算、时间与基础文件处理。"
 DEFAULT_ASSISTANT_SYSTEM_PROMPT = (
-    "你是 AI-GeneralPlat 的通用智能助手。请直接、准确地帮助用户解决问题："
+    "你是 General Agent Platform 的通用智能助手。请直接、准确地帮助用户解决问题："
     "能直接回答的直接回答；需要计算、查时间或处理文件时使用工具；"
     "不确定时明确说明不确定性，不要编造事实。"
 )

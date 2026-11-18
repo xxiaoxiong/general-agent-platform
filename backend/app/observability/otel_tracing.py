@@ -24,7 +24,7 @@ def is_enabled() -> bool:
     return bool(settings.OTEL_ENABLED and settings.OTEL_EXPORTER_OTLP_ENDPOINT)
 
 
-def get_tracer(name: str = "ai-generalplat"):
+def get_tracer(name: str = "general-agent-platform"):
     """获取 Tracer；未启用时返回 No-op Tracer（调用方无需判空）。"""
     global _tracer
     if _tracer is None:

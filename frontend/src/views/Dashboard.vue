@@ -4,7 +4,7 @@
     <div class="welcome-banner">
       <div class="banner-left">
         <h2>欢迎回来，{{ authStore.user?.full_name || authStore.user?.username }} 👋</h2>
-        <p>{{ currentDate }} · AI 通用能力大平台平台</p>
+        <p>{{ currentDate }} · General Agent Platform</p>
       </div>
       <div class="banner-right">
         <el-button type="primary" class="banner-btn" @click="router.push('/workspace')">

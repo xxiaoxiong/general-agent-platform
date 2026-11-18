@@ -1,4 +1,4 @@
-name: ai-generalplat
+name: general-agent-platform
 
 # P0-04 部署安全：所有凭据经环境变量 / Secret 注入，文件内不保留默认密码。
 # 启动前先准备 .env（参考 docker/.env.example），缺失必填变量时 compose 直接报错。
@@ -129,10 +129,15 @@ services:
       - backend
 
 volumes:
+  # 显式固定卷名：沿用项目改名前（ai-generalplat）已有的卷，避免重建容器时数据丢失
   mysql_data:
+    name: ai-generalplat_mysql_data
   redis_data:
+    name: ai-generalplat_redis_data
   app_data:
+    name: ai-generalplat_app_data
   checkpoint_pg_data:
+    name: ai-generalplat_checkpoint_pg_data
 
 networks:
   # 已部署的 Langfuse 栈（langfuse-deploy 项目）所在网络，用于 Trace 上报与评分回写

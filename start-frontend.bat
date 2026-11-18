@@ -1,8 +1,8 @@
 @echo off
-title AI Platform - Frontend
+title General Agent Platform - Frontend
 
 echo ============================================
-echo   AI-GeneralPlat Frontend Startup
+echo   General Agent Platform Frontend Startup
 echo ============================================
 echo.
 

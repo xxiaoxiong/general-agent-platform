@@ -29,7 +29,7 @@ logger = get_logger("main")
 async def lifespan(app: FastAPI):
     # ── 初始化日志系统 ──
     setup_logging()
-    logger.info("启动 AI-GeneralPlat v2.0 Agent 平台")
+    logger.info("启动 General Agent Platform v2.0")
 
     # ── 启动期配置校验（P0-01）：非法配置直接拒绝启动 ──
     settings.validate_startup()
