@@ -1,7 +1,7 @@
-{
-  "title": "AI-GeneralPlat Agent Runtime",
-  "uid": "ai-generalplat-runtime",
-  "tags": ["ai-generalplat", "agent"],
+﻿{
+  "title": "General Agent Platform Agent Runtime",
+  "uid": "general-agent-platform-runtime",
+  "tags": ["general-agent-platform", "agent"],
   "timezone": "browser",
   "schemaVersion": 39,
   "refresh": "30s",
