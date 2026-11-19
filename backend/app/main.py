@@ -11,6 +11,7 @@ from app.core.config import settings
 from app.core.database import init_db
 from app.core.redis import init_redis, close_redis
 from app.core.logging import setup_logging, get_logger
+from app.api.v1 import asr
 from app.api.v1 import auth, users, models, knowledge, workflows, app_market, audit, prompts, agents, databases
 from app.api.v2 import admin as v2_admin
 from app.api.v2 import artifacts as v2_artifacts
@@ -236,6 +237,7 @@ app.include_router(audit.router, prefix=API_PREFIX)
 app.include_router(prompts.router, prefix=API_PREFIX)
 app.include_router(agents.router, prefix=API_PREFIX)
 app.include_router(databases.router, prefix=API_PREFIX)
+app.include_router(asr.router, prefix=API_PREFIX)
 
 # API v2（产品工作台契约，任务书 §7）：迁移期与 v1 并存
 API_V2_PREFIX = "/api/v2"

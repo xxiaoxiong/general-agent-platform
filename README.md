@@ -132,7 +132,7 @@ npm run dev
 
 前端默认在 http://localhost:5173 启动（端口被占用会自动递增）。
 
-> **注意**：`vite.config.ts` 中的代理目标需与后端端口一致，默认配置为 `http://127.0.0.1:8002`。
+> **注意**：`vite.config.mts` 中的代理目标需与后端端口一致，默认配置为 `http://127.0.0.1:8002`。
 
 ### 默认账号
 - 用户名：`admin`
@@ -153,8 +153,8 @@ cd frontend && npm run build
 ## Docker Compose 一键部署
 
 ```bash
-# 启动所有服务（MySQL + Redis + PostgreSQL Checkpointer + 后端 + 前端）
-docker compose -f docker/docker-compose.yml up -d
+# 构建并启动平台、数据库、Checkpointer 和语音转写服务
+docker compose -f docker/docker-compose.yml up -d --build
 
 # 查看日志
 docker compose -f docker/docker-compose.yml logs -f backend
@@ -273,3 +273,5 @@ general-agent-platform/
 
 - [AGENTS.md](AGENTS.md) — AI 编码代理协作指南（架构约定、常用命令、已知陷阱）
 - [docs/](docs/) — 需求与设计文档、各阶段交付说明、Agent Runtime 架构文档
+- [UI/UX 改造交付](docs/ui-ux-delivery.md) — 页面覆盖、工程验收和实机对比截图。
+- [智能体语音听写](docs/asr-dictation-delivery.md) — 本地 ASR 启停、配置与实测结果。

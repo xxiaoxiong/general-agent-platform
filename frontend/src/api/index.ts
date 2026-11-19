@@ -1,4 +1,5 @@
 import request from '@/utils/request'
+import type { AxiosProgressEvent } from 'axios'
 import type {
   User, ModelProvider, ModelConfig, KnowledgeBase, KnowledgeDocument,
   Workflow, WorkflowExecution, AppTemplate, AppInstance, AuditLog, PageResponse, ChatMessage
@@ -38,7 +39,18 @@ export const modelApi = {
   listConfigs: (params?: any) => request.get<any, ModelConfig[]>('/models/configs', { params }),
   createConfig: (data: any) => request.post<any, ModelConfig>('/models/configs', data),
   updateConfig: (id: number, data: any) => request.put<any, ModelConfig>(`/models/configs/${id}`, data),
+  testConfig: (id: number) => request.post<any, ModelProbeReport | { detail: { report?: ModelProbeReport } }>(
+    `/models/configs/${id}/test`, undefined, { validateStatus: status => status === 200 || status === 422 },
+  ),
   deleteConfig: (id: number) => request.delete(`/models/configs/${id}`),
+}
+
+export interface ModelProbeReport {
+  tool_calling: boolean
+  tool_calling_latency_ms: number | null
+  streaming: boolean
+  streaming_latency_ms: number | null
+  passed: boolean
 }
 
 // ─── Knowledge ────────────────────────────────────────────────────────────────
@@ -51,11 +63,12 @@ export const knowledgeApi = {
 
   listDocuments: (kbId: number, params?: any) =>
     request.get<any, PageResponse<KnowledgeDocument>>(`/knowledge/bases/${kbId}/documents`, { params }),
-  uploadDocument: (kbId: number, file: File) => {
+  uploadDocument: (kbId: number, file: File, onUploadProgress?: (event: AxiosProgressEvent) => void) => {
     const form = new FormData()
     form.append('file', file)
     return request.post<any, KnowledgeDocument>(`/knowledge/bases/${kbId}/documents`, form, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress,
     })
   },
   deleteDocument: (kbId: number, docId: number) =>

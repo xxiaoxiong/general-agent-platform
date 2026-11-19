@@ -9,14 +9,17 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
 
 from app.api.deps import get_current_user
 from app.core.database import get_db
-from app.models.agent import Agent, AgentSession, session_message_count_expr
+from app.models.agent import Agent, AgentRun, AgentSession, session_message_count_expr
+from app.models.evolution import AgentEvaluation
 from app.models.user import User
+from app.services.agent_runtime.lifecycle import TERMINAL_STATUSES
+from app.services.agent_runtime.repositories.run_repository import _sql_now
 
 from .schemas import ConversationCreate
 from .serializers import conversation_to_dict
@@ -116,7 +119,51 @@ async def delete_conversation(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    session = await _get_owned_session(db, session_id, current_user)
-    await db.delete(session)
+    # 锁住会话行，防止同一会话在拆除历史引用时被新的 Run 领取。
+    session = (await db.execute(
+        select(
+            AgentSession.id,
+            AgentSession.active_run_id,
+            (AgentSession.active_run_lease_expires_at > _sql_now(db)).label("has_live_lease"),
+        )
+        .where(AgentSession.id == session_id, AgentSession.user_id == current_user.id)
+        .with_for_update()
+    )).one_or_none()
+    if session is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    # 没有执行权的旧 Run 仍可能在排队、等待审批或等待恢复。
+    busy = await db.scalar(
+        select(AgentRun.id)
+        .where(
+            AgentRun.session_id == session_id,
+            or_(AgentRun.status.is_(None), AgentRun.status.not_in(TERMINAL_STATUSES)),
+        )
+        .limit(1)
+    )
+    if not busy and session.active_run_id and session.has_live_lease:
+        # MySQL 快照可能尚未看到刚领取会话的 Run，租约可保护这段窗口。
+        # 已进入终态的 Run 可以解除关联，即使历史数据残留了租约。
+        claimed_status = await db.scalar(
+            select(AgentRun.status).where(
+                AgentRun.id == session.active_run_id, AgentRun.session_id == session_id,
+            )
+        )
+        busy = claimed_status not in TERMINAL_STATUSES
+    if busy:
+        raise HTTPException(status_code=409, detail="会话仍有未完成的任务，请取消或等待任务结束后再删除")
+
+    # Run、事件、Trace 和评测仍可按 Run 查询。仅解除已删除会话的可空外键引用。
+    await db.execute(
+        update(AgentEvaluation)
+        .where(AgentEvaluation.session_id == session_id)
+        .values(session_id=None, updated_at=AgentEvaluation.updated_at)
+    )
+    await db.execute(
+        update(AgentRun)
+        .where(AgentRun.session_id == session_id, AgentRun.status.in_(TERMINAL_STATUSES))
+        .values(session_id=None, updated_at=AgentRun.updated_at)
+    )
+    await db.execute(delete(AgentSession).where(AgentSession.id == session_id))
     await db.commit()
     return {"message": "已删除"}

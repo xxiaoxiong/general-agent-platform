@@ -1,0 +1,89 @@
+/* 过渡期适配。Element Plus 保留复杂交互，基础视觉来自平台主题。 */
+:root,
+html.dark {
+  --el-color-primary: var(--ui-accent);
+  --el-color-primary-light-3: color-mix(in srgb, var(--ui-accent), var(--ui-surface) 28%);
+  --el-color-primary-light-5: color-mix(in srgb, var(--ui-accent), var(--ui-surface) 48%);
+  --el-color-primary-light-7: color-mix(in srgb, var(--ui-accent), var(--ui-surface) 68%);
+  --el-color-primary-light-8: color-mix(in srgb, var(--ui-accent), var(--ui-surface) 78%);
+  --el-color-primary-light-9: var(--ui-accent-soft);
+  --el-color-primary-dark-2: var(--ui-accent-hover);
+  --el-color-success: var(--ui-success);
+  --el-color-success-light-9: var(--ui-success-soft);
+  --el-color-warning: var(--ui-warning);
+  --el-color-warning-light-9: var(--ui-warning-soft);
+  --el-color-danger: var(--ui-danger);
+  --el-color-danger-light-9: var(--ui-danger-soft);
+  --el-color-error: var(--ui-danger);
+  --el-color-info: var(--ui-muted);
+  --el-color-info-light-9: var(--ui-subtle);
+  --el-border-radius-base: var(--ui-radius-md);
+  --el-border-radius-small: var(--ui-radius-sm);
+  --el-border-color: var(--ui-border-strong);
+  --el-border-color-light: var(--ui-border);
+  --el-border-color-lighter: var(--ui-border);
+  --el-fill-color-light: var(--ui-subtle);
+  --el-fill-color-lighter: var(--ui-bg);
+  --el-fill-color-blank: var(--ui-surface);
+  --el-bg-color: var(--ui-surface);
+  --el-bg-color-page: var(--ui-bg);
+  --el-bg-color-overlay: var(--ui-surface);
+  --el-text-color-primary: var(--ui-text);
+  --el-text-color-regular: var(--ui-secondary);
+  --el-text-color-secondary: var(--ui-muted);
+  --el-text-color-placeholder: var(--ui-muted);
+  --el-box-shadow-light: var(--ui-shadow-md);
+  --el-overlay-color-lighter: var(--ui-overlay);
+  --el-font-family: var(--ui-font);
+  --el-transition-duration: var(--ui-duration-slow);
+  --el-transition-duration-fast: var(--ui-duration);
+}
+
+.el-button--primary:not(.is-plain, .is-link, .is-text) {
+  --el-button-text-color: var(--ui-on-accent);
+  --el-button-hover-text-color: var(--ui-on-accent);
+  --el-button-active-text-color: var(--ui-on-accent);
+  --el-button-hover-bg-color: var(--ui-accent-hover);
+  --el-button-hover-border-color: var(--ui-accent-hover);
+}
+
+.el-card {
+  --el-card-border-color: var(--ui-border);
+  --el-card-border-radius: var(--ui-radius-lg);
+  --el-card-padding: var(--ui-space-5);
+}
+
+.el-table {
+  --el-table-header-bg-color: var(--ui-subtle);
+  --el-table-border-color: var(--ui-border);
+  --el-table-row-hover-bg-color: var(--ui-subtle);
+  --el-table-header-text-color: var(--ui-secondary);
+  --el-table-text-color: var(--ui-text);
+  --el-table-bg-color: var(--ui-surface);
+  --el-table-tr-bg-color: var(--ui-surface);
+  border: var(--ui-line);
+  border-radius: var(--ui-radius-lg);
+  width: 100%;
+  max-width: 100%;
+}
+
+.el-table th.el-table__cell { font-weight: var(--ui-weight-semibold); }
+.el-table:not(.el-table--border)::before,
+.el-table:not(.el-table--border) .el-table__inner-wrapper::before { display: none; }
+.data-surface > .el-table { border: 0; border-radius: 0; }
+
+.el-dialog {
+  --el-dialog-border-radius: var(--ui-radius-dialog);
+  --el-dialog-padding-primary: var(--ui-space-6);
+  --el-dialog-box-shadow: var(--ui-shadow-md);
+  max-width: calc(100% - 24px);
+  border: var(--ui-line);
+}
+.el-dialog__title, .el-drawer__title { font-weight: var(--ui-weight-semibold); }
+.el-dialog__header { margin-bottom: var(--ui-space-4); }
+.el-dialog__footer { margin-top: var(--ui-space-4); }
+.el-message-box { max-width: calc(100% - 24px); border-radius: var(--ui-radius-lg); }
+.el-drawer { max-width: calc(100% - 16px); }
+.el-pagination { flex-wrap: wrap; row-gap: var(--ui-space-2); }
+.el-form--inline .el-form-item { max-width: 100%; }
+.el-tabs__nav-wrap::after { height: 1px; }

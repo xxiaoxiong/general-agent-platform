@@ -1,0 +1,110 @@
+/* 全站设计刻度。组件使用语义名称，主题只替换颜色和阴影映射。 */
+:root {
+  color-scheme: light;
+  --ui-bg: #fbfbfc;
+  --ui-surface: #fff;
+  --ui-subtle: #f5f5f8;
+  --ui-hover: #eeeef3;
+  --ui-border: #e6e6ed;
+  --ui-border-strong: #d4d4e0;
+  --ui-text: #222231;
+  --ui-secondary: #535367;
+  --ui-muted: #68687b;
+  --ui-accent: #5451a6;
+  --ui-accent-hover: #464391;
+  --ui-accent-soft: #eeedf9;
+  --ui-on-accent: #fff;
+  --ui-success: #23694e;
+  --ui-success-soft: #e8f5ee;
+  --ui-warning: #85530b;
+  --ui-warning-soft: #fdf1d9;
+  --ui-danger: #a23845;
+  --ui-danger-soft: #fcecef;
+  --ui-info: #315f94;
+  --ui-info-soft: #eaf2fc;
+  --ui-code-bg: #222233;
+  --ui-code-text: #efeff8;
+  --ui-overlay: #16152761;
+  --ui-shadow-sm: 0 1px 2px #1e1b3a0d;
+  --ui-shadow-md: 0 12px 34px #1e1b3a18, 0 3px 8px #1e1b3a0a;
+  --ui-font: "Segoe UI", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+  --ui-font-mono: ui-monospace, "Cascadia Code", Consolas, "Microsoft YaHei", monospace;
+  --ui-size-xs: .75rem;
+  --ui-size-sm: .8125rem;
+  --ui-size-base: .875rem;
+  --ui-size-body: 1rem;
+  --ui-size-lg: 1.125rem;
+  --ui-size-xl: 1.5rem;
+  --ui-size-title: clamp(1.5rem, 1.25rem + .65vw, 2rem);
+  --ui-weight-medium: 500;
+  --ui-weight-semibold: 600;
+  --ui-weight-bold: 700;
+  --ui-leading-tight: 1.25;
+  --ui-leading: 1.55;
+  --ui-tracking-tight: -.025em;
+  --ui-space-1: .25rem;
+  --ui-space-2: .5rem;
+  --ui-space-3: .75rem;
+  --ui-space-4: 1rem;
+  --ui-space-5: 1.25rem;
+  --ui-space-6: 1.5rem;
+  --ui-space-8: 2rem;
+  --ui-space-10: 2.5rem;
+  --ui-radius-sm: 5px;
+  --ui-radius-md: 8px;
+  --ui-radius-lg: 12px;
+  --ui-radius-dialog: 16px;
+  --ui-line: 1px solid var(--ui-border);
+  --ui-line-strong: 1px solid var(--ui-border-strong);
+  --ui-focus: 2px solid var(--ui-accent);
+  --ui-duration: 145ms;
+  --ui-duration-slow: 220ms;
+  --ui-ease: cubic-bezier(.2, .75, .25, 1);
+  --ui-z-header: 10;
+  --ui-z-navigation: 24;
+  --ui-z-popover: 2010;
+  --ui-z-dialog: 2100;
+  --ui-z-toast: 2200;
+  --ui-sidebar-width: 228px;
+  --ui-sidebar-rail: 60px;
+  --ui-header-height: 52px;
+  --ui-content-max: 1456px;
+  --ui-page-pad: clamp(16px, 3.1vw, 48px);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --ui-bg: #1a1a23;
+  --ui-surface: #20202a;
+  --ui-subtle: #262632;
+  --ui-hover: #30303d;
+  --ui-border: #373745;
+  --ui-border-strong: #505063;
+  --ui-text: #efeff7;
+  --ui-secondary: #c1c1d1;
+  --ui-muted: #a5a5bb;
+  --ui-accent: #c0bcff;
+  --ui-accent-hover: #d3d0ff;
+  --ui-accent-soft: #343152;
+  --ui-on-accent: #252148;
+  --ui-success: #8ad4ac;
+  --ui-success-soft: #1e4036;
+  --ui-warning: #f2c271;
+  --ui-warning-soft: #453620;
+  --ui-danger: #f0a0aa;
+  --ui-danger-soft: #472a36;
+  --ui-info: #99c2f0;
+  --ui-info-soft: #26374f;
+  --ui-code-bg: #171720;
+  --ui-code-text: #e8e8f4;
+  --ui-overlay: #0f0e18a8;
+  --ui-shadow-sm: 0 1px 2px #0003;
+  --ui-shadow-md: 0 12px 34px #0006, 0 3px 8px #0003;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --ui-duration: 0ms;
+    --ui-duration-slow: 0ms;
+  }
+}

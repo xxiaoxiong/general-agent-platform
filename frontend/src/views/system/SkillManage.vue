@@ -1,21 +1,19 @@
 <template>
   <div class="page-container">
-    <div class="page-header">
-      <div>
-        <h2>技能管理</h2>
-        <p class="page-desc">
-          技能 = 可复用指令（SKILL.md）+ 附属文件（scripts/、references/ 等，标准 Skill 多文件形态），
+    <PageHeader title="技能管理" description="维护可复用指令，按需注入一个或多个 Agent。">
+      <template #actions><UiButton variant="primary" @click="openCreate"><Plus />新建技能</UiButton></template>
+    </PageHeader>
+    <details class="extension-help">
+      <summary>技能注入说明</summary>
+      <p>技能 = 可复用指令（SKILL.md）+ 附属文件（scripts/、references/ 等，标准 Skill 多文件形态），
           按 Agent 绑定注入 <code>/skills/**</code> 供模型按需加载；
           技能只做文件注入，不携带任何工具授权（工具面由能力包与安全策略决定）；
-          附属脚本的执行需要沙箱（execute 能力），无执行能力时脚本可被读取作参考。
-        </p>
-      </div>
-      <el-button type="primary" @click="openCreate">
-        <el-icon><Plus /></el-icon>新建技能
-      </el-button>
-    </div>
+          附属脚本的执行需要沙箱（execute 能力），无执行能力时脚本可被读取作参考。</p>
+    </details>
 
-    <el-table :data="skills" v-loading="loading" border stripe>
+    <div class="data-surface">
+      <ErrorState v-if="loadError" title="无法加载技能列表" @retry="load" />
+    <el-table v-else :data="skills" v-loading="loading" empty-text="暂无技能">
       <el-table-column prop="name" label="名称" min-width="140" show-overflow-tooltip>
         <template #default="{ row }">
           <span class="mono">{{ row.name }}</span>
@@ -47,19 +45,20 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="220" fixed="right">
+      <el-table-column label="操作" width="220">
         <template #default="{ row }">
           <template v-if="row.managed">
-            <el-button size="small" @click="openEdit(row)">编辑</el-button>
+            <el-button size="small" link @click="openEdit(row)">编辑</el-button>
             <el-button size="small" :type="row.enabled ? 'warning' : 'success'" @click="handleToggle(row)">
               {{ row.enabled ? '停用' : '启用' }}
             </el-button>
-            <el-button size="small" type="danger" @click="handleDelete(row)">删除</el-button>
+            <el-button size="small" link type="danger" @click="handleDelete(row)">删除</el-button>
           </template>
           <el-text v-else type="info" size="small">内置/目录技能只读</el-text>
         </template>
       </el-table-column>
     </el-table>
+    </div>
 
     <!-- 新建/编辑对话框 -->
     <el-dialog v-model="dialogVisible" :title="editingId ? '编辑技能' : '新建技能'" width="720px" destroy-on-close>
@@ -133,12 +132,16 @@
 </template>
 
 <script setup lang="ts">
+import PageHeader from '@/components/layout/PageHeader.vue'
+import UiButton from '@/components/ui/UiButton.vue'
+import ErrorState from '@/components/ui/ErrorState.vue'
 import { onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus } from '@element-plus/icons-vue'
+import { Plus } from '@lucide/vue'
 import { agentOptionApi, skillApi, type AgentOption, type SkillItem } from '@/api/extensions'
 
-const loading = ref(false)
+const loading = ref(true)
+const loadError = ref(false)
 const saving = ref(false)
 const skills = ref<SkillItem[]>([])
 const agentOptions = ref<AgentOption[]>([])
@@ -157,8 +160,11 @@ const MAX_FILE_COUNT = 50
 
 async function load() {
   loading.value = true
+  loadError.value = false
   try {
     skills.value = (await skillApi.list()).items
+  } catch {
+    loadError.value = true
   } finally {
     loading.value = false
   }
@@ -257,28 +263,9 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.page-container {
-  padding: 20px;
-}
-.page-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  margin-bottom: 16px;
-}
-.page-header h2 {
-  margin: 0 0 4px;
-  font-size: 20px;
-}
-.page-desc {
-  margin: 0;
-  color: #6b7280;
-  font-size: 13px;
-  max-width: 720px;
-}
-.mono {
-  font-family: monospace;
-}
+.extension-help { width: fit-content; max-width: 760px; margin-bottom: var(--ui-space-4); color: var(--ui-muted); }
+.extension-help summary { cursor: pointer; color: var(--ui-secondary); }
+.extension-help p { padding: var(--ui-space-2) 0; }
 .ml-6 {
   margin-left: 6px;
 }
@@ -290,7 +277,7 @@ onMounted(async () => {
   width: 100%;
 }
 .file-row {
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--ui-border);
   border-radius: 6px;
   padding: 8px;
   margin-bottom: 8px;
@@ -300,7 +287,7 @@ onMounted(async () => {
 }
 .file-hint {
   margin-top: 6px;
-  color: #9ca3af;
+  color: var(--ui-muted);
   font-size: 12px;
   line-height: 1.6;
 }

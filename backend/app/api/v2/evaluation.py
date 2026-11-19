@@ -397,7 +397,8 @@ async def create_run(body: RunCreateRequest, background: BackgroundTasks,
         )
     except ValueError as e:
         raise HTTPException(422, str(e))
-    # 后台执行（与请求生命周期解耦）
+    # 后台任务使用自己的数据库会话，先提交任务和用例快照。
+    await db.commit()
     background.add_task(start_eval_run_background, eval_run.id)
     return _run_dict(eval_run)
 

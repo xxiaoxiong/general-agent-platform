@@ -1,19 +1,21 @@
 <template>
-  <div class="evaluation-page">
-    <div class="page-header">
-      <h2>Agent 测评</h2>
-      <div class="header-actions">
-        <el-button type="primary" @click="openCreateRun">
-          <el-icon><Plus /></el-icon>新建测评
-        </el-button>
-        <el-button :loading="loading" @click="refreshAll">刷新</el-button>
-      </div>
-    </div>
+  <div class="page-container evaluation-page">
+    <PageHeader title="Agent 测评" description="管理评测任务和数据集，回查执行轨迹与版本表现。">
+      <template #actions>
+        <UiButton :loading="refreshing" @click="refreshAll"><RefreshCw />刷新</UiButton>
+        <UiButton variant="primary" @click="openCreateRun"><Plus />新建测评</UiButton>
+      </template>
+    </PageHeader>
 
-    <el-tabs v-model="tab" class="evaluation-tabs">
+    <el-alert v-if="sectionError && !refreshing" class="section-alert" title="部分数据加载失败" type="error" show-icon :closable="false">
+      <UiButton size="sm" @click="loadSection">重新加载当前分区</UiButton>
+    </el-alert>
+
+    <el-tabs v-model="tab" class="evaluation-tabs" aria-label="评测与运行视图">
       <!-- ── 测评任务 ── -->
       <el-tab-pane label="测评任务" name="runs">
-        <el-table :data="runs" v-loading="loading" size="small" stripe>
+        <div v-if="sectionLoading || loading || runs.length" class="data-surface">
+        <el-table :data="runs" v-loading="sectionLoading || loading" size="small" empty-text="暂无测评任务">
           <el-table-column prop="id" label="ID" width="60" />
           <el-table-column prop="name" label="任务名称" min-width="160" show-overflow-tooltip />
           <el-table-column label="数据集" width="170" show-overflow-tooltip>
@@ -60,9 +62,12 @@
             </template>
           </el-table-column>
         </el-table>
-        <el-empty v-if="!loading && !runs.length" description="还没有测评任务：用社区数据集一键创建，快速验证 Agent 能力">
-          <el-button type="primary" @click="openCreateRun">新建测评</el-button>
-        </el-empty>
+        </div>
+        <div v-else-if="!sectionError" class="data-surface">
+          <EmptyState :icon="ClipboardList" title="还没有测评任务" description="选择一个数据集和 Agent，创建任务以评估结果。">
+            <UiButton @click="tab = 'datasets'">查看数据集</UiButton>
+          </EmptyState>
+        </div>
       </el-tab-pane>
 
       <!-- ── 测评结果 ── -->
@@ -216,7 +221,7 @@
           <el-button type="success" :loading="loading" @click="seedCommunity">导入社区通用数据集</el-button>
           <span class="hint">社区数据集：GSM8K / BBH（多步推理）/ BFCL（函数调用·对抗）/ IFEval（指令遵循）/ 工具链·多轮·对抗鲁棒 + 长程任务（工程构建 / 长文档生成修改 / 复杂数学 / 深度研究），标注复杂度 L1-L4</span>
         </div>
-        <el-table :data="datasets" v-loading="loading" size="small" stripe>
+        <el-table :data="datasets" v-loading="sectionLoading || loading" empty-text="暂无数据集" size="small" stripe>
           <el-table-column prop="id" label="ID" width="60" />
           <el-table-column prop="name" label="名称" min-width="180" show-overflow-tooltip />
           <el-table-column label="来源" width="90">
@@ -243,8 +248,10 @@
       <!-- ── 运行评估（概览 + 评估记录） ── -->
       <el-tab-pane label="运行评估" name="overview">
         <div class="toolbar">
-          <el-input-number v-model="agentId" :min="1" placeholder="Agent ID" style="width:140px;" />
-          <el-button type="primary" :loading="loading" @click="loadOverview">查询</el-button>
+          <el-input-number v-model="agentId" :min="1" aria-label="Agent ID" placeholder="Agent ID" style="width:140px;" />
+          <label for="overview-window" class="hint">时间窗口（小时）</label>
+          <el-input-number id="overview-window" v-model="windowHours" :min="1" :max="2160" style="width:130px;" />
+          <el-button type="primary" :loading="sectionLoading" @click="filterOverview">查询</el-button>
           <el-button :loading="loading" @click="triggerEval">触发评估</el-button>
         </div>
         <div class="metric-cards" v-if="overview">
@@ -268,7 +275,7 @@
         </el-card>
         <el-card shadow="never" style="margin-top:12px;">
           <h4>评估记录（LLM 裁判）</h4>
-          <el-table :data="evaluations" v-loading="loading" size="small" stripe>
+          <el-table :data="evaluations" v-loading="sectionLoading || loading" empty-text="暂无运行评估记录" size="small" stripe>
             <el-table-column prop="run_id" label="Run" width="150" show-overflow-tooltip />
             <el-table-column prop="agent_version_id" label="版本ID" width="80" />
             <el-table-column label="成功" width="70">
@@ -295,7 +302,7 @@
           </el-table>
           <div style="margin-top:12px;text-align:right;" v-if="evalTotal > evalPageSize">
             <el-pagination v-model:current-page="evalPage" :page-size="evalPageSize" :total="evalTotal"
-              layout="total, prev, pager, next" @current-change="loadEvaluations" />
+              layout="total, prev, pager, next" @current-change="loadSection" />
           </div>
         </el-card>
       </el-tab-pane>
@@ -403,7 +410,7 @@
           <span class="hint">小时窗口</span>
           <el-button type="primary" :loading="loading" @click="generateReport">生成优化报告</el-button>
         </div>
-        <el-table :data="reports" v-loading="loading" size="small" stripe>
+        <el-table :data="reports" v-loading="sectionLoading || loading" empty-text="暂无优化报告" size="small" stripe>
           <el-table-column prop="id" label="ID" width="60" />
           <el-table-column prop="agent_id" label="Agent" width="70" />
           <el-table-column label="窗口" min-width="200">
@@ -428,7 +435,7 @@
 
         <el-card shadow="never" style="margin-top:12px;">
           <h4>变更审计</h4>
-          <el-table :data="changes" v-loading="loading" size="small" stripe>
+          <el-table :data="changes" v-loading="sectionLoading || loading" empty-text="暂无版本变更" size="small" stripe>
             <el-table-column prop="id" label="ID" width="60" />
             <el-table-column prop="change_type" label="类型" width="90" />
             <el-table-column prop="target" label="目标" width="130" show-overflow-tooltip />
@@ -500,7 +507,7 @@
     </el-dialog>
 
     <!-- 用例结果详情 -->
-    <el-dialog v-model="itemVisible" title="用例结果详情" width="820px" top="5vh">
+    <el-drawer v-model="itemVisible" title="用例结果详情" size="min(870px, 100vw)">
       <el-descriptions v-if="currentItem" :column="2" border size="small">
         <el-descriptions-item label="状态">{{ itemStatusText(currentItem.status) }}</el-descriptions-item>
         <el-descriptions-item label="得分">{{ currentItem.score ?? '-' }}</el-descriptions-item>
@@ -595,29 +602,43 @@
           <h4>错误</h4>
           <pre class="block error">{{ currentItem.error }}</pre>
         </template>
-        <div class="toolbar" style="margin-top:12px;">
-          <el-button size="small" :loading="traceLoading" @click="loadTrace">查看执行轨迹（事件时间线）</el-button>
-          <span class="hint">来源：AgentRunEvent / AgentToolExecution 事实表</span>
-        </div>
-        <template v-if="itemTrace">
-          <div v-for="rt in itemTrace.runs" :key="rt.run_id" class="trace-block">
-            <h4>Run {{ rt.run_id }}</h4>
-            <el-table v-if="rt.events.length" :data="rt.events" size="small" stripe max-height="240">
-              <el-table-column prop="sequence" label="#" width="56" />
-              <el-table-column prop="event_type" label="事件" width="150" show-overflow-tooltip />
-              <el-table-column label="载荷（摘录）" min-width="240">
-                <template #default="{ row }">{{ row.payload || '-' }}</template>
-              </el-table-column>
-              <el-table-column label="时间" width="150">
-                <template #default="{ row }">{{ formatDate(row.created_at) }}</template>
-              </el-table-column>
-            </el-table>
-            <div v-else class="hint">无事件记录</div>
+        <section class="trace-section" aria-label="执行轨迹">
+          <div class="toolbar trace-heading">
+            <h4>执行轨迹</h4>
+            <UiButton size="sm" :loading="traceLoading" @click="loadTrace">{{ itemTrace ? '刷新轨迹' : '加载轨迹' }}</UiButton>
           </div>
-          <div v-if="!itemTrace.runs.length" class="hint">无轨迹数据</div>
-        </template>
+          <p v-if="traceError" class="hint" role="alert">轨迹加载失败，请重试。</p>
+          <template v-if="itemTrace">
+            <div v-for="rt in itemTrace.runs" :key="rt.run_id" class="trace-block">
+              <header class="trace-run-meta"><code>{{ rt.run_id }}</code><span>{{ rt.events.length }} 条事件 · {{ rt.tools.length }} 次工具调用</span></header>
+              <ol v-if="rt.events.length" class="trace-timeline">
+                <li v-for="event in rt.events" :key="event.sequence">
+                  <details>
+                    <summary><code>{{ event.event_type }}</code><time>{{ formatDate(event.created_at) }}</time></summary>
+                    <pre class="block">{{ event.payload || '无载荷' }}</pre>
+                  </details>
+                </li>
+              </ol>
+              <p v-else class="hint">无事件记录</p>
+              <details v-if="rt.tools.length" class="trace-tools">
+                <summary>工具执行明细</summary>
+                <article v-for="(tool, index) in rt.tools" :key="index" class="trace-tool">
+                  <div class="trace-tool-title">
+                    <strong>{{ tool.tool_name }}</strong>
+                    <el-tag :type="tool.status === 'succeeded' ? 'success' : tool.error ? 'danger' : 'info'" size="small">{{ tool.status }}</el-tag>
+                    <span class="hint">尝试 {{ tool.attempt_count }} 次 · {{ formatDate(tool.started_at) }}</span>
+                  </div>
+                  <template v-if="tool.args"><div class="hint">参数</div><pre class="block">{{ tool.args }}</pre></template>
+                  <template v-if="tool.result"><div class="hint">结果</div><pre class="block">{{ tool.result }}</pre></template>
+                  <template v-if="tool.error"><div class="hint">错误</div><pre class="block error">{{ tool.error }}</pre></template>
+                </article>
+              </details>
+            </div>
+            <p v-if="!itemTrace.runs.length" class="hint">无轨迹数据</p>
+          </template>
+        </section>
       </template>
-    </el-dialog>
+    </el-drawer>
 
     <!-- 数据集详情（用例管理） -->
     <el-dialog v-model="datasetVisible" :title="`数据集用例：${currentDataset?.name || ''}`" width="860px" top="5vh">
@@ -779,9 +800,12 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus } from '@element-plus/icons-vue'
+import { ClipboardList, Plus, RefreshCw } from '@lucide/vue'
+import PageHeader from '@/components/layout/PageHeader.vue'
+import UiButton from '@/components/ui/UiButton.vue'
+import EmptyState from '@/components/ui/EmptyState.vue'
 import dayjs from 'dayjs'
 import {
   evaluationApi,
@@ -796,7 +820,11 @@ import {
 import { agentOptionApi } from '@/api/extensions'
 
 const tab = ref('runs')
-const loading = ref(false)
+const loading = ref(true)
+const refreshing = ref(false)
+const sectionError = ref(false)
+const sectionLoading = ref(false)
+let sectionRequest = 0
 const agentId = ref<number | undefined>(undefined)
 const windowHours = ref(168)
 
@@ -817,6 +845,7 @@ const itemVisible = ref(false)
 const currentItem = ref<EvalRunItemDetail | null>(null)
 const itemTrace = ref<EvalRunItemTrace | null>(null)
 const traceLoading = ref(false)
+const traceError = ref(false)
 
 // ── 数据集 ──
 const datasetVisible = ref(false)
@@ -955,13 +984,41 @@ async function loadAgents() {
   try { agents.value = await agentOptionApi.list() } catch { agents.value = [] }
 }
 async function refreshAll() {
-  loading.value = true
+  if (refreshing.value) return
+  refreshing.value = true
   try {
-    await Promise.all([loadRuns(), loadDatasets(), loadAgents(), loadOverview(), loadEvaluations(), loadReports(), loadChanges()])
+    const results = await Promise.allSettled([loadRuns(), loadDatasets(), loadAgents(), loadOverview(), loadEvaluations(), loadReports(), loadChanges()])
+    sectionError.value = results.some(result => result.status === 'rejected')
   } finally {
-    loading.value = false
+    refreshing.value = false
   }
 }
+
+async function loadSection() {
+  const current = ++sectionRequest
+  sectionError.value = false
+  let requests: Promise<unknown>[]
+  switch (tab.value) {
+    case 'runs': requests = [loadRuns(), loadDatasets(), loadAgents()]; break
+    case 'datasets': requests = [loadDatasets()]; break
+    case 'overview': requests = [loadOverview(), loadEvaluations()]; break
+    case 'reports': requests = [loadReports(), loadChanges()]; break
+    default:
+      sectionLoading.value = false
+      return
+  }
+  sectionLoading.value = true
+  const results = await Promise.allSettled(requests)
+  if (current === sectionRequest) {
+    sectionError.value = results.some(result => result.status === 'rejected')
+    sectionLoading.value = false
+  }
+}
+function filterOverview() {
+  evalPage.value = 1
+  void loadSection()
+}
+watch(tab, loadSection)
 
 // 运行中任务自动轮询
 let pollTimer: number | undefined
@@ -970,12 +1027,21 @@ function schedulePolling() {
   const active = runs.value.some(r => ['pending', 'running', 'cancel_requested'].includes(r.status))
   if (active) {
     pollTimer = window.setTimeout(async () => {
-      await loadRuns()
-      if (resultRun.value && tab.value === 'results') await loadResultItems()
+      try {
+        await loadRuns()
+        if (resultRun.value && tab.value === 'results') await loadResultItems()
+      } catch {
+        schedulePolling()
+      }
     }, 5000)
   }
 }
 onUnmounted(() => { if (pollTimer) window.clearTimeout(pollTimer) })
+
+async function confirmAction(message: string, title: string) {
+  return ElMessageBox.confirm(message, title, { type: 'warning', confirmButtonText: '确认', cancelButtonText: '取消' })
+    .then(() => true, () => false)
+}
 
 // ── 测评任务操作 ──
 function openCreateRun() {
@@ -1006,18 +1072,22 @@ async function submitRun() {
     ElMessage.success('测评任务已创建并开始执行')
     tab.value = 'runs'
     await loadRuns()
-    openResult(run)
+    await openResult(run)
+  } catch {
+    // 请求拦截器统一显示接口错误。
   } finally {
     loading.value = false
   }
 }
 async function cancelRun(row: EvalRun) {
-  await ElMessageBox.confirm(`确认取消测评「${row.name}」？未开始的用例将标记为跳过。`, '取消测评', { type: 'warning' })
+  if (!await confirmAction(`确认取消测评「${row.name}」？未开始的用例将标记为跳过。`, '取消测评')) return
   loading.value = true
   try {
     await evaluationApi.cancelRun(row.id)
     ElMessage.success('已请求取消')
     await loadRuns()
+  } catch {
+    // 请求拦截器统一显示接口错误。
   } finally {
     loading.value = false
   }
@@ -1028,6 +1098,8 @@ async function resumeRun(row: EvalRun) {
     await evaluationApi.resumeRun(row.id)
     ElMessage.success('已重新执行未完成用例')
     await loadRuns()
+  } catch {
+    // 请求拦截器统一显示接口错误。
   } finally {
     loading.value = false
   }
@@ -1054,6 +1126,8 @@ async function loadResultItems() {
   try {
     resultRun.value = await evaluationApi.getRun(resultRun.value.id)
     resultItems.value = (await evaluationApi.listRunItems(resultRun.value.id)).items
+  } catch {
+    // 请求拦截器统一显示接口错误。
   } finally {
     loading.value = false
   }
@@ -1061,13 +1135,17 @@ async function loadResultItems() {
 async function openItem(row: EvalRunItemBrief) {
   currentItem.value = await evaluationApi.getRunItem(row.id)
   itemTrace.value = null
+  traceError.value = false
   itemVisible.value = true
 }
 async function loadTrace() {
   if (!currentItem.value) return
   traceLoading.value = true
+  traceError.value = false
   try {
     itemTrace.value = await evaluationApi.getRunItemTrace(currentItem.value.id)
+  } catch {
+    traceError.value = true
   } finally {
     traceLoading.value = false
   }
@@ -1091,17 +1169,21 @@ async function saveDataset() {
     datasetEditVisible.value = false
     ElMessage.success('已保存')
     await loadDatasets()
+  } catch {
+    // 请求拦截器统一显示接口错误。
   } finally {
     loading.value = false
   }
 }
 async function deleteDataset(row: EvalDataset) {
-  await ElMessageBox.confirm(`确认删除数据集「${row.name}」及其全部用例？`, '删除数据集', { type: 'warning' })
+  if (!await confirmAction(`确认删除数据集「${row.name}」及其全部用例？`, '删除数据集')) return
   loading.value = true
   try {
     await evaluationApi.deleteDataset(row.id)
     ElMessage.success('已删除')
     await loadDatasets()
+  } catch {
+    // 请求拦截器统一显示接口错误。
   } finally {
     loading.value = false
   }
@@ -1149,18 +1231,22 @@ async function saveItem() {
     ElMessage.success('已保存')
     await viewDataset(currentDataset.value)
     await loadDatasets()
+  } catch {
+    // 请求拦截器统一显示接口错误。
   } finally {
     loading.value = false
   }
 }
 async function deleteItem(row: EvalDatasetItem) {
   if (!currentDataset.value) return
-  await ElMessageBox.confirm('确认删除该用例？', '删除用例', { type: 'warning' })
+  if (!await confirmAction('确认删除该用例？', '删除用例')) return
   loading.value = true
   try {
     await evaluationApi.deleteItem(currentDataset.value.id, row.id)
     await viewDataset(currentDataset.value)
     await loadDatasets()
+  } catch {
+    // 请求拦截器统一显示接口错误。
   } finally {
     loading.value = false
   }
@@ -1176,6 +1262,8 @@ async function submitImport() {
     importVisible.value = false
     ElMessage.success('导入成功')
     await loadDatasets()
+  } catch {
+    // 请求拦截器统一显示接口错误。
   } finally {
     loading.value = false
   }
@@ -1193,6 +1281,8 @@ async function seedCommunity() {
       ElMessage.info('社区数据集无变化（按名称幂等）')
     }
     await loadDatasets()
+  } catch {
+    // 请求拦截器统一显示接口错误。
   } finally {
     loading.value = false
   }
@@ -1221,6 +1311,8 @@ async function triggerEval() {
     const res = await evolutionApi.triggerEvaluations({ agent_id: agentId.value })
     ElMessage.success(`已评估 ${res.queued} 个 Run`)
     await loadEvaluations()
+  } catch {
+    // 请求拦截器统一显示接口错误。
   } finally {
     loading.value = false
   }
@@ -1246,6 +1338,8 @@ async function generateReport() {
     ElMessage.success('报告已生成')
     await loadReports()
     showReport(report)
+  } catch {
+    // 请求拦截器统一显示接口错误。
   } finally {
     loading.value = false
   }
@@ -1257,27 +1351,31 @@ function showReport(report: EvolutionReport) {
 async function applySuggestion(index: number) {
   if (!currentReport.value) return
   const s = currentReport.value.suggestions[index]
-  await ElMessageBox.confirm(
+  if (!await confirmAction(
     `确认应用建议 [${s.type}/${s.target}]？将修改 Agent 配置并发布新版本。`,
-    '一键应用', { type: 'warning' })
+    '一键应用')) return
   loading.value = true
   try {
     const res = await evolutionApi.applySuggestion(currentReport.value.id, index)
     ElMessage.success(`已应用并发布 v${res.new_version_no}（新 Run 自动生效）`)
     await loadChanges()
+  } catch {
+    // 请求拦截器统一显示接口错误。
   } finally {
     loading.value = false
   }
 }
 async function rollback(row: EvolutionChange) {
-  await ElMessageBox.confirm(
+  if (!await confirmAction(
     `确认回滚变更 #${row.id}（${row.target}）？将还原旧值并发布新版本。`,
-    '回滚', { type: 'warning' })
+    '回滚')) return
   loading.value = true
   try {
     const res = await evolutionApi.rollbackChange(row.id)
     ElMessage.success(`已回滚并发布 v${res.restored_version_no}`)
     await loadChanges()
+  } catch {
+    // 请求拦截器统一显示接口错误。
   } finally {
     loading.value = false
   }
@@ -1296,6 +1394,8 @@ async function loadBriefing() {
       agent_id: agentId.value, hours: windowHours.value,
     })
     ElMessage.success('简报已生成')
+  } catch {
+    // 请求拦截器统一显示接口错误。
   } finally {
     loading.value = false
   }
@@ -1320,57 +1420,60 @@ async function downloadBriefingMd() {
 }
 
 onMounted(async () => {
-  await Promise.all([loadRuns(), loadDatasets(), loadAgents()])
+  await loadSection()
+  loading.value = false
 })
 </script>
 
 <style scoped>
-.evaluation-page {
-  padding: 24px;
-  background: #fff;
-  height: calc(100vh - 56px);
-  box-sizing: border-box;
-  overflow-y: auto;
-}
-.page-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-.page-header h2 { font-size: 20px; font-weight: 700; color: #0d0d0d; }
-.header-actions { display: flex; gap: 10px; align-items: center; }
-.toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
-.hint { color: #909399; font-size: 13px; }
-.metric-cards {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 12px;
-  margin-bottom: 16px;
-}
-.metric-label { color: #909399; font-size: 12px; }
-.metric-value { font-size: 22px; font-weight: 700; color: #0d0d0d; margin-top: 4px; }
-.progress-text { color: #909399; font-size: 12px; }
+.section-alert { margin-bottom: var(--ui-space-4); }
+.evaluation-tabs :deep(.el-tabs__header) { margin-bottom: var(--ui-space-5); }
+.evaluation-tabs :deep(.el-tabs__item) { padding-inline: 14px; }
+.evaluation-tabs :deep(.el-card h4) { margin-bottom: var(--ui-space-3); }
+.evaluation-tabs :deep(.el-tab-pane > .el-card + .el-card) { margin-top: var(--ui-space-3); }
+.toolbar { display: flex; gap: var(--ui-space-2); align-items: center; margin-bottom: var(--ui-space-3); flex-wrap: wrap; }
+.toolbar :deep(.el-button + .el-button) { margin-left: 0; }
+.hint, .progress-text { color: var(--ui-muted); font-size: var(--ui-size-sm); }
+.metric-cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--ui-space-3); margin-bottom: var(--ui-space-4); }
+.metric-label { color: var(--ui-muted); font-size: var(--ui-size-xs); }
+.metric-value { font-size: var(--ui-size-xl); font-weight: var(--ui-weight-semibold); margin-top: 5px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .block {
-  background: #f7f8fa;
-  border-radius: 8px;
-  padding: 12px;
-  font-size: 12px;
-  max-height: 260px;
-  overflow: auto;
-  white-space: pre-wrap;
-  font-family: inherit;
+  background: var(--ui-subtle); color: var(--ui-text); border: var(--ui-line); border-radius: var(--ui-radius-md);
+  padding: var(--ui-space-3); font-size: var(--ui-size-sm); margin: var(--ui-space-2) 0 var(--ui-space-4);
+  max-height: 280px; white-space: pre-wrap; overflow-wrap: anywhere;
 }
-.block.error { background: #fef0f0; color: #c45656; }
-/* 能力画像 */
-.cap-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
-.cap-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-.cap-name { width: 110px; flex-shrink: 0; font-size: 12px; color: #606266; }
-.cap-bar { flex: 1; }
-.cap-detail { width: 190px; flex-shrink: 0; font-size: 12px; color: #909399; }
-.cap-facts { margin: 0; padding-left: 18px; font-size: 13px; color: #303133; }
+.block.error { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.cap-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--ui-space-3); margin-bottom: var(--ui-space-3); }
+.cap-row { display: grid; grid-template-columns: minmax(5rem, auto) 1fr; gap: 4px 8px; margin-bottom: 8px; align-items: center; }
+.cap-name { color: var(--ui-secondary); font-size: var(--ui-size-xs); }
+.cap-detail { grid-column: 2; font-size: var(--ui-size-xs); color: var(--ui-muted); }
+.cap-facts { padding-inline-start: 18px; color: var(--ui-secondary); }
 .cap-facts li { margin-bottom: 4px; }
-.problem-card { margin-bottom: 12px; }
-/* 执行事实 / 轨迹 */
-.fact-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px; font-size: 13px; margin-bottom: 8px; }
-.warn { color: #c45656; }
-.ok { color: #67c23a; }
+.problem-card { margin-bottom: var(--ui-space-3); }
+.fact-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 16px; margin-bottom: 8px; overflow-wrap: anywhere; }
+.warn { color: var(--ui-danger); }
+.ok { color: var(--ui-success); }
 .turn-block { margin-bottom: 8px; }
-.turn-title { font-size: 12px; color: #909399; margin-bottom: 4px; }
-.trace-block { margin-top: 8px; }
+.turn-title { font-size: var(--ui-size-xs); color: var(--ui-muted); margin-bottom: 4px; }
+.trace-section { border-top: var(--ui-line); padding-top: var(--ui-space-4); }
+.trace-heading { justify-content: space-between; }
+.trace-block { border: var(--ui-line); border-radius: var(--ui-radius-lg); padding: var(--ui-space-3); margin-bottom: var(--ui-space-3); }
+.trace-run-meta, .trace-tool-title { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+.trace-run-meta { margin-bottom: var(--ui-space-3); overflow-wrap: anywhere; }
+.trace-run-meta span { color: var(--ui-muted); font-size: var(--ui-size-xs); }
+.trace-timeline { padding: 0 0 0 16px; list-style: none; border-inline-start: var(--ui-line-strong); max-height: 420px; overflow: auto; }
+.trace-timeline li { position: relative; }
+.trace-timeline li::before { content: ''; position: absolute; left: -20px; top: 14px; width: 7px; height: 7px; border-radius: 50%; background: var(--ui-accent); }
+.trace-timeline summary, .trace-tools summary { cursor: pointer; padding: 7px 4px; overflow-wrap: anywhere; }
+.trace-timeline time { margin-inline-start: 10px; font-size: var(--ui-size-xs); color: var(--ui-muted); }
+.trace-tools { border-top: var(--ui-line); margin-top: var(--ui-space-3); }
+.trace-tool { padding: var(--ui-space-2); border-top: var(--ui-line); }
+.trace-tool-title { justify-content: flex-start; margin-bottom: 6px; }
+@media (max-width: 1100px) {
+  .cap-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 680px) {
+  .metric-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .fact-grid { grid-template-columns: minmax(0, 1fr); }
+}
 </style>

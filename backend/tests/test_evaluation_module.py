@@ -4,6 +4,7 @@
     pytest backend/tests/test_evaluation_module.py -q
 """
 import os
+from threading import Event
 import uuid
 
 import pytest
@@ -1110,6 +1111,36 @@ class TestDatasetApi:
 
 
 class TestRunApi:
+    def test_created_run_is_committed_before_background_execution(self, client, users, monkeypatch):
+        from app.services.evaluation import runner as runner_mod
+
+        finished = Event()
+        observed = []
+
+        async def observe_run(eval_run_id):
+            async with AsyncSessionLocal() as session:
+                run = await session.get(EvalRun, eval_run_id)
+                items = (await session.scalars(
+                    select(EvalRunItem).where(EvalRunItem.eval_run_id == eval_run_id)
+                )).all()
+                observed.append((run.status if run else None, [item.snap_input for item in items]))
+            finished.set()
+
+        monkeypatch.setattr(runner_mod, "execute_eval_run", observe_run)
+        headers = _auth(users["admin_id"])
+        dataset = client.post("/api/v2/evaluation/datasets", headers=headers, json={
+            "name": "后台调度回归数据集", "scoring_method": "exact_match",
+            "items": [{"input": "已提交的输入", "expected": "期望结果"}],
+        })
+        assert dataset.status_code == 200, dataset.text
+        response = client.post("/api/v2/evaluation/runs", headers=headers, json={
+            "dataset_id": dataset.json()["id"], "agent_id": _mk_agent_sync(),
+        })
+
+        assert response.status_code == 200, response.text
+        assert finished.wait(timeout=5)
+        assert observed == [("pending", ["已提交的输入"])]
+
     def test_run_lifecycle_endpoints(self, client, users, monkeypatch):
         h = _auth(users["admin_id"])
 

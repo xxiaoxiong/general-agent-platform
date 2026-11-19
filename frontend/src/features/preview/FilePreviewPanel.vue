@@ -1,7 +1,8 @@
 <template>
-  <div v-if="maximized" class="fp-backdrop" @click="maximized = false"></div>
+  <div class="fp-backdrop" :class="{ visible: maximized }" aria-hidden="true" @click="closeOverlay"></div>
   <aside
     class="file-preview"
+    aria-label="文件预览"
     :class="{ maximized }"
     :style="maximized ? undefined : { width: panelWidth + 'px' }"
   >
@@ -23,15 +24,16 @@
           type="button"
           class="fp-icon-btn"
           :title="maximized ? '还原预览' : '放大预览'"
+          :aria-label="maximized ? '还原预览' : '放大预览'"
           @click="maximized = !maximized"
         >
-          <el-icon><FullScreen /></el-icon>
+          <component :is="maximized ? Minimize : Maximize" :size="16" />
         </button>
-        <button v-if="data" type="button" class="fp-icon-btn" title="下载" @click="$emit('download')">
-          <el-icon><Download /></el-icon>
+        <button v-if="data" type="button" class="fp-icon-btn" title="下载" aria-label="下载" @click="$emit('download')">
+          <Download :size="16" />
         </button>
-        <button type="button" class="fp-icon-btn" title="关闭（Esc）" @click="$emit('close')">
-          <el-icon><Close /></el-icon>
+        <button type="button" class="fp-icon-btn" title="关闭（Esc）" aria-label="关闭文件预览" @click="$emit('close')">
+          <X :size="16" />
         </button>
       </div>
     </header>
@@ -41,24 +43,24 @@
 
     <!-- 文本抽取副本提示：一键切换到原文件富预览 -->
     <div v-if="originalPath" class="fp-extracted-bar">
-      <el-icon><InfoFilled /></el-icon>
+      <Info :size="15" />
       <span>此为「{{ originalName }}」的文本抽取副本</span>
       <button type="button" class="fp-link-btn" @click="$emit('open-original', originalPath)">
-        查看原文件 <el-icon size="11"><Top /></el-icon>
+        查看原文件
       </button>
     </div>
 
     <!-- 内容体 -->
     <div class="fp-body" :class="{ 'no-pad': data?.kind === 'image' || data?.kind === 'pdf' }">
       <!-- 加载态 -->
-      <div v-if="loading" class="fp-state">
-        <span class="mini-spin"></span>
+      <div v-if="loading" class="fp-state" role="status">
+        <LoaderCircle class="mini-spin" :size="16" />
         <span>正在加载预览…</span>
       </div>
 
       <!-- 错误态 -->
-      <div v-else-if="error" class="fp-state fp-error">
-        <el-icon><WarningFilled /></el-icon>
+      <div v-else-if="error" class="fp-state fp-error" role="alert">
+        <CircleAlert :size="16" />
         <span>{{ error }}</span>
       </div>
 
@@ -85,12 +87,10 @@
         ></iframe>
 
         <!-- Markdown -->
-        <div
+        <MessageMarkdown
           v-else-if="data.kind === 'markdown'"
-          class="fp-md"
-          v-html="renderedMarkdown"
-          @click="onCopyClick"
-        ></div>
+          :text="data.text || ''"
+        />
 
         <!-- 代码：行号槽 + 语法高亮 + 语言标签 -->
         <div v-else-if="data.kind === 'code'" class="fp-code-wrap">
@@ -139,7 +139,7 @@
 
         <!-- 二进制 / 未知：下载 + 元信息兜底 -->
         <div v-else class="fp-state">
-          <el-icon><Document /></el-icon>
+          <File :size="16" />
           <span>该文件类型（{{ data.mime || '未知' }}）暂不支持在线预览，可下载查看。</span>
         </div>
       </template>
@@ -156,16 +156,15 @@
  * 按类型深度优化展示：表格(数据网格) / 代码(行号+高亮) / 文本 / Markdown /
  * 图片 / PDF / Office(段落) / 二进制兜底。
  */
-import { computed, ref } from 'vue'
+import { computed, onUnmounted, ref, type Component } from 'vue'
 import {
-  Close, Document, Download, Folder, FullScreen, Grid, InfoFilled, Monitor, Notebook,
-  Picture, Tickets, Top, WarningFilled,
-} from '@element-plus/icons-vue'
-import { marked } from 'marked'
+  CircleAlert, CodeXml, Download, File, FileText, Folder, Image as ImageIcon, Info, LoaderCircle,
+  Maximize, Minimize, Notebook, Table, X,
+} from '@lucide/vue'
 import DOMPurify from 'dompurify'
 import hljs from 'highlight.js/lib/common'
-import 'highlight.js/styles/github.css'
 import type { PreviewContent } from '@/api/v2'
+import MessageMarkdown from '@/features/run/MessageMarkdown.vue'
 
 const props = defineProps<{
   /** 已解析的预览内容（null 时仅显示文件名占位） */
@@ -180,13 +179,20 @@ const emit = defineEmits<{ close: []; download: []; 'open-original': [path: stri
 // ── 面板交互：拖拽调宽 + 放大（最大化）+ 代码块复制 ─────────────────────────
 const panelWidth = ref(460)
 const maximized = ref(false)
+let endResize: (() => void) | undefined
 
-/** 左缘拖拽调宽（clamp 到 320px ~ 视口 75%） */
+function closeOverlay() {
+  if (maximized.value) maximized.value = false
+  else emit('close')
+}
+
+/** 左缘调宽时为对话保留阅读空间。 */
 function startResize(e: MouseEvent) {
   e.preventDefault()
   const startX = e.clientX
-  const startW = panelWidth.value
-  const maxW = Math.min(window.innerWidth * 0.75, 1100)
+  const panel = (e.currentTarget as HTMLElement).parentElement
+  const startW = panel?.clientWidth || panelWidth.value
+  const maxW = Math.max(320, Math.min((panel?.parentElement?.clientWidth || window.innerWidth) * 0.45, 620))
   const onMove = (ev: MouseEvent) => {
     panelWidth.value = Math.min(maxW, Math.max(320, startW + (startX - ev.clientX)))
   }
@@ -195,42 +201,30 @@ function startResize(e: MouseEvent) {
     window.removeEventListener('mouseup', onUp)
     document.body.style.cursor = ''
     document.body.style.userSelect = ''
+    endResize = undefined
   }
   document.body.style.cursor = 'col-resize'
+  endResize = onUp
   document.body.style.userSelect = 'none'
   window.addEventListener('mousemove', onMove)
   window.addEventListener('mouseup', onUp)
 }
 
-/** 代码块复制（事件委托）：内联 onclick 会被 DOMPurify 剥离，故用委托 */
-function onCopyClick(e: MouseEvent) {
-  const btn = (e.target as HTMLElement | null)?.closest?.('.copy-btn') as HTMLElement | null
-  if (!btn) return
-  const code = btn.closest('.code-block-wrapper')?.querySelector('code')?.textContent || ''
-  const flash = (t: string) => {
-    btn.textContent = t
-    window.setTimeout(() => { btn.textContent = '复制' }, 1500)
-  }
-  if (navigator.clipboard?.writeText) {
-    navigator.clipboard.writeText(code).then(() => flash('已复制')).catch(() => flash('复制失败'))
-  } else {
-    flash('复制失败')
-  }
-}
+onUnmounted(() => endResize?.())
 
 /** 类型 -> 图标 / 标签 / 配色（头部视觉锚点） */
-const KIND_META: Record<string, { label: string; icon: any; color: string; bg: string }> = {
-  image: { label: '图片', icon: Picture, color: '#2f9e6f', bg: '#e8f6ef' },
-  pdf: { label: 'PDF', icon: Document, color: '#d64545', bg: '#fdecec' },
-  markdown: { label: 'Markdown', icon: Notebook, color: '#3b82f6', bg: '#e8f0fe' },
-  code: { label: '代码', icon: Monitor, color: '#7c4dff', bg: '#f0eaff' },
-  text: { label: '文本', icon: Document, color: '#606266', bg: '#f0f2f5' },
-  table: { label: '表格', icon: Grid, color: '#1f8fde', bg: '#e7f2fc' },
-  office: { label: '文档', icon: Tickets, color: '#c77700', bg: '#fdf2e0' },
-  binary: { label: '文件', icon: Folder, color: '#909399', bg: '#f0f2f5' },
+const KIND_META: Record<PreviewContent['kind'], { label: string; icon: Component; color: string; bg: string }> = {
+  image: { label: '图片', icon: ImageIcon, color: 'var(--ui-success)', bg: 'var(--ui-success-soft)' },
+  pdf: { label: 'PDF', icon: FileText, color: 'var(--ui-danger)', bg: 'var(--ui-danger-soft)' },
+  markdown: { label: 'Markdown', icon: Notebook, color: 'var(--ui-info)', bg: 'var(--ui-info-soft)' },
+  code: { label: '代码', icon: CodeXml, color: 'var(--ui-accent)', bg: 'var(--ui-accent-soft)' },
+  text: { label: '文本', icon: FileText, color: 'var(--ui-secondary)', bg: 'var(--ui-subtle)' },
+  table: { label: '表格', icon: Table, color: 'var(--ui-info)', bg: 'var(--ui-info-soft)' },
+  office: { label: '文档', icon: FileText, color: 'var(--ui-warning)', bg: 'var(--ui-warning-soft)' },
+  binary: { label: '文件', icon: Folder, color: 'var(--ui-secondary)', bg: 'var(--ui-subtle)' },
 }
 const meta = computed(() =>
-  (props.data && KIND_META[props.data.kind]) || { label: '文件', icon: Document, color: '#909399', bg: '#f0f2f5' },
+  (props.data && KIND_META[props.data.kind]) || KIND_META.binary,
 )
 
 // ── 代码高亮 + 行号 ──────────────────────────────────────────────────────────
@@ -248,17 +242,6 @@ const highlightedCode = computed(() => {
   }
 })
 const lineCount = computed(() => (props.data?.text || '').split('\n').length)
-
-// ── Markdown ─────────────────────────────────────────────────────────────────
-const renderedMarkdown = computed(() => {
-  const text = props.data?.text || ''
-  if (!text) return ''
-  try {
-    return DOMPurify.sanitize(marked.parse(text, { breaks: true, gfm: true }) as string)
-  } catch {
-    return ''
-  }
-})
 
 // ── 表格（数据网格）─────────────────────────────────────────────────────────
 const tableCols = computed(() =>
@@ -307,8 +290,9 @@ function formatSize(size: number): string {
 .file-preview {
   position: relative;
   min-width: 320px;
-  border-left: 1px solid #e4e7ed;
-  background: #fff;
+  max-width: min(45%, 620px);
+  border-left: 1px solid var(--ui-border);
+  background: var(--ui-surface);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -318,18 +302,19 @@ function formatSize(size: number): string {
   position: absolute; left: 0; top: 0; bottom: 0; width: 6px; z-index: 5;
   cursor: col-resize; background: transparent;
 }
-.fp-resize:hover { background: rgba(64, 158, 255, 0.35); }
+.fp-resize:hover { background: var(--ui-accent-soft); }
 
 /* 放大（最大化）：覆盖式大面板 */
 .file-preview.maximized {
-  position: fixed; inset: 28px; z-index: 2001;
-  width: auto; min-width: 0; height: auto;
-  border: none; border-radius: 12px;
-  box-shadow: 0 16px 56px rgba(0, 0, 0, 0.28);
+  position: fixed; inset: 28px; z-index: var(--ui-z-dialog);
+  width: auto; min-width: 0; max-width: none; height: auto;
+  border: none; border-radius: var(--ui-radius-lg);
+  box-shadow: var(--ui-shadow-md);
 }
 .fp-backdrop {
-  position: fixed; inset: 0; z-index: 2000; background: rgba(20, 24, 31, 0.42);
+  display: none; position: fixed; inset: 0; z-index: calc(var(--ui-z-dialog) - 1); background: var(--ui-overlay);
 }
+.fp-backdrop.visible { display: block; }
 
 /* 头部 */
 .fp-head {
@@ -337,175 +322,153 @@ function formatSize(size: number): string {
   align-items: center;
   gap: 10px;
   padding: 10px 12px;
-  border-bottom: 1px solid #e4e7ed;
+  border-bottom: 1px solid var(--ui-border);
   flex-shrink: 0;
 }
 .fp-kind-icon {
-  width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0;
+  width: 30px; height: 30px; border-radius: var(--ui-radius-md); flex-shrink: 0;
   display: inline-flex; align-items: center; justify-content: center; font-size: 16px;
 }
+.fp-kind-icon svg { width: 16px; height: 16px; }
 .fp-title { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; }
 .fp-name {
-  font-weight: 600; font-size: 13px; color: #303133;
+  font-weight: 600; font-size: 13px; color: var(--ui-text);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .fp-kind {
   flex-shrink: 0; font-size: 11px; font-weight: 500;
-  border-radius: 4px; padding: 1px 7px;
+  border-radius: var(--ui-radius-sm); padding: 1px 7px;
 }
 .fp-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
-.fp-size { font-size: 11px; color: #b0b3b8; }
+.fp-size { font-size: 11px; color: var(--ui-muted); }
 .fp-icon-btn {
-  width: 26px; height: 26px; padding: 0; border: none; border-radius: 6px;
-  background: transparent; color: #909399; cursor: pointer;
+  width: 30px; height: 30px; padding: 0; border: none; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-secondary); cursor: pointer;
   display: inline-flex; align-items: center; justify-content: center;
 }
-.fp-icon-btn:hover { background: #f0f2f5; color: #409eff; }
+.fp-icon-btn:hover { background: var(--ui-hover); color: var(--ui-accent); }
 
 .fp-path {
-  padding: 5px 12px; font-size: 11px; color: #b0b3b8;
-  border-bottom: 1px solid #f5f7fa;
+  padding: 5px 12px; font-size: 11px; color: var(--ui-muted);
+  border-bottom: 1px solid var(--ui-subtle);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  font-family: 'Consolas', monospace; flex-shrink: 0;
+  font-family: var(--ui-font-mono); flex-shrink: 0;
 }
 
 /* 文本抽取副本提示条 */
 .fp-extracted-bar {
   display: flex; align-items: center; gap: 6px;
-  padding: 6px 12px; font-size: 11px; color: #c77700; background: #fdf7ec;
-  border-bottom: 1px solid #f5e9d4; flex-shrink: 0;
+  padding: 6px 12px; font-size: 11px; color: var(--ui-warning); background: var(--ui-warning-soft);
+  border-bottom: 1px solid var(--ui-border); flex-shrink: 0;
 }
 .fp-extracted-bar span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fp-link-btn {
   display: inline-flex; align-items: center; gap: 2px;
-  border: none; background: transparent; color: #409eff; cursor: pointer;
-  font-size: 11px; padding: 2px 6px; border-radius: 4px; flex-shrink: 0;
+  border: none; background: transparent; color: var(--ui-accent); cursor: pointer;
+  font-size: 11px; padding: 2px 6px; border-radius: var(--ui-radius-sm); flex-shrink: 0;
 }
-.fp-link-btn:hover { background: #ecf5ff; }
+.fp-link-btn:hover { background: var(--ui-accent-soft); }
 
 /* 内容体 */
-.fp-body { flex: 1; overflow: auto; padding: 12px; }
+.fp-body { flex: 1; min-height: 0; overflow: auto; padding: 12px; }
 .fp-body.no-pad { padding: 0; overflow: hidden; display: flex; }
 
 .fp-state {
   display: flex; align-items: center; gap: 8px; justify-content: center;
-  padding: 40px 16px; color: #909399; font-size: 13px; text-align: center;
+  padding: 40px 16px; color: var(--ui-secondary); font-size: 13px; text-align: center;
 }
-.fp-error { color: #f56c6c; }
-.mini-spin {
-  width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
-  background: #409eff; animation: fppulse 1.2s infinite ease-in-out;
-}
-@keyframes fppulse { 0%, 100% { opacity: 0.35; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1); } }
-
+.fp-error { color: var(--ui-danger); }
 /* 图片 */
 .fp-image-wrap {
   flex: 1; display: flex; align-items: center; justify-content: center;
   padding: 16px; min-height: 240px;
   background:
-    repeating-conic-gradient(#f6f7f9 0% 25%, #ffffff 0% 50%) 50% / 20px 20px;
+    repeating-conic-gradient(var(--ui-subtle) 0% 25%, var(--ui-surface) 0% 50%) 50% / 20px 20px;
 }
-.fp-image { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 6px; box-shadow: 0 2px 12px rgba(0,0,0,0.12); }
+.fp-image { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: var(--ui-radius-sm); box-shadow: var(--ui-shadow-md); }
 
 /* PDF */
-.fp-pdf { flex: 1; width: 100%; height: 100%; min-height: 420px; border: none; display: block; background: #525659; }
-
-/* Markdown */
-.fp-md { line-height: 1.75; font-size: 13.5px; color: #303133; word-break: break-word; }
-.fp-md :deep(h1), .fp-md :deep(h2), .fp-md :deep(h3) { font-weight: 650; color: #1a1a1a; margin: 14px 0 8px; line-height: 1.35; }
-.fp-md :deep(h1) { font-size: 20px; } .fp-md :deep(h2) { font-size: 17px; } .fp-md :deep(h3) { font-size: 15px; }
-.fp-md :deep(p) { margin: 8px 0; }
-.fp-md :deep(ul), .fp-md :deep(ol) { padding-left: 22px; margin: 8px 0; }
-.fp-md :deep(li) { margin: 4px 0; }
-.fp-md :deep(code) { background: #eef1f5; color: #c7254e; padding: 2px 6px; border-radius: 4px; font-family: 'Consolas', monospace; font-size: 12px; }
-/* 代码块 + 复制按钮（marked 全局渲染器注入 .code-block-wrapper/.copy-btn） */
-.fp-md :deep(.code-block-wrapper) { position: relative; margin: 12px 0; }
-.fp-md :deep(.copy-btn) {
-  position: absolute; top: 8px; right: 8px; z-index: 1;
-  background: rgba(255, 255, 255, 0.88); color: #606266;
-  border: 1px solid #dcdfe6; border-radius: 5px;
-  padding: 2px 10px; font-size: 11px; cursor: pointer; line-height: 1.6;
-}
-.fp-md :deep(.copy-btn:hover) { background: #fff; color: #409eff; border-color: #409eff; }
-.fp-md :deep(pre) { background: #f6f8fa; border: 1px solid #eef1f5; border-radius: 8px; padding: 14px 16px; overflow-x: auto; margin: 0; }
-.fp-md :deep(pre code) { background: none; color: #24292e; padding: 0; font-size: 12.5px; line-height: 1.65; }
-.fp-md :deep(blockquote) { border-left: 3px solid #409eff; margin: 10px 0; padding: 4px 12px; color: #606266; background: #f6f9ff; border-radius: 0 6px 6px 0; }
-.fp-md :deep(table) {
-  border-collapse: separate; border-spacing: 0; width: 100%; margin: 12px 0; font-size: 12.5px;
-  border: 1px solid #e8ebf0; border-radius: 8px; overflow: hidden;
-}
-.fp-md :deep(th), .fp-md :deep(td) { border-bottom: 1px solid #eef1f5; padding: 8px 12px; text-align: left; }
-.fp-md :deep(th) { background: #f5f7fa; font-weight: 600; color: #303133; }
-.fp-md :deep(tbody tr:nth-child(even)) { background: #fafbfc; }
-.fp-md :deep(tbody tr:last-child td) { border-bottom: none; }
-.fp-md :deep(img) { max-width: 100%; border-radius: 8px; margin: 8px 0; }
-.fp-md :deep(hr) { border: none; border-top: 1px solid #e4e7ed; margin: 14px 0; }
-.fp-md :deep(a) { color: #409eff; text-decoration: none; }
-.fp-md :deep(a:hover) { text-decoration: underline; }
+.fp-pdf { flex: 1; width: 100%; height: 100%; border: none; display: block; background: var(--ui-code-bg); }
 
 /* 代码：行号槽 + 高亮 */
 .fp-code-wrap {
   display: flex; align-items: flex-start;
-  border: 1px solid #eef1f5; border-radius: 8px; overflow: auto; background: #fff;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-md); overflow: auto; background: var(--ui-surface);
 }
 .fp-code-gutter {
   position: sticky; left: 0; z-index: 1; flex-shrink: 0;
-  padding: 12px 0; background: #f7f9fb; border-right: 1px solid #eef1f5;
+  padding: 12px 0; background: var(--ui-subtle); border-right: 1px solid var(--ui-border);
   user-select: none;
 }
 .fp-gutter-line {
   width: 40px; padding: 0 10px 0 8px; text-align: right;
-  font-family: 'Consolas', monospace; font-size: 12px; line-height: 20px; color: #b0b3b8;
+  font-family: var(--ui-font-mono); font-size: 12px; line-height: 20px; color: var(--ui-muted);
 }
 .fp-code {
-  margin: 0; padding: 12px 16px; font-family: 'Consolas', monospace;
-  font-size: 12px; line-height: 20px; color: #24292e;
+  margin: 0; padding: 12px 16px; font-family: var(--ui-font-mono);
+  font-size: 12px; line-height: 20px; color: var(--ui-text);
   white-space: pre; flex: 1; min-width: 0;
 }
 
 /* 表格：数据网格 */
 .fp-table-wrap {
-  border: 1px solid #eef1f5; border-radius: 8px; overflow: auto; background: #fff;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-md); overflow: auto; background: var(--ui-surface);
   max-height: 100%;
 }
 .fp-table { border-collapse: separate; border-spacing: 0; font-size: 12.5px; min-width: 100%; }
 .fp-table th, .fp-table td {
   padding: 7px 12px; white-space: nowrap; max-width: 260px;
-  overflow: hidden; text-overflow: ellipsis; border-bottom: 1px solid #f0f2f5;
+  overflow: hidden; text-overflow: ellipsis; border-bottom: 1px solid var(--ui-hover);
 }
 .fp-table thead th {
   position: sticky; top: 0; z-index: 2;
-  background: #f5f7fa; color: #303133; font-weight: 600; text-align: left;
-  border-bottom: 1px solid #e4e7ed;
+  background: var(--ui-subtle); color: var(--ui-text); font-weight: 600; text-align: left;
+  border-bottom: 1px solid var(--ui-border);
 }
 .fp-table thead th .th-text { display: block; overflow: hidden; text-overflow: ellipsis; }
-.fp-table tbody tr:nth-child(even) { background: #fafbfc; }
-.fp-table tbody tr:hover { background: #ecf5ff; }
-.fp-table td.num, .fp-table th.num { text-align: right; font-variant-numeric: tabular-nums; font-family: 'Consolas', monospace; }
+.fp-table tbody tr:nth-child(even) { background: var(--ui-bg); }
+.fp-table tbody tr:hover { background: var(--ui-accent-soft); }
+.fp-table td.num, .fp-table th.num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--ui-font-mono); }
 /* 行号槽 */
 .fp-rownum {
   position: sticky; left: 0; z-index: 1;
   width: 40px; min-width: 40px; text-align: center;
-  color: #b0b3b8; background: #f7f9fb; font-family: 'Consolas', monospace;
-  border-right: 1px solid #eef1f5; font-size: 11px;
+  color: var(--ui-muted); background: var(--ui-subtle); font-family: var(--ui-font-mono);
+  border-right: 1px solid var(--ui-border); font-size: 11px;
 }
-.fp-table thead th.fp-corner { z-index: 3; background: #eef1f5; }
-.fp-table tbody tr:hover .fp-rownum { background: #dcecff; color: #79a7e0; }
+.fp-table thead th.fp-corner { z-index: 3; background: var(--ui-border); }
+.fp-table tbody tr:hover .fp-rownum { background: var(--ui-accent-soft); color: var(--ui-accent); }
 
 /* Office 段落 */
-.fp-office { line-height: 1.8; font-size: 13.5px; color: #303133; }
+.fp-office { line-height: 1.8; font-size: 13.5px; color: var(--ui-text); }
 .fp-office-p { margin: 0 0 10px; word-break: break-word; }
 
 /* 纯文本 */
 .fp-text {
-  margin: 0; padding: 14px 16px; font-family: 'Consolas', monospace;
-  font-size: 12.5px; line-height: 1.7; color: #303133;
+  margin: 0; padding: 14px 16px; font-family: var(--ui-font-mono);
+  font-size: 12.5px; line-height: 1.7; color: var(--ui-text);
   white-space: pre-wrap; word-break: break-word;
-  background: #fafbfc; border: 1px solid #eef1f5; border-radius: 8px;
+  background: var(--ui-bg); border: 1px solid var(--ui-border); border-radius: var(--ui-radius-md);
 }
 
 .fp-truncated {
-  padding: 8px 14px; font-size: 11px; color: #e6a23c;
-  border-top: 1px solid #f0f2f5; background: #fdf7ec; flex-shrink: 0;
+  padding: 8px 14px; font-size: 11px; color: var(--ui-warning);
+  border-top: 1px solid var(--ui-hover); background: var(--ui-warning-soft); flex-shrink: 0;
+}
+.fp-code :deep(.hljs-comment) { color: var(--ui-muted); }
+.fp-code :deep(.hljs-string) { color: var(--ui-success); }
+.fp-code :deep(.hljs-keyword), .fp-code :deep(.hljs-built_in), .fp-code :deep(.hljs-literal) { color: var(--ui-accent); }
+.fp-code :deep(.hljs-number), .fp-code :deep(.hljs-title), .fp-code :deep(.hljs-attr) { color: var(--ui-info); }
+.mini-spin { flex: none; animation: fp-spin 1s linear infinite; }
+@keyframes fp-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .mini-spin { animation: none; } }
+@media (max-width: 1119px) {
+  .file-preview, .file-preview.maximized {
+    position: fixed; inset: var(--ui-header-height) 0 0 auto; z-index: var(--ui-z-dialog);
+    width: min(100vw, 540px); max-width: 100vw; min-width: 0; height: auto;
+    border-left: 1px solid var(--ui-border); border-radius: 0; box-shadow: var(--ui-shadow-md);
+  }
+  .fp-backdrop { display: block; }
+  .fp-resize, .fp-actions .fp-icon-btn:first-of-type, .fp-size { display: none; }
 }
 </style>

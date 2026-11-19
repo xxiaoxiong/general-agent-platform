@@ -1,50 +1,50 @@
 <template>
   <div class="page-container">
-    <div class="page-header">
-      <h2>数据库管理</h2>
-      <el-button type="primary" :icon="Plus" @click="openDialog()">添加连接</el-button>
-    </div>
+    <PageHeader title="数据库管理" description="管理数据源连接，测试连通性并打开查询工作区。">
+      <template #actions><UiButton variant="primary" @click="openDialog()"><Plus />添加连接</UiButton></template>
+    </PageHeader>
 
-    <el-row :gutter="16">
-      <el-col :span="8" v-for="conn in connections" :key="conn.id">
-        <el-card shadow="hover" class="conn-card">
-          <div class="conn-header">
-            <div class="conn-icon">
-              <el-icon size="28" :color="dbIconColor(conn.db_type)">
-                <Coin />
-              </el-icon>
-            </div>
-            <div class="conn-info">
-              <div class="conn-name">{{ conn.name }}</div>
-              <el-tag size="small" :type="conn.db_type === 'mysql' ? 'primary' : conn.db_type === 'postgresql' ? 'success' : 'warning'">
-                {{ conn.db_type.toUpperCase() }}
-              </el-tag>
-            </div>
-            <el-tag v-if="conn.last_tested_at" :type="conn.last_test_ok ? 'success' : 'danger'" size="small" effect="light">
-              {{ conn.last_test_ok ? '已连通' : '连接失败' }}
+    <div class="data-surface">
+      <ErrorState v-if="loadError" title="无法加载数据库连接" @retry="loadConnections" />
+      <EmptyState v-else-if="!loading && !connections.length" :icon="Database" title="暂无数据库连接" description="添加连接以查看表结构并执行查询。">
+        <UiButton @click="openDialog()"><Plus />添加连接</UiButton>
+      </EmptyState>
+      <el-table v-else :data="connections" v-loading="loading">
+        <el-table-column label="连接名称" min-width="180">
+          <template #default="{ row }">
+            <RouterLink class="resource-name connection-link" :to="`/databases/${row.id}/query`">{{ row.name }}</RouterLink>
+            <p v-if="row.description" class="resource-meta">{{ row.description }}</p>
+          </template>
+        </el-table-column>
+        <el-table-column label="类型" width="115">
+          <template #default="{ row }"><el-tag size="small" type="info">{{ row.db_type.toUpperCase() }}</el-tag></template>
+        </el-table-column>
+        <el-table-column label="目标" min-width="205" show-overflow-tooltip>
+          <template #default="{ row }">
+            <p class="mono">{{ row.database }}</p>
+            <p v-if="row.db_type !== 'sqlite'" class="resource-meta mono">{{ row.host }}:{{ row.port }}</p>
+          </template>
+        </el-table-column>
+        <el-table-column label="最近测试" width="120">
+          <template #default="{ row }">
+            <el-tag v-if="row.last_tested_at" :type="row.last_test_ok ? 'success' : 'danger'" size="small">
+              {{ row.last_test_ok ? '已连通' : '连接失败' }}
             </el-tag>
-          </div>
-          <div class="conn-detail">
-            <div><el-icon><Location /></el-icon> {{ conn.host }}:{{ conn.port }}</div>
-            <div><el-icon><Box /></el-icon> {{ conn.database }}</div>
-            <div v-if="conn.description" class="conn-desc">{{ conn.description }}</div>
-          </div>
-          <div class="conn-actions">
-            <el-button size="small" :icon="Connection" @click="testConn(conn)" :loading="testingId === conn.id">测试连接</el-button>
-            <el-button size="small" :icon="Search" @click="$router.push(`/databases/${conn.id}/query`)">查询</el-button>
-            <el-button size="small" :icon="Edit" @click="openDialog(conn)">编辑</el-button>
-            <el-button size="small" type="danger" :icon="Delete" @click="deleteConn(conn)">删除</el-button>
-          </div>
-        </el-card>
-      </el-col>
-
-      <el-col :span="8">
-        <div class="conn-add" @click="openDialog()">
-          <el-icon size="36" color="#c0c4cc"><Plus /></el-icon>
-          <span>添加数据库连接</span>
-        </div>
-      </el-col>
-    </el-row>
+            <span v-else class="resource-meta">未测试</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="235">
+          <template #default="{ row }">
+            <div class="connection-actions">
+              <el-button size="small" link :loading="testingId === row.id" @click="testConn(row)">测试连接</el-button>
+              <el-button size="small" link type="primary" @click="$router.push(`/databases/${row.id}/query`)">查询</el-button>
+              <el-button size="small" link @click="openDialog(row)">编辑</el-button>
+              <el-button size="small" link type="danger" @click="deleteConn(row)">删除</el-button>
+            </div>
+          </template>
+        </el-table-column>
+      </el-table>
+    </div>
 
     <!-- 添加/编辑对话框 -->
     <el-dialog v-model="dialogVisible" :title="editingConn ? '编辑连接' : '添加连接'" width="520px" destroy-on-close>
@@ -91,11 +91,17 @@
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { Plus, Edit, Delete, Search, Connection, Location, Box, Coin } from '@element-plus/icons-vue'
+import { Database, Plus } from '@lucide/vue'
+import PageHeader from '@/components/layout/PageHeader.vue'
+import UiButton from '@/components/ui/UiButton.vue'
+import EmptyState from '@/components/ui/EmptyState.vue'
+import ErrorState from '@/components/ui/ErrorState.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { databaseApi } from '@/api'
 
 const connections = ref<any[]>([])
+const loading = ref(true)
+const loadError = ref(false)
 const dialogVisible = ref(false)
 const editingConn = ref<any>(null)
 const testingId = ref<number | null>(null)
@@ -121,20 +127,22 @@ const rules = {
   database: [{ required: true, message: '请输入数据库名', trigger: 'blur' }],
 }
 
-function dbIconColor(type: string) {
-  return type === 'mysql' ? '#4479A1' : type === 'postgresql' ? '#336791' : '#003B57'
-}
-
 function onDbTypeChange(val: string) {
   if (val === 'mysql') form.value.port = 3306
   else if (val === 'postgresql') form.value.port = 5432
 }
 
 async function loadConnections() {
+  loading.value = true
+  loadError.value = false
   try {
     const res = await databaseApi.list()
     connections.value = res.items || []
-  } catch { /* ignore */ }
+  } catch {
+    loadError.value = true
+  } finally {
+    loading.value = false
+  }
 }
 
 function openDialog(conn?: any) {
@@ -201,33 +209,8 @@ onMounted(loadConnections)
 </script>
 
 <style scoped>
-.page-container { padding: 20px; }
-.page-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-.page-header h2 { margin: 0; font-size: 20px; }
-
-.conn-card { margin-bottom: 16px; }
-.conn-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-.conn-icon { width: 40px; height: 40px; border-radius: 8px; background: #f5f7fa; display: flex; align-items: center; justify-content: center; }
-.conn-info { flex: 1; }
-.conn-name { font-weight: 600; font-size: 15px; margin-bottom: 4px; }
-.conn-detail { font-size: 13px; color: #666; line-height: 1.8; margin-bottom: 12px; }
-.conn-detail .el-icon { margin-right: 4px; vertical-align: middle; }
-.conn-desc { color: #999; font-size: 12px; margin-top: 4px; }
-.conn-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-
-.conn-add {
-  height: 200px;
-  border: 2px dashed #dcdfe6;
-  border-radius: 8px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  transition: all 0.3s;
-  gap: 8px;
-  color: #c0c4cc;
-  margin-bottom: 16px;
-}
-.conn-add:hover { border-color: #409eff; color: #409eff; }
+.connection-link { text-decoration: none; }
+.connection-link:hover { color: var(--ui-accent); text-decoration: underline; }
+.connection-actions { display: flex; align-items: center; gap: 12px; }
+.connection-actions :deep(.el-button) { margin: 0; }
 </style>

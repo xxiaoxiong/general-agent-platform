@@ -1,7 +1,7 @@
 import re
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import delete, select, func
 from typing import Optional
 
 from app.core.database import get_db
@@ -159,6 +159,8 @@ async def delete_template(
         raise HTTPException(status_code=404, detail="模板不存在")
     if tpl.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="无权删除")
+    # 历史版本持有模板外键，先在同一事务中清理子记录。
+    await db.execute(delete(PromptTemplateVersion).where(PromptTemplateVersion.template_id == template_id))
     await db.delete(tpl)
     await db.commit()
     return {"message": "删除成功"}

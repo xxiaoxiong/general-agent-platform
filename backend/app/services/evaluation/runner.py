@@ -837,7 +837,7 @@ async def execute_eval_run(eval_run_id: int) -> None:
 _background_tasks: set = set()
 
 
-def start_eval_run_background(eval_run_id: int) -> None:
+async def start_eval_run_background(eval_run_id: int) -> None:
     """把测评任务丢到后台执行（事件循环内）。"""
     task = asyncio.create_task(execute_eval_run(eval_run_id))
     _background_tasks.add(task)

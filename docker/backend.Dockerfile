@@ -14,6 +14,10 @@ COPY backend/requirements.txt .
 ARG PIP_INDEX_URL=https://pypi.org/simple
 RUN pip install --no-cache-dir -i ${PIP_INDEX_URL} -r requirements.txt
 
+# 语音转写网关使用 CPU 解码校验录音时长。
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY backend/ /app/
 COPY docker/backend-entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh \

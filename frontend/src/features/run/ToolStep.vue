@@ -3,28 +3,30 @@
     class="tool-step"
     :class="{ 'is-running': tool.state === 'running', 'is-failed': tool.state === 'failed', 'is-open': open }"
   >
-    <div class="tool-line" @click="open = !open">
-      <span class="tool-state" :class="tool.state">
-        <span v-if="tool.state === 'running'" class="mini-spin"></span>
-        <template v-else>{{ tool.state === 'done' ? '✓' : '✗' }}</template>
-      </span>
-      <!-- Trae 式动词标签：已读取 / 已编辑 / 命令已执行 …（替代裸工具名，更直观） -->
-      <span class="tool-name">{{ toolLabel }}</span>
-      <!-- 文件类工具：文件名可点，点击在右侧临时区块预览文件内容 -->
-      <a
+    <div class="tool-line">
+      <button type="button" class="tool-toggle" :aria-expanded="open" @click="open = !open">
+        <span class="tool-state" :class="tool.state">
+          <LoaderCircle v-if="tool.state === 'running'" class="mini-spin" :size="14" />
+          <CircleCheck v-else-if="tool.state === 'done'" :size="14" />
+          <CircleX v-else :size="14" />
+        </span>
+        <span class="tool-name">{{ toolLabel }}</span>
+        <span v-if="tool.target && !tool.filePath" class="tool-target" :title="tool.target">{{ tool.target }}</span>
+        <ChevronDown class="row-chevron" :class="{ expanded: open }" :size="14" />
+      </button>
+      <button
         v-if="tool.filePath"
+        type="button"
         class="tool-file"
         :title="tool.filePath"
-        @click.stop="$emit('preview', tool.filePath!, fileLabel)"
-      >{{ fileLabel }}</a>
-      <span v-else-if="tool.target" class="tool-target">{{ tool.target }}</span>
+        @click="$emit('preview', tool.filePath!, fileLabel)"
+      >{{ fileLabel }}</button>
       <!-- 编辑 diff 增删统计（Trae 式 +N -N） -->
       <span v-if="diffStat" class="tool-diff">
         <template v-if="diffStat.add != null"><span class="diff-add">+{{ diffStat.add }}</span></template>
         <template v-if="diffStat.del"><span class="diff-del"> -{{ diffStat.del }}</span></template>
       </span>
       <span v-if="durationText" class="tool-duration">{{ durationText }}</span>
-      <el-icon class="row-chevron"><component :is="open ? 'ArrowDown' : 'ArrowRight'" /></el-icon>
     </div>
 
     <!-- 详情：工具名 / 入参 / 出参 / 错误（小字，不干扰主流程阅读） -->
@@ -55,6 +57,7 @@
  * 点击行可展开入参 / 结果 / 错误详情；文件类工具的文件名可点（右侧预览）。
  */
 import { computed, ref } from 'vue'
+import { ChevronDown, CircleCheck, CircleX, LoaderCircle } from '@lucide/vue'
 import type { ToolBlock } from './blocks'
 
 const props = defineProps<{ tool: ToolBlock }>()
@@ -87,6 +90,7 @@ const TOOL_VERBS: Record<string, [string, string]> = {
   http_request: ['请求已发送', '请求发送中'],
 }
 const toolLabel = computed(() => {
+  if (props.tool.state === 'failed') return '工具执行失败'
   const verbs = TOOL_VERBS[props.tool.name] || ['已完成', '正在执行']
   return props.tool.state === 'running' ? verbs[1] : verbs[0]
 })
@@ -135,69 +139,49 @@ const diffStat = computed(() => {
 </script>
 
 <style scoped>
-.tool-step { border-radius: 6px; margin-bottom: 2px; }
-.tool-line {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 3px 6px;
-  color: #606266;
-  cursor: pointer;
-  font-size: 12px;
+.tool-step { min-width: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-md); background: var(--ui-surface); }
+.tool-step + .tool-step { margin-top: 4px; }
+.tool-line { display: flex; align-items: center; gap: 7px; padding: 3px 7px; color: var(--ui-secondary); min-width: 0; font-size: 12px; }
+.tool-toggle {
+  display: inline-flex; align-items: center; gap: 6px; min-width: 0;
+  border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-secondary); padding: 4px;
+  cursor: pointer; text-align: start; line-height: 1.35;
 }
-.tool-line:hover { background: #eef1f5; }
-.tool-step.is-open { background: #eef1f5; }
-.tool-state { width: 14px; text-align: center; flex-shrink: 0; line-height: 18px; font-size: 12px; }
-.tool-state.running { color: #409eff; display: inline-flex; justify-content: center; }
-.tool-state.done { color: #67c23a; }
-.tool-state.failed { color: #f56c6c; }
-.mini-spin {
-  width: 8px; height: 8px; border-radius: 50%;
-  background: #409eff; animation: pulse 1.2s infinite ease-in-out;
+.tool-toggle:hover { color: var(--ui-text); background: var(--ui-hover); }
+.tool-state { display: inline-flex; flex: none; }
+.tool-state.running { color: var(--ui-info); }
+.tool-state.done { color: var(--ui-success); }
+.tool-state.failed { color: var(--ui-danger); }
+.mini-spin { animation: tools-spin 1s linear infinite; }
+@keyframes tools-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .mini-spin { animation: none; } }
+.tool-name { color: var(--ui-text); font-weight: 550; }
+.tool-step.is-running .tool-name { color: var(--ui-info); }
+.tool-step.is-failed .tool-name { color: var(--ui-danger); }
+.tool-target, .tool-file {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+  font-family: var(--ui-font-mono);
 }
-@keyframes pulse { 0%, 100% { opacity: 0.35; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1); } }
-.tool-name { font-weight: 500; color: #303133; flex-shrink: 0; }
-.tool-step.is-running .tool-name { color: #409eff; }
-.tool-step.is-failed .tool-name { color: #f56c6c; }
-.tool-target {
-  color: #909399; font-family: 'Consolas', monospace;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1;
-}
-/* 文件名链接：点击打开右侧预览 */
+.tool-target { color: var(--ui-muted); }
 .tool-file {
-  color: #409eff; font-family: 'Consolas', monospace; cursor: pointer;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1;
-  text-decoration: none;
+  max-width: 44%; padding: 2px 5px; border: 0; border-radius: var(--ui-radius-sm);
+  background: var(--ui-accent-soft); color: var(--ui-accent); cursor: pointer;
 }
 .tool-file:hover { text-decoration: underline; }
-.tool-diff { flex-shrink: 0; font-family: 'Consolas', monospace; font-size: 11px; }
-.diff-add { color: #67c23a; }
-.diff-del { color: #f56c6c; }
-.tool-duration { color: #b0b3b8; font-size: 11px; flex-shrink: 0; }
-.row-chevron { color: #c0c4cc; font-size: 11px; flex-shrink: 0; }
-
-.tool-detail { padding: 2px 6px 8px 28px; }
-.detail-block { margin-top: 4px; }
-.detail-label { font-size: 11px; color: #909399; margin-bottom: 2px; }
-.detail-tool-name {
-  font-family: 'Consolas', monospace; font-size: 11px; color: #5a6270;
-  background: #fff; border: 1px solid #e4e7ed; border-radius: 6px; padding: 4px 8px;
+.tool-diff, .tool-duration { flex: none; font-family: var(--ui-font-mono); font-size: 12px; }
+.diff-add { color: var(--ui-success); }
+.diff-del { color: var(--ui-danger); }
+.tool-duration { color: var(--ui-muted); margin-inline-start: auto; }
+.row-chevron { color: var(--ui-muted); flex: none; transform: rotate(-90deg); }
+.row-chevron.expanded { transform: none; }
+.tool-detail { padding: 0 10px 10px; }
+.detail-block { margin-top: 6px; }
+.detail-label { font-size: 12px; color: var(--ui-muted); margin-bottom: 3px; }
+.detail-tool-name, .detail-pre {
+  background: var(--ui-bg); border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  padding: 6px 8px; color: var(--ui-secondary); font-family: var(--ui-font-mono); font-size: 12px;
 }
-.detail-label-err { color: #f56c6c; }
-.detail-pre {
-  margin: 0;
-  background: #fff;
-  border: 1px solid #e4e7ed;
-  border-radius: 6px;
-  padding: 6px 8px;
-  font-size: 11px;
-  line-height: 1.5;
-  color: #5a6270;
-  max-height: 160px;
-  overflow: auto;
-  white-space: pre-wrap;
-  word-break: break-all;
-  font-family: 'Consolas', monospace;
-}
-.detail-pre-err { background: #fff5f5; border-color: #fbc4c4; color: #c45656; }
+.detail-pre { margin: 0; line-height: 1.5; max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.detail-label-err, .detail-pre-err { color: var(--ui-danger); }
+.detail-pre-err { background: var(--ui-danger-soft); }
 </style>

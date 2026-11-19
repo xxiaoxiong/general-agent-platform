@@ -82,6 +82,12 @@ services:
       DEBUG: "false"
       UPLOAD_DIR: /app/data/uploads
       CHROMA_PERSIST_DIR: /app/data/chroma
+      # 语音听写通过项目网络访问 ASR 服务。
+      ASR_BASE_URL: ${ASR_BASE_URL-http://asr:8000}
+      ASR_MODEL: ${ASR_MODEL:-sensevoice}
+      ASR_TIMEOUT_SECONDS: ${ASR_TIMEOUT_SECONDS:-60}
+      ASR_MAX_UPLOAD_MB: ${ASR_MAX_UPLOAD_MB:-10}
+      ASR_MAX_AUDIO_SECONDS: ${ASR_MAX_AUDIO_SECONDS:-60}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required (>=12 chars, change on first login)}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
@@ -120,6 +126,28 @@ services:
       checkpoint_pg:
         condition: service_healthy
 
+  asr:
+    image: general-agent-platform-asr:local
+    build:
+      context: ../deploy/asr
+    container_name: ai_plat_asr
+    restart: unless-stopped
+    volumes:
+      - asr_model_cache:/var/cache/funasr
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json, urllib.request; state = json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)); assert state['device'] == 'cpu' and 'sensevoice' in state['models_loaded']"
+      interval: 20s
+      timeout: 5s
+      start_period: 10m
+      start_interval: 5s
+      retries: 4
+
   frontend:
     build:
       context: ../frontend
@@ -141,6 +169,9 @@ volumes:
     name: ai-generalplat_app_data
   checkpoint_pg_data:
     name: ai-generalplat_checkpoint_pg_data
+  # 沿用原独立部署的模型卷，新装环境由 Compose 创建。
+  asr_model_cache:
+    name: general-agent-platform-asr_model_cache
 
 networks:
   # 已部署的 Langfuse 栈（langfuse-deploy 项目）所在网络，用于 Trace 上报与评分回写

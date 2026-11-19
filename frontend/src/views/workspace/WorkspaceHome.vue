@@ -1,274 +1,189 @@
 <template>
-  <div class="workspace-home">
-    <!-- 左侧：最近对话 -->
-    <aside class="ws-sidebar">
-      <el-button type="primary" class="new-chat-btn" @click="newConversation">
-        <el-icon><Plus /></el-icon> 新建对话
-      </el-button>
+  <section class="workspace-home" :class="{ 'has-preview': preview }" aria-label="智能体工作空间">
+    <button v-if="historyOpen" type="button" class="history-overlay" aria-label="关闭会话历史" @click="closeHistory()"></button>
+    <ConversationHistory
+      v-show="historyOpen"
+      class="ws-history"
+      :items="conversations"
+      :active-id="currentConversation?.id"
+      :loading="historyLoading"
+      :failed="historyFailed"
+      :creating="creatingConversation"
+      :deleting-id="deletingId"
+      :status="conversationStatus"
+      @close="closeHistory"
+      @retry="loadConversations()"
+      @create="newConversation"
+      @select="selectConversation"
+      @remove="removeConversation"
+    />
 
-      <div class="sidebar-section">
-        <div class="sidebar-title">最近对话</div>
-        <div
-          v-for="c in conversations"
-          :key="c.id"
-          class="conv-item"
-          :class="{ active: currentConversation?.id === c.id, 'is-running': runningConvIds.includes(c.id) }"
-          @click="selectConversation(c)"
+    <section class="ws-main" :class="{ 'is-empty': showWelcome }" aria-label="当前会话">
+      <header class="thread-head">
+        <button
+          v-if="!historyOpen"
+          ref="historyToggle"
+          type="button"
+          class="icon-button"
+          aria-label="打开会话历史"
+          aria-controls="conversation-history"
+          title="打开会话历史"
+          @click="openHistory"
         >
-          <span v-if="runningConvIds.includes(c.id)" class="conv-run-dot"></span>
-          <span class="conv-title">{{ c.title || '新对话' }}</span>
-          <el-icon class="conv-delete" @click.stop="removeConversation(c)"><Delete /></el-icon>
+          <PanelLeft :size="17" />
+        </button>
+        <div class="thread-heading">
+          <span>{{ currentConversation?.title || '新对话' }}</span>
         </div>
-        <div v-if="!conversations.length" class="sidebar-empty">暂无对话</div>
-      </div>
-    </aside>
-
-    <!-- 右侧：对话区 -->
-    <main class="ws-main">
-      <div class="ws-header">
-        <span class="ws-assistant-name">{{ currentAssistant?.name || '通用助手' }}</span>
-      </div>
+        <span class="assistant-name"><Bot :size="15" />{{ currentAssistant?.name || '通用助手' }}</span>
+      </header>
 
       <div
         ref="messagesRef"
         class="ws-messages"
+        :aria-busy="loadingMessages"
+        aria-label="对话消息"
+        role="region"
+        tabindex="0"
         @scroll.passive="onMessagesScroll"
         @wheel.passive="onWheelScroll"
-        @click="onCopyClick"
       >
-        <div v-if="!messages.length" class="ws-empty">
-          <h2>有什么可以帮你？</h2>
-          <p>直接输入问题开始对话，或试试：</p>
-          <div class="ws-examples">
-            <div class="ws-example" @click="sendExample('帮我分析这份数据的趋势并给出结论')">数据分析</div>
-            <div class="ws-example" @click="sendExample('搜索行业最新动态并生成结构化研究摘要')">行业研究</div>
-            <div class="ws-example" @click="sendExample('帮我把这段内容整理成一份正式报告')">生成报告</div>
+        <div v-if="loadingMessages" class="thread-state" role="status">
+          <LoaderCircle class="spin" :size="17" /> 正在加载消息…
+        </div>
+        <div v-else-if="messagesFailed" class="thread-state" role="alert">
+          <CircleAlert :size="17" /> 无法加载此对话
+          <button type="button" class="text-button" @click="reloadMessages">重试</button>
+        </div>
+        <div v-else-if="showWelcome" class="ws-welcome">
+          <div class="welcome-mark"><Bot :size="26" :stroke-width="1.65" /></div>
+          <h1>今天想完成什么？</h1>
+          <p>向{{ currentAssistant?.name || '智能体' }}提问，或上传文件开始协作。</p>
+          <div class="task-examples" aria-label="示例任务">
+            <button v-for="example in examples" :key="example.label" type="button" class="task-example" @click="sendExample(example.prompt)">
+              <component :is="example.icon" :size="16" />
+              {{ example.label }}
+            </button>
           </div>
         </div>
 
-        <template v-for="(m, idx) in messages" :key="idx">
-          <!-- 用户消息（id 供右侧提问圆点导航锚点跳转） -->
-          <div v-if="m.role === 'user'" :id="`q-${idx}`" class="msg-row msg-user">
-            <div class="msg-bubble">
-              <div v-if="m.files?.length" class="msg-files">
-                <template v-for="f in m.files" :key="f.name">
-                  <!-- 图片附件：缩略图点击看大图 -->
-                  <el-image
-                    v-if="f.previewUrl"
-                    class="msg-thumb"
-                    :src="f.previewUrl"
-                    :preview-src-list="[f.previewUrl]"
-                    fit="cover"
-                    preview-teleported
-                    hide-on-click-modal
-                  />
-                  <a
-                    v-else
-                    class="msg-file-tag"
-                    :title="f.name"
-                    @click="openPreview('uploads/' + f.name, f.name)"
+        <div v-else ref="threadRef" class="thread">
+          <template v-for="(m, idx) in messages" :key="idx">
+            <article v-if="m.role === 'user'" :id="'q-' + idx" class="msg-user" aria-label="你的消息">
+              <div class="msg-bubble">
+                <div v-if="m.files?.length" class="msg-files">
+                  <button
+                    v-for="(file, fileIdx) in m.files"
+                    :key="fileIdx"
+                    type="button"
+                    class="msg-file"
+                    :title="file.name"
+                    @click="openPreview('uploads/' + file.name, file.name)"
                   >
-                    <el-icon><Paperclip /></el-icon> {{ f.name }}
-                  </a>
+                    <img v-if="file.previewUrl" :src="file.previewUrl" alt="" />
+                    <FileText v-else :size="16" />
+                    <span>{{ file.name }}</span>
+                  </button>
+                </div>
+                {{ m.content }}
+              </div>
+            </article>
+
+            <article v-else class="msg-assistant" aria-label="助手消息">
+              <div class="assistant-mark"><Bot :size="16" /></div>
+              <div class="msg-content">
+                <div class="msg-heading">
+                  <strong>{{ currentAssistant?.name || '助手' }}</strong>
+                  <span v-if="runState(m)" class="run-state" :data-state="runState(m)?.tone">{{ runState(m)?.label }}</span>
+                  <span v-if="taskTimeText(m)" class="run-duration">{{ taskTimeText(m) }}</span>
+                </div>
+                <template v-for="(block, blockIdx) in messageBlocks[idx]" :key="block.kind === 'tool' ? block.key : blockIdx">
+                  <MessageMarkdown v-if="block.kind === 'text'" :text="block.text" />
+                  <ToolStep v-else-if="block.kind === 'tool'" :tool="block" @preview="openPreview" />
+
+                  <details v-else-if="block.kind === 'plan'" class="process-disclosure" open>
+                    <summary><ListTodo :size="15" />任务计划 <span>{{ planItems(block.todos).length }} 项</span></summary>
+                    <ul>
+                      <li v-for="(todo, todoIdx) in planItems(block.todos)" :key="todoIdx">
+                        <component :is="planIcon(todo.status)" :size="14" :class="'plan-' + todo.status" />
+                        <span :class="{ 'plan-done': todo.status === 'completed' }">{{ todo.content }}</span>
+                      </li>
+                    </ul>
+                  </details>
+
+                  <details v-else-if="block.kind === 'group'" class="process-disclosure">
+                    <summary>
+                      <Layers :size="14" /> {{ groupSummary(block) }}
+                      <span v-if="groupFailCount(block)" class="group-failure">{{ groupFailCount(block) }} 项失败</span>
+                    </summary>
+                    <div class="tool-group-items">
+                      <ToolStep v-for="tool in block.items" :key="tool.key" :tool="tool" @preview="openPreview" />
+                    </div>
+                  </details>
                 </template>
-              </div>
-              {{ m.content }}
-            </div>
-          </div>
 
-          <!-- 助手消息：文本段 / 工具小步骤按事件顺序实时穿插在对话流尾部 -->
-          <div v-else class="msg-row msg-assistant">
-            <div class="msg-content">
-              <!-- 任务耗时（对齐 Trae）：运行中实时累加，终态固化 -->
-              <div v-if="taskTimeText(m)" class="task-time">
-                {{ m.streaming ? '已运行 ' : '任务耗时 ' }}{{ taskTimeText(m) }}
-              </div>
-              <template v-for="(b, bi) in displayBlocks(m, idx)" :key="bi">
-                <div v-if="b.kind === 'text'" class="msg-text" v-html="renderMarkdown(b.text)"></div>
-
-                <ToolStep v-else-if="b.kind === 'tool'" :tool="b" @preview="openPreview" />
-
-                <div v-else-if="b.kind === 'plan'" class="plan-inline">
-                  <div class="plan-inline-title">任务计划</div>
-                  <div v-for="(t, ti) in planItems(b.todos)" :key="ti" class="plan-inline-item">
-                    <span class="plan-mark" :class="'st-' + (t.status || '')">{{ planMark(t.status) }}</span>
-                    <span :class="{ 'plan-done': t.status === 'completed' }">{{ t.content }}</span>
-                  </div>
+                <div v-if="m.streaming" class="live-status" role="status">
+                  <LoaderCircle class="spin" :size="14" />
+                  {{ m.liveStatus || '正在处理…' }}
                 </div>
+                <p v-if="staleSeconds(m) >= 8" class="stale-hint">已 {{ staleSeconds(m) }} 秒无新进展，任务仍在执行。</p>
 
-                <!-- 完成后的连续工具步骤折叠为摘要（不刷屏），可展开回看 -->
-                <div v-else-if="b.kind === 'group'" class="tool-group">
-                  <div class="tool-group-head" @click="toggleGroup(b.key)">
-                    <span class="tool-state-mark">✓</span>
-                    <span>{{ groupSummary(b) }}<span v-if="groupFailCount(b)">（{{ groupFailCount(b) }} 个失败）</span></span>
-                    <el-icon class="row-chevron"><component :is="b.open ? 'ArrowDown' : 'ArrowRight'" /></el-icon>
-                  </div>
-                  <template v-if="b.open">
-                    <ToolStep v-for="it in b.items" :key="it.key" :tool="it" @preview="openPreview" />
-                  </template>
+                <div v-if="m.error" class="msg-error" role="alert"><CircleAlert :size="16" />{{ m.error }}</div>
+                <ApprovalPanel
+                  v-if="m.runId && m.pendingActions?.length && currentConversation"
+                  :key="m.runId"
+                  :actions="m.pendingActions"
+                  :deciding="pendingDecisions.get(m.runId)"
+                  @decide="decideApproval(currentConversation.id, m, $event)"
+                />
+                <div v-if="!m.streaming && (m.runId || m.error || answerText(m))" class="message-actions">
+                  <button v-if="answerText(m)" type="button" class="icon-button" aria-label="复制回复" title="复制回复" @click="copyAnswer(m)">
+                    <Copy :size="15" />
+                  </button>
+                  <button v-if="m.runId" type="button" class="trace-link" @click="openTrace(m.runId)">
+                    <ExternalLink :size="14" /> 执行 Trace
+                  </button>
+                  <button v-if="m.error && messages[idx - 1]?.role === 'user'" type="button" class="trace-link" @click="editRetry(idx - 1)">
+                    <RotateCcw :size="14" /> 编辑并重试
+                  </button>
                 </div>
-              </template>
-
-              <!-- 打字光标：仅"正在生成文本"时出现；工具执行期间用状态行表示 -->
-              <div v-if="m.streaming && m.lastActivity === 'text'" class="typing-cursor-line">
-                <span class="typing-cursor"></span>
               </div>
-
-              <!-- 实时状态行：明确告知当前在做什么；久无进展时给出等待提示（不是卡死） -->
-              <div v-if="m.streaming" class="live-status">
-                <span class="mini-spin"></span>
-                <span>{{ m.liveStatus || '正在处理…' }}</span>
-                <span v-if="staleSeconds(m) >= 8" class="stale-hint">
-                  · 已 {{ staleSeconds(m) }}s 无新进展，仍在执行
-                </span>
-              </div>
-
-              <div v-if="m.error" class="msg-error">{{ m.error }}</div>
-              <ApprovalPanel
-                v-if="m.runId && m.pendingActions?.length"
-                :run-id="m.runId"
-                :actions="m.pendingActions"
-                @decided="onApprovalDecided"
-              />
-              <!-- Langfuse Trace 入口：按 run_id 确定性关联，查看完整执行链路 -->
-              <button
-                v-if="m.runId && !m.streaming"
-                type="button"
-                class="trace-link"
-                @click="openTrace(m.runId)"
-              >查看执行 Trace（Langfuse）</button>
-            </div>
-          </div>
-        </template>
+            </article>
+          </template>
+        </div>
       </div>
 
-      <!-- 提问锚点导航：右侧纵向圆点，点击跳转对应提问，悬浮气泡预览提问内容 -->
-      <div v-if="questionAnchors.length" class="q-nav">
-        <el-tooltip
-          v-for="q in questionAnchors"
-          :key="q.idx"
-          :content="q.preview"
-          placement="left"
-          :show-after="80"
-          popper-class="q-nav-popper"
-        >
-          <button type="button" class="q-nav-dot" @click="jumpToQuestion(q.idx)"></button>
+      <nav v-if="questionAnchors.length > 1" class="question-nav" aria-label="提问导航">
+        <el-tooltip v-for="(question, index) in questionAnchors" :key="question.idx" :content="question.preview" placement="left" popper-class="workspace-question-tooltip">
+          <button type="button" :aria-label="`跳到第 ${index + 1} 个提问：${question.preview}`" @click="jumpToQuestion(question.idx)"></button>
         </el-tooltip>
-      </div>
+      </nav>
 
-      <!-- 输入区（Trae 式：单个圆角容器 = 附件 + 文本 + 底部工具栏） -->
-      <div class="ws-composer">
-        <div v-if="streaming" class="composer-running">
-          <span class="mini-spin"></span>
-          <span>{{ streamingStatus }}</span>
-          <el-button size="small" type="danger" plain @click="stopGeneration">
-            <el-icon><VideoPause /></el-icon> 停止
-          </el-button>
-        </div>
-        <div class="composer-box">
-          <!-- 待发送附件（图片缩略图点击看大图，右上角叉号移除） -->
-          <div v-if="attachments.length" class="attach-strip">
-            <div v-for="(a, i) in attachments" :key="a.path" class="attach-item">
-              <el-image
-                v-if="a.previewUrl"
-                class="attach-thumb"
-                :src="a.previewUrl"
-                :preview-src-list="[a.previewUrl]"
-                fit="cover"
-                preview-teleported
-                hide-on-click-modal
-              />
-              <span v-else class="attach-chip">
-                <el-icon><Paperclip /></el-icon>
-                <span class="attach-name">{{ a.name }}</span>
-                <el-icon class="attach-remove" @click="removeAttachment(i)"><Close /></el-icon>
-              </span>
-              <button
-                v-if="a.previewUrl"
-                type="button"
-                class="attach-x"
-                title="取消"
-                @click.stop="removeAttachment(i)"
-              >×</button>
-            </div>
-          </div>
-          <el-input
-            v-model="inputText"
-            class="composer-textarea"
-            type="textarea"
-            :autosize="{ minRows: 2, maxRows: 12 }"
-            placeholder="输入消息，Enter 发送（Shift+Enter 换行）"
-            @keydown.enter.exact.prevent="sendMessage"
-          />
-          <!-- 底部工具栏：左 = 上传/审批模式，右 = 模型选择/发送 -->
-          <div class="composer-bar">
-            <div class="bar-left">
-              <el-upload
-                class="attach-upload"
-                :show-file-list="false"
-                :http-request="handleUpload"
-                multiple
-              >
-                <el-button class="bar-btn" text title="上传文件">
-                  <el-icon size="18"><Paperclip /></el-icon>
-                </el-button>
-              </el-upload>
-              <el-dropdown trigger="click" @command="onApprovalCommand">
-                <el-button class="bar-btn bar-trigger" text>
-                  <el-icon size="14"><Lock /></el-icon>
-                  <span class="bar-label">{{ approvalMode === 'manual' ? '手动审批' : '自动审批' }}</span>
-                  <el-icon size="11" class="bar-caret"><ArrowDown /></el-icon>
-                </el-button>
-                <template #dropdown>
-                  <el-dropdown-menu>
-                    <el-dropdown-item command="manual">
-                      <span class="item-check">{{ approvalMode === 'manual' ? '✓' : '' }}</span>手动审批（高危工具需确认）
-                    </el-dropdown-item>
-                    <el-dropdown-item command="auto">
-                      <span class="item-check">{{ approvalMode === 'auto' ? '✓' : '' }}</span>自动审批（高危工具自动放行）
-                    </el-dropdown-item>
-                  </el-dropdown-menu>
-                </template>
-              </el-dropdown>
-            </div>
-            <div class="bar-right">
-              <el-dropdown trigger="click" @command="onModelCommand">
-                <el-button class="bar-btn bar-trigger" text>
-                  <el-icon size="14"><Cpu /></el-icon>
-                  <span class="bar-label">{{ selectedModelLabel }}</span>
-                  <el-icon size="11" class="bar-caret"><ArrowDown /></el-icon>
-                </el-button>
-                <template #dropdown>
-                  <el-dropdown-menu>
-                    <el-dropdown-item command="0">
-                      <span class="item-check">{{ !selectedModelId ? '✓' : '' }}</span>默认模型
-                    </el-dropdown-item>
-                    <el-dropdown-item
-                      v-for="m in modelOptions"
-                      :key="m.id"
-                      :command="String(m.id)"
-                    >
-                      <span class="item-check">{{ selectedModelId === m.id ? '✓' : '' }}</span>{{ m.display_name || m.name }}
-                    </el-dropdown-item>
-                  </el-dropdown-menu>
-                </template>
-              </el-dropdown>
-              <button
-                class="send-btn"
-                type="button"
-                title="发送"
-                :disabled="streaming || !inputText.trim()"
-                @click="sendMessage"
-              >
-                <el-icon size="16"><Top /></el-icon>
-              </button>
-            </div>
-          </div>
-        </div>
+      <div class="composer-dock">
+        <button v-if="showJumpToLatest" type="button" class="latest-button" @click="forceScrollToBottom">
+          <ArrowDown :size="15" /> 跳到最新消息
+        </button>
+        <ConversationComposer
+          ref="composer"
+          v-model:text="inputText"
+          v-model:approval-mode="approvalMode"
+          v-model:model="selectedModelId"
+          :options="modelOptions"
+          :attachments="attachments"
+          :uploading="uploading"
+          :sending="sending"
+          :stoppable="streaming"
+          :blocked-reason="blockedReason"
+          :locked="loadingMessages || messagesFailed"
+          @send="sendMessage"
+          @stop="stopGeneration"
+          @upload="uploadAttachments"
+          @remove="removeAttachment"
+          @preview="openPreview"
+        />
       </div>
-    </main>
+    </section>
 
-    <!-- 右侧临时文件预览区块（点文件名打开，Esc / × 关闭） -->
     <FilePreviewPanel
       v-if="preview"
       :data="preview.data"
@@ -277,9 +192,9 @@
       :error="preview.error"
       @close="closePreview"
       @download="downloadPreview"
-      @open-original="(p: string) => openPreview(p)"
+      @open-original="openPreview"
     />
-  </div>
+  </section>
 </template>
 
 <script setup lang="ts">
@@ -293,10 +208,12 @@
  * - 审批按 action_id 决策（UX-09）。
  */
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { Delete, Paperclip, Plus, VideoPause } from '@element-plus/icons-vue'
+import { useRoute, useRouter } from 'vue-router'
+import {
+  ArrowDown, Bot, ChartNoAxesCombined, Circle, CircleAlert, CircleCheck, CircleDot,
+  Copy, ExternalLink, FilePenLine, FileText, Layers, ListTodo, LoaderCircle, PanelLeft, RotateCcw, Search,
+} from '@lucide/vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { marked } from 'marked'
-import DOMPurify from 'dompurify'
 import { modelApi } from '@/api'
 import {
   conversationApi, consumeRunEvents, runApi, workspaceApi,
@@ -308,7 +225,11 @@ import {
 } from '@/features/run/blocks'
 import ToolStep from '@/features/run/ToolStep.vue'
 import ApprovalPanel from '@/features/run/ApprovalPanel.vue'
+import MessageMarkdown from '@/features/run/MessageMarkdown.vue'
 import FilePreviewPanel from '@/features/preview/FilePreviewPanel.vue'
+import ConversationComposer from './ConversationComposer.vue'
+import ConversationHistory from './ConversationHistory.vue'
+import { hasScrolledAway, isNearLatest } from './interactions'
 
 interface ChatMessage extends RunStreamMessage {
   role: 'user' | 'assistant'
@@ -321,9 +242,7 @@ interface ChatMessage extends RunStreamMessage {
 /** 折叠后的连续工具步骤组（完成后折叠防刷屏） */
 interface ToolGroupItem {
   kind: 'group'
-  key: string
   items: ToolBlock[]
-  open: boolean
 }
 type DisplayItem = MsgBlock | ToolGroupItem
 
@@ -339,12 +258,71 @@ const messages = computed<ChatMessage[]>(() =>
   currentConversation.value ? convArr(currentConversation.value.id) : [],
 )
 const messagesRef = ref<HTMLElement>()
+const threadRef = ref<HTMLElement>()
 const inputText = ref('')
+const route = useRoute()
+const router = useRouter()
+const composer = ref<InstanceType<typeof ConversationComposer>>()
+const historyToggle = ref<HTMLButtonElement>()
+const historyMedia = window.matchMedia('(min-width: 850px)')
+const historyOpen = ref(historyMedia.matches)
+const historyLoading = ref(false)
+const historyFailed = ref(false)
+const creatingConversation = ref(false)
+const deletingId = ref<number | null>(null)
+const loadingMessagesFor = reactive(new Set<number>())
+const failedMessagesFor = reactive(new Set<number>())
+const loadingMessages = computed(() => loadingMessagesFor.has(currentConversation.value?.id ?? -1))
+const messagesFailed = computed(() => failedMessagesFor.has(currentConversation.value?.id ?? -1))
+const showWelcome = computed(() => !messages.value.length && !loadingMessages.value && !messagesFailed.value)
+const sending = ref(false)
+const uploading = ref(0)
+let creating: Promise<Conversation> | undefined
+let historyRevision = 0
+let inactive = false
+
+const examples = [
+  { label: '分析数据', icon: ChartNoAxesCombined, prompt: '帮我分析这份数据的趋势并给出结论' },
+  { label: '研究主题', icon: Search, prompt: '搜索行业最新动态并生成结构化研究摘要' },
+  { label: '整理报告', icon: FilePenLine, prompt: '帮我把这段内容整理成一份正式报告' },
+]
+
+function syncConversationUrl(id?: number) {
+  if (route.name !== 'Workspace' || route.query.conversation === (id ? String(id) : undefined)) return
+  const query = { ...route.query }
+  if (id) query.conversation = String(id)
+  else delete query.conversation
+  void router.replace({ query })
+}
+
+function openLinkedConversation() {
+  const id = route.query.conversation
+  if (typeof id !== 'string' || historyLoading.value || historyFailed.value || inactive) return
+  const item = conversations.value.find((conversation) => String(conversation.id) === id)
+  if (item && currentConversation.value?.id !== item.id) void selectConversation(item)
+}
+
+watch(() => route.query.conversation, openLinkedConversation)
+
+function openHistory() {
+  historyOpen.value = true
+  nextTick(() => document.querySelector<HTMLElement>('#conversation-history button')?.focus())
+}
+
+function closeHistory(restoreFocus = true) {
+  historyOpen.value = false
+  if (restoreFocus) nextTick(() => historyToggle.value?.focus())
+}
+
+function syncHistoryVisibility(event: MediaQueryListEvent) {
+  historyOpen.value = event.matches
+}
 
 // 当前会话是否有活跃 Run（各会话互不影响，可并行执行）
 // 注意：entry 含 AbortController 等类实例且需要引用相等比较，必须用普通 Map；
 // 响应式仅体现在 runningConvIds（供模板/计算属性跟踪）
 const activeRuns = new Map<number, ActiveRun>()
+const pendingDecisions = reactive(new Map<string, 'approve' | 'reject'>())
 const runningConvIds = ref<number[]>([])
 
 function setActiveRun(convId: number, entry: ActiveRun) {
@@ -363,15 +341,25 @@ function clearActiveRun(convId: number, entry?: ActiveRun) {
 
 const streaming = computed(() =>
   !!currentConversation.value && runningConvIds.value.includes(currentConversation.value.id))
-const streamingStatus = computed(() => {
-  const entry = currentConversation.value && activeRuns.get(currentConversation.value.id)
-  return entry?.msg.liveStatus || '任务执行中…'
+const blockedReason = computed(() => {
+  if (streaming.value) return '任务运行中，可以停止生成。'
+  if (messages.value.some((m) => m.pendingActions?.length)) return '请先处理消息中的审批请求。'
+  if (messages.value.some((m) => m.streaming)) return '正在恢复执行进度…'
+  return ''
 })
 
 const conversations = ref<Conversation[]>([])
 const currentConversation = ref<Conversation | null>(null)
 /** 当前对话使用的助手：固定为 bootstrap 下发的默认助手（不再提供助手管理入口） */
 const currentAssistant = ref<Assistant | null>(null)
+
+function conversationStatus(c: Conversation) {
+  if (runningConvIds.value.includes(c.id)) return '执行中'
+  const cached = convMessages.get(c.id)
+  if (cached?.some((message) => message.pendingActions?.length)) return '等待审批'
+  if (cached?.some((message) => message.streaming)) return '恢复进度中'
+  return c.active_run_id && !cached ? '有活跃任务' : ''
+}
 
 // 权限模块：审批模式（manual=高危工具人工审批；auto=自动放行不询问），随 Run 创建下发
 const approvalMode = ref<'manual' | 'auto'>(
@@ -380,18 +368,8 @@ const approvalMode = ref<'manual' | 'auto'>(
 watch(approvalMode, (v) => localStorage.setItem('approval_mode', v))
 
 // 模型选择（手动选模型仅本次 Run 生效；0 = 助手默认模型）
-const modelOptions = ref<any[]>([])
+const modelOptions = ref<Array<{ id: number; name: string; display_name?: string | null }>>([])
 const selectedModelId = ref<number>(0)
-const selectedModelLabel = computed(() => {
-  const m = modelOptions.value.find((x) => x.id === selectedModelId.value)
-  return m ? (m.display_name || m.name) : '默认模型'
-})
-function onModelCommand(cmd: string) {
-  selectedModelId.value = Number(cmd) || 0
-}
-function onApprovalCommand(cmd: string) {
-  approvalMode.value = cmd === 'auto' ? 'auto' : 'manual'
-}
 
 // 待发送附件（上传即写入会话工作区，随消息告知模型读取；切换会话即清空）
 const attachments = ref<Array<{
@@ -428,53 +406,36 @@ function taskTimeText(m: ChatMessage): string {
   return ''
 }
 
-// Markdown 渲染（marked + DOMPurify）：回答主体是用户的核心产物，必须完整渲染
-// marked v12 renderer 收 token 对象；兼容旧式 (code, lang) 双签名
-// 注意：复制按钮不用内联 onclick —— DOMPurify 会剥离事件处理器导致复制失效，
-// 改为 class 标记 + 容器事件委托（onCopyClick）处理。
-function renderCodeBlock(code: string, lang?: string) {
-  const langClass = lang ? ` class="language-${lang}"` : ''
-  const escaped = code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-  return `<div class="code-block-wrapper"><button class="copy-btn" type="button">复制</button><pre><code${langClass}>${escaped}</code></pre></div>`
+const statuses: Record<string, { label: string; tone: string }> = {
+  pending: { label: '排队中', tone: 'info' },
+  running: { label: '执行中', tone: 'info' },
+  waiting_approval: { label: '等待审批', tone: 'warning' },
+  needs_reconciliation: { label: '等待处理', tone: 'warning' },
+  completed: { label: '已完成', tone: 'success' },
+  failed: { label: '失败', tone: 'danger' },
+  cancelled: { label: '已停止', tone: 'neutral' },
+  suspended: { label: '已挂起', tone: 'warning' },
+  limit_exceeded: { label: '达到执行上限', tone: 'warning' },
 }
 
-/** 代码块复制（事件委托）：v-html 内联 onclick 会被 DOMPurify 剥离，故用委托 */
-function onCopyClick(e: MouseEvent) {
-  const btn = (e.target as HTMLElement | null)?.closest?.('.copy-btn') as HTMLElement | null
-  if (!btn) return
-  const code = btn.closest('.code-block-wrapper')?.querySelector('code')?.textContent || ''
-  const flash = (t: string) => {
-    btn.textContent = t
-    window.setTimeout(() => { btn.textContent = '复制' }, 1500)
-  }
-  if (navigator.clipboard?.writeText) {
-    navigator.clipboard.writeText(code).then(() => flash('已复制')).catch(() => flash('复制失败'))
-  } else {
-    flash('复制失败')
-  }
+function runState(message: ChatMessage) {
+  if (message.pendingActions?.length) return statuses.waiting_approval
+  if (message.streaming && message.runStatus !== 'pending') return statuses.running
+  if (message.error) return statuses.failed
+  return message.runId ? statuses[message.runStatus || ''] : undefined
 }
 
-marked.use({
-  breaks: true,
-  gfm: true,
-  renderer: {
-    code(arg1: any, arg2?: string) {
-      if (arg1 && typeof arg1 === 'object') {
-        return renderCodeBlock(String(arg1.text || ''), arg1.lang || undefined)
-      }
-      return renderCodeBlock(String(arg1 || ''), arg2)
-    },
-    link(href: string, title: string | null, text: string) {
-      const titleAttr = title ? ` title="${title}"` : ''
-      return `<a href="${href}" target="_blank" rel="noopener noreferrer"${titleAttr}>${text}</a>`
-    },
-  } as any,
-})
+function answerText(message: ChatMessage) {
+  return message.blocks.flatMap((block) => block.kind === 'text' ? [block.text] : []).join('\n\n')
+}
 
-function renderMarkdown(text: string): string {
-  if (!text) return ''
-  const raw = marked.parse(text) as string
-  return DOMPurify.sanitize(raw)
+async function copyAnswer(message: ChatMessage) {
+  try {
+    await navigator.clipboard.writeText(answerText(message))
+    ElMessage.success('回复已复制')
+  } catch {
+    ElMessage.error('无法复制回复')
+  }
 }
 
 /**
@@ -486,13 +447,16 @@ function renderMarkdown(text: string): string {
  * 超出阈值导致从此不再自动滚动。粘底标志表达的是"用户意图"，与内容涨幅无关。
  */
 const stickToBottom = ref(true)
+const showJumpToLatest = ref(false)
+let messageResize: ResizeObserver | undefined
 /** 最近一次钉底时的 scrollTop：内容撑开不改变 scrollTop，用户上翻才会 */
 let lastPinnedTop = -1
 
 function onMessagesScroll() {
   const el = messagesRef.value
   if (!el) return
-  stickToBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+  stickToBottom.value = isNearLatest(el)
+  showJumpToLatest.value = !stickToBottom.value
 }
 
 /** 滚轮上翻 = 明确的"离开底部"意图，同步解除粘底（scroll 事件派发晚于微任务，存在竞态） */
@@ -508,8 +472,9 @@ async function scrollToBottom() {
   // 粘底判定必须放在滚动前一刻：若在 nextTick 之前检查，上翻瞬间在途的
   // 跟随调用会把用户强行拽回底部（并经 scroll 事件把粘底标志重新武装）
   // 双保险：scrollTop 被拽离最近钉底位置 = 用户上翻（内容撑开不会改 scrollTop）
-  if (lastPinnedTop >= 0 && el.scrollTop < lastPinnedTop - 40) {
+  if (hasScrolledAway(el, lastPinnedTop)) {
     stickToBottom.value = false
+    showJumpToLatest.value = true
     return
   }
   el.scrollTop = el.scrollHeight
@@ -519,6 +484,7 @@ async function scrollToBottom() {
 /** 强制回到底部并恢复跟随（切换会话/发送消息/任务开始等明确意图） */
 async function forceScrollToBottom() {
   stickToBottom.value = true
+  showJumpToLatest.value = false
   await nextTick()
   const el = messagesRef.value
   if (el) {
@@ -533,7 +499,7 @@ const questionAnchors = computed(() =>
   messages.value
     .map((m, idx) => ({ m, idx }))
     .filter(({ m }) => m.role === 'user')
-    .map(({ m, idx }) => ({ idx, preview: questionPreview(m.content) })),
+    .map(({ m, idx }) => ({ idx, preview: questionPreview(m.content) || '附件消息' })),
 )
 
 function questionPreview(text: string): string {
@@ -554,12 +520,6 @@ function jumpToQuestion(idx: number) {
 }
 
 // ── 块流展示（工具步骤实时穿插；完成后连续步骤折叠防刷屏）──────────────────
-
-const groupOpen = reactive<Record<string, boolean>>({})
-
-function toggleGroup(key: string) {
-  groupOpen[key] = !groupOpen[key]
-}
 
 function groupFailCount(g: ToolGroupItem): number {
   return g.items.filter((i) => i.state === 'failed').length
@@ -595,23 +555,15 @@ function groupSummary(g: ToolGroupItem): string {
   return parts.join('，') || `${g.items.length} 个工具调用`
 }
 
-/** markdown 渲染后无可见内容（只剩注释/标记/不可见字符）的文本块视为空块 */
-function rendersEmpty(md: string): boolean {
-  const tmp = document.createElement('div')
-  tmp.innerHTML = renderMarkdown(md)
-  const text = (tmp.textContent || '').replace(new RegExp('[\\s\\u00ad\\u200b-\\u200f\\u2060\\ufeff]', 'g'), '')
-  return !text && !tmp.querySelector('img, pre, table, hr')
-}
-
 /** 计划清单可见条目（无内容条目不渲染，防白板） */
 function planItems(todos: any[]): any[] {
   return (todos || []).filter((t) => hasVisibleText(String(t?.content ?? '')))
 }
 
-function displayBlocks(m: ChatMessage, msgIdx: number): DisplayItem[] {
+function displayBlocks(m: ChatMessage): DisplayItem[] {
   // 空白文本块（模型偶发的纯空白/零宽增量）与空计划块不渲染，避免"白板区块"
   const blocks = m.blocks.filter((b) => {
-    if (b.kind === 'text') return hasVisibleText(b.text) && !rendersEmpty(b.text)
+    if (b.kind === 'text') return hasVisibleText(b.text.replace(/<!--.*?-->/gs, ''))
     if (b.kind === 'plan') return planItems(b.todos).length > 0
     return true
   })
@@ -625,8 +577,7 @@ function displayBlocks(m: ChatMessage, msgIdx: number): DisplayItem[] {
       while (j < blocks.length && blocks[j].kind === 'tool') j++
       const group = blocks.slice(i, j) as ToolBlock[]
       if (group.length > 3) {
-        const key = `${msgIdx}-${i}`
-        out.push({ kind: 'group', key, items: group, open: !!groupOpen[key] })
+        out.push({ kind: 'group', items: group })
       } else {
         out.push(...group)
       }
@@ -639,8 +590,12 @@ function displayBlocks(m: ChatMessage, msgIdx: number): DisplayItem[] {
   return out
 }
 
-function planMark(status: string) {
-  return { completed: '[x]', in_progress: '[>]' }[status] || '[ ]'
+const messageBlocks = computed(() => messages.value.map(displayBlocks))
+
+function planIcon(status: string) {
+  if (status === 'completed') return CircleCheck
+  if (status === 'in_progress') return CircleDot
+  return Circle
 }
 
 // ── 初始化 ────────────────────────────────────────────────────────────────────
@@ -648,27 +603,56 @@ function planMark(status: string) {
 onMounted(async () => {
   clockTimer = window.setInterval(() => { clock.value = Date.now() }, 1000)
   window.addEventListener('keydown', onGlobalKeydown)
-  const boot = await workspaceApi.bootstrap()
-  currentAssistant.value = boot.default_assistant
+  historyMedia.addEventListener('change', syncHistoryVisibility)
+  messageResize = new ResizeObserver(() => { void scrollToBottom() })
+  if (messagesRef.value) messageResize.observe(messagesRef.value)
+  workspaceApi.bootstrap().then((boot) => {
+    currentAssistant.value = boot.default_assistant
+  }).catch(() => { /* 默认助手仍可由服务端选择 */ })
   modelApi.listConfigs({ model_type: 'chat' }).then((list) => {
     modelOptions.value = (list || []).filter((m: any) => m.is_active)
   }).catch(() => { /* 模型列表加载失败不阻断对话 */ })
   await loadConversations()
+  openLinkedConversation()
+})
+
+watch(threadRef, (thread, previous) => {
+  if (previous) messageResize?.unobserve(previous)
+  if (thread) messageResize?.observe(thread)
 })
 
 onUnmounted(() => {
+  inactive = true
   if (clockTimer) clearInterval(clockTimer)
   window.removeEventListener('keydown', onGlobalKeydown)
+  historyMedia.removeEventListener('change', syncHistoryVisibility)
+  messageResize?.disconnect()
   for (const entry of activeRuns.values()) {
     entry.stopped = true
     entry.abort.abort()
   }
   runningConvIds.value = []
+  closePreview()
+  for (const url of attachmentUrls) URL.revokeObjectURL(url)
+  for (const controller of historyStreams.values()) controller.abort()
 })
 
-async function loadConversations() {
-  const res = await conversationApi.list()
-  conversations.value = res.items || []
+async function loadConversations(refresh = false) {
+  const revision = ++historyRevision
+  if (!refresh) historyLoading.value = true
+  historyFailed.value = false
+  try {
+    const res = await conversationApi.list()
+    if (revision === historyRevision) {
+      conversations.value = res.items || []
+      const refreshed = conversations.value.find((item) => item.id === currentConversation.value?.id)
+      if (refreshed) currentConversation.value = refreshed
+    }
+  } catch {
+    if (revision === historyRevision && !conversations.value.length) historyFailed.value = true
+  } finally {
+    if (revision === historyRevision) historyLoading.value = false
+  }
 }
 
 // ── 会话管理（执行中自由切换；后台运行互不干扰）──────────────────────────────
@@ -685,33 +669,74 @@ function pushMsg(convId: number, msg: ChatMessage): ChatMessage {
 }
 
 async function newConversation() {
-  const c = await conversationApi.create({ assistant_id: currentAssistant.value?.id })
-  conversations.value.unshift(c)
-  currentConversation.value = c
-  convMessages.set(c.id, [])
-  attachments.value = []
+  composer.value?.cancelDictation()
+  try {
+    const c = await createConversation()
+    if (currentConversation.value?.id === c.id) focusConversation()
+  } catch { /* 请求层提示失败，用户可重试 */ }
 }
 
 /** 无会话时（上传附件 / 首条消息）自动创建会话 */
-async function ensureConversation(): Promise<Conversation> {
-  if (currentConversation.value) return currentConversation.value
-  const c = await conversationApi.create({ assistant_id: currentAssistant.value?.id })
-  conversations.value.unshift(c)
-  currentConversation.value = c
-  convMessages.set(c.id, [])
-  return c
+function createConversation(): Promise<Conversation> {
+  if (creating) return creating
+  const origin = currentConversation.value?.id
+  creatingConversation.value = true
+  creating = conversationApi.create({ assistant_id: currentAssistant.value?.id }).then((c) => {
+    conversations.value.unshift(c)
+    convMessages.set(c.id, [])
+    if (currentConversation.value?.id === origin) switchConversation(c)
+    void loadConversations(true)
+    return c
+  }).finally(() => {
+    creating = undefined
+    creatingConversation.value = false
+  })
+  return creating
 }
 
-async function selectConversation(c: Conversation) {
-  currentConversation.value = c
+function ensureConversation() {
+  return currentConversation.value ?? createConversation()
+}
+
+function disposeAttachments() {
+  for (const file of attachments.value) releaseAttachmentUrl(file.previewUrl)
   attachments.value = []
-  if (convMessages.has(c.id)) {
+}
+
+function switchConversation(c: Conversation | null) {
+  composer.value?.cancelDictation()
+  disposeAttachments()
+  closePreview()
+  currentConversation.value = c
+  syncConversationUrl(c?.id)
+  showJumpToLatest.value = false
+}
+
+function focusConversation() {
+  if (!historyMedia.matches) closeHistory(false)
+  nextTick(() => composer.value?.focus())
+}
+
+function reloadMessages() {
+  if (currentConversation.value) void selectConversation(currentConversation.value)
+}
+
+const historyStreams = new Map<string, AbortController>()
+
+async function selectConversation(c: Conversation) {
+  if (currentConversation.value?.id !== c.id) switchConversation(c)
+  if (!historyMedia.matches) closeHistory()
+  if (loadingMessagesFor.has(c.id)) return
+  if (convMessages.has(c.id) && !failedMessagesFor.has(c.id)) {
     await forceScrollToBottom()
     return
   }
-  const arr = convArr(c.id)
+  loadingMessagesFor.add(c.id)
+  failedMessagesFor.delete(c.id)
   try {
     const res = await conversationApi.messages(c.id)
+    if (inactive || !conversations.value.some((item) => item.id === c.id)) return
+    const arr = convArr(c.id)
     const raw: any[] = res.items || []
     for (const m of raw) {
       if (m.role === 'user') {
@@ -721,7 +746,8 @@ async function selectConversation(c: Conversation) {
         files.forEach((f, fi) => {
           if (isImageName(f.name)) {
             loadFilePreview(c.id, f.name).then((url) => {
-              if (url && msg.files) msg.files[fi].previewUrl = url
+              if (url && msg.files && convMessages.has(c.id)) msg.files[fi].previewUrl = url
+              else releaseAttachmentUrl(url)
             })
           }
         })
@@ -744,34 +770,70 @@ async function selectConversation(c: Conversation) {
           lastActivity: 'other', lastEventAt: Date.now(),
           liveStatus: '正在恢复执行进度…',
         })
-        consumeRunEvents(runId, {
+        const controller = new AbortController()
+        historyStreams.set(runId, controller)
+        void consumeRunEvents(runId, {
+          signal: controller.signal,
           afterSeq: 0,
-          onEvent: (envelope) => applyRunEvent(msg, envelope),
+          onEvent: (envelope) => {
+            applyRunEvent(msg, envelope)
+            if (currentConversation.value?.id === c.id) void scrollToBottom()
+          },
           onDone: (reason) => finalizeRunMessage(msg, reason, msg.content),
         }).catch(() => {
           msg.streaming = false
           msg.liveStatus = ''
+        }).finally(() => {
+          historyStreams.delete(runId)
         })
       }
     }
-    await forceScrollToBottom()
-  } catch { /* ignore */ }
+  } catch {
+    convMessages.delete(c.id)
+    failedMessagesFor.add(c.id)
+  } finally {
+    loadingMessagesFor.delete(c.id)
+    if (currentConversation.value?.id === c.id && !failedMessagesFor.has(c.id)) await forceScrollToBottom()
+  }
 }
 
 async function removeConversation(c: Conversation) {
-  await ElMessageBox.confirm('确定删除此对话？', '确认', { type: 'warning' })
-  const entry = activeRuns.get(c.id)
-  if (entry) {
-    entry.stopped = true
-    entry.abort.abort()
-    clearActiveRun(c.id)
-    if (entry.msg.runId) runApi.cancel(entry.msg.runId, '会话已删除').catch(() => {})
+  if (deletingId.value !== null) return
+  deletingId.value = c.id
+  try {
+    await ElMessageBox.confirm(`确定删除「${c.title || '新对话'}」？`, '删除对话', {
+      type: 'warning', confirmButtonText: '删除', cancelButtonText: '保留',
+    })
+  } catch {
+    deletingId.value = null
+    return
   }
-  await conversationApi.delete(c.id)
-  conversations.value = conversations.value.filter((x) => x.id !== c.id)
-  convMessages.delete(c.id)
-  if (currentConversation.value?.id === c.id) {
-    currentConversation.value = null
+  try {
+    const entry = activeRuns.get(c.id)
+    if (entry && !entry.msg.runId) {
+      ElMessage.info('任务正在创建，请稍后再删除对话')
+      return
+    }
+    const runId = entry?.msg.runId
+    if (runId) await runApi.cancel(runId, '删除会话前取消任务')
+    await conversationApi.delete(c.id)
+    if (entry) {
+      entry.stopped = true
+      entry.abort.abort()
+      clearActiveRun(c.id, entry)
+    }
+    conversations.value = conversations.value.filter((x) => x.id !== c.id)
+    for (const message of convMessages.get(c.id) || []) {
+      for (const file of message.files || []) releaseAttachmentUrl(file.previewUrl)
+      if (message.runId) historyStreams.get(message.runId)?.abort()
+    }
+    convMessages.delete(c.id)
+    if (currentConversation.value?.id === c.id) switchConversation(null)
+    ElMessage.success('对话已删除')
+    void loadConversations(true)
+  } catch { /* 请求层提示失败，原对话仍可查看 */ }
+  finally {
+    deletingId.value = null
   }
 }
 
@@ -800,27 +862,47 @@ function splitAttachmentNote(content: string): {
 }
 
 /** 历史图片附件懒加载预览（Blob -> objectURL） */
+const attachmentUrls = new Set<string>()
+
+function attachmentUrl(blob: Blob) {
+  if (inactive) return undefined
+  const url = URL.createObjectURL(blob)
+  attachmentUrls.add(url)
+  return url
+}
+
+function releaseAttachmentUrl(url?: string) {
+  if (url && attachmentUrls.delete(url)) URL.revokeObjectURL(url)
+}
+
 async function loadFilePreview(conversationId: number, name: string): Promise<string | undefined> {
   try {
     const blob = await conversationApi.fileBlob(conversationId, name)
-    return URL.createObjectURL(blob)
+    return attachmentUrl(blob)
   } catch { return undefined }
 }
 
-async function handleUpload(req: { file: File }) {
+async function uploadAttachments(files: File[]) {
+  uploading.value += files.length
   try {
     const conv = await ensureConversation()
-    const res = await conversationApi.uploadFile(conv.id, req.file)
-    attachments.value.push({
-      ...res,
-      previewUrl: isImageName(res.name) ? URL.createObjectURL(req.file) : undefined,
-    })
+    const results = await Promise.allSettled(files.map(async (file) => {
+      const res = await conversationApi.uploadFile(conv.id, file)
+      if (currentConversation.value?.id !== conv.id || inactive) return
+      attachments.value.push({ ...res, previewUrl: isImageName(res.name) ? attachmentUrl(file) : undefined })
+    }))
+    const completeCount = results.filter((result) => result.status === 'fulfilled').length
+    if (completeCount && currentConversation.value?.id === conv.id) ElMessage.success(`已上传 ${completeCount} 个附件`)
   } catch { /* 错误提示已由请求层统一弹出 */ }
+  finally {
+    uploading.value -= files.length
+  }
 }
 
 async function removeAttachment(i: number) {
   const a = attachments.value[i]
   attachments.value.splice(i, 1)
+  releaseAttachmentUrl(a?.previewUrl)
   if (currentConversation.value && a) {
     conversationApi.deleteFile(currentConversation.value.id, a.name).catch(() => {})
   }
@@ -836,18 +918,24 @@ interface PreviewState {
   data: PreviewContent | null
 }
 const preview = ref<PreviewState | null>(null)
+let previewGeneration = 0
 
 /** 打开右侧预览（path 为工作区相对路径；name 为展示名） */
 async function openPreview(path: string, name?: string) {
   const conv = currentConversation.value
   if (!conv || !path) return
   const display = name || path.replace(/\\/g, '/').split('/').filter(Boolean).pop() || path
+  const previousUrl = preview.value?.data?.objectUrl
+  if (previousUrl) URL.revokeObjectURL(previousUrl)
+  const generation = ++previewGeneration
   preview.value = { name: display, path, loading: true, error: '', data: null }
   try {
     const meta = await conversationApi.filePreview(conv.id, path)
+    if (generation !== previewGeneration) return
     let objectUrl: string | undefined
     if (meta.kind === 'image' || meta.kind === 'pdf') {
       const blob = await conversationApi.fileBytes(conv.id, path)
+      if (generation !== previewGeneration) return
       objectUrl = URL.createObjectURL(blob)
     }
     preview.value = {
@@ -855,15 +943,18 @@ async function openPreview(path: string, name?: string) {
       loading: false, error: '', data: { ...meta, objectUrl },
     }
   } catch (e: any) {
+    if (generation !== previewGeneration) return
+    const detail = e?.response?.data?.detail
     preview.value = {
       name: display, path, loading: false,
-      error: e?.response?.data?.detail || e?.message || '预览失败', data: null,
+      error: typeof detail === 'string' ? detail : '无法加载文件预览', data: null,
     }
   }
 }
 
 /** 关闭预览（回收 objectURL，防内存泄漏） */
 function closePreview() {
+  ++previewGeneration
   const url = preview.value?.data?.objectUrl
   if (url) URL.revokeObjectURL(url)
   preview.value = null
@@ -891,27 +982,44 @@ async function downloadPreview() {
 
 /** Esc 关闭预览（仅预览打开时拦截） */
 function onGlobalKeydown(e: KeyboardEvent) {
-  if (e.key === 'Escape' && preview.value) {
-    e.preventDefault()
-    closePreview()
-  }
+  if (e.key !== 'Escape' || e.defaultPrevented) return
+  if (preview.value) closePreview()
+  else if (historyOpen.value && !historyMedia.matches) closeHistory()
 }
 
 // ── 发送与事件流消费（§7.1 v2 协议 + §8.4 重连）──────────────────────────────
 
 function sendExample(text: string) {
   inputText.value = text
-  sendMessage()
+  composer.value?.focus()
+}
+
+function editRetry(userMessageIndex: number) {
+  const message = messages.value[userMessageIndex]
+  if (message?.role !== 'user') return
+  inputText.value = message.content
+  if (message.files?.length) ElMessage.info('请为重试重新选择附件')
+  composer.value?.focus()
 }
 
 async function sendMessage() {
   const text = inputText.value.trim()
-  if (!text || streaming.value) return
+  if (!text || blockedReason.value || sending.value || uploading.value || loadingMessages.value || messagesFailed.value) return
 
-  const conv = await ensureConversation()
+  sending.value = true
+  let conv: Conversation
+  try {
+    conv = await ensureConversation()
+  } catch {
+    return
+  } finally {
+    sending.value = false
+  }
   const convId = conv.id
+  if (inactive || currentConversation.value?.id !== convId) return
   const sentFiles = attachments.value.map((a) => ({ ...a }))
   const sentModelId = selectedModelId.value
+  const sentMode = approvalMode.value
 
   inputText.value = ''
   attachments.value = []
@@ -924,21 +1032,25 @@ async function sendMessage() {
     lastActivity: 'other', lastEventAt: Date.now(),
     liveStatus: '正在创建任务…', runStatus: 'pending', pendingActions: [],
   })
-  await forceScrollToBottom()
-
   const entry: ActiveRun = { abort: new AbortController(), stopped: false, msg: aMsg }
   setActiveRun(convId, entry)
+  void forceScrollToBottom()
 
   try {
     const created = await runApi.create({
       message: text,
       conversation_id: convId,
       assistant_id: currentAssistant.value?.id,
-      approval_mode: approvalMode.value,
+      approval_mode: sentMode,
       model_config_id: sentModelId || undefined,
       attachments: sentFiles,
     })
-    if (entry.stopped) return
+    if (entry.stopped) {
+      if (!inactive) runApi.cancel(created.run_id, '用户主动停止').catch(() => {
+        ElMessage.warning('取消请求失败，任务可能继续执行')
+      })
+      return
+    }
     aMsg.runId = created.run_id
 
     consumeRunEvents(created.run_id, {
@@ -958,20 +1070,22 @@ async function sendMessage() {
         finishRun(convId, entry, reason)
       },
     }).catch(() => { /* 网络异常已由 onDone 兜底 */ })
-  } catch (e: any) {
+  } catch {
     if (entry.stopped) return
     aMsg.streaming = false
     aMsg.liveStatus = ''
-    aMsg.error = `执行出错: ${e.message}`
+    aMsg.runStatus = 'failed'
+    aMsg.error = '创建任务失败，可编辑原消息后重新发送。'
     clearActiveRun(convId, entry)
-    ElMessage.error('请求失败: ' + e.message)
+    if (currentConversation.value?.id === convId && !inputText.value) inputText.value = text
   }
 }
 
 function finishRun(convId: number, entry: ActiveRun, reason: string) {
+  if (activeRuns.get(convId) !== entry) return
   finalizeRunMessage(entry.msg, reason, entry.msg.content)
   clearActiveRun(convId, entry)
-  loadConversations().catch(() => {}) // 标题已规范化生成，刷新会话列表
+  void loadConversations(true) // 标题已规范化生成，刷新会话列表
   if (currentConversation.value?.id === convId) scrollToBottom()
 }
 
@@ -980,7 +1094,7 @@ async function openTrace(runId: string) {
   try {
     const info = await runApi.get(runId)
     if (info.langfuse_trace_url) {
-      window.open(info.langfuse_trace_url, '_blank')
+      window.open(info.langfuse_trace_url, '_blank', 'noopener,noreferrer')
     } else {
       ElMessage.warning('未配置 Langfuse 或 Trace 暂不可用')
     }
@@ -1010,12 +1124,27 @@ async function stopGeneration() {
   }
 }
 
-function onApprovalDecided(type: 'approve' | 'reject') {
-  const convId = currentConversation.value?.id
-  if (!convId) return
-  const arr = convArr(convId)
-  const aMsg = arr.find((m) => m.role === 'assistant' && m.pendingActions?.length)
-  if (!aMsg?.runId) return
+async function decideApproval(convId: number, message: ChatMessage, type: 'approve' | 'reject') {
+  const runId = message.runId
+  if (!runId || !message.pendingActions?.length || pendingDecisions.has(runId)) return
+  pendingDecisions.set(runId, type)
+  try {
+    await runApi.resume(runId, message.pendingActions.map((action) => ({ type, action_id: action.action_id || null })))
+    if (!inactive && convMessages.get(convId)?.includes(message)) observeResumedRun(convId, message, type)
+  } catch { /* 请求层显示错误，保留待审批操作以便重试 */ }
+  finally {
+    pendingDecisions.delete(runId)
+  }
+}
+
+function observeResumedRun(convId: number, aMsg: ChatMessage, type: 'approve' | 'reject') {
+  if (!aMsg.runId) return
+  const previous = activeRuns.get(convId)
+  if (previous) {
+    previous.stopped = true
+    previous.abort.abort()
+  }
+  historyStreams.get(aMsg.runId)?.abort()
   aMsg.pendingActions = []
   aMsg.streaming = true
   aMsg.lastActivity = 'other'
@@ -1043,409 +1172,165 @@ function onApprovalDecided(type: 'approve' | 'reject') {
 
 <style scoped>
 .workspace-home {
+  --thread-gutter: clamp(16px, 4%, 48px);
+  --thread-line: 720px;
+  position: relative;
   display: flex;
-  height: calc(100vh - 56px);
-  background: #fff;
+  height: 100%;
+  min-height: 0;
+  width: 100%;
+  overflow: hidden;
+  background: var(--ui-surface);
 }
+.ws-history { flex: 0 0 224px; border-inline-end: 1px solid var(--ui-border); }
+.history-overlay { display: none; }
+.ws-main { position: relative; display: flex; flex: 1 1 0; flex-direction: column; min-width: 0; min-height: 0; }
+.thread-head {
+  flex: none; min-height: 48px; padding: 0 16px; border-bottom: 1px solid var(--ui-border);
+  display: flex; align-items: center; gap: 8px; color: var(--ui-secondary);
+}
+.thread-heading { flex: 1; min-width: 0; padding-inline: 4px; }
+.thread-heading span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; color: var(--ui-text); }
+.assistant-name { display: inline-flex; align-items: center; flex: none; gap: 6px; font-size: 12px; color: var(--ui-secondary); }
+.icon-button {
+  display: inline-flex; flex: none; align-items: center; justify-content: center; width: 30px; height: 30px;
+  border: 0; background: transparent; color: var(--ui-muted); border-radius: var(--ui-radius-sm); cursor: pointer;
+}
+.icon-button:hover, .trace-link:hover { color: var(--ui-accent); background: var(--ui-hover); }
 
-/* 左栏 */
-.ws-sidebar {
-  width: 240px;
-  border-right: 1px solid #e4e7ed;
-  padding: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  overflow-y: auto;
+.ws-messages { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; overflow-anchor: none; }
+.ws-messages:focus-visible { outline-offset: -2px; }
+.thread {
+  display: flex; flex-direction: column; gap: 28px; width: min(calc(100% - var(--thread-gutter) * 2), var(--thread-line));
+  margin-inline: auto; padding: 30px 0 24px; min-width: 0;
 }
-.new-chat-btn { width: 100%; }
-.sidebar-title { font-size: 12px; color: #909399; margin-bottom: 6px; }
-.conv-item {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 7px 10px;
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 13px;
-  color: #606266;
+.ws-welcome {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+  min-height: 100%; padding: 32px var(--thread-gutter) 24px; text-align: center; color: var(--ui-secondary);
 }
-.conv-item:hover { background: #f5f7fa; }
-.conv-item.active { background: #ecf5ff; color: #409eff; }
-.conv-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.conv-delete { opacity: 0; color: #c0c4cc; }
-.conv-item:hover .conv-delete { opacity: 1; }
-.conv-delete:hover { color: #f56c6c; }
-/* 后台运行中的会话指示（切换不打断执行） */
-.conv-run-dot {
-  width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
-  background: #409eff; animation: pulse 1.2s infinite ease-in-out;
+.welcome-mark {
+  display: grid; place-items: center; width: 52px; height: 52px; margin-bottom: 4px;
+  color: var(--ui-accent); background: var(--ui-accent-soft); border-radius: var(--ui-radius-lg);
 }
-@keyframes pulse { 0%, 100% { opacity: 0.35; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1); } }
-.sidebar-empty { color: #c0c4cc; font-size: 12px; }
+.ws-welcome h1 { font-weight: 660; font-size: clamp(24px, 3.5vw, 38px); line-height: 1.21; letter-spacing: -.045em; color: var(--ui-text); }
+.ws-welcome p { font-size: 14px; line-height: 1.5; }
+.task-examples { display: flex; justify-content: center; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.task-example {
+  display: flex; align-items: center; gap: 7px; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-md); background: var(--ui-surface);
+  color: var(--ui-secondary); font-size: 13px; cursor: pointer;
+}
+.task-example svg { color: var(--ui-muted); }
+.task-example:hover { background: var(--ui-hover); border-color: var(--ui-border-strong); color: var(--ui-text); }
+.task-example:hover svg { color: var(--ui-accent); }
+.thread-state { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 60%; color: var(--ui-secondary); font-size: 14px; }
+.text-button { color: var(--ui-accent); background: none; border: 0; cursor: pointer; }
 
-/* 主区 */
-.ws-main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
-.ws-header {
-  padding: 10px 20px;
-  border-bottom: 1px solid #e4e7ed;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-.ws-assistant-name { font-weight: 600; }
-
-/* 右侧预留提问圆点导航宽度，避免内容压到圆点下 */
-.ws-messages { flex: 1; overflow-y: auto; padding: 20px 36px 20px 20px; }
-
-/* 提问锚点导航：右侧纵向小圆点，点击快速跳转对应提问 */
-.q-nav {
-  position: absolute;
-  right: 12px;
-  top: 50%;
-  transform: translateY(-50%);
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 10px;
-  max-height: 68%;
-  overflow-y: auto;
-  scrollbar-width: none;
-  z-index: 2;
-}
-.q-nav::-webkit-scrollbar { display: none; }
-.q-nav-dot {
-  width: 8px;
-  height: 8px;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: #dcdfe6;
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: background 0.15s ease, transform 0.15s ease;
-}
-.q-nav-dot:hover { background: #409eff; transform: scale(1.35); }
-.ws-empty { text-align: center; color: #909399; margin-top: 10vh; }
-.ws-examples {
-  display: flex;
-  gap: 12px;
-  justify-content: center;
-  margin-top: 16px;
-  flex-wrap: wrap;
-}
-.ws-example {
-  border: 1px solid #e4e7ed;
-  border-radius: 8px;
-  padding: 10px 16px;
-  cursor: pointer;
-  font-size: 13px;
-}
-.ws-example:hover { border-color: #409eff; color: #409eff; }
-
-.msg-row { display: flex; margin-bottom: 16px; }
-.msg-user { justify-content: flex-end; }
+.msg-user { display: flex; justify-content: end; min-width: 0; scroll-margin-top: 16px; }
 .msg-bubble {
-  max-width: 70%;
-  background: #409eff;
-  color: #fff;
-  border-radius: 12px;
-  padding: 10px 14px;
-  white-space: pre-wrap;
-  word-break: break-word;
+  max-width: min(85%, 580px); padding: 10px 14px; white-space: pre-wrap; overflow-wrap: anywhere;
+  font-size: 14px; line-height: 1.7; color: var(--ui-text); background: var(--ui-subtle); border-radius: var(--ui-radius-lg);
 }
-.msg-assistant { justify-content: flex-start; }
-.msg-content { max-width: 86%; width: 100%; }
-/* 任务耗时（Trae 式）：消息顶部小字，弱化不抢正文 */
-.task-time {
-  font-size: 11px;
-  color: #b0b3b8;
-  margin: 0 0 4px 2px;
-  letter-spacing: 0.2px;
+.msg-files { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.msg-file {
+  min-width: 0; max-width: 100%; display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-secondary); cursor: pointer;
 }
-.msg-text {
-  background: #f5f7fa;
-  border-radius: 12px;
-  padding: 12px 16px;
-  line-height: 1.7;
-  word-break: break-word;
-  font-size: 14px;
-  color: #303133;
+.msg-file:hover { color: var(--ui-accent); border-color: var(--ui-accent); }
+.msg-file img { width: 40px; height: 40px; object-fit: cover; border-radius: var(--ui-radius-sm); }
+.msg-file span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.msg-file svg { flex: none; }
+.msg-assistant { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 10px; align-items: start; }
+.assistant-mark {
+  display: grid; place-items: center; width: 30px; height: 30px;
+  border: 1px solid var(--ui-border); color: var(--ui-accent); border-radius: var(--ui-radius-md); background: var(--ui-surface);
 }
-/* Markdown 排版（回答是核心产物，完整渲染） */
-.msg-text :deep(h1), .msg-text :deep(h2), .msg-text :deep(h3) {
-  font-weight: 600; color: #0d0d0d; margin: 12px 0 6px;
-}
-.msg-text :deep(h1) { font-size: 19px; }
-.msg-text :deep(h2) { font-size: 17px; }
-.msg-text :deep(h3) { font-size: 15px; }
-.msg-text :deep(p) { margin: 6px 0; }
-.msg-text :deep(ul), .msg-text :deep(ol) { padding-left: 22px; margin: 6px 0; }
-.msg-text :deep(li) { margin: 3px 0; }
-.msg-text :deep(code) {
-  background: #e8eaef; color: #c7254e;
-  padding: 2px 6px; border-radius: 4px; font-family: 'Consolas', monospace; font-size: 13px;
-}
-.msg-text :deep(.code-block-wrapper) { position: relative; margin: 10px 0; }
-.msg-text :deep(.copy-btn) {
-  position: absolute; top: 6px; right: 8px;
-  background: rgba(255,255,255,0.12); color: #d4d4d4;
-  border: 1px solid rgba(255,255,255,0.2); border-radius: 4px;
-  padding: 2px 10px; font-size: 12px; cursor: pointer; z-index: 1; line-height: 1.6;
-}
-.msg-text :deep(.copy-btn:hover) { background: rgba(255,255,255,0.22); color: #fff; }
-.msg-text :deep(pre) {
-  background: #1e1e1e; border-radius: 8px;
-  padding: 12px 14px; overflow-x: auto; margin: 0; font-size: 13px;
-}
-.msg-text :deep(pre code) { background: none; padding: 0; color: #d4d4d4; font-family: 'Consolas', 'Monaco', monospace; }
-.msg-text :deep(blockquote) {
-  border-left: 3px solid #409eff; margin: 8px 0; padding: 4px 12px;
-  color: #606266; background: #ecf5ff33; border-radius: 0 6px 6px 0;
-}
-.msg-text :deep(table) {
-  border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 13px;
-  border: 1px solid #e4e7ed; border-radius: 8px; overflow: hidden;
-}
-.msg-text :deep(th), .msg-text :deep(td) { border: 1px solid #e4e7ed; padding: 7px 12px; text-align: left; }
-.msg-text :deep(th) { background: #eef1f6; font-weight: 600; }
-.msg-text :deep(a) { color: #409eff; text-decoration: none; word-break: break-all; }
-.msg-text :deep(a:hover) { text-decoration: underline; }
-.msg-text :deep(img) { max-width: 100%; border-radius: 8px; margin: 8px 0; }
-.msg-text :deep(hr) { border: none; border-top: 1px solid #e4e7ed; margin: 12px 0; }
-
-/* 计划块（穿插在流中的紧凑清单） */
-.plan-inline {
-  border-left: 3px solid #409eff;
-  background: #f5f7fa;
-  border-radius: 0 8px 8px 0;
-  padding: 8px 12px;
-  margin: 6px 0;
-}
-.plan-inline-title { font-size: 12px; color: #909399; margin-bottom: 2px; }
-.plan-inline-item { padding: 2px 0; color: #606266; font-size: 13px; }
-.plan-mark { font-family: monospace; margin-right: 6px; color: #909399; }
-.plan-mark.st-completed { color: #67c23a; }
-.plan-mark.st-in_progress { color: #409eff; }
-.plan-done { color: #a0a4ab; text-decoration: line-through; }
-
-/* 工具步骤组（完成后折叠摘要，防刷屏） */
-.tool-group {
-  border: 1px solid #e4e7ed;
-  border-radius: 8px;
-  background: #fafbfc;
-  padding: 4px 8px;
-  margin: 6px 0;
-}
-.tool-group-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 3px 6px;
-  cursor: pointer;
-  user-select: none;
-  font-size: 12px;
-  color: #606266;
-}
-.tool-group-head:hover { background: #eef1f5; border-radius: 6px; }
-.tool-state-mark { color: #67c23a; width: 14px; text-align: center; }
-.row-chevron { color: #c0c4cc; font-size: 11px; }
-
-/* 流式打字光标：仅文本生成中出现 */
-.typing-cursor-line { margin-top: -6px; padding-left: 4px; }
-.typing-cursor {
-  display: inline-block; width: 2px; height: 1.1em;
-  background: #409eff; vertical-align: text-bottom;
-  animation: cursorBlink 0.8s infinite;
-}
-@keyframes cursorBlink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
-
-/* 实时状态行：明确"正在做什么/仍在执行"，替代孤立光标 */
-.live-status {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 6px;
-  padding: 4px 2px;
-  color: #909399;
-  font-size: 12px;
-}
-.mini-spin {
-  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
-  background: #409eff; animation: pulse 1.2s infinite ease-in-out;
-}
-.stale-hint { color: #e6a23c; }
-
+.msg-content { display: grid; gap: 8px; min-width: 0; }
+.msg-heading { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-height: 30px; font-size: 13px; color: var(--ui-text); }
+.run-state { padding: 2px 6px; border-radius: var(--ui-radius-sm); color: var(--ui-secondary); background: var(--ui-subtle); font-size: 12px; }
+.run-state[data-state="success"] { color: var(--ui-success); background: var(--ui-success-soft); }
+.run-state[data-state="info"] { color: var(--ui-info); background: var(--ui-info-soft); }
+.run-state[data-state="warning"] { color: var(--ui-warning); background: var(--ui-warning-soft); }
+.run-state[data-state="danger"] { color: var(--ui-danger); background: var(--ui-danger-soft); }
+.run-duration, .stale-hint { color: var(--ui-muted); font-size: 12px; }
+.run-duration { font-variant-numeric: tabular-nums; }
+.live-status, .msg-error { display: flex; align-items: center; gap: 7px; font-size: 13px; }
+.live-status { color: var(--ui-info); }
 .msg-error {
-  color: #f56c6c;
-  background: #fef0f0;
-  border-radius: 8px;
-  padding: 8px 12px;
-  margin-top: 6px;
-  font-size: 13px;
+  align-items: start; padding: 8px 10px; border-radius: var(--ui-radius-md);
+  color: var(--ui-danger); background: var(--ui-danger-soft); white-space: pre-wrap; overflow-wrap: anywhere;
 }
-
+.msg-error svg { flex: none; margin-top: 2px; }
+.message-actions { display: flex; align-items: center; gap: 4px; }
 .trace-link {
-  margin-top: 6px;
-  padding: 0;
-  border: none;
-  background: none;
-  color: #909399;
-  font-size: 12px;
-  cursor: pointer;
-  text-decoration: underline;
-  text-underline-offset: 2px;
+  display: inline-flex; align-items: center; min-height: 30px; gap: 6px; padding: 0 8px;
+  border: 0; border-radius: var(--ui-radius-sm); color: var(--ui-secondary); background: transparent; font-size: 12px; cursor: pointer;
 }
-.trace-link:hover { color: #409eff; }
+.process-disclosure { min-width: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-md); background: var(--ui-bg); }
+.process-disclosure summary {
+  display: flex; align-items: center; gap: 7px; min-height: 35px; padding: 5px 9px;
+  color: var(--ui-secondary); font-size: 13px; font-weight: 550; list-style: none; cursor: pointer;
+}
+.process-disclosure summary::-webkit-details-marker { display: none; }
+.process-disclosure summary:hover { color: var(--ui-text); }
+.process-disclosure summary::after {
+  content: ''; flex: none; width: 6px; height: 6px; margin-inline: auto 4px;
+  border: solid var(--ui-muted); border-width: 0 1.5px 1.5px 0; transform: rotate(-45deg);
+}
+.process-disclosure[open] summary::after { transform: rotate(45deg); }
+.process-disclosure summary span { color: var(--ui-muted); font-weight: 450; font-size: 12px; }
+.process-disclosure summary .group-failure { color: var(--ui-danger); }
+.process-disclosure ul, .tool-group-items { padding: 3px 7px 7px; list-style: none; }
+.process-disclosure li { display: flex; align-items: start; gap: 7px; padding: 4px; font-size: 13px; }
+.process-disclosure li svg { flex: none; margin-top: 2px; color: var(--ui-muted); }
+.process-disclosure li .plan-completed { color: var(--ui-success); }
+.process-disclosure li .plan-in_progress { color: var(--ui-info); }
+.plan-done { color: var(--ui-muted); }
 
-/* 输入区（Trae 式）：单个圆角容器，底部工具栏 */
-.ws-composer { border-top: 1px solid #e4e7ed; padding: 12px 20px 16px; }
-.composer-running {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-  color: #409eff;
-  font-size: 13px;
+.question-nav {
+  position: absolute; inset-inline-end: 2px; top: 50%; transform: translateY(-50%);
+  display: flex; flex-direction: column; max-height: 45%; overflow-y: auto; padding: 3px; scrollbar-width: thin;
 }
-.composer-box {
-  border: 1px solid #dcdfe6;
-  border-radius: 14px;
-  background: #fff;
-  padding: 10px 12px 8px;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+.question-nav button { position: relative; width: 20px; height: 18px; flex: none; border: 0; background: transparent; cursor: pointer; }
+.question-nav button::before { content: ''; position: absolute; inset: 6px 5px; border-radius: 10px; background: var(--ui-border-strong); }
+.question-nav button:hover::before, .question-nav button:focus-visible::before { background: var(--ui-accent); }
+
+.composer-dock {
+  width: min(calc(100% - var(--thread-gutter) * 2), var(--thread-line)); margin: 0 auto;
+  flex: none; padding: 6px 0 max(10px, env(safe-area-inset-bottom)); position: relative;
 }
-.composer-box:focus-within {
-  border-color: #409eff;
-  box-shadow: 0 0 0 2px rgba(64, 158, 255, 0.12);
+.latest-button {
+  display: inline-flex; gap: 5px; align-items: center; position: absolute; z-index: 1; top: -40px; left: 50%;
+  transform: translateX(-50%); width: max-content; padding: 6px 9px; border-radius: var(--ui-radius-md); cursor: pointer;
+  color: var(--ui-secondary); background: var(--ui-surface); border: 1px solid var(--ui-border); box-shadow: var(--ui-shadow-sm); font-size: 12px;
 }
-.composer-textarea :deep(.el-textarea__inner) {
-  border: none;
-  box-shadow: none;
-  background: transparent;
-  resize: none;
-  padding: 2px 2px 6px;
+.latest-button:hover { color: var(--ui-accent); }
+.is-empty .composer-dock { padding-bottom: clamp(20px, 23vh, 218px); }
+.is-empty .ws-welcome { justify-content: end; }
+.has-preview .ws-history { flex-basis: 192px; }
+.spin { animation: rotate 1s linear infinite; }
+@keyframes rotate { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+
+@media (max-width: 849px) {
+  .ws-history { position: absolute; z-index: 6; inset: 0 auto 0 0; width: min(250px, 83%); box-shadow: var(--ui-shadow-md); }
+  .history-overlay { display: block; position: absolute; z-index: 5; inset: 0; border: none; background: color-mix(in srgb, var(--ui-text) 25%, transparent); }
+  .is-empty .composer-dock { padding-bottom: clamp(16px, 20vh, 168px); }
 }
-.composer-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+@media (max-width: 480px) {
+  .msg-assistant { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .assistant-mark { display: none; }
+  .thread { padding-top: 18px; gap: 18px; }
+  .ws-main:has(.question-nav) .thread { margin-inline: 12px 26px; width: auto; }
+  .question-nav { inset-inline-end: 0; }
+  .thread-head { padding: 0 10px; }
+  .composer-dock { margin-bottom: 0; padding-bottom: 0; }
 }
-.bar-left, .bar-right { display: flex; align-items: center; gap: 2px; }
-.bar-btn {
-  color: #606266;
-  padding: 5px 8px;
-  height: 28px;
-}
-.bar-btn:hover { color: #409eff; }
-.bar-trigger { gap: 4px; }
-.bar-label { font-size: 12px; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.bar-caret { color: #909399; margin-left: 1px; }
-.item-check { display: inline-block; width: 14px; color: #409eff; }
-/* 发送键：Trae 式圆形箭头 */
-.send-btn {
-  width: 30px;
-  height: 30px;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: #409eff;
-  color: #fff;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  transition: background 0.15s ease, opacity 0.15s ease;
-}
-.send-btn:hover:not(:disabled) { background: #337ecc; }
-.send-btn:disabled { background: #c0c4cc; cursor: not-allowed; }
-.attach-strip {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-.attach-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 10px;
-  border: 1px solid #dcdfe6;
-  border-radius: 12px;
-  font-size: 12px;
-  color: #606266;
-  background: #f5f7fa;
-}
-.attach-chip .attach-name {
-  max-width: 180px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.attach-remove { cursor: pointer; color: #c0c4cc; }
-.attach-remove:hover { color: #f56c6c; }
-/* 图片附件：缩略图 + 右上角小叉号取消 */
-.attach-item { position: relative; display: inline-flex; }
-.attach-thumb {
-  width: 56px;
-  height: 56px;
-  border-radius: 8px;
-  border: 1px solid #e4e7ed;
-  cursor: zoom-in;
-  display: block;
-}
-.attach-x {
-  position: absolute;
-  top: -6px;
-  right: -6px;
-  width: 16px;
-  height: 16px;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: rgba(0, 0, 0, 0.55);
-  color: #fff;
-  font-size: 11px;
-  line-height: 16px;
-  cursor: pointer;
-  z-index: 1;
-}
-.attach-x:hover { background: #f56c6c; }
-/* 消息气泡内附件标签 / 图片缩略图 */
-.msg-files {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 6px;
-}
-.msg-file-tag {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  padding: 2px 8px;
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.18);
-  font-size: 12px;
-  color: inherit;
-  text-decoration: none;
-  cursor: pointer;
-  max-width: 220px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.msg-file-tag:hover { background: rgba(255, 255, 255, 0.32); text-decoration: underline; }
-.msg-thumb {
-  width: 72px;
-  height: 72px;
-  border-radius: 8px;
-  cursor: zoom-in;
-  display: block;
+@media (max-height: 630px) {
+  .is-empty .composer-dock { padding-bottom: 12px; }
 }
 </style>
 
 <style>
-/* 提问预览气泡（el-tooltip popper 默认挂到 body，scoped 样式够不到，需全局块） */
-.q-nav-popper { max-width: 320px; word-break: break-word; }
+.workspace-question-tooltip { max-width: 280px; overflow-wrap: anywhere; }
 </style>

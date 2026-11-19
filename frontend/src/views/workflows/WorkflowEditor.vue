@@ -1,1228 +1,552 @@
 <template>
-  <div class="editor-page" @click="closeContextMenu" @contextmenu.prevent>
-    <!-- Toolbar -->
-    <div class="editor-toolbar">
-      <div class="toolbar-left">
-        <el-button :icon="ArrowLeft" @click="router.back()">返回</el-button>
-        <el-input v-model="workflow.name" style="width:200px;" size="small" />
-        <el-tag type="info" size="small">v{{ workflow.version }}</el-tag>
+  <div class="studio">
+    <header class="studio-toolbar">
+      <div class="workflow-heading">
+        <UiButton as-child variant="ghost" size="icon">
+          <router-link to="/workflows" title="流程列表" aria-label="返回流程列表"><ArrowLeft /></router-link>
+        </UiButton>
+        <div class="workflow-title">
+          <el-input v-if="workflow" v-model="workflow.name" aria-label="工作流名称" maxlength="100"
+            placeholder="工作流名称" :disabled="busy" @input="markDirty" />
+          <span v-else>工作流编辑器</span>
+          <div v-if="workflow" class="workflow-meta">
+            <span>v{{ workflow.version }}</span>
+            <span>{{ workflow.is_published ? '已发布' : '草稿' }}</span>
+            <span class="save-state" :class="{ 'save-error': saveError, 'save-dirty': dirty }" role="status">
+              <span class="save-dot" />{{ saveLabel }}
+            </span>
+          </div>
+        </div>
       </div>
-      <div class="toolbar-center">
-        <span class="toolbar-hint">拖拽节点到画布 · 从右侧端口拖出连线 · 右键查看操作</span>
+
+      <div v-if="workflow" class="workflow-actions">
+        <UiButton size="sm" :loading="saving" :disabled="publishing || testing" @click="saveWorkflow"><Save v-if="!saving" />保存</UiButton>
+        <UiButton size="sm" :loading="publishing" :disabled="saving || testing" @click="publishWorkflow">
+          <RadioTower v-if="!publishing" />
+          {{ workflow.is_published ? '取消发布' : '发布' }}
+        </UiButton>
+        <UiButton size="sm" :disabled="busy" @click="router.push(`/workflows/${workflowId}/run`)"><Play />运行</UiButton>
+        <UiButton size="sm" :disabled="busy" @click="openPublishAsApp"><PackagePlus />发布为应用</UiButton>
+        <UiButton size="sm" variant="primary" :disabled="busy" @click="openDebugPanel"><FlaskConical />调试</UiButton>
       </div>
-      <div class="toolbar-right">
-        <el-button size="small" @click="saveWorkflow" :loading="saving">保存</el-button>
-        <el-button size="small" type="success" @click="publishWorkflow">
-          {{ workflow.is_published ? '已发布' : '发布' }}
-        </el-button>
-        <el-button size="small" type="warning" plain @click="router.push(`/workflows/${workflowId}/run`)">▶ 运行</el-button>
-        <el-button size="small" type="info" plain @click="openPublishAsApp">📦 发布为应用</el-button>
-        <el-button size="small" type="primary" @click="testRun">调试</el-button>
-      </div>
+    </header>
+
+    <div v-if="loading" class="studio-status" role="status"><LoaderCircle :size="21" class="studio-spin" /><strong>正在加载工作流</strong></div>
+    <div v-else-if="loadError" class="studio-status" role="alert">
+      <strong>工作流加载失败</strong>
+      <span>请检查访问权限或网络连接后重试。</span>
+      <UiButton @click="loadWorkflow">重试</UiButton>
     </div>
 
-    <div class="editor-body">
-      <!-- Node Panel -->
-      <div class="node-panel">
-        <div class="panel-title">节点库</div>
-        <div
-          v-for="nt in nodeTypes"
-          :key="nt.type"
-          class="node-item"
-          draggable="true"
-          @dragstart="onDragStart($event, nt)"
-        >
-          <span class="node-icon">{{ nt.icon }}</span>
+    <div v-else-if="workflow" class="studio-body">
+      <aside class="node-library" :class="{ 'library-open': mobileLibraryOpen }" aria-label="节点库">
+        <div class="panel-heading">
+          <div><h2>节点库</h2><p>点击添加，或拖入画布</p></div>
+          <button type="button" class="studio-icon-button library-close" aria-label="关闭节点库" @click="mobileLibraryOpen = false"><X :size="16" /></button>
+        </div>
+        <div class="library-search">
+          <el-input v-model="search" clearable :prefix-icon="Search" aria-label="搜索节点" placeholder="搜索节点" />
+        </div>
+        <div class="library-groups">
+          <section v-for="group in nodeGroups" :key="group.name">
+            <h3>{{ group.name }}</h3>
+            <button v-for="node in group.nodes" :key="node.type" type="button" class="library-node"
+              :draggable="!busy" :disabled="busy" @click="addAtCenter(node.type)"
+              @dragstart="dragNode($event, node.type)">
+              <span class="library-icon"><component :is="node.icon" :size="16" /></span>
+              <span class="library-label">{{ node.label }}<small>{{ node.description }}</small></span>
+              <Plus :size="14" class="library-add" />
+            </button>
+          </section>
+          <p v-if="!nodeGroups.length" class="panel-hint">找不到匹配的节点</p>
+        </div>
+      </aside>
+
+      <button type="button" class="library-launch studio-icon-button" aria-label="打开节点库" title="打开节点库"
+        :aria-expanded="mobileLibraryOpen" @click="mobileLibraryOpen = !mobileLibraryOpen"><PanelLeftOpen :size="16" /></button>
+      <WorkflowCanvas ref="canvas" :nodes="nodes" :edges="edges" :selected-id="selectedId"
+        :node-results="debugResult?.node_results" :busy="busy"
+        @select="selectNode" @move="moveNodes" @connect="createConnection" @create="createNode" @remove="removeItems" />
+
+      <aside class="inspector" :class="{ 'inspector-empty': !selectedNode }" aria-label="节点配置">
+        <header v-if="selectedNode" class="panel-heading inspector-heading">
+          <span class="inspector-icon"><component :is="getNodeType(selectedNode.type)?.icon || WorkflowIcon" :size="18" /></span>
           <div>
-            <div class="node-name">{{ nt.label }}</div>
-            <div class="node-desc">{{ nt.desc }}</div>
+            <h2>{{ nodeLabels[selectedNode.id] }}</h2>
+            <p>{{ getNodeType(selectedNode.type)?.label || selectedNode.type }} · 节点配置</p>
           </div>
+          <button type="button" class="studio-icon-button" title="定位到画布" aria-label="定位到画布" @click="canvas?.locateNode(selectedNode.id)">
+            <LocateFixed :size="16" />
+          </button>
+          <button type="button" class="studio-icon-button" aria-label="关闭节点配置" @click="selectNode(null)"><X :size="16" /></button>
+        </header>
+        <div v-if="selectedNode" class="inspector-body">
+          <fieldset :disabled="busy">
+            <WorkflowNodeConfig :key="selectedNode.id" :selected-node="selectedNode" :nodes="nodes"
+              :chat-models="chatModels" :knowledge-bases="knowledgeBases" :prompt-templates="promptTemplates" @change="markDirty" />
+          </fieldset>
+          <section class="node-links">
+            <h3>节点连接</h3>
+            <p v-if="!connections.length" class="panel-hint">还没有连线。拖动节点右侧端口连接到目标节点。</p>
+            <div v-for="link in connections" :key="link.key" class="node-link">
+              <span>{{ link.label }}</span>
+              <button type="button" @click="inspectConnectedNode(link.nodeId)">{{ nodeLabels[link.nodeId] || link.nodeId }}</button>
+            </div>
+            <code :title="selectedNode.id">{{ selectedNode.id }}</code>
+          </section>
         </div>
-      </div>
-
-      <!-- Canvas -->
-      <div
-        class="canvas-area"
-        ref="canvasRef"
-        @dragover.prevent
-        @drop="onDrop"
-        @mouseup="onCanvasMouseUp"
-        @mousemove="onCanvasMouseMove"
-        @contextmenu.prevent="onCanvasRightClick($event)"
-        @click.self="deselectAll"
-      >
-        <svg class="canvas-svg" :width="canvasWidth" :height="canvasHeight">
-          <defs>
-            <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-              <polygon points="0 0, 10 3.5, 0 7" fill="#409eff" />
-            </marker>
-            <marker id="arrowhead-hover" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-              <polygon points="0 0, 10 3.5, 0 7" fill="#f56c6c" />
-            </marker>
-          </defs>
-
-          <!-- Existing edges -->
-          <g v-for="edge in edges" :key="edge.id"
-            class="edge-group"
-            @contextmenu.prevent="onEdgeRightClick($event, edge)"
-          >
-            <path
-              :d="getEdgePath(edge)"
-              :stroke="hoveredEdge?.id === edge.id ? '#f56c6c' : '#409eff'"
-              stroke-width="2"
-              fill="none"
-              marker-end="url(#arrowhead)"
-              class="edge-path"
-            />
-            <!-- Invisible wider hit area -->
-            <path
-              :d="getEdgePath(edge)"
-              stroke="transparent"
-              stroke-width="12"
-              fill="none"
-              class="edge-hit"
-              @mouseenter="hoveredEdge = edge"
-              @mouseleave="hoveredEdge = null"
-              @contextmenu.prevent="onEdgeRightClick($event, edge)"
-            />
-          </g>
-
-          <!-- Connecting preview line -->
-          <path
-            v-if="connectingState.active"
-            :d="connectingPreviewPath"
-            stroke="#67c23a"
-            stroke-width="2"
-            stroke-dasharray="6,3"
-            fill="none"
-            pointer-events="none"
-          />
-        </svg>
-
-        <!-- Nodes -->
-        <div
-          v-for="node in nodes"
-          :key="node.id"
-          class="canvas-node"
-          :class="{ selected: selectedNode?.id === node.id, [node.type]: true, connecting: connectingState.active }"
-          :style="{ left: node.position.x + 'px', top: node.position.y + 'px' }"
-          @mousedown.left="startDragNode($event, node)"
-          @click.stop="selectNode(node)"
-          @contextmenu.prevent="onNodeRightClick($event, node)"
-        >
-          <div class="node-header">
-            <span>{{ getNodeType(node.type)?.icon }}</span>
-            <span>{{ node.config?.label || getNodeType(node.type)?.label }}</span>
-          </div>
-          <!-- Input port (left) -->
-          <div
-            class="node-port port-in"
-            :class="{ 'port-highlight': connectingState.active && connectingState.fromNode?.id !== node.id }"
-            @mouseup.stop="onPortMouseUp(node, 'in')"
-            @mousedown.stop
-          />
-          <!-- Output port (right) -->
-          <div
-            class="node-port port-out"
-            @mousedown.stop="startConnect($event, node)"
-          />
+        <div v-else class="inspector-guide">
+          <header><WorkflowIcon :size="17" /><h2>节点配置</h2></header>
+          <p>选中画布中的节点，编辑参数和查看连接。</p>
+          <dl>
+            <div><dt>平移</dt><dd>拖动画布</dd></div>
+            <div><dt>框选</dt><dd><kbd>Shift</kbd> + 拖动</dd></div>
+            <div><dt>连线</dt><dd>从右侧端口拖向左侧端口</dd></div>
+          </dl>
         </div>
-      </div>
-
-      <!-- Config Panel -->
-      <div class="config-panel" v-if="selectedNode">
-        <div class="panel-title">节点配置 - {{ getNodeType(selectedNode.type)?.label }}</div>
-        <el-form label-width="80px" size="small">
-          <el-form-item label="节点标签">
-            <el-input v-model="selectedNode.config.label" @change="markDirty" />
-          </el-form-item>
-
-          <template v-if="selectedNode.type === 'ai_chat'">
-            <el-form-item label="选择模型">
-              <el-select v-model="selectedNode.config.model_config_id" style="width:100%" @change="markDirty">
-                <el-option v-for="m in chatModels" :key="m.id" :label="m.display_name" :value="m.id" />
-              </el-select>
-            </el-form-item>
-            <el-form-item label="提示词模板">
-              <el-select
-                v-model="selectedNode.config._template_id"
-                clearable
-                placeholder="从模板库选择（可选）"
-                style="width:100%"
-                @change="applyPromptTemplate(selectedNode, $event)"
-              >
-                <el-option v-for="t in promptTemplates" :key="t.id" :label="t.name" :value="t.id">
-                  <span>{{ t.name }}</span>
-                  <span style="float:right;font-size:11px;color:#aaa">{{ t.category }}</span>
-                </el-option>
-              </el-select>
-            </el-form-item>
-            <el-form-item label="系统提示">
-              <el-input v-model="selectedNode.config.system_prompt" type="textarea" :rows="2" @change="markDirty" />
-            </el-form-item>
-            <el-form-item label="提示词">
-              <el-input v-model="selectedNode.config.prompt" type="textarea" :rows="5"
-                placeholder="使用 {{变量名}} 引用上下文变量" @change="markDirty" />
-            </el-form-item>
-          </template>
-
-          <template v-if="selectedNode.type === 'condition'">
-            <el-form-item label="条件表达式">
-              <el-input v-model="selectedNode.config.expression" placeholder="如: score > 0.8" @change="markDirty" />
-            </el-form-item>
-          </template>
-
-          <template v-if="selectedNode.type === 'http'">
-            <el-form-item label="请求方法">
-              <el-select v-model="selectedNode.config.method" style="width:100%" @change="markDirty">
-                <el-option label="GET" value="GET" /><el-option label="POST" value="POST" />
-                <el-option label="PUT" value="PUT" /><el-option label="DELETE" value="DELETE" />
-              </el-select>
-            </el-form-item>
-            <el-form-item label="URL">
-              <el-input v-model="selectedNode.config.url" @change="markDirty" />
-            </el-form-item>
-          </template>
-
-          <template v-if="selectedNode.type === 'knowledge_search'">
-            <el-form-item label="知识库">
-              <el-select v-model="selectedNode.config.knowledge_base_id" style="width:100%" @change="markDirty">
-                <el-option v-for="kb in knowledgeBases" :key="kb.id" :label="kb.name" :value="kb.id" />
-              </el-select>
-            </el-form-item>
-            <el-form-item label="检索问题">
-              <el-input v-model="selectedNode.config.query" type="textarea" :rows="2"
-                placeholder="使用 {{变量名}} 引用变量" @change="markDirty" />
-            </el-form-item>
-            <el-form-item label="返回数量">
-              <el-input-number v-model="selectedNode.config.top_k" :min="1" :max="10" @change="markDirty" />
-            </el-form-item>
-          </template>
-
-          <template v-if="selectedNode.type === 'delay'">
-            <el-form-item label="延迟秒数">
-              <el-input-number v-model="selectedNode.config.seconds" :min="1" :max="30" @change="markDirty" />
-            </el-form-item>
-          </template>
-
-          <template v-if="selectedNode.type === 'doc_output'">
-            <el-form-item label="文档标题">
-              <el-input v-model="selectedNode.config.doc_title" placeholder="生成的 Word 文档标题" @change="markDirty" />
-            </el-form-item>
-            <el-form-item label="内容来源">
-              <el-select v-model="selectedNode.config.source_node_id" clearable style="width:100%"
-                placeholder="选择 AI 节点（留空=自动取最后一个AI输出）" @change="markDirty">
-                <el-option
-                  v-for="n in nodes.filter(n => n.type === 'ai_chat')"
-                  :key="n.id"
-                  :label="n.config?.label || 'AI 对话节点'"
-                  :value="n.id"
-                />
-              </el-select>
-            </el-form-item>
-            <div style="font-size:11px;color:#888;padding:0 4px 8px;">
-              运行后在结果页点击「⬇ 下载 Word」即可获取文档。
-            </div>
-          </template>
-
-          <!-- Data Source Node -->
-          <template v-if="selectedNode.type === 'data_source'">
-            <el-form-item label="数据源类型">
-              <el-select v-model="selectedNode.config.source_type" style="width:100%" @change="markDirty">
-                <el-option label="CSV 文件" value="csv" />
-                <el-option label="Excel 文件" value="excel" />
-                <el-option label="MySQL 数据库" value="mysql" />
-              </el-select>
-            </el-form-item>
-            <template v-if="selectedNode.config.source_type === 'csv' || selectedNode.config.source_type === 'excel'">
-              <el-form-item label="文件路径">
-                <el-input v-model="selectedNode.config.file_path" placeholder="服务器上的绝对路径" @change="markDirty" />
-              </el-form-item>
-              <el-form-item v-if="selectedNode.config.source_type === 'excel'" label="工作表">
-                <el-input v-model="selectedNode.config.sheet" placeholder="工作表名或索引(0开始)" @change="markDirty" />
-              </el-form-item>
-            </template>
-            <template v-if="selectedNode.config.source_type === 'mysql'">
-              <el-form-item label="主机">
-                <el-input v-model="selectedNode.config.host" placeholder="localhost" @change="markDirty" />
-              </el-form-item>
-              <el-form-item label="端口">
-                <el-input v-model="selectedNode.config.port" placeholder="3306" @change="markDirty" />
-              </el-form-item>
-              <el-form-item label="用户名">
-                <el-input v-model="selectedNode.config.user" @change="markDirty" />
-              </el-form-item>
-              <el-form-item label="密码">
-                <el-input v-model="selectedNode.config.password" type="password" show-password @change="markDirty" />
-              </el-form-item>
-              <el-form-item label="数据库名">
-                <el-input v-model="selectedNode.config.database" @change="markDirty" />
-              </el-form-item>
-              <el-form-item label="SQL 查询">
-                <el-input v-model="selectedNode.config.sql" type="textarea" :rows="3"
-                  placeholder="SELECT * FROM table WHERE id = {{input_id}}" @change="markDirty" />
-              </el-form-item>
-            </template>
-            <div style="font-size:11px;color:#888;padding:0 4px 8px;">
-              读取结果存入 rows 数组，可在 AI 节点提示词中引用上游节点数据。
-            </div>
-          </template>
-
-          <!-- DB Write Node -->
-          <template v-if="selectedNode.type === 'db_write'">
-            <el-form-item label="主机">
-              <el-input v-model="selectedNode.config.host" placeholder="localhost" @change="markDirty" />
-            </el-form-item>
-            <el-form-item label="端口">
-              <el-input v-model="selectedNode.config.port" placeholder="3306" @change="markDirty" />
-            </el-form-item>
-            <el-form-item label="用户名">
-              <el-input v-model="selectedNode.config.user" @change="markDirty" />
-            </el-form-item>
-            <el-form-item label="密码">
-              <el-input v-model="selectedNode.config.password" type="password" show-password @change="markDirty" />
-            </el-form-item>
-            <el-form-item label="数据库名">
-              <el-input v-model="selectedNode.config.database" @change="markDirty" />
-            </el-form-item>
-            <el-form-item label="目标表名">
-              <el-input v-model="selectedNode.config.table" placeholder="target_table" @change="markDirty" />
-            </el-form-item>
-            <el-form-item label="数据来源节点">
-              <el-select v-model="selectedNode.config.source_node_id" clearable style="width:100%" @change="markDirty">
-                <el-option
-                  v-for="n in nodes.filter(n => n.id !== selectedNode.id)"
-                  :key="n.id"
-                  :label="n.config?.label || getNodeType(n.type)?.label || n.id"
-                  :value="n.id"
-                />
-              </el-select>
-            </el-form-item>
-          </template>
-
-          <!-- Send Email Node -->
-          <template v-if="selectedNode.type === 'send_email'">
-            <el-form-item label="SMTP 服务器">
-              <el-input v-model="selectedNode.config.smtp_host" placeholder="smtp.qq.com" @change="markDirty" />
-            </el-form-item>
-            <el-form-item label="SMTP 端口">
-              <el-input v-model="selectedNode.config.smtp_port" placeholder="465" @change="markDirty" />
-            </el-form-item>
-            <el-form-item label="发件人邮箱">
-              <el-input v-model="selectedNode.config.smtp_user" @change="markDirty" />
-            </el-form-item>
-            <el-form-item label="邮箱密码">
-              <el-input v-model="selectedNode.config.smtp_password" type="password" show-password @change="markDirty" />
-            </el-form-item>
-            <el-form-item label="SSL">
-              <el-switch v-model="selectedNode.config.use_ssl" @change="markDirty" />
-            </el-form-item>
-            <el-form-item label="收件人">
-              <el-input v-model="selectedNode.config.to" placeholder="a@x.com, b@x.com" @change="markDirty" />
-            </el-form-item>
-            <el-form-item label="邮件主题">
-              <el-input v-model="selectedNode.config.subject" placeholder="支持 {{变量}}" @change="markDirty" />
-            </el-form-item>
-            <el-form-item label="邮件正文">
-              <el-input v-model="selectedNode.config.body" type="textarea" :rows="4"
-                placeholder="支持 HTML 和 {{节点ID.content}} 变量" @change="markDirty" />
-            </el-form-item>
-          </template>
-
-          <!-- Agent Invoke Node -->
-          <template v-if="selectedNode.type === 'agent_invoke'">
-            <el-form-item label="Agent ID">
-              <el-input v-model="selectedNode.config.agent_id" placeholder="Agent ID（数字）" @change="markDirty" />
-            </el-form-item>
-            <el-form-item label="输入内容">
-              <el-input v-model="selectedNode.config.input" type="textarea" :rows="3"
-                placeholder="支持 {{变量名}} 引用上游节点输出，如 {{n_ai_analyze.content}}" @change="markDirty" />
-            </el-form-item>
-            <div style="font-size:11px;color:#888;padding:0 4px 8px;">
-              Agent 将自主思考并调用工具完成任务，结果存入 content 字段。
-            </div>
-          </template>
-
-          <template v-if="selectedNode.type === 'start'">
-            <div style="font-size:12px;color:#888;margin-bottom:8px;padding:0 4px;">
-              在此定义用户运行工作流时需要填写的输入字段，运行时将自动生成表单。
-            </div>
-            <div
-              v-for="(field, idx) in (selectedNode.config.input_fields || [])"
-              :key="idx"
-              style="background:#f5f7fa;border-radius:6px;padding:8px;margin-bottom:8px;"
-            >
-              <div style="display:flex;gap:4px;margin-bottom:4px;">
-                <el-input v-model="field.key" placeholder="字段名(英文)" size="small" style="width:100px;" @change="markDirty" />
-                <el-select v-model="field.type" size="small" style="width:90px;" @change="markDirty">
-                  <el-option label="单行文本" value="text" />
-                  <el-option label="多行文本" value="textarea" />
-                  <el-option label="下拉选择" value="select" />
-                </el-select>
-                <el-button size="small" type="danger" text @click="removeInputField(Number(idx))">删除</el-button>
-              </div>
-              <el-input v-model="field.label" placeholder="显示标签" size="small" style="margin-bottom:4px;" @change="markDirty" />
-              <el-input v-model="field.placeholder" placeholder="占位提示文字" size="small" style="margin-bottom:4px;" @change="markDirty" />
-              <el-input v-if="field.type === 'select'" v-model="field.options" placeholder="选项,用逗号分隔,如: yes,no" size="small" @change="markDirty" />
-            </div>
-            <el-button size="small" type="primary" text @click="addInputField">＋ 添加输入字段</el-button>
-          </template>
-        </el-form>
-      </div>
+      </aside>
     </div>
 
-    <!-- Right-click Context Menu -->
-    <div
-      v-if="contextMenu.visible"
-      class="context-menu"
-      :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
-      @click.stop
-    >
-      <template v-if="contextMenu.type === 'node'">
-        <div class="ctx-item" @click="ctxSelectNode">选中节点</div>
-        <div class="ctx-item" @click="ctxConnectFrom">从此节点连线</div>
-        <div class="ctx-divider" />
-        <div class="ctx-item" @click="ctxDeleteInEdges">删除所有入连线</div>
-        <div class="ctx-item" @click="ctxDeleteOutEdges">删除所有出连线</div>
-        <div class="ctx-divider" />
-        <div class="ctx-item danger" @click="ctxDeleteNode">删除节点</div>
-      </template>
-      <template v-else-if="contextMenu.type === 'edge'">
-        <div class="ctx-item danger" @click="ctxDeleteEdge">删除此连线</div>
-      </template>
-      <template v-else>
-        <div class="ctx-item" @click="ctxAddNode('ai_chat')">➕ 添加 AI 对话节点</div>
-        <div class="ctx-item" @click="ctxAddNode('condition')">➕ 添加条件判断节点</div>
-        <div class="ctx-item" @click="ctxAddNode('knowledge_search')">➕ 添加知识检索节点</div>
-        <div class="ctx-item" @click="ctxAddNode('http')">➕ 添加 HTTP 请求节点</div>
-        <div class="ctx-divider" />
-        <div class="ctx-item" @click="ctxCancelConnect" v-if="connectingState.active">取消连线</div>
-      </template>
-    </div>
-
-    <!-- Test Run Dialog -->
-    <el-dialog v-model="testDialogVisible" title="测试运行" width="700px" top="3vh" :close-on-click-modal="false">
-      <div class="test-dialog-body">
-        <!-- Input Form -->
-        <div v-if="!testResult" class="test-input-section">
-          <div class="test-section-title">填写输入参数</div>
-          <!-- Smart form from start node input_fields -->
-          <template v-if="startInputFields.length">
-            <el-form label-position="top" style="margin-top:8px;">
-              <el-form-item
-                v-for="field in startInputFields"
-                :key="field.key"
-                :label="field.label || field.key"
-              >
-                <el-input
-                  v-if="field.type === 'textarea'"
-                  v-model="testFormData[field.key]"
-                  type="textarea" :rows="3"
-                  :placeholder="field.placeholder || '请输入' + (field.label || field.key)"
-                />
-                <el-select
-                  v-else-if="field.type === 'select'"
-                  v-model="testFormData[field.key]"
-                  style="width:100%"
-                  :placeholder="field.placeholder || '请选择'"
-                >
-                  <el-option
-                    v-for="opt in (field.options || '').split(',')"
-                    :key="opt.trim()" :label="opt.trim()" :value="opt.trim()"
-                  />
-                </el-select>
-                <el-input
-                  v-else
-                  v-model="testFormData[field.key]"
-                  :placeholder="field.placeholder || '请输入' + (field.label || field.key)"
-                />
-              </el-form-item>
-            </el-form>
-          </template>
-          <!-- Fallback: inferred fields as simple inputs -->
-          <template v-else-if="inferredInputFields.length">
-            <div style="font-size:12px;color:#999;margin-bottom:10px;">
-              💡 从节点配置中检测到以下变量，请填写对应的值：
-            </div>
-            <el-form label-position="top">
-              <el-form-item v-for="f in inferredInputFields" :key="f" :label="f">
-                <el-input v-model="testFormData[f]" :placeholder="'请输入 ' + f" />
-              </el-form-item>
-            </el-form>
-          </template>
-          <template v-else>
-            <div style="color:#aaa;font-size:13px;padding:20px 0;text-align:center;">
-              该工作流无需输入参数，直接点击运行即可
-            </div>
-          </template>
-        </div>
-
-        <!-- Result Section -->
-        <div v-if="testResult">
-          <!-- Status bar -->
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
-            <div style="display:flex;align-items:center;gap:10px;">
-              <el-tag :type="testResult.status === 'success' ? 'success' : 'danger'" size="large">
-                {{ testResult.status === 'success' ? '✅ 执行成功' : '❌ 执行失败' }}
-              </el-tag>
-              <span style="color:#888;font-size:13px;">耗时 {{ testResult.duration_ms }}ms</span>
-            </div>
-            <el-button size="small" text @click="testResult = null">← 重新填写</el-button>
-          </div>
-
-          <!-- Error -->
-          <div v-if="testResult.error_msg" style="background:#fff2f0;border:1px solid #ffccc7;border-radius:8px;padding:12px;color:#cf1322;margin-bottom:16px;">
-            {{ testResult.error_msg }}
-          </div>
-
-          <!-- Final Output — most prominent -->
-          <div v-if="finalOutput" class="final-output-card">
-            <div class="final-output-header">
-              <span>📄 最终输出</span>
-              <el-button size="small" text @click="copyOutput">复制</el-button>
-            </div>
-            <div class="final-output-content">{{ finalOutput }}</div>
-          </div>
-
-          <!-- Node execution log — collapsed by default -->
-          <el-collapse style="margin-top:12px;">
-            <el-collapse-item name="log">
-              <template #title>
-                <span style="font-size:13px;color:#888;">🔍 查看节点执行详情（{{ Object.keys(testResult.node_results || {}).length }} 个节点）</span>
-              </template>
-              <div
-                v-for="(r, nid) in testResult.node_results"
-                :key="nid"
-                class="node-log-item"
-              >
-                <div class="node-log-header">
-                  <el-tag size="small" :type="r.status === 'ok' ? 'success' : 'danger'">{{ r.status }}</el-tag>
-                  <span>{{ getNodeLabel(nid) }}</span>
-                  <span v-if="r.condition_result !== undefined" class="node-log-cond">
-                    → {{ r.condition_result ? '走上分支 True' : '走下分支 False' }}
-                  </span>
-                  <span v-if="r.results" class="node-log-cond">→ 检索到 {{ r.results.length }} 条</span>
-                </div>
-                <div v-if="r.content" class="node-log-content ai">{{ r.content }}</div>
-                <div v-else-if="r.results">
-                  <div v-for="(item, i) in r.results" :key="i" class="node-log-kb-item">
-                    <span class="kb-meta">{{ item.filename }} · {{ (item.score*100).toFixed(0) }}%</span>
-                    <div>{{ item.content?.slice(0, 120) }}{{ item.content?.length > 120 ? '...' : '' }}</div>
-                  </div>
-                </div>
-              </div>
-            </el-collapse-item>
-          </el-collapse>
-        </div>
+    <el-drawer v-model="debugOpen" title="调试工作流" :size="'min(520px, 100vw)'" :modal="false" :close-on-click-modal="false">
+      <div v-if="testing" class="studio-status compact" role="status">
+        <LoaderCircle :size="22" class="studio-spin" /><strong>正在执行工作流</strong>
+        <span>节点结果会在执行结束后显示。</span>
       </div>
-
+      <WorkflowResults v-else-if="debugResult" :result="debugResult" :node-labels="nodeLabels">
+        <template #actions><el-button size="small" text @click="debugResult = undefined">修改输入</el-button></template>
+      </WorkflowResults>
+      <div v-else class="debug-input">
+        <h3>运行参数</h3>
+        <p v-if="dirty" class="panel-hint">运行调试时将先保存当前编辑。</p>
+        <p v-if="debugError" class="failure-notice" role="alert">{{ debugError }}</p>
+        <WorkflowInputs v-model="debugInput" :fields="fields" />
+      </div>
       <template #footer>
-        <el-button @click="testDialogVisible = false">关闭</el-button>
-        <el-button v-if="!testResult" type="primary" :loading="testing" @click="runTest">
-          ▶ 运行
-        </el-button>
+        <div class="form-actions">
+          <UiButton @click="debugOpen = false">收起</UiButton>
+          <UiButton v-if="!debugResult" variant="primary" :disabled="saving || publishing" :loading="testing" @click="runDebug"><Play v-if="!testing" />运行调试</UiButton>
+        </div>
       </template>
-    </el-dialog>
+    </el-drawer>
 
-    <!-- Publish as App Dialog -->
-    <el-dialog v-model="publishAppDialogVisible" title="📦 发布为应用市场" width="480px">
-      <div style="font-size:13px;color:#888;margin-bottom:16px;">
-        将此工作流包装成应用，用户可在应用市场直接找到并运行，无需了解工作流细节。
-      </div>
-      <el-form :model="publishAppForm" label-width="80px">
-        <el-form-item label="应用名称">
-          <el-input v-model="publishAppForm.name" placeholder="应用展示名称" />
-        </el-form-item>
-        <el-form-item label="描述">
-          <el-input v-model="publishAppForm.description" type="textarea" :rows="2" placeholder="简要描述应用的用途" />
-        </el-form-item>
-        <el-form-item label="分类">
-          <el-select v-model="publishAppForm.category" style="width:100%">
-            <el-option label="法务合规" value="legal" />
-            <el-option label="财税金融" value="finance" />
-            <el-option label="人力资源" value="hr" />
-            <el-option label="采购供应链" value="procurement" />
-            <el-option label="市场营销" value="marketing" />
-            <el-option label="客户服务" value="service" />
-            <el-option label="政务办公" value="office" />
-            <el-option label="合规管理" value="compliance" />
-            <el-option label="研发技术" value="tech" />
-            <el-option label="其他" value="other" />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="公开访问">
-          <el-switch v-model="publishAppForm.is_public" active-text="公开" inactive-text="私有" />
-        </el-form-item>
+    <el-dialog v-model="publishAppOpen" title="发布为应用" width="min(480px, calc(100vw - 32px))" :close-on-click-modal="!publishing">
+      <p class="dialog-description">发布后，可在应用管理中运行此工作流。</p>
+      <el-form :model="publishAppForm" label-position="top">
+        <el-form-item label="应用名称"><el-input v-model="publishAppForm.name" placeholder="应用展示名称" /></el-form-item>
+        <el-form-item label="描述"><el-input v-model="publishAppForm.description" type="textarea" :rows="3" placeholder="简要描述应用的用途" /></el-form-item>
+        <el-form-item label="公开访问"><el-switch v-model="publishAppForm.is_public" aria-label="公开访问" /></el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="publishAppDialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="publishingApp" @click="confirmPublishAsApp">发布</el-button>
+        <div class="form-actions">
+          <UiButton :disabled="publishing" @click="publishAppOpen = false">取消</UiButton>
+          <UiButton variant="primary" :loading="publishing" @click="publishAsApp">发布</UiButton>
+        </div>
       </template>
     </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
-import { ArrowLeft } from '@element-plus/icons-vue'
-import { workflowApi, modelApi, knowledgeApi, appApi, promptApi } from '@/api'
-import type { ModelConfig, KnowledgeBase } from '@/types'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
+import type { RouteLocationNormalized } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { ArrowLeft, FlaskConical, LoaderCircle, LocateFixed, PackagePlus, PanelLeftOpen, Play, Plus, RadioTower, Save, Search, Workflow as WorkflowIcon, X } from '@lucide/vue'
+import type { Connection } from '@vue-flow/core'
+import { appApi, knowledgeApi, modelApi, promptApi, workflowApi } from '@/api'
+import UiButton from '@/components/ui/UiButton.vue'
+import type { KnowledgeBase, ModelConfig, Workflow as WorkflowRecord, WorkflowExecution } from '@/types'
+import WorkflowCanvas from './WorkflowCanvas.vue'
+import WorkflowInputs from './WorkflowInputs.vue'
+import WorkflowNodeConfig from './WorkflowNodeConfig.vue'
+import WorkflowResults from './WorkflowResults.vue'
+import { edgeEndpoints, inputFields, moveNode, nodePosition, replaceGraph, type Point, type WorkflowEdge, type WorkflowNode } from './workflowGraph'
+import { getNodeType, nodeTypes, type WorkflowPromptTemplate } from './workflowNodes'
 
 const route = useRoute()
 const router = useRouter()
-const workflowId = Number(route.params.id)
-
-const workflow = ref<any>({ name: '', version: 1, is_published: false })
-const nodes = ref<any[]>([])
-const edges = ref<any[]>([])
-const selectedNode = ref<any>(null)
-const hoveredEdge = ref<any>(null)
+const workflowId = computed(() => Number(route.params.id))
+const canvas = ref<InstanceType<typeof WorkflowCanvas>>()
+const workflow = ref<WorkflowRecord>()
+const nodes = ref<(WorkflowNode & { config: Record<string, any> })[]>([])
+const edges = ref<WorkflowEdge[]>([])
+const selectedId = ref<string | null>(null)
+const selectedNode = computed(() => nodes.value.find(node => node.id === selectedId.value))
+const loading = ref(false)
+const loadError = ref(false)
 const saving = ref(false)
-const isDirty = ref(false)
-const canvasRef = ref<HTMLElement>()
-const canvasWidth = 2000
-const canvasHeight = 1200
-
+const dirty = ref(false)
+const saveError = ref(false)
+const publishing = ref(false)
+const testing = ref(false)
+const busy = computed(() => saving.value || publishing.value || testing.value)
+const search = ref('')
+const mobileLibraryOpen = ref(false)
 const chatModels = ref<ModelConfig[]>([])
 const knowledgeBases = ref<KnowledgeBase[]>([])
-const promptTemplates = ref<any[]>([])
-
-const testDialogVisible = ref(false)
-const testInput = ref('{}')
-const testFormData = ref<Record<string, string>>({})
-const testResult = ref<any>(null)
-const testing = ref(false)
-
-// Start node input fields (defined by workflow designer)
-const startInputFields = computed(() => {
-  const startNode = nodes.value.find(n => n.type === 'start')
-  return startNode?.config?.input_fields || []
-})
-
-// Final output: last ai_chat node's content in execution order
-const finalOutput = computed(() => {
-  if (!testResult.value?.node_results) return ''
-  const nr = testResult.value.node_results
-  // Find last node with content (ai_chat output)
-  const entries = Object.entries(nr) as [string, any][]
-  const aiEntries = entries.filter(([, v]) => v.content)
-  if (!aiEntries.length) return ''
-  return aiEntries[aiEntries.length - 1][1].content as string
-})
-
-function addInputField() {
-  const startNode = nodes.value.find(n => n.type === 'start')
-  if (!startNode) return
-  if (!startNode.config.input_fields) startNode.config.input_fields = []
-  startNode.config.input_fields.push({ key: '', label: '', type: 'text', placeholder: '', options: '' })
-  markDirty()
-}
-
-function removeInputField(idx: number) {
-  const startNode = nodes.value.find(n => n.type === 'start')
-  if (!startNode?.config?.input_fields) return
-  startNode.config.input_fields.splice(idx, 1)
-  markDirty()
-}
-
-function copyOutput() {
-  if (!finalOutput.value) return
-  navigator.clipboard.writeText(finalOutput.value).then(() => ElMessage.success('已复制到剪贴板'))
-}
-
-// ── Publish as App ─────────────────────────────────────────────────────────────
-const publishAppDialogVisible = ref(false)
-const publishingApp = ref(false)
-const publishAppForm = reactive({
-  name: '',
-  description: '',
-  category: 'other',
-  is_public: false,
-})
-
-function openPublishAsApp() {
-  publishAppForm.name = workflow.value.name || ''
-  publishAppForm.description = workflow.value.description || ''
-  publishAppForm.category = workflow.value.category || 'other'
-  publishAppForm.is_public = false
-  publishAppDialogVisible.value = true
-}
-
-async function confirmPublishAsApp() {
-  if (!publishAppForm.name.trim()) return ElMessage.warning('请输入应用名称')
-  publishingApp.value = true
-  try {
-    // Ensure workflow is published first
-    if (!workflow.value.is_published) {
-      await workflowApi.update(workflowId, { is_published: true })
-      workflow.value.is_published = true
-    }
-    // Create app instance directly bound to this workflow (no template needed)
-    await appApi.createInstance({
-      template_id: 1,
-      name: publishAppForm.name,
-      description: publishAppForm.description,
-      workflow_id: workflowId,
-      is_public: publishAppForm.is_public,
-    })
-    ElMessage.success('已发布到应用市场！')
-    publishAppDialogVisible.value = false
-  } catch (e: any) {
-    ElMessage.error(e?.message || '发布失败')
-  } finally {
-    publishingApp.value = false
-  }
-}
-
-// ── Connecting state (drag from out-port to in-port) ──────────────────────────
-const connectingState = reactive({
-  active: false,
-  fromNode: null as any,
-  mouseX: 0,
-  mouseY: 0,
-})
-
-const connectingPreviewPath = computed(() => {
-  if (!connectingState.active || !connectingState.fromNode) return ''
-  const src = connectingState.fromNode
-  const x1 = src.position.x + 124
-  const y1 = src.position.y + 30
-  const x2 = connectingState.mouseX
-  const y2 = connectingState.mouseY
-  const cx = (x1 + x2) / 2
-  return `M ${x1} ${y1} C ${cx} ${y1}, ${cx} ${y2}, ${x2} ${y2}`
-})
-
-// ── Context menu ──────────────────────────────────────────────────────────────
-const contextMenu = reactive({
-  visible: false,
-  x: 0,
-  y: 0,
-  type: '' as 'node' | 'edge' | 'canvas',
-  target: null as any,
-})
-
-function showContextMenu(e: MouseEvent, type: 'node' | 'edge' | 'canvas', target: any = null) {
-  contextMenu.visible = true
-  contextMenu.x = e.clientX
-  contextMenu.y = e.clientY
-  contextMenu.type = type
-  contextMenu.target = target
-}
-
-function closeContextMenu() {
-  contextMenu.visible = false
-}
-
-// ── Node types ────────────────────────────────────────────────────────────────
-let draggingNodeType: any = null
-let draggingNode: any = null
-let dragOffsetX = 0
-let dragOffsetY = 0
+const promptTemplates = ref<WorkflowPromptTemplate[]>([])
 let nodeCounter = 0
 
-const nodeTypes = [
-  { type: 'start', label: '开始', icon: '▶️', desc: '流程入口' },
-  { type: 'end', label: '结束', icon: '⏹️', desc: '流程出口' },
-  { type: 'ai_chat', label: 'AI 对话', icon: '🤖', desc: '调用大模型' },
-  { type: 'knowledge_search', label: '知识检索', icon: '🔍', desc: '检索知识库' },
-  { type: 'condition', label: '条件判断', icon: '🔀', desc: '分支条件' },
-  { type: 'http', label: 'HTTP 请求', icon: '🌐', desc: '调用外部接口' },
-  { type: 'delay', label: '延时等待', icon: '⏱️', desc: '等待指定时间' },
-  { type: 'set_variable', label: '设置变量', icon: '📝', desc: '设置上下文变量' },
-  { type: 'doc_output', label: '文档生成', icon: '📄', desc: '生成 Word 文档' },
-  { type: 'data_source', label: '数据读取', icon: '🗄️', desc: 'MySQL/CSV/Excel' },
-  { type: 'db_write', label: '写入数据库', icon: '💾', desc: '结果写回 MySQL' },
-  { type: 'send_email', label: '发送邮件', icon: '📧', desc: 'SMTP 邮件通知' },
-  { type: 'agent_invoke', label: 'Agent 调用', icon: '🧠', desc: 'ReAct 智能体' },
-  { type: 'loop', label: '循环', icon: '🔁', desc: '遍历列表执行' },
-  { type: 'parallel', label: '并行', icon: '⚡', desc: '并行执行子节点' },
-  { type: 'code', label: '代码执行', icon: '🐍', desc: 'Python 沙箱执行' },
-  { type: 'web_crawl', label: '网页爬取', icon: '🕷️', desc: '抓取网页文本' },
-]
-
-function getNodeType(type: string) {
-  return nodeTypes.find(n => n.type === type)
-}
-
-function markDirty() { isDirty.value = true }
-
-// ── Drag from node library ────────────────────────────────────────────────────
-function onDragStart(e: DragEvent, nt: any) {
-  draggingNodeType = nt
-}
-
-function onDrop(e: DragEvent) {
-  if (!draggingNodeType || !canvasRef.value) return
-  const rect = canvasRef.value.getBoundingClientRect()
-  const scrollLeft = canvasRef.value.scrollLeft
-  const scrollTop = canvasRef.value.scrollTop
-  const x = e.clientX - rect.left + scrollLeft - 60
-  const y = e.clientY - rect.top + scrollTop - 20
-  nodeCounter++
-  nodes.value.push({
-    id: `node_${Date.now()}_${nodeCounter}`,
-    type: draggingNodeType.type,
-    config: { label: draggingNodeType.label },
-    position: { x: Math.max(0, x), y: Math.max(0, y) },
+const debugOpen = ref(false)
+const debugInput = ref<Record<string, string>>({})
+const debugResult = ref<WorkflowExecution>()
+const debugError = ref('')
+const fields = computed(() => inputFields(nodes.value))
+const saveLabel = computed(() => saving.value ? '保存中' : saveError.value ? '保存失败' : dirty.value ? '有未保存的更改' : '已保存')
+const nodeLabels = computed(() => Object.fromEntries(nodes.value.map(node => [
+  node.id, node.config.label || node.label || getNodeType(node.type)?.label || node.type,
+])))
+const nodeGroups = computed(() => {
+  const filter = search.value.trim().toLowerCase()
+  const groups = new Map<string, typeof nodeTypes>()
+  for (const node of nodeTypes) {
+    if (!`${node.type} ${node.label} ${node.description}`.toLowerCase().includes(filter)) continue
+    const group = groups.get(node.group) || []
+    group.push(node)
+    groups.set(node.group, group)
+  }
+  return [...groups].map(([name, nodes]) => ({ name, nodes }))
+})
+const connections = computed(() => {
+  const node = selectedNode.value
+  if (!node) return []
+  let outgoing = 0
+  return edges.value.flatMap((edge, index) => {
+    const { source, target } = edgeEndpoints(edge)
+    if (source === node.id) {
+      const branch = outgoing++
+      const label = node.type === 'condition' && branch < 2 ? (branch === 0 ? 'True 出口' : 'False 出口') : '输出到'
+      return [{ key: index, label, nodeId: target }]
+    }
+    return target === node.id ? [{ key: index, label: '来自', nodeId: source }] : []
   })
-  draggingNodeType = null
+})
+
+function markDirty() {
+  dirty.value = true
+  saveError.value = false
+}
+
+function selectNode(id: string | null) {
+  selectedId.value = id
+}
+
+function inspectConnectedNode(id: string) {
+  if (!nodes.value.some(node => node.id === id)) return
+  selectNode(id)
+  canvas.value?.locateNode(id)
+}
+
+function dragNode(event: DragEvent, type: string) {
+  if (!event.dataTransfer) return
+  event.dataTransfer.effectAllowed = 'copy'
+  event.dataTransfer.setData('application/x-platform-workflow-node', type)
+}
+
+function addAtCenter(type: string) {
+  mobileLibraryOpen.value = false
+  canvas.value?.addAtCenter(type)
+}
+
+function createNode(type: string, position: Point) {
+  const nodeType = getNodeType(type)
+  if (!nodeType || busy.value) return
+  const id = `node_${Date.now()}_${++nodeCounter}`
+  nodes.value.push({ id, type, config: { label: nodeType.label }, position })
+  selectNode(id)
   markDirty()
 }
 
-// ── Node drag-move ────────────────────────────────────────────────────────────
-function startDragNode(e: MouseEvent, node: any) {
-  if (connectingState.active) return
-  e.stopPropagation()
-  draggingNode = node
-  dragOffsetX = e.clientX - node.position.x
-  dragOffsetY = e.clientY - node.position.y
-
-  const onMove = (ev: MouseEvent) => {
-    if (!draggingNode) return
-    draggingNode.position.x = Math.max(0, ev.clientX - dragOffsetX)
-    draggingNode.position.y = Math.max(0, ev.clientY - dragOffsetY)
-    markDirty()
-  }
-  const onUp = () => {
-    draggingNode = null
-    document.removeEventListener('mousemove', onMove)
-    document.removeEventListener('mouseup', onUp)
-  }
-  document.addEventListener('mousemove', onMove)
-  document.addEventListener('mouseup', onUp)
-}
-
-// ── Connect: drag from out-port ───────────────────────────────────────────────
-function startConnect(e: MouseEvent, node: any) {
-  e.stopPropagation()
-  e.preventDefault()
-  connectingState.active = true
-  connectingState.fromNode = node
-  if (canvasRef.value) {
-    const rect = canvasRef.value.getBoundingClientRect()
-    connectingState.mouseX = e.clientX - rect.left + canvasRef.value.scrollLeft
-    connectingState.mouseY = e.clientY - rect.top + canvasRef.value.scrollTop
-  }
-}
-
-function onCanvasMouseMove(e: MouseEvent) {
-  if (!connectingState.active || !canvasRef.value) return
-  const rect = canvasRef.value.getBoundingClientRect()
-  connectingState.mouseX = e.clientX - rect.left + canvasRef.value.scrollLeft
-  connectingState.mouseY = e.clientY - rect.top + canvasRef.value.scrollTop
-}
-
-function onCanvasMouseUp(e: MouseEvent) {
-  if (connectingState.active) {
-    connectingState.active = false
-    connectingState.fromNode = null
-  }
-}
-
-function onPortMouseUp(node: any, portType: string) {
-  if (!connectingState.active || portType !== 'in') return
-  const from = connectingState.fromNode
-  if (!from || from.id === node.id) {
-    connectingState.active = false
-    connectingState.fromNode = null
-    return
-  }
-  const exists = edges.value.find(ed => ed.source === from.id && ed.target === node.id)
-  if (!exists) {
-    edges.value.push({ id: `edge_${from.id}_${node.id}`, source: from.id, target: node.id })
-    markDirty()
-    ElMessage.success('连线成功')
-  }
-  connectingState.active = false
-  connectingState.fromNode = null
-}
-
-// ── Select / deselect ─────────────────────────────────────────────────────────
-function selectNode(node: any) {
-  if (connectingState.active) return
-  selectedNode.value = node
-  closeContextMenu()
-}
-
-function deselectAll() {
-  selectedNode.value = null
-  closeContextMenu()
-}
-
-// ── Delete ────────────────────────────────────────────────────────────────────
-function deleteNode(node: any) {
-  nodes.value = nodes.value.filter(n => n.id !== node.id)
-  edges.value = edges.value.filter(e => e.source !== node.id && e.target !== node.id)
-  if (selectedNode.value?.id === node.id) selectedNode.value = null
-  markDirty()
-}
-
-// ── Edge path ─────────────────────────────────────────────────────────────────
-function getEdgePath(edge: any) {
-  const src = nodes.value.find(n => n.id === edge.source)
-  const tgt = nodes.value.find(n => n.id === edge.target)
-  if (!src || !tgt) return ''
-  const x1 = src.position.x + 124
-  const y1 = src.position.y + 30
-  const x2 = tgt.position.x
-  const y2 = tgt.position.y + 30
-  const cx = (x1 + x2) / 2
-  return `M ${x1} ${y1} C ${cx} ${y1}, ${cx} ${y2}, ${x2} ${y2}`
-}
-
-// ── Right-click handlers ──────────────────────────────────────────────────────
-function onNodeRightClick(e: MouseEvent, node: any) {
-  e.stopPropagation()
-  selectedNode.value = node
-  showContextMenu(e, 'node', node)
-}
-
-function onEdgeRightClick(e: MouseEvent, edge: any) {
-  e.stopPropagation()
-  showContextMenu(e, 'edge', edge)
-}
-
-function onCanvasRightClick(e: MouseEvent) {
-  showContextMenu(e, 'canvas', { x: e.clientX, y: e.clientY })
-}
-
-// ── Context menu actions ──────────────────────────────────────────────────────
-function ctxSelectNode() {
-  selectedNode.value = contextMenu.target
-  closeContextMenu()
-}
-
-function ctxConnectFrom() {
-  const node = contextMenu.target
-  closeContextMenu()
-  connectingState.active = true
-  connectingState.fromNode = node
-  if (canvasRef.value) {
-    connectingState.mouseX = node.position.x + 124
-    connectingState.mouseY = node.position.y + 30
-  }
-  ElMessage.info('请点击目标节点的左侧端口完成连线，或右键取消')
-}
-
-function ctxDeleteNode() {
-  deleteNode(contextMenu.target)
-  closeContextMenu()
-}
-
-function ctxDeleteEdge() {
-  edges.value = edges.value.filter(e => e.id !== contextMenu.target.id)
-  markDirty()
-  closeContextMenu()
-}
-
-function ctxDeleteInEdges() {
-  const nodeId = contextMenu.target.id
-  edges.value = edges.value.filter(e => e.target !== nodeId)
-  markDirty()
-  closeContextMenu()
-}
-
-function ctxDeleteOutEdges() {
-  const nodeId = contextMenu.target.id
-  edges.value = edges.value.filter(e => e.source !== nodeId)
-  markDirty()
-  closeContextMenu()
-}
-
-function ctxAddNode(type: string) {
-  const nt = getNodeType(type)
-  if (!nt || !canvasRef.value) return
-  const rect = canvasRef.value.getBoundingClientRect()
-  const x = contextMenu.x - rect.left + canvasRef.value.scrollLeft - 60
-  const y = contextMenu.y - rect.top + canvasRef.value.scrollTop - 20
-  nodeCounter++
-  nodes.value.push({
-    id: `node_${Date.now()}_${nodeCounter}`,
-    type,
-    config: { label: nt.label },
-    position: { x: Math.max(0, x), y: Math.max(0, y) },
+function moveNodes(positions: Map<string, Point>) {
+  let changed = false
+  nodes.value = nodes.value.map(node => {
+    const position = positions.get(node.id)
+    const previous = nodePosition(node)
+    if (!position || (previous.x === position.x && previous.y === position.y)) return node
+    changed = true
+    return moveNode(node, position)
   })
+  if (changed) markDirty()
+}
+
+function createConnection({ source, target }: Connection) {
+  if (!source || !target || busy.value) return
+  edges.value.push({ id: `edge_${source}_${target}`, source, target })
   markDirty()
-  closeContextMenu()
 }
 
-function ctxCancelConnect() {
-  connectingState.active = false
-  connectingState.fromNode = null
-  closeContextMenu()
-}
-
-// ── Save / Publish / Test ─────────────────────────────────────────────────────
-async function saveWorkflow() {
-  saving.value = true
+async function removeItems(nodeIds: string[], edgeIndices: number[]) {
+  if (busy.value) return
+  const nodesToRemove = new Set(nodeIds)
+  const linksToRemove = new Set(edgeIndices.map(index => edges.value[index]))
   try {
-    const definition = { nodes: nodes.value, edges: edges.value }
-    await workflowApi.update(workflowId, { name: workflow.value.name, definition })
-    workflow.value.version++
-    isDirty.value = false
-    ElMessage.success('保存成功')
+    await ElMessageBox.confirm(nodeIds.length ? `将删除 ${nodeIds.length} 个节点及其连线。` : `将删除 ${edgeIndices.length} 条连线。`,
+      '确认删除', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' })
+  } catch { return }
+  nodes.value = nodes.value.filter(node => !nodesToRemove.has(node.id))
+  edges.value = edges.value.filter(edge => {
+    const { source, target } = edgeEndpoints(edge)
+    return !linksToRemove.has(edge) && !nodesToRemove.has(source) && !nodesToRemove.has(target)
+  })
+  if (selectedId.value && nodesToRemove.has(selectedId.value)) selectNode(null)
+  markDirty()
+}
+
+async function saveWorkflow() {
+  if (!workflow.value || saving.value) return false
+  if (!workflow.value.name.trim()) {
+    ElMessage.warning('请输入工作流名称')
+    return false
+  }
+  saving.value = true
+  saveError.value = false
+  try {
+    const definition = replaceGraph(workflow.value.definition || {}, nodes.value, edges.value)
+    workflow.value = await workflowApi.update(workflowId.value, { name: workflow.value.name, definition })
+    dirty.value = false
+    ElMessage.success('工作流已保存')
+    return true
+  } catch {
+    saveError.value = true
+    return false
   } finally {
     saving.value = false
   }
 }
 
 async function publishWorkflow() {
-  await workflowApi.update(workflowId, { is_published: !workflow.value.is_published })
-  workflow.value.is_published = !workflow.value.is_published
-  ElMessage.success(workflow.value.is_published ? '已发布' : '已取消发布')
-}
-
-// ── Infer input fields from node configs (find {{var}} patterns) ──────────────
-const inferredInputFields = computed(() => {
-  const fields = new Set<string>()
-  const re = /\{\{(\w+)\}\}/g
-  for (const node of nodes.value) {
-    const cfg = node.config || {}
-    for (const val of Object.values(cfg)) {
-      if (typeof val === 'string') {
-        let m: RegExpExecArray | null
-        while ((m = re.exec(val)) !== null) fields.add(m[1])
-        re.lastIndex = 0
-      }
-    }
-  }
-  return Array.from(fields)
-})
-
-function insertField(field: string) {
+  if (!workflow.value || busy.value) return
+  const publish = !workflow.value.is_published
   try {
-    const obj = JSON.parse(testInput.value || '{}')
-    if (!(field in obj)) obj[field] = `示例${field}`
-    testInput.value = JSON.stringify(obj, null, 2)
+    await ElMessageBox.confirm(publish ? '发布后，此工作流可用于应用。' : '确定取消工作流的发布状态？',
+      publish ? '发布工作流' : '取消发布', { confirmButtonText: publish ? '发布' : '取消发布', cancelButtonText: '返回' })
+  } catch { return }
+  publishing.value = true
+  try {
+    if (publish && dirty.value && !await saveWorkflow()) return
+    const updated = await workflowApi.update(workflowId.value, { is_published: publish })
+    workflow.value.is_published = updated.is_published
+    ElMessage.success(publish ? '已发布' : '已取消发布')
   } catch {
-    testInput.value = JSON.stringify({ [field]: `示例${field}` }, null, 2)
+    // 请求层提供失败反馈。
+  } finally {
+    publishing.value = false
   }
 }
 
-function getNodeLabel(nodeId: string | number) {
-  const id = String(nodeId)
-  const node = nodes.value.find(n => n.id === id)
-  if (!node) return id
-  return node.config?.label || getNodeType(node.type)?.label || id
+const publishAppOpen = ref(false)
+const publishAppForm = reactive({ name: '', description: '', is_public: false })
+
+function openPublishAsApp() {
+  if (!workflow.value) return
+  Object.assign(publishAppForm, {
+    name: workflow.value.name, description: workflow.value.description || '',
+    is_public: false,
+  })
+  publishAppOpen.value = true
 }
 
-function testRun() {
-  testResult.value = null
-  // Init form data: use start node fields or inferred fields
-  const fd: Record<string, string> = {}
-  if (startInputFields.value.length) {
-    for (const f of startInputFields.value) fd[f.key] = ''
-  } else {
-    for (const f of inferredInputFields.value) fd[f] = ''
-  }
-  testFormData.value = fd
-  testDialogVisible.value = true
-}
-
-async function runTest() {
-  testing.value = true
+async function publishAsApp() {
+  if (!workflow.value || busy.value) return
+  if (!publishAppForm.name.trim()) return ElMessage.warning('请输入应用名称')
+  publishing.value = true
   try {
-    if (isDirty.value) await saveWorkflow()
-    const result = await workflowApi.execute(workflowId, { input_data: testFormData.value })
-    testResult.value = result
+    if (dirty.value && !await saveWorkflow()) return
+    if (!workflow.value.is_published) {
+      const updated = await workflowApi.update(workflowId.value, { is_published: true })
+      workflow.value.is_published = updated.is_published
+    }
+    await appApi.createInstance({
+      template_id: 1, name: publishAppForm.name, description: publishAppForm.description,
+      workflow_id: workflowId.value, is_public: publishAppForm.is_public,
+    })
+    ElMessage.success('已发布为应用')
+    publishAppOpen.value = false
+  } catch {
+    // 请求层提供失败反馈。
+  } finally {
+    publishing.value = false
+  }
+}
+
+function openDebugPanel() {
+  debugInput.value = Object.fromEntries(fields.value.map(field => [field.key, debugInput.value[field.key] ?? '']))
+  debugError.value = ''
+  debugOpen.value = true
+}
+
+async function runDebug() {
+  if (busy.value) return
+  testing.value = true
+  debugError.value = ''
+  debugResult.value = undefined
+  try {
+    if (dirty.value && !await saveWorkflow()) {
+      debugError.value = '工作流未能保存，请检查编辑内容后重试。'
+      return
+    }
+    debugResult.value = await workflowApi.execute(workflowId.value, { input_data: debugInput.value })
+  } catch {
+    debugError.value = '调试请求失败，请重试。'
   } finally {
     testing.value = false
   }
 }
 
-function applyPromptTemplate(node: any, templateId: number | null) {
-  if (!templateId) return
-  const tpl = promptTemplates.value.find(t => t.id === templateId)
-  if (!tpl) return
-  node.config.prompt = tpl.content
-  markDirty()
-  ElMessage.success(`已应用模板「${tpl.name}」`)
+async function loadWorkflow() {
+  const id = workflowId.value
+  loading.value = true
+  loadError.value = false
+  selectedId.value = null
+  dirty.value = false
+  saveError.value = false
+  debugOpen.value = false
+  debugResult.value = undefined
+  debugInput.value = {}
+  try {
+    const data = await workflowApi.get(id)
+    if (id !== workflowId.value) return
+    workflow.value = data
+    nodes.value = (data.definition?.nodes || []).map((node: WorkflowNode) => ({ ...node, config: node.config || {} }))
+    edges.value = data.definition?.edges || []
+  } catch {
+    if (id === workflowId.value) loadError.value = true
+  } finally {
+    if (id === workflowId.value) loading.value = false
+  }
 }
 
-onMounted(async () => {
+async function confirmLeave(to: RouteLocationNormalized) {
+  if (to.name === 'Login' && !localStorage.getItem('access_token')) return true
+  if (busy.value) return false
+  if (!dirty.value) return true
   try {
-    const wf = await workflowApi.get(workflowId)
-    workflow.value = wf
-    nodes.value = (wf.definition?.nodes || []).map((n: any) => {
-      if (!n.position) {
-        n.position = { x: n.x ?? 100, y: n.y ?? 100 }
-      }
-      return n
+    await ElMessageBox.confirm('离开编辑器会丢失未保存的更改。', '离开工作流', {
+      type: 'warning', confirmButtonText: '离开', cancelButtonText: '继续编辑',
     })
-    edges.value = (wf.definition?.edges || []).map((e: any) => ({
-      ...e,
-      source: e.source || e.from || '',
-      target: e.target || e.to || '',
-    }))
-  } catch (e: any) {
-    ElMessage.error('加载工作流失败: ' + (e?.message || e))
-    return
-  }
+    return true
+  } catch { return false }
+}
 
-  // Load auxiliary data (non-blocking failures)
-  try {
-    const models = await modelApi.listConfigs({ model_type: 'chat' })
-    chatModels.value = models.filter((m: ModelConfig) => m.model_type === 'chat' && m.is_active)
-  } catch { /* ignore */ }
-  try {
-    const kbs = await knowledgeApi.listBases({ page_size: 100 })
-    knowledgeBases.value = kbs.items
-  } catch { /* ignore */ }
-  try {
-    const tpls = await promptApi.list({ page_size: 100, include_public: true })
-    promptTemplates.value = tpls.items || []
-  } catch { /* ignore */ }
+onBeforeRouteLeave(confirmLeave)
+onBeforeRouteUpdate(confirmLeave)
+watch(workflowId, loadWorkflow, { immediate: true })
+onMounted(async () => {
+  const results = await Promise.allSettled([
+    modelApi.listConfigs({ model_type: 'chat' }),
+    knowledgeApi.listBases({ page_size: 100 }),
+    promptApi.list({ page_size: 100, include_public: true }),
+  ] as const)
+  const [models, knowledge, prompts] = results
+  if (models.status === 'fulfilled') chatModels.value = models.value.filter(model => model.model_type === 'chat' && model.is_active)
+  if (knowledge.status === 'fulfilled') knowledgeBases.value = knowledge.value.items
+  if (prompts.status === 'fulfilled') promptTemplates.value = prompts.value.items
 })
 </script>
 
 <style scoped>
-.editor-page {
-  display: flex; flex-direction: column; height: calc(100vh - 56px);
-  background: #f9f9f9; position: relative; user-select: none;
+.studio { display: flex; flex-direction: column; height: calc(100dvh - var(--ui-header-height, 52px)); min-height: 470px; background: var(--ui-bg); }
+.studio-toolbar {
+  position: relative; z-index: 2; display: flex; flex: none; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; gap: 8px 16px; padding: 10px 16px; min-height: 65px;
+  border-bottom: 1px solid var(--ui-border); background: var(--ui-surface);
 }
-.editor-toolbar {
-  height: 52px; background: #fff; border-bottom: 1px solid #e5e5e5;
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 0 16px; gap: 12px; flex-shrink: 0; z-index: 10;
+.workflow-heading,.workflow-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.workflow-heading { flex-wrap: nowrap; gap: 8px; }
+.workflow-title { min-width: 0; width: min(235px, 66vw); }
+.workflow-title :deep(.el-input__wrapper) { box-shadow: none; padding: 0 5px; background: transparent; }
+.workflow-title :deep(.el-input__wrapper:hover),.workflow-title :deep(.el-input__wrapper.is-focus) { box-shadow: inset 0 0 0 1px var(--ui-border-strong); }
+.workflow-title :deep(.el-input__inner) { height: 29px; font-size: 16px; font-weight: 650; }
+.workflow-meta { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding-inline: 5px; color: var(--ui-secondary); font-size: 11px; }
+.save-state { display: inline-flex; align-items: center; gap: 5px; color: var(--ui-secondary); }
+.save-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--ui-success); }
+.save-error .save-dot { background: var(--ui-danger); }
+.save-dirty .save-dot { background: var(--ui-warning); }
+.form-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.studio-body { display: flex; flex: 1; min-height: 0; min-width: 0; position: relative; overflow: hidden; }
+.node-library,.inspector { display: flex; flex-direction: column; flex: none; min-height: 0; background: var(--ui-surface); }
+.node-library { width: 215px; border-right: 1px solid var(--ui-border); }
+.inspector { width: 294px; border-left: 1px solid var(--ui-border); }
+.panel-heading { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 14px 12px; }
+.panel-heading h2 { margin: 0; font-size: 14px; font-weight: 650; overflow-wrap: anywhere; }
+.panel-heading p { margin: 3px 0 0; color: var(--ui-secondary); font-size: 12px; overflow-wrap: anywhere; }
+.panel-heading > div { flex: 1; min-width: 0; }
+.library-search { padding: 0 12px 10px; }
+.library-groups,.inspector-body { overflow: auto; }
+.library-groups { padding: 0 7px 12px; }
+.library-groups h3 { margin: 10px 5px 5px; color: var(--ui-secondary); font-size: 11px; font-weight: 650; }
+.library-node {
+  display: flex; align-items: center; gap: 8px; width: 100%; min-height: 47px; padding: 5px;
+  border: 1px solid transparent; background: transparent; color: var(--ui-text);
+  border-radius: var(--ui-radius-md); font: inherit; text-align: left; cursor: grab;
 }
-.toolbar-left, .toolbar-right { display: flex; align-items: center; gap: 8px; }
-.toolbar-hint { font-size: 13px; color: #9ca3af; }
-.editor-body { flex: 1; display: flex; overflow: hidden; }
-
-/* Node panel */
-.node-panel {
-  width: 180px; background: #fff; border-right: 1px solid #e5e5e5;
-  overflow-y: auto; flex-shrink: 0; padding: 8px;
+.library-node:hover,.library-node:focus-visible { background: var(--ui-hover); border-color: var(--ui-border); }
+.library-node:disabled { opacity: 0.6; cursor: default; }
+.library-icon,.inspector-icon {
+  flex: 0 0 30px; height: 30px; display: grid; place-items: center;
+  color: var(--ui-accent); background: var(--ui-accent-soft); border-radius: var(--ui-radius-md);
 }
-.panel-title {
-  font-size: 13px; font-weight: 600; color: #0d0d0d;
-  padding: 8px 4px; border-bottom: 1px solid #f3f4f6; margin-bottom: 8px;
+.library-label { display: grid; gap: 2px; flex: 1; min-width: 0; font-size: 12px; font-weight: 600; }
+.library-label small { color: var(--ui-secondary); font-weight: 400; font-size: 11px; line-height: 1.35; }
+.library-add { flex: none; color: var(--ui-muted); visibility: hidden; }
+.library-node:hover .library-add,.library-node:focus-visible .library-add { visibility: visible; }
+.inspector-heading { border-bottom: 1px solid var(--ui-border); }
+.inspector-body { padding: 14px; }
+.inspector-body fieldset { margin: 0; padding: 0; min-width: 0; border: 0; }
+.inspector-body fieldset:disabled { pointer-events: none; opacity: .7; }
+.inspector-guide { padding: 14px; color: var(--ui-secondary); font-size: 12px; }
+.inspector-guide header { display: flex; align-items: center; gap: 8px; color: var(--ui-text); }
+.inspector-guide h2 { margin: 0; font-size: 14px; }
+.inspector-guide p { margin: 12px 0 16px; }
+.inspector-guide dl { display: grid; gap: 9px; margin: 0; padding-top: 12px; border-top: 1px solid var(--ui-border); }
+.inspector-guide dl div { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.inspector-guide dd { margin: 0; text-align: right; }
+.inspector-guide kbd { padding-inline: 4px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); font: 11px var(--ui-font-mono); }
+.node-links { border-top: 1px solid var(--ui-border); padding-top: 12px; }
+.node-links h3,.debug-input h3 { font-size: 13px; margin: 0 0 10px; }
+.node-link { display: grid; grid-template-columns: 62px minmax(0, 1fr); align-items: baseline; gap: 4px; margin-bottom: 6px; color: var(--ui-secondary); font-size: 12px; }
+.node-link button {
+  width: fit-content; max-width: 100%; border: 0; background: transparent; color: var(--ui-accent);
+  font: inherit; padding: 2px; text-align: left; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.node-item {
-  display: flex; align-items: center; gap: 8px; padding: 8px;
-  border-radius: 8px; cursor: grab; transition: background 0.15s; margin-bottom: 4px;
+.node-link button:hover { text-decoration: underline; }
+.node-links code { display: block; margin-top: 12px; color: var(--ui-secondary); font: 11px/1.5 var(--ui-font-mono); overflow-wrap: anywhere; }
+.panel-hint,.dialog-description { color: var(--ui-secondary); font-size: 13px; line-height: 1.5; margin: 0 0 12px; }
+.library-groups .panel-hint { padding: 8px; }
+.studio-icon-button {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 30px; height: 30px; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-secondary); cursor: pointer;
 }
-.node-item:hover { background: #f3f4f6; }
-.node-icon { font-size: 18px; }
-.node-name { font-size: 13px; font-weight: 500; color: #374151; }
-.node-desc { font-size: 11px; color: #9ca3af; }
-
-/* Canvas */
-.canvas-area {
-  flex: 1; position: relative; overflow: auto; background: #fafafa;
-  background-image: radial-gradient(circle, #e5e5e5 1px, transparent 1px);
-  background-size: 24px 24px; cursor: default;
+.studio-icon-button:hover { background: var(--ui-hover); color: var(--ui-text); }
+.library-launch,.library-close { display: none; }
+.studio-status {
+  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 11px;
+  padding: 24px; text-align: center; color: var(--ui-secondary); font-size: 13px;
 }
-.canvas-area.is-connecting { cursor: crosshair; }
-.canvas-svg {
-  position: absolute; top: 0; left: 0;
-  pointer-events: none; overflow: visible;
+.studio-status strong { color: var(--ui-text); font-size: 15px; }
+.studio-status.compact { min-height: 200px; }
+.studio-spin { color: var(--ui-accent); animation: studio-spin 1s linear infinite; }
+@keyframes studio-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .studio-spin { animation: none; } }
+.failure-notice { color: var(--ui-danger); padding: 10px; background: var(--ui-danger-soft); border-radius: var(--ui-radius-md); }
+@media (max-width: 1050px) {
+  .node-library { width: 174px; }
+  .inspector { width: 260px; }
+  .library-label small { display: none; }
+  .library-node { min-height: 40px; }
 }
-:deep(.edge-path) { pointer-events: none; }
-:deep(.edge-hit) { pointer-events: stroke; cursor: pointer; }
-
-/* Nodes */
-.canvas-node {
-  position: absolute; min-width: 120px; background: #fff;
-  border: 1.5px solid #e5e5e5; border-radius: 10px; padding: 8px 16px 8px 12px;
-  cursor: move; user-select: none; box-shadow: 0 1px 4px rgba(0,0,0,0.07);
-  transition: border-color 0.15s, box-shadow 0.15s;
+@media (max-width: 1100px) {
+  .inspector { position: absolute; z-index: 3; inset: 0 0 0 auto; width: min(280px, 76%); box-shadow: var(--ui-shadow-md); }
+  .inspector-empty { display: none; }
 }
-.canvas-node:hover { border-color: #10a37f; box-shadow: 0 2px 8px rgba(16,163,127,0.12); }
-.canvas-node.selected { border-color: #10a37f; box-shadow: 0 0 0 3px rgba(16,163,127,0.15); }
-.canvas-node.start { border-color: #22c55e; }
-.canvas-node.end { border-color: #ef4444; }
-.canvas-node.connecting { cursor: default; }
-.node-header { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 500; white-space: nowrap; }
-
-/* Ports */
-.node-port {
-  position: absolute; width: 12px; height: 12px; border-radius: 50%;
-  background: #d1d5db; border: 2px solid #fff;
-  box-shadow: 0 0 0 1px #d1d5db;
-  transition: background 0.15s, transform 0.15s;
-  z-index: 2;
+@media (max-width: 680px) {
+  .studio-toolbar { padding: 9px; gap: 7px; }
+  .workflow-actions { gap: 4px; }
+  .workflow-actions :deep(button) { padding-inline: 7px; font-size: 12px; }
+  .node-library { display: none; }
+  .node-library.library-open { display: flex; z-index: 4; position: absolute; inset: 0 auto 0 0; width: min(220px, 75%); box-shadow: var(--ui-shadow-md); }
+  .library-close,.library-launch { display: inline-flex; }
+  .library-launch { position: absolute; z-index: 2; top: 12px; right: 12px; background: var(--ui-surface); border: 1px solid var(--ui-border); }
 }
-.port-in {
-  left: -7px; top: 50%; transform: translateY(-50%);
-  cursor: cell;
-}
-.port-out {
-  right: -7px; top: 50%; transform: translateY(-50%);
-  cursor: crosshair; background: #10a37f; box-shadow: 0 0 0 1px #10a37f;
-}
-.port-out:hover { background: #0d8f6f; transform: translateY(-50%) scale(1.3); }
-.port-in:hover, .port-in.port-highlight {
-  background: #22c55e; box-shadow: 0 0 0 1px #22c55e;
-  transform: translateY(-50%) scale(1.4);
-}
-
-/* Config panel */
-.config-panel {
-  width: 280px; background: #fff; border-left: 1px solid #e5e5e5;
-  overflow-y: auto; flex-shrink: 0; padding: 12px;
-}
-
-/* Context menu */
-.context-menu {
-  position: fixed; z-index: 9999;
-  background: #fff; border: 1px solid #e5e5e5;
-  border-radius: 10px; padding: 4px 0;
-  box-shadow: 0 4px 20px rgba(0,0,0,0.1);
-  min-width: 160px;
-}
-.ctx-item {
-  padding: 8px 16px; font-size: 13px; color: #374151;
-  cursor: pointer; transition: background 0.15s;
-}
-.ctx-item:hover { background: #f3f4f6; }
-.ctx-item.danger { color: #ef4444; }
-.ctx-item.danger:hover { background: #fef2f2; }
-.ctx-divider { height: 1px; background: #f3f4f6; margin: 4px 0; }
-
-/* Test dialog */
-.test-dialog-body { max-height: 70vh; overflow-y: auto; padding-right: 4px; }
-.test-input-section { padding: 4px 0; }
-.test-section-title { font-size: 14px; font-weight: 600; color: #0d0d0d; margin-bottom: 12px; }
-
-/* Final output card */
-.final-output-card {
-  border: 1px solid #d1fae5; border-radius: 12px; overflow: hidden;
-  box-shadow: 0 2px 12px rgba(16,163,127,0.1);
-}
-.final-output-header {
-  background: #f0fdf9; padding: 10px 16px;
-  display: flex; align-items: center; justify-content: space-between;
-  font-size: 14px; font-weight: 600; color: #065f46;
-  border-bottom: 1px solid #d1fae5;
-}
-.final-output-content {
-  padding: 16px; font-size: 14px; line-height: 1.8; color: #0d0d0d;
-  white-space: pre-wrap; max-height: 360px; overflow-y: auto;
-  background: #fff;
-}
-
-/* Node execution log */
-.node-log-item {
-  border-left: 2px solid #e5e5e5; padding: 8px 12px; margin-bottom: 8px;
-  border-radius: 0 6px 6px 0; background: #f9f9f9;
-}
-.node-log-header {
-  display: flex; align-items: center; gap: 8px;
-  font-size: 13px; font-weight: 500; margin-bottom: 4px;
-}
-.node-log-cond { font-size: 12px; color: #9ca3af; }
-.node-log-content { font-size: 13px; line-height: 1.7; color: #374151; white-space: pre-wrap; }
-.node-log-content.ai {
-  background: #f0fdf9; border: 1px solid #d1fae5; border-radius: 6px;
-  padding: 8px; margin-top: 4px; max-height: 120px; overflow-y: auto;
-}
-.node-log-kb-item {
-  background: #f3f4f6; border-radius: 4px; padding: 6px 8px;
-  margin-bottom: 4px; font-size: 12px;
-}
-.kb-meta { color: #9ca3af; display: block; margin-bottom: 2px; }
 </style>

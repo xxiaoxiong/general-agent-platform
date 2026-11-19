@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import delete, select, func
+from sqlalchemy.exc import IntegrityError
 from typing import Optional
 
 from app.core.database import get_db
@@ -74,6 +75,7 @@ async def create_user(
     await db.flush()
     await log_action(db, current_user.id, current_user.username, "create_user", "user",
                      resource_id=str(user.id))
+    await db.commit()
     return UserOut.model_validate(user)
 
 
@@ -107,6 +109,7 @@ async def update_user(
     db.add(user)
     await log_action(db, current_user.id, current_user.username, "update_user", "user",
                      resource_id=str(user_id))
+    await db.commit()
     return UserOut.model_validate(user)
 
 
@@ -122,9 +125,18 @@ async def delete_user(
         raise HTTPException(status_code=404, detail="用户不存在")
     if user.id == current_user.id:
         raise HTTPException(status_code=400, detail="不能删除自己")
-    await db.delete(user)
+    try:
+        await db.execute(delete(UserRole).where(UserRole.user_id == user.id))
+        await db.delete(user)
+        # 在发送响应前检查关联业务记录，避免提交被外键拒绝后前端已收到成功。
+        await db.flush()
+    except IntegrityError as exc:
+        raise HTTPException(
+            status_code=409, detail="该账号仍有关联数据，无法删除。可以先禁用账号。",
+        ) from exc
     await log_action(db, current_user.id, current_user.username, "delete_user", "user",
                      resource_id=str(user_id))
+    await db.commit()
     return {"message": "删除成功"}
 
 

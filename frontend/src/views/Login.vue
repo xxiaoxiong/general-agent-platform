@@ -1,115 +1,89 @@
-<template>
-  <div class="login-page">
-    <div class="login-card">
-      <div class="login-header">
-        <el-icon size="40" color="#409eff"><Cpu /></el-icon>
-        <h1>General Agent Platform</h1>
-        <p>企业级 AI 能力统一管控与落地平台</p>
-      </div>
-      <el-form :model="form" :rules="rules" ref="formRef" @submit.prevent="handleLogin">
-        <el-form-item prop="username">
-          <el-input
-            v-model="form.username"
-            placeholder="用户名 / 邮箱"
-            size="large"
-            :prefix-icon="User"
-            clearable
-          />
-        </el-form-item>
-        <el-form-item prop="password">
-          <el-input
-            v-model="form.password"
-            type="password"
-            placeholder="密码"
-            size="large"
-            :prefix-icon="Lock"
-            show-password
-            @keyup.enter="handleLogin"
-          />
-        </el-form-item>
-        <el-button
-          type="primary"
-          size="large"
-          :loading="loading"
-          @click="handleLogin"
-          style="width: 100%; margin-top: 8px;"
-        >
-          登 录
-        </el-button>
-      </el-form>
-      <div class="login-footer">
-        <span>默认账号：admin / Admin@123456</span>
-      </div>
-    </div>
-  </div>
-</template>
-
 <script setup lang="ts">
 import { ref, reactive } from 'vue'
+import { AxiosError } from 'axios'
+import { Eye, EyeOff } from '@lucide/vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
-import { User, Lock } from '@element-plus/icons-vue'
 import { useAuthStore } from '@/stores/auth'
+import BrandMark from '@/components/layout/BrandMark.vue'
+import UiButton from '@/components/ui/UiButton.vue'
 
 const router = useRouter()
-const authStore = useAuthStore()
-
-const formRef = ref()
+const auth = useAuthStore()
 const loading = ref(false)
+const showPassword = ref(false)
+const error = ref('')
 const form = reactive({ username: '', password: '' })
 
-const rules = {
-  username: [{ required: true, message: '请输入用户名', trigger: 'blur' }],
-  password: [{ required: true, message: '请输入密码', trigger: 'blur' }],
-}
-
 async function handleLogin() {
-  await formRef.value?.validate()
+  if (loading.value) return
+  error.value = ''
   loading.value = true
   try {
-    await authStore.login(form.username, form.password)
-    ElMessage.success('登录成功')
-    router.push('/')
+    await auth.login(form.username, form.password)
+    await router.push('/')
+  } catch (cause) {
+    const status = cause instanceof AxiosError ? cause.response?.status : undefined
+    if (status === 401) error.value = '用户名或密码错误，请重新输入。'
+    else if (status === 403) error.value = '此账号已停用，请联系管理员。'
+    else error.value = '暂时无法登录，请稍后重试。'
   } finally {
     loading.value = false
   }
 }
 </script>
 
+<template>
+  <main class="login-page">
+    <div class="login-brand"><BrandMark :size="32" /><span>General Agent Platform</span></div>
+    <section class="login-box" aria-labelledby="login-title">
+      <header class="login-heading">
+        <h1 id="login-title">登录工作空间</h1>
+        <p>使用您的平台账号继续。</p>
+      </header>
+      <form class="login-form" @submit.prevent="handleLogin">
+        <div class="login-field">
+          <label for="login-username">用户名或邮箱</label>
+          <input id="login-username" v-model="form.username" autocomplete="username" required />
+        </div>
+        <div class="login-field">
+          <label for="login-password">密码</label>
+          <div class="password-field">
+            <input id="login-password" v-model="form.password" :type="showPassword ? 'text' : 'password'" autocomplete="current-password" required />
+            <UiButton variant="ghost" size="icon" :aria-label="showPassword ? '隐藏密码' : '显示密码'" @click="showPassword = !showPassword">
+              <EyeOff v-if="showPassword" /><Eye v-else />
+            </UiButton>
+          </div>
+        </div>
+        <p v-if="error" class="login-error" role="alert">{{ error }}</p>
+        <UiButton variant="primary" type="submit" class="login-submit" :loading="loading">登录</UiButton>
+      </form>
+    </section>
+  </main>
+</template>
+
 <style scoped>
 .login-page {
-  min-height: 100vh;
-  background: #f9f9f9;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  min-height: 100%; display: grid; align-content: center; justify-items: center; gap: 24px;
+  background: var(--ui-bg); padding: 32px 16px 12vh;
 }
-.login-card {
-  background: #fff;
-  border-radius: 16px;
-  padding: 48px 40px;
-  width: 400px;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 4px 24px rgba(0,0,0,0.06);
-  border: 1px solid #e5e5e5;
+.login-brand { display: flex; align-items: center; gap: 9px; font-weight: var(--ui-weight-semibold); color: var(--ui-secondary); }
+.login-box {
+  width: min(100%, 404px); padding: clamp(22px, 5vw, 36px);
+  border: var(--ui-line); background: var(--ui-surface); border-radius: var(--ui-radius-dialog); box-shadow: var(--ui-shadow-sm);
 }
-.login-header {
-  text-align: center;
-  margin-bottom: 32px;
+.login-heading { margin-bottom: 24px; }
+.login-heading h1 { font-size: var(--ui-size-xl); line-height: 1.35; letter-spacing: var(--ui-tracking-tight); }
+.login-heading p { color: var(--ui-muted); margin-top: 6px; }
+.login-form, .login-field { display: grid; gap: 14px; }
+.login-field { gap: 6px; }
+.login-field label { font-weight: var(--ui-weight-medium); }
+.login-field input {
+  width: 100%; height: 40px; padding: 0 11px; color: var(--ui-text); background: var(--ui-bg);
+  border: var(--ui-line-strong); border-radius: var(--ui-radius-md);
 }
-.login-header h1 {
-  font-size: 22px;
-  font-weight: 700;
-  color: #0d0d0d;
-  margin: 12px 0 6px;
-}
-.login-header p {
-  font-size: 13px;
-  color: #9ca3af;
-}
-.login-footer {
-  margin-top: 20px;
-  text-align: center;
-  font-size: 12px;
-  color: #d1d5db;
-}
+.password-field { position: relative; }
+.password-field input { padding-right: 44px; }
+.password-field button { position: absolute; top: 4px; right: 4px; }
+.login-submit { width: 100%; margin-top: 6px; }
+.login-error { border-radius: var(--ui-radius-md); background: var(--ui-danger-soft); color: var(--ui-danger); padding: 8px 10px; }
 </style>

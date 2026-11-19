@@ -1,153 +1,114 @@
 <template>
-  <div class="debugger-page">
-    <div class="page-header">
-      <div class="header-left">
-        <el-button text @click="$router.push('/prompts')">← 返回模板库</el-button>
-        <h2>提示词调试器</h2>
-      </div>
-    </div>
+  <div class="page-container">
+    <RouterLink to="/prompts" class="debug-back"><ArrowLeft :size="15" /> 提示词模板库</RouterLink>
+    <PageHeader title="提示词调试器" description="预览变量替换效果，并比较不同模型的输出。">
+      <template #actions>
+        <el-button :icon="Save" :disabled="!promptContent.trim()" @click="saveAsTemplate">保存为模板</el-button>
+        <el-button type="primary" :icon="Play" :loading="running"
+          :disabled="!renderedPrompt || !selectedModelIds.length || previewing || templateLoading" @click="runDebug">
+          {{ selectedModelIds.length > 1 ? `对比 ${selectedModelIds.length} 个模型` : '运行调试' }}
+        </el-button>
+      </template>
+    </PageHeader>
 
-    <div class="debugger-layout">
-      <!-- Left: Editor -->
-      <div class="editor-panel">
-        <el-card class="panel-card">
-          <template #header>
-            <div class="card-header">
-              <span>✏️ 提示词编辑</span>
-              <div class="header-actions">
-                <el-select v-model="selectedTemplateId" clearable placeholder="从模板库加载" style="width:180px" @change="loadTemplate">
-                  <el-option v-for="t in templateOptions" :key="t.id" :label="t.name" :value="t.id" />
-                </el-select>
-                <el-button size="small" @click="saveAsTemplate">💾 保存为模板</el-button>
-              </div>
-            </div>
-          </template>
-
-          <el-form label-width="80px" size="small">
-            <el-form-item label="系统提示">
-              <el-input v-model="systemPrompt" type="textarea" :rows="2" placeholder="可选，设置 AI 角色" />
+    <div class="debug-layout">
+      <section class="data-surface debug-panel" aria-labelledby="editor-heading">
+        <header>
+          <h2 id="editor-heading">编辑与参数</h2>
+          <el-select v-model="selectedTemplateId" class="template-select" filterable clearable
+            aria-label="从模板库加载" placeholder="从模板库加载" :loading="optionsLoading || templateLoading" @change="loadTemplate">
+            <el-option v-for="template in templateOptions" :key="template.id" :label="template.name" :value="template.id" />
+          </el-select>
+        </header>
+        <div class="debug-content">
+          <el-form label-position="top" :disabled="templateLoading">
+            <el-form-item label="系统提示（可选）">
+              <el-input v-model="systemPrompt" type="textarea" :rows="2" placeholder="设置模型角色或全局指令" />
             </el-form-item>
-            <el-form-item label="提示词">
-              <el-input
-                v-model="promptContent"
-                type="textarea"
-                :rows="10"
-                placeholder="输入提示词，使用 {{变量名}} 定义变量"
-                @input="onContentChange"
-              />
+            <el-form-item label="提示词" required>
+              <el-input v-model="promptContent" type="textarea" :rows="7" class="code-editor"
+                placeholder="输入提示词，使用 {{变量名}} 定义变量" />
             </el-form-item>
           </el-form>
 
-          <!-- Variables -->
-          <div v-if="detectedVars.length" class="vars-section">
-            <div class="vars-title">📌 变量填写</div>
-            <el-form label-width="100px" size="small">
-              <el-form-item v-for="v in detectedVars" :key="v" :label="v">
-                <el-input v-model="varValues[v]" :placeholder="`填写 ${v} 的值`" @input="updatePreview" />
+          <section v-if="detectedVars.length" class="debug-section">
+            <h3>变量</h3>
+            <el-form label-position="top">
+              <el-form-item v-for="variable in detectedVars" :key="variable" :label="variable">
+                <el-input v-model="varValues[variable]" :placeholder="`填写 ${variable} 的值`" />
               </el-form-item>
             </el-form>
-          </div>
+          </section>
 
-          <!-- Preview -->
-          <div class="preview-section">
-            <div class="preview-title">
-              👁 实时预览
-              <el-tag v-if="missingVars.length" type="warning" size="small">
-                缺少变量: {{ missingVars.join(', ') }}
-              </el-tag>
+          <section class="debug-section">
+            <h3>对比模型</h3>
+            <el-skeleton v-if="optionsLoading" animated :rows="1" />
+            <div v-else-if="optionsFailed" class="retry-options">
+              <span class="resource-meta">模型或模板列表加载失败。</span>
+              <el-button text :icon="RefreshCw" @click="loadOptions">重试</el-button>
             </div>
-            <div class="preview-content">{{ renderedPrompt || '（请输入提示词）' }}</div>
-          </div>
-
-          <!-- Model selection -->
-          <div class="model-section">
-            <div class="model-title">🤖 选择对比模型（可多选）</div>
-            <el-checkbox-group v-model="selectedModelIds">
-              <el-checkbox v-for="m in chatModels" :key="m.id" :label="m.id">
-                {{ m.display_name }}
-              </el-checkbox>
+            <p v-else-if="!chatModels.length" class="resource-meta">
+              暂无可用对话模型。<RouterLink to="/models">前往模型管理</RouterLink>
+            </p>
+            <el-checkbox-group v-if="chatModels.length" v-model="selectedModelIds" class="model-list">
+              <el-checkbox v-for="model in chatModels" :key="model.id" :value="model.id">{{ model.display_name }}</el-checkbox>
             </el-checkbox-group>
-          </div>
-
-          <el-button
-            type="primary"
-            :loading="running"
-            :disabled="!renderedPrompt || selectedModelIds.length === 0"
-            style="width:100%;margin-top:12px"
-            @click="runDebug"
-          >
-            ▶ 运行调试{{ selectedModelIds.length > 1 ? `（${selectedModelIds.length} 个模型对比）` : '' }}
-          </el-button>
-        </el-card>
-      </div>
-
-      <!-- Right: Results -->
-      <div class="results-panel">
-        <el-card class="panel-card" v-if="results.length || running">
-          <template #header>
-            <div class="card-header">
-              <span>📊 调试结果</span>
-              <el-button size="small" text @click="results = []">清空</el-button>
-            </div>
-          </template>
-
-          <div v-if="running" class="running-hint">
-            <el-icon class="is-loading"><Loading /></el-icon> 正在运行...
-          </div>
-
-          <div v-for="(r, idx) in results" :key="idx" class="result-item">
-            <div class="result-header">
-              <span class="result-model">🤖 {{ r.model_name || `模型 ${r.model_config_id}` }}</span>
-              <div class="result-meta">
-                <el-tag v-if="r.error" type="danger" size="small">失败</el-tag>
-                <el-tag v-else type="success" size="small">成功</el-tag>
-                <span class="result-time">{{ r.duration_ms }}ms</span>
-                <span v-if="r.usage" class="result-tokens">
-                  {{ r.usage.prompt_tokens || 0 }}+{{ r.usage.completion_tokens || 0 }} tokens
-                </span>
-              </div>
-            </div>
-            <div v-if="r.error" class="result-error">{{ r.error }}</div>
-            <div v-else class="result-content markdown-body" v-html="renderMd(r.content)" />
-            <div class="result-actions">
-              <el-button size="small" @click="copyResult(r.content)">复制</el-button>
-              <el-button size="small" @click="useAsPrompt(r.content)">用作提示词</el-button>
-            </div>
-          </div>
-
-          <div v-if="!running && results.length === 0" class="empty-hint">
-            点击「运行调试」查看结果
-          </div>
-        </el-card>
-
-        <div v-else class="results-placeholder">
-          <div class="placeholder-icon">🔬</div>
-          <div class="placeholder-text">填写提示词并选择模型，点击运行查看结果</div>
-          <div class="placeholder-tips">
-            <div>💡 支持多模型同时对比，找出最佳提示词</div>
-            <div>💡 使用 &#123;&#123;变量名&#125;&#125; 定义可复用变量</div>
-            <div>💡 满意后可保存为模板，在工作流中引用</div>
-          </div>
+          </section>
         </div>
+      </section>
+
+      <div class="debug-output">
+        <section class="data-surface debug-panel" aria-labelledby="preview-heading">
+          <header>
+            <h2 id="preview-heading">渲染预览</h2>
+            <el-tag v-if="missingVars.length" size="small" type="warning">缺少 {{ missingVars.length }} 个变量</el-tag>
+          </header>
+          <div class="debug-content">
+            <pre class="render-preview" :aria-busy="previewing">{{ renderedPrompt || '输入提示词后，可在此查看变量替换后的内容。' }}</pre>
+            <p v-if="missingVars.length" class="resource-meta missing-variables">{{ missingVars.join('、') }}</p>
+          </div>
+        </section>
+
+      <section class="data-surface debug-panel" aria-labelledby="output-heading">
+        <header>
+          <h2 id="output-heading">调试结果</h2>
+          <el-button v-if="results.length" text size="small" @click="clearResults">清空</el-button>
+        </header>
+        <div class="debug-content" aria-live="polite" :aria-busy="running">
+          <el-skeleton v-if="running" animated :rows="5" />
+          <EmptyState v-else-if="debugFailed" title="运行失败" description="检查模型配置后，可重新运行调试。" :icon="CircleAlert" />
+          <EmptyState v-else-if="!results.length" :title="ran ? '未返回调试结果' : '等待运行'"
+            :description="ran ? '确认模型可用后再试。' : '输入提示词并选择模型，这里将显示响应、耗时和 Token 用量。'" :icon="FlaskConical" />
+          <article v-for="result in results" :key="result.model_config_id" class="model-result">
+            <div class="result-heading">
+              <h3>{{ result.model_name || `模型 ${result.model_config_id}` }}</h3>
+              <el-tag :type="result.error ? 'danger' : 'success'" size="small">{{ result.error ? '失败' : '完成' }}</el-tag>
+            </div>
+            <div v-if="result.duration_ms != null || result.usage" class="result-metadata resource-meta mono">
+              <span v-if="result.duration_ms != null">{{ result.duration_ms.toLocaleString() }} ms</span>
+              <span v-if="result.usage">输入 {{ result.usage.prompt_tokens || 0 }} · 输出 {{ result.usage.completion_tokens || 0 }} Token</span>
+            </div>
+            <p v-if="result.error" class="result-error">{{ result.error }}</p>
+            <div v-else class="markdown-body result-content" v-html="renderMarkdown(result.content)" />
+            <div v-if="result.content" class="result-actions">
+              <el-button size="small" text :icon="Copy" @click="copyResult(result.content)">复制</el-button>
+              <el-button size="small" text @click="useAsPrompt(result.content)">用作提示词</el-button>
+            </div>
+          </article>
+        </div>
+      </section>
       </div>
     </div>
 
     <!-- Save as Template Dialog -->
-    <el-dialog v-model="saveDialogVisible" title="保存为模板" width="480px">
-      <el-form :model="saveForm" label-width="80px">
+    <el-dialog v-model="saveDialogVisible" title="保存为模板" width="min(480px, calc(100vw - 32px))">
+      <el-form :model="saveForm" label-position="top">
         <el-form-item label="模板名称" required>
           <el-input v-model="saveForm.name" />
         </el-form-item>
         <el-form-item label="分类">
-          <el-select v-model="saveForm.category" style="width:100%">
-            <el-option label="通用" value="general" />
-            <el-option label="分析" value="analysis" />
-            <el-option label="写作" value="writing" />
-            <el-option label="编程" value="coding" />
-            <el-option label="总结" value="summary" />
-            <el-option label="翻译" value="translation" />
-            <el-option label="问答" value="qa" />
-            <el-option label="其他" value="other" />
+          <el-select v-model="saveForm.category" class="w-full">
+            <el-option v-for="category in categories" :key="category.value" :label="category.label" :value="category.value" />
           </el-select>
         </el-form-item>
         <el-form-item label="描述">
@@ -169,194 +130,226 @@
 import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { Loading } from '@element-plus/icons-vue'
+import { ArrowLeft, CircleAlert, Copy, FlaskConical, Play, RefreshCw, Save } from '@lucide/vue'
+import { useDebounceFn } from '@vueuse/core'
 import { marked } from 'marked'
+import DOMPurify from 'dompurify'
 import { promptApi, modelApi } from '@/api'
+import PageHeader from '@/components/layout/PageHeader.vue'
+import EmptyState from '@/components/ui/EmptyState.vue'
 import type { ModelConfig } from '@/types'
+import { categories, detectVariables, type PromptTemplate } from './promptPresentation'
 
-const route = useRoute()
-
-function renderMd(text: string): string {
-  if (!text) return ''
-  return marked(text) as string
+interface DebugResult {
+  model_config_id: number
+  model_name?: string
+  content?: string
+  error?: string
+  duration_ms?: number
+  usage?: { prompt_tokens?: number; completion_tokens?: number }
 }
 
+const route = useRoute()
 const promptContent = ref('')
 const systemPrompt = ref('')
-const varValues = reactive<Record<string, string>>({})
-const detectedVars = ref<string[]>([])
+const varValues = reactive<Record<string, string>>(Object.create(null))
+const detectedVars = computed(() => detectVariables(promptContent.value))
 const renderedPrompt = ref('')
 const missingVars = ref<string[]>([])
 const selectedModelIds = ref<number[]>([])
 const chatModels = ref<ModelConfig[]>([])
 const running = ref(false)
-const results = ref<any[]>([])
-
-const templateOptions = ref<any[]>([])
+const ran = ref(false)
+const debugFailed = ref(false)
+const previewing = ref(false)
+const results = ref<DebugResult[]>([])
+const optionsLoading = ref(true)
+const optionsFailed = ref(false)
+const templateLoading = ref(false)
+const templateOptions = ref<Pick<PromptTemplate, 'id' | 'name'>[]>([])
 const selectedTemplateId = ref<number | null>(null)
+let previewVersion = 0
+let templateVersion = 0
 
-function onContentChange() {
-  const matches = promptContent.value.match(/\{\{(\w+)\}\}/g) || []
-  const vars = [...new Set(matches.map((m: string) => m.slice(2, -2)))]
-  // Remove vars no longer in content
-  for (const k of Object.keys(varValues)) {
-    if (!vars.includes(k)) delete varValues[k]
-  }
-  // Add new vars
-  for (const v of vars) {
-    if (!(v in varValues)) varValues[v] = ''
-  }
-  detectedVars.value = vars
-  updatePreview()
+function renderMarkdown(value?: string) {
+  return DOMPurify.sanitize(marked.parse(value ?? '', { async: false }) as string)
 }
 
-async function updatePreview() {
-  if (!promptContent.value) {
+watch(detectedVars, variables => {
+  for (const key of Object.keys(varValues)) {
+    if (!variables.includes(key)) delete varValues[key]
+  }
+  for (const key of variables) {
+    if (!(key in varValues)) varValues[key] = ''
+  }
+}, { flush: 'sync' })
+
+const renderPreview = useDebounceFn(async (id: number, content: string, variables: Record<string, string>) => {
+  try {
+    const response = await promptApi.render({ content, variables })
+    if (id !== previewVersion) return
+    renderedPrompt.value = response.rendered
+    missingVars.value = response.missing_vars || []
+  } catch {
+    if (id !== previewVersion) return
+    renderedPrompt.value = content.replace(/\{\{([\p{L}\p{N}_]+)\}\}/gu, (match, key: string) => variables[key] || match)
+    missingVars.value = detectVariables(content).filter(variable => !variables[variable])
+  } finally {
+    if (id === previewVersion) previewing.value = false
+  }
+}, 220)
+
+watch([promptContent, varValues], () => {
+  const id = ++previewVersion
+  const content = promptContent.value
+  if (!content.trim()) {
+    previewing.value = false
     renderedPrompt.value = ''
     missingVars.value = []
     return
   }
-  try {
-    const res = await promptApi.render({ content: promptContent.value, variables: { ...varValues } })
-    renderedPrompt.value = res.rendered
-    missingVars.value = res.missing_vars || []
-  } catch {
-    // Fallback: simple replace
-    let text = promptContent.value
-    for (const [k, v] of Object.entries(varValues)) {
-      text = text.split(`{{${k}}}`).join(v)
-    }
-    renderedPrompt.value = text
-    missingVars.value = []
-  }
-}
+  previewing.value = true
+  void renderPreview(id, content, { ...varValues })
+}, { deep: true })
 
 async function runDebug() {
-  if (!renderedPrompt.value || selectedModelIds.value.length === 0) return
+  if (running.value || previewing.value || !renderedPrompt.value || !selectedModelIds.value.length) return
   running.value = true
+  debugFailed.value = false
   results.value = []
   try {
     const res = await promptApi.debug({
       content: promptContent.value,
       variables: { ...varValues },
-      model_config_ids: selectedModelIds.value,
+      model_config_ids: [...selectedModelIds.value],
       system_prompt: systemPrompt.value || undefined,
     })
     results.value = res.results || []
-  } catch (e: any) {
-    ElMessage.error(e?.message || '调试失败')
+    ran.value = true
+  } catch {
+    debugFailed.value = true
   } finally {
     running.value = false
   }
 }
 
-function copyResult(content: string) {
-  navigator.clipboard.writeText(content).then(() => ElMessage.success('已复制'))
+function clearResults() {
+  results.value = []
+  ran.value = false
+}
+
+async function copyResult(content: string) {
+  try {
+    await navigator.clipboard.writeText(content)
+    ElMessage.success('已复制')
+  } catch {
+    ElMessage.error('无法访问剪贴板，请选中文本后手动复制')
+  }
 }
 
 function useAsPrompt(content: string) {
   promptContent.value = content
-  onContentChange()
   ElMessage.success('已填入提示词编辑框')
 }
 
-async function loadTemplate(id: number | null) {
-  if (!id) return
+async function loadTemplate(value?: number | string | null) {
+  const id = ++templateVersion
+  const templateId = Number(value)
+  if (!Number.isSafeInteger(templateId) || templateId <= 0) {
+    templateLoading.value = false
+    return
+  }
+  templateLoading.value = true
   try {
-    const tpl = await promptApi.get(id)
-    promptContent.value = tpl.content
+    const template: PromptTemplate = await promptApi.get(templateId)
+    if (id !== templateVersion) return
+    promptContent.value = template.content
     systemPrompt.value = ''
-    onContentChange()
   } catch {
-    ElMessage.error('加载模板失败')
+    // 请求层已提示失败原因。
+  } finally {
+    if (id === templateVersion) templateLoading.value = false
   }
 }
 
-// Save as template
 const saveDialogVisible = ref(false)
 const saving = ref(false)
 const saveForm = reactive({ name: '', category: 'general', description: '', is_public: false })
 
 function saveAsTemplate() {
-  if (!promptContent.value) return ElMessage.warning('请先输入提示词')
-  saveForm.name = ''
-  saveForm.description = ''
+  if (!promptContent.value.trim()) return
+  Object.assign(saveForm, { name: '', category: 'general', description: '', is_public: false })
   saveDialogVisible.value = true
 }
 
 async function confirmSaveTemplate() {
+  if (saving.value) return
   if (!saveForm.name.trim()) return ElMessage.warning('请输入模板名称')
   saving.value = true
   try {
-    await promptApi.create({
-      name: saveForm.name,
-      category: saveForm.category,
-      description: saveForm.description,
-      content: promptContent.value,
-      is_public: saveForm.is_public,
-    })
+    const template: PromptTemplate = await promptApi.create({ ...saveForm, content: promptContent.value })
+    templateOptions.value.unshift({ id: template.id, name: template.name })
     ElMessage.success('已保存为模板')
     saveDialogVisible.value = false
+  } catch {
+    // 请求层已提示失败原因，保留表单方便重试。
   } finally {
     saving.value = false
   }
 }
 
-onMounted(async () => {
-  const [models, tpls] = await Promise.all([
-    modelApi.listConfigs({ model_type: 'chat' }),
-    promptApi.list({ page_size: 100, include_public: true }),
-  ])
-  chatModels.value = models.filter((m: ModelConfig) => m.is_active)
-  templateOptions.value = tpls.items || []
-
-  // Load from query param
-  const tid = route.query.template_id
-  if (tid) {
-    selectedTemplateId.value = Number(tid)
-    await loadTemplate(Number(tid))
+async function loadOptions() {
+  optionsLoading.value = true
+  optionsFailed.value = false
+  try {
+    const [models, templates] = await Promise.allSettled([
+      modelApi.listConfigs({ model_type: 'chat' }),
+      promptApi.list({ page_size: 100, include_public: true }),
+    ])
+    if (models.status === 'fulfilled') chatModels.value = models.value.filter(model => model.is_active)
+    if (templates.status === 'fulfilled') templateOptions.value = templates.value.items || []
+    optionsFailed.value = models.status === 'rejected' || templates.status === 'rejected'
+  } finally {
+    optionsLoading.value = false
   }
-})
+}
+
+watch(() => route.query.template_id, value => {
+  const id = Number(value)
+  if (Number.isSafeInteger(id) && id > 0) {
+    selectedTemplateId.value = id
+    void loadTemplate(id)
+  }
+}, { immediate: true })
+
+onMounted(loadOptions)
 </script>
 
 <style scoped>
-.debugger-page { padding: 24px; height: calc(100vh - 56px); display: flex; flex-direction: column; background: #fff; }
-.page-header { display: flex; align-items: center; margin-bottom: 16px; }
-.header-left { display: flex; align-items: center; gap: 8px; }
-.header-left h2 { font-size: 20px; font-weight: 700; color: #0d0d0d; margin: 0; }
-.debugger-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; flex: 1; min-height: 0; overflow: hidden; }
-.editor-panel, .results-panel { overflow-y: auto; }
-.panel-card { height: 100%; border: 1px solid #e5e5e5 !important; border-radius: 12px !important; box-shadow: 0 1px 3px rgba(0,0,0,0.04) !important; }
-.card-header { display: flex; justify-content: space-between; align-items: center; }
-.header-actions { display: flex; gap: 8px; align-items: center; }
-.vars-section { border-top: 1px solid #f3f4f6; padding-top: 12px; margin-top: 12px; }
-.vars-title { font-size: 13px; font-weight: 600; color: #374151; margin-bottom: 8px; }
-.preview-section { border: 1px solid #e5e5e5; border-radius: 8px; padding: 12px; margin: 12px 0; background: #f9f9f9; }
-.preview-title { font-size: 12px; font-weight: 600; color: #9ca3af; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
-.preview-content { font-size: 13px; color: #374151; white-space: pre-wrap; line-height: 1.7; max-height: 150px; overflow-y: auto; }
-.model-section { margin-top: 12px; }
-.model-title { font-size: 13px; font-weight: 600; color: #374151; margin-bottom: 8px; }
-.running-hint { text-align: center; padding: 20px; color: #9ca3af; display: flex; align-items: center; justify-content: center; gap: 8px; }
-.result-item { border: 1px solid #e5e5e5; border-radius: 10px; padding: 12px; margin-bottom: 12px; }
-.result-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-.result-model { font-size: 14px; font-weight: 600; color: #0d0d0d; }
-.result-meta { display: flex; align-items: center; gap: 8px; }
-.result-time { font-size: 12px; color: #9ca3af; }
-.result-tokens { font-size: 12px; color: #6b7280; }
-.result-error { color: #dc2626; font-size: 13px; background: #fef2f2; padding: 8px; border-radius: 6px; }
-.result-content { font-size: 13px; line-height: 1.7; color: #0d0d0d; max-height: 400px; overflow-y: auto; }
-.result-actions { display: flex; gap: 8px; margin-top: 8px; border-top: 1px solid #f3f4f6; padding-top: 8px; }
-.results-placeholder { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: #9ca3af; text-align: center; gap: 12px; }
-.placeholder-icon { font-size: 48px; }
-.placeholder-text { font-size: 15px; color: #6b7280; }
-.placeholder-tips { font-size: 13px; color: #d1d5db; line-height: 2; }
-.empty-hint { text-align: center; color: #9ca3af; padding: 40px; }
-
-/* Markdown */
-.markdown-body :deep(h1), .markdown-body :deep(h2), .markdown-body :deep(h3) { font-weight: 600; margin: 8px 0 4px; color: #0d0d0d; }
-.markdown-body :deep(p) { margin: 4px 0; }
-.markdown-body :deep(ul), .markdown-body :deep(ol) { padding-left: 20px; margin: 4px 0; }
-.markdown-body :deep(code) { background: #f3f4f6; border-radius: 4px; padding: 1px 5px; font-size: 12px; color: #c7254e; }
-.markdown-body :deep(pre) { background: #1e1e1e; color: #d4d4d4; border-radius: 8px; padding: 12px; overflow-x: auto; }
-.markdown-body :deep(pre code) { background: none; padding: 0; color: inherit; }
+.debug-back { display: inline-flex; align-items: center; gap: 6px; color: var(--ui-secondary); text-decoration: none; margin-bottom: 12px; }
+.debug-back:hover { color: var(--ui-accent); }
+.debug-layout { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
+.debug-output { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+.debug-panel { min-width: 0; }
+.debug-panel > header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--ui-border); min-height: 54px; }
+.debug-panel h2 { font-size: 15px; }
+.template-select { width: min(100%, 210px); }
+.debug-content { padding: 16px; }
+.code-editor :deep(textarea) { font-family: var(--ui-font-mono); line-height: 1.65; }
+.debug-section { border-top: 1px solid var(--ui-border); padding-top: 12px; margin-top: 12px; }
+.debug-section h3, .result-heading h3 { font-size: 14px; font-weight: 600; }
+.debug-section h3 { margin-bottom: 8px; }
+.render-preview { background: var(--ui-subtle); color: var(--ui-secondary); border-radius: var(--ui-radius-sm); padding: 12px; max-height: 180px; overflow: auto; font: 12px/1.65 var(--ui-font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.missing-variables { margin-top: 6px; overflow-wrap: anywhere; }
+.retry-options, .model-list { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; }
+.model-list :deep(.el-checkbox) { margin-right: 0; max-width: 100%; }
+.model-list :deep(.el-checkbox__label) { white-space: normal; overflow-wrap: anywhere; }
+.model-result + .model-result { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--ui-border); }
+.result-heading { display: flex; justify-content: space-between; align-items: start; gap: 8px; }
+.result-heading h3 { overflow-wrap: anywhere; }
+.result-metadata { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; }
+.result-content { margin-top: 12px; max-height: 540px; overflow: auto; overflow-wrap: anywhere; }
+.result-error { color: var(--ui-danger); background: var(--ui-danger-soft); border-radius: var(--ui-radius-sm); margin-top: 12px; padding: 8px 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.result-actions { margin-top: 8px; }
+@media (max-width: 950px) { .debug-layout { grid-template-columns: minmax(0, 1fr); } }
 </style>

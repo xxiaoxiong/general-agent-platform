@@ -1,20 +1,18 @@
 <template>
   <div class="page-container">
-    <div class="page-header">
-      <div>
-        <h2>MCP 服务</h2>
-        <p class="page-desc">
-          接入外部 MCP（Model Context Protocol）服务，将其工具以
+    <PageHeader title="MCP 服务" description="查看外部工具服务、Agent 绑定和调用策略。">
+      <template #actions><UiButton variant="primary" @click="openCreate"><Plus />接入 MCP 服务</UiButton></template>
+    </PageHeader>
+    <details class="extension-help">
+      <summary>MCP 工具审批与重试规则</summary>
+      <p>接入外部 MCP（Model Context Protocol）服务，将其工具以
           <code>mcp__服务__工具</code> 命名注入指定 Agent。MCP 工具默认需人工审批且禁止自动重试，
-          只读工具可显式降级；未启用 / 未绑定 / 未发现的工具不进工具面。
-        </p>
-      </div>
-      <el-button type="primary" @click="openCreate">
-        <el-icon><Plus /></el-icon>接入 MCP 服务
-      </el-button>
-    </div>
+          只读工具可显式降级；未启用 / 未绑定 / 未发现的工具不进工具面。</p>
+    </details>
 
-    <el-table :data="servers" v-loading="loading" border stripe>
+    <div class="data-surface">
+      <ErrorState v-if="loadError" title="无法加载MCP 服务列表" @retry="load" />
+    <el-table v-else :data="servers" v-loading="loading" empty-text="暂无 MCP 服务">
       <el-table-column prop="name" label="服务" min-width="130" show-overflow-tooltip>
         <template #default="{ row }">
           <span class="mono">{{ row.name }}</span>
@@ -66,14 +64,15 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="240" fixed="right">
+      <el-table-column label="操作" width="240">
         <template #default="{ row }">
-          <el-button size="small" :loading="testingId === row.id" @click="handleTest(row)">测试</el-button>
-          <el-button size="small" @click="openEdit(row)">编辑</el-button>
-          <el-button size="small" type="danger" @click="handleDelete(row)">删除</el-button>
+          <el-button size="small" link :loading="testingId === row.id" @click="handleTest(row)">测试</el-button>
+          <el-button size="small" link @click="openEdit(row)">编辑</el-button>
+          <el-button size="small" link type="danger" @click="handleDelete(row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
+    </div>
 
     <!-- 接入/编辑对话框 -->
     <el-dialog v-model="dialogVisible" :title="editingId ? '编辑 MCP 服务' : '接入 MCP 服务'" width="720px" destroy-on-close>
@@ -171,9 +170,12 @@
 </template>
 
 <script setup lang="ts">
+import PageHeader from '@/components/layout/PageHeader.vue'
+import UiButton from '@/components/ui/UiButton.vue'
+import ErrorState from '@/components/ui/ErrorState.vue'
 import { onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus } from '@element-plus/icons-vue'
+import { Plus } from '@lucide/vue'
 import {
   agentOptionApi,
   mcpApi,
@@ -182,7 +184,8 @@ import {
   type McpToolSetting,
 } from '@/api/extensions'
 
-const loading = ref(false)
+const loading = ref(true)
+const loadError = ref(false)
 const saving = ref(false)
 const testingId = ref<number | null>(null)
 const servers = ref<McpServerItem[]>([])
@@ -215,8 +218,11 @@ function kvToText(kv: Record<string, string>): string {
 
 async function load() {
   loading.value = true
+  loadError.value = false
   try {
     servers.value = (await mcpApi.list()).items
+  } catch {
+    loadError.value = true
   } finally {
     loading.value = false
   }
@@ -328,28 +334,9 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.page-container {
-  padding: 20px;
-}
-.page-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  margin-bottom: 16px;
-}
-.page-header h2 {
-  margin: 0 0 4px;
-  font-size: 20px;
-}
-.page-desc {
-  margin: 0;
-  color: #6b7280;
-  font-size: 13px;
-  max-width: 720px;
-}
-.mono {
-  font-family: monospace;
-}
+.extension-help { width: fit-content; max-width: 760px; margin-bottom: var(--ui-space-4); color: var(--ui-muted); }
+.extension-help summary { cursor: pointer; color: var(--ui-secondary); }
+.extension-help p { padding: var(--ui-space-2) 0; }
 .ml-6 {
   margin-left: 6px;
 }
@@ -361,6 +348,6 @@ onMounted(async () => {
 }
 .sub-text {
   font-size: 12px;
-  color: #9ca3af;
+  color: var(--ui-muted);
 }
 </style>

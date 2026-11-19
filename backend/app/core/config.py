@@ -1,5 +1,7 @@
 from pydantic_settings import BaseSettings
+from pydantic import Field
 from typing import List, Optional
+from urllib.parse import urlsplit
 import json
 
 # P0-04：生产环境拒绝的默认/弱凭据（大小写不敏感）
@@ -31,6 +33,13 @@ class Settings(BaseSettings):
 
     UPLOAD_DIR: str = "./data/uploads"
     MAX_UPLOAD_SIZE_MB: int = 100
+
+    # 语音听写。未配置地址时，对话可继续使用普通文本输入。
+    ASR_BASE_URL: str = ""
+    ASR_MODEL: str = "sensevoice"
+    ASR_TIMEOUT_SECONDS: float = Field(default=60.0, ge=1, le=120)
+    ASR_MAX_UPLOAD_MB: int = Field(default=10, ge=1, le=16)
+    ASR_MAX_AUDIO_SECONDS: int = Field(default=60, ge=1, le=120)
 
     ADMIN_EMAIL: str = "admin@example.com"
     ADMIN_PASSWORD: str = "Admin@123456"
@@ -171,6 +180,14 @@ class Settings(BaseSettings):
         return json.loads(self.CORS_ORIGINS)
 
     @property
+    def asr_enabled(self) -> bool:
+        return bool(self.ASR_BASE_URL.strip())
+
+    @property
+    def asr_max_file_bytes(self) -> int:
+        return self.ASR_MAX_UPLOAD_MB * 1024 * 1024
+
+    @property
     def is_production(self) -> bool:
         return (self.APP_ENV or "").lower() in ("production", "prod")
 
@@ -180,6 +197,8 @@ class Settings(BaseSettings):
         生产环境禁止 Durable Runtime 使用 Memory Checkpointer——Memory 是进程内
         单例，多 Worker / 重启后 Graph State 无法恢复。
         """
+        if self.asr_enabled:
+            self._validate_asr_settings()
         if self.is_production:
             dsn = (self.AGENT_CHECKPOINT_DSN or "").strip().lower()
             if dsn in ("", "memory"):
@@ -190,6 +209,22 @@ class Settings(BaseSettings):
                     "多 Worker 部署必须使用 PostgreSQL 以共享 Graph State。"
                 )
             self._validate_production_secrets()
+
+    def _validate_asr_settings(self) -> None:
+        error = "配置非法：ASR_BASE_URL 必须是无认证、查询参数和片段的 HTTP(S) 服务地址。"
+        try:
+            url = urlsplit(self.ASR_BASE_URL.strip())
+            port = url.port
+        except ValueError:
+            raise RuntimeError(error) from None
+        if (
+            url.scheme not in {"http", "https"}
+            or not url.hostname or url.username is not None
+            or url.query or url.fragment or port == 0
+        ):
+            raise RuntimeError(error)
+        if not self.ASR_MODEL.strip():
+            raise RuntimeError("配置非法：ASR_MODEL 不能为空。")
 
     def _validate_production_secrets(self) -> None:
         """P0-04 部署安全：生产环境拒绝默认凭据，强制经环境变量/Secret 注入真实值。"""

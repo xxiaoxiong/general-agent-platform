@@ -1,8 +1,9 @@
 import axios, { type AxiosInstance, type AxiosResponse } from 'axios'
 import { ElMessage } from 'element-plus'
 import router from '@/router'
+import { useAuthStore } from '@/stores/auth'
 
-export function createRequest(baseURL: string): AxiosInstance {
+export function createRequest(baseURL: string, options: { inlineErrors?: boolean } = {}): AxiosInstance {
   const instance = axios.create({
     baseURL,
     timeout: 60000,
@@ -22,13 +23,15 @@ export function createRequest(baseURL: string): AxiosInstance {
   instance.interceptors.response.use(
     (response: AxiosResponse) => response.data,
     (error) => {
+      // 登录表单就地显示认证错误。
+      if (error.config?.url === '/auth/login') return Promise.reject(error)
       const status = error.response?.status
+      if (options.inlineErrors && status !== 401) return Promise.reject(error)
       const message = error.response?.data?.detail || error.response?.data?.message || error.message
 
       if (status === 401) {
-        localStorage.removeItem('access_token')
-        localStorage.removeItem('refresh_token')
-        router.push('/login')
+        useAuthStore().logout()
+        void router.replace('/login')
         ElMessage.error('登录已过期，请重新登录')
       } else if (status === 403) {
         ElMessage.error('权限不足')

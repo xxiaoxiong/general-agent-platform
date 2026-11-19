@@ -23,25 +23,25 @@ const router = createRouter({
           path: 'workspace',
           name: 'Workspace',
           component: () => import('@/views/workspace/WorkspaceHome.vue'),
-          meta: { title: '智能体对话', icon: 'ChatDotRound' },
+          meta: { title: '智能体对话' },
         },
         {
           path: 'dashboard',
           name: 'Dashboard',
           component: () => import('@/views/Dashboard.vue'),
-          meta: { title: '概览', icon: 'Odometer' },
+          meta: { title: '概览' },
         },
         {
           path: 'models',
           name: 'Models',
           component: () => import('@/views/models/ModelList.vue'),
-          meta: { title: '模型配置', icon: 'Cpu' },
+          meta: { title: '模型配置' },
         },
         {
           path: 'knowledge',
           name: 'Knowledge',
           component: () => import('@/views/knowledge/KnowledgeList.vue'),
-          meta: { title: '知识库', icon: 'Collection' },
+          meta: { title: '知识库' },
         },
         {
           path: 'knowledge/:id',
@@ -53,7 +53,7 @@ const router = createRouter({
           path: 'workflows',
           name: 'Workflows',
           component: () => import('@/views/workflows/WorkflowList.vue'),
-          meta: { title: '流程编排', icon: 'Share' },
+          meta: { title: '流程编排' },
         },
         {
           path: 'workflows/:id/editor',
@@ -71,7 +71,7 @@ const router = createRouter({
           path: 'databases',
           name: 'DatabaseList',
           component: () => import('@/views/databases/DatabaseList.vue'),
-          meta: { title: '数据库管理', icon: 'Coin' },
+          meta: { title: '数据库管理' },
         },
         {
           path: 'databases/:id/query',
@@ -83,7 +83,7 @@ const router = createRouter({
           path: 'prompts',
           name: 'PromptList',
           component: () => import('@/views/prompts/PromptList.vue'),
-          meta: { title: '提示词库', icon: 'EditPen' },
+          meta: { title: '提示词库' },
         },
         {
           path: 'prompts/debugger',
@@ -92,34 +92,46 @@ const router = createRouter({
           meta: { title: '提示词调试器' },
         },
         {
+          path: 'apps',
+          name: 'AppMarket',
+          component: () => import('@/views/apps/AppMarket.vue'),
+          meta: { title: '应用市场' },
+        },
+        {
+          path: 'apps/instances',
+          name: 'AppInstances',
+          component: () => import('@/views/apps/AppInstances.vue'),
+          meta: { title: '我的应用' },
+        },
+        {
           path: 'system/users',
           name: 'SystemUsers',
           component: () => import('@/views/system/UserManage.vue'),
-          meta: { title: '用户管理', icon: 'User', requiresSuperuser: true },
+          meta: { title: '用户管理', requiresSuperuser: true },
         },
         {
           path: 'system/audit',
           name: 'SystemAudit',
           component: () => import('@/views/system/AuditLog.vue'),
-          meta: { title: '审计日志', icon: 'Document', requiresSuperuser: true },
+          meta: { title: '审计日志', requiresSuperuser: true },
         },
         {
           path: 'system/evaluation',
           name: 'SystemEvaluation',
           component: () => import('@/views/system/Evaluation.vue'),
-          meta: { title: 'Agent测评', icon: 'TrendCharts', requiresSuperuser: true },
+          meta: { title: 'Agent 测评', requiresSuperuser: true },
         },
         {
           path: 'system/skills',
           name: 'SystemSkills',
           component: () => import('@/views/system/SkillManage.vue'),
-          meta: { title: '技能管理', icon: 'MagicStick', requiresSuperuser: true },
+          meta: { title: '技能管理', requiresSuperuser: true },
         },
         {
           path: 'system/mcp',
           name: 'SystemMcp',
           component: () => import('@/views/system/McpManage.vue'),
-          meta: { title: 'MCP服务', icon: 'Connection', requiresSuperuser: true },
+          meta: { title: 'MCP 服务', requiresSuperuser: true },
         },
       ],
     },
@@ -146,6 +158,7 @@ router.beforeEach(async (to, _from, next) => {
 
   if (!authStore.user) {
     await authStore.fetchMe()
+    if (!authStore.isLoggedIn) return next('/login')
   }
 
   if (to.meta.requiresSuperuser && !authStore.isSuperuser) {
