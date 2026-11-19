@@ -51,6 +51,12 @@ class ItemCreate(BaseModel):
     scoring_method: Optional[str] = None
     scoring_config: Dict[str, Any] = {}
     item_metadata: Dict[str, Any] = Field(default_factory=dict)
+    # 复杂任务体系（客观能力对照维度）
+    complexity: str = "L2"                 # L1 简单 / L2 中等 / L3 复杂 / L4 困难
+    task_type: str = "direct_qa"           # direct_qa / multi_step_reasoning / ...
+    required_tools: List[str] = Field(default_factory=list)
+    expected_min_steps: Optional[int] = None
+    turns: List[str] = Field(default_factory=list)   # 多轮任务后续用户消息
 
 
 class DatasetImportRequest(BaseModel):
@@ -91,16 +97,22 @@ def _item_dict(it: EvalDatasetItem) -> Dict[str, Any]:
         "scoring_method": it.scoring_method,
         "scoring_config": it.scoring_config or {},
         "metadata": it.item_metadata or {},
+        "complexity": it.complexity or "L2",
+        "task_type": it.task_type or "direct_qa",
+        "required_tools": list(it.required_tools or []),
+        "expected_min_steps": it.expected_min_steps,
+        "turns": list(it.turns or []),
     }
 
 
 def _parse_items(raw: List[Dict[str, Any]]) -> List[EvalDatasetItem]:
-    """容错解析导入用例：input/question/prompt 字段皆可。"""
+    """容错解析导入用例：input/question/prompt 字段皆可，复杂维度缺省取默认。"""
     out = []
     for pos, r in enumerate(raw):
         text = str(r.get("input") or r.get("question") or r.get("prompt") or "").strip()
         if not text:
             continue
+        meta = dict(r.get("metadata") or r.get("item_metadata") or {})
         out.append(EvalDatasetItem(
             position=int(r.get("position") if r.get("position") is not None else pos),
             input=text,
@@ -108,7 +120,14 @@ def _parse_items(raw: List[Dict[str, Any]]) -> List[EvalDatasetItem]:
             criteria=str(r.get("criteria") or ""),
             scoring_method=(r.get("scoring_method") or None),
             scoring_config=dict(r.get("scoring_config") or {}),
-            item_metadata=dict(r.get("metadata") or r.get("item_metadata") or {}),
+            item_metadata=meta,
+            complexity=str(r.get("complexity") or meta.get("complexity") or "L2"),
+            task_type=str(r.get("task_type") or meta.get("task_type") or "direct_qa"),
+            required_tools=list(r.get("required_tools") or meta.get("required_tools") or []),
+            expected_min_steps=(r.get("expected_min_steps")
+                                if r.get("expected_min_steps") is not None
+                                else meta.get("expected_min_steps")),
+            turns=list(r.get("turns") or meta.get("turns") or []),
         ))
     return out
 
@@ -212,6 +231,10 @@ async def add_item(dataset_id: int, body: ItemCreate,
         scoring_method=body.scoring_method,
         scoring_config=body.scoring_config,
         item_metadata=body.item_metadata,
+        complexity=body.complexity, task_type=body.task_type,
+        required_tools=body.required_tools,
+        expected_min_steps=body.expected_min_steps,
+        turns=body.turns,
     )
     db.add(item)
     await db.commit()
@@ -234,6 +257,11 @@ async def update_item(dataset_id: int, item_id: int, body: ItemCreate,
     item.scoring_method = body.scoring_method
     item.scoring_config = body.scoring_config
     item.item_metadata = body.item_metadata
+    item.complexity = body.complexity
+    item.task_type = body.task_type
+    item.required_tools = body.required_tools
+    item.expected_min_steps = body.expected_min_steps
+    item.turns = body.turns
     await db.commit()
     await db.refresh(item)
     return _item_dict(item)
@@ -432,11 +460,12 @@ async def list_run_items(
         select(EvalRun.id).where(EvalRun.id == run_id))).scalar_one_or_none()
     if run is None:
         raise HTTPException(404, "测评任务不存在")
-    # 窄列 + substr 预览（大 Text 列不全量加载）
+    # 窄列 + substr 预览（大 Text 列不全量加载；stats 为小 JSON，可整列取）
     stmt = select(
         EvalRunItem.id, EvalRunItem.dataset_item_id, EvalRunItem.position,
         EvalRunItem.status, EvalRunItem.score, EvalRunItem.passed,
         EvalRunItem.run_id, EvalRunItem.error,
+        EvalRunItem.snap_complexity, EvalRunItem.snap_task_type, EvalRunItem.stats,
         func.substr(EvalRunItem.snap_input, 1, 160).label("input_preview"),
         func.substr(EvalRunItem.actual_output, 1, 160).label("output_preview"),
     ).where(EvalRunItem.eval_run_id == run_id)
@@ -450,6 +479,13 @@ async def list_run_items(
                 "position": r.position, "status": r.status,
                 "score": r.score, "passed": r.passed, "run_id": r.run_id,
                 "error": r.error,
+                "complexity": r.snap_complexity or "L2",
+                "task_type": r.snap_task_type or "direct_qa",
+                "steps": (r.stats or {}).get("steps"),
+                "tool_calls": (r.stats or {}).get("tool_calls"),
+                "output_chars": (r.stats or {}).get("output_chars"),
+                "used_tools": (r.stats or {}).get("used_tools") or [],
+                "missing_tools": (r.stats or {}).get("missing_tools") or [],
                 "input_preview": (r.input_preview or "").replace("\n", " "),
                 "output_preview": (r.output_preview or "").replace("\n", " "),
             }
@@ -476,6 +512,9 @@ async def get_run_item(item_id: int,
         "snap_criteria": item.snap_criteria or "",
         "snap_scoring_method": item.snap_scoring_method,
         "snap_scoring_config": item.snap_scoring_config or {},
+        "complexity": item.snap_complexity or "L2",
+        "task_type": item.snap_task_type or "direct_qa",
+        "snap_meta": item.snap_meta or {},
         "run_id": item.run_id,
         "actual_output": item.actual_output or "",
         "error": item.error,
@@ -486,6 +525,63 @@ async def get_run_item(item_id: int,
         "started_at": item.started_at.isoformat() if item.started_at else None,
         "finished_at": item.finished_at.isoformat() if item.finished_at else None,
     }
+
+
+@router.get("/run-items/{item_id}/trace")
+async def get_run_item_trace(item_id: int,
+                             db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
+    """用例执行轨迹（纯客观）：逐轮 Run 的事件时间线 + 工具执行账本。"""
+    from app.models.agent import AgentRunEvent, AgentToolExecution
+
+    item = (await db.execute(
+        select(EvalRunItem).where(EvalRunItem.id == item_id))).scalar_one_or_none()
+    if item is None:
+        raise HTTPException(404, "测评结果不存在")
+    run_ids: List[str] = []
+    if item.run_id:
+        run_ids.append(item.run_id)
+    for t in ((item.stats or {}).get("turns") or []):
+        rid = t.get("run_id")
+        if rid and rid not in run_ids:
+            run_ids.append(rid)
+
+    runs_trace = []
+    for rid in run_ids:
+        events = (await db.execute(
+            select(AgentRunEvent.sequence, AgentRunEvent.event_type,
+                   AgentRunEvent.payload, AgentRunEvent.created_at)
+            .where(AgentRunEvent.run_id == rid)
+            .order_by(AgentRunEvent.sequence).limit(200))).all()
+        tools = (await db.execute(
+            select(AgentToolExecution).where(AgentToolExecution.run_id == rid)
+        )).scalars().all()
+        tools = sorted(tools, key=lambda r: (r.started_at or r.created_at or datetime.min))
+        runs_trace.append({
+            "run_id": rid,
+            "events": [
+                {
+                    "sequence": e.sequence,
+                    "event_type": e.event_type,
+                    "payload": str(e.payload)[:300] if e.payload else None,
+                    "created_at": e.created_at.isoformat() if e.created_at else None,
+                }
+                for e in events
+            ],
+            "tools": [
+                {
+                    "tool_name": t.tool_name,
+                    "status": t.status,
+                    "attempt_count": int(t.attempt_count or 0),
+                    "args": str(t.args_snapshot)[:300] if t.args_snapshot else None,
+                    "result": str(t.result_payload)[:300] if t.result_payload else None,
+                    "error": str(t.error)[:300] if t.error else None,
+                    "started_at": t.started_at.isoformat() if t.started_at else None,
+                    "finished_at": t.finished_at.isoformat() if t.finished_at else None,
+                }
+                for t in tools
+            ],
+        })
+    return {"item_id": item.id, "runs": runs_trace}
 
 
 @router.post("/runs/{run_id}/cancel")
@@ -546,31 +642,112 @@ async def export_markdown(run_id: int,
         f"（通过 {agg.get('passed', 0)} / 完成 {agg.get('completed', 0)}）",
         f"- 平均分：{agg.get('avg_score') if agg.get('avg_score') is not None else '—'}",
         f"- 平均耗时：{agg.get('avg_duration_s') or '—'}s；"
-        f"总 tokens：{agg.get('total_tokens', 0)}",
+        f"总 tokens：{agg.get('total_tokens', 0)}；总工具调用：{agg.get('total_tool_calls', 0)}",
         f"- 创建时间：{run.created_at.isoformat() if run.created_at else '—'}",
+        "",
+        "## 按复杂度分层（客观数据）",
+        "",
+        "| 复杂度 | 用例数 | 通过 | 通过率 | 平均分 | 平均步数 | 平均工具调用 |",
+        "|--------|--------|------|--------|--------|----------|--------------|",
+    ]
+    for lvl, s in (agg.get("by_complexity") or {}).items():
+        lines.append(
+            f"| {lvl} | {s.get('total')} | {s.get('passed')} | {s.get('pass_rate')} "
+            f"| {s.get('avg_score')} | {s.get('avg_steps')} | {s.get('avg_tool_calls')} |")
+    lines += [
+        "",
+        "## 按任务类型分层（客观数据）",
+        "",
+        "| 任务类型 | 用例数 | 通过 | 通过率 | 平均分 | 平均步数 | 平均工具调用 |",
+        "|----------|--------|------|--------|--------|----------|--------------|",
+    ]
+    for tt, s in (agg.get("by_task_type") or {}).items():
+        lines.append(
+            f"| {tt} | {s.get('total')} | {s.get('passed')} | {s.get('pass_rate')} "
+            f"| {s.get('avg_score')} | {s.get('avg_steps')} | {s.get('avg_tool_calls')} |")
+    cap = agg.get("capability") or {}
+    if cap:
+        lines += [
+            "",
+            "## Agent 能力事实（客观数据）",
+            "",
+            f"- 平均步数：{cap.get('avg_steps')}；最大步数：{cap.get('max_steps')}",
+            f"- 多步执行用例（步数≥2）：{cap.get('multi_step_count')}",
+            f"- 全程未用工具用例：{cap.get('zero_tool_count')}",
+            f"- 工具错误率：{cap.get('tool_error_rate')}",
+            f"- 未调用必需工具用例：{cap.get('missing_required_tools_count')}",
+            f"- 超出执行上限用例：{cap.get('limit_exceeded_count')}",
+            f"- 平均输出字数：{cap.get('avg_output_chars')}；"
+            f"最大输出字数：{cap.get('max_output_chars')}",
+            f"- 客观约束达成率：{cap.get('constraint_ratio')}"
+            f"（{cap.get('constraint_passed', 0)}/{cap.get('constraint_total', 0)}，"
+            f"覆盖 {cap.get('constraint_items', 0)} 条用例）",
+        ]
+    tool_usage = agg.get("tool_usage") or {}
+    if tool_usage:
+        lines += ["", "## 工具使用统计", "",
+                  "| 工具 | 调用 | 失败 |", "|------|------|------|"]
+        for name, u in sorted(tool_usage.items()):
+            lines.append(f"| {name} | {u.get('calls')} | {u.get('failed')} |")
+    problems = agg.get("problem_items") or []
+    if problems:
+        lines += ["", "## 问题用例清单（客观事实）", "",
+                  "| # | 复杂度 | 任务类型 | 状态 | 问题 | 步数 | 工具调用 | 未用工具 |",
+                  "|---|--------|----------|------|------|------|----------|----------|"]
+        for p in problems:
+            lines.append(
+                f"| {p.get('position')} | {p.get('complexity')} | {p.get('task_type')} "
+                f"| {p.get('status')} | {','.join(p.get('problems') or [])} "
+                f"| {p.get('steps')} | {p.get('tool_calls')} "
+                f"| {','.join(p.get('missing_tools') or []) or '—'} |")
+    lines += [
         "",
         "## 用例明细",
         "",
-        "| # | 状态 | 得分 | 输入（摘录） | 实际输出（摘录） |",
-        "|---|------|------|--------------|------------------|",
+        "| # | 复杂度 | 任务类型 | 状态 | 得分 | 步数 | 工具调用 | 输出字数 | 输入（摘录） | 实际输出（摘录） |",
+        "|---|--------|----------|------|------|------|----------|----------|--------------|------------------|",
     ]
     for it in items:
         inp = (it.snap_input or "").replace("\n", " ").replace("|", "\\|")[:60]
         out = (it.actual_output or "").replace("\n", " ").replace("|", "\\|")[:60]
         score = f"{it.score}" if it.score is not None else "—"
-        lines.append(f"| {it.position + 1} | {it.status} | {score} | {inp} | {out} |")
+        st = it.stats or {}
+        lines.append(
+            f"| {it.position + 1} | {it.snap_complexity or 'L2'} "
+            f"| {it.snap_task_type or 'direct_qa'} | {it.status} | {score} "
+            f"| {st.get('steps', '—')} | {st.get('tool_calls', '—')} "
+            f"| {st.get('output_chars', '—')} | {inp} | {out} |")
     lines += ["", "## 评分明细", ""]
     for it in items:
         detail = it.score_detail or {}
         reasoning = detail.get("reasoning") or detail.get("method") or ""
+        st = it.stats or {}
+        used = "、".join(st.get("used_tools") or []) or "—"
+        missing = "、".join(st.get("missing_tools") or [])
         lines += [
-            f"### 用例 {it.position + 1}（{it.status}，得分 {it.score if it.score is not None else '—'}）",
+            f"### 用例 {it.position + 1}（{it.snap_complexity or 'L2'}/"
+            f"{it.snap_task_type or 'direct_qa'}，{it.status}，"
+            f"得分 {it.score if it.score is not None else '—'}）",
             "",
             f"- 期望：{(it.snap_expected or '—')[:300]}",
             f"- 评分理由：{str(reasoning)[:500] or '—'}",
+            f"- 执行事实：步数 {st.get('steps', '—')}，工具调用 {st.get('tool_calls', '—')}"
+            f"（使用：{used}）"
+            + (f"，未用必需工具：{missing}" if missing else ""),
+            f"- 输出规模：{st.get('output_chars', '—')} 字；"
+            f"轮次：{st.get('turns_count', 1)}",
             f"- Run：{it.run_id or '—'}",
             "",
         ]
+        # 客观约束检查清单（constraint 评分）
+        checks = detail.get("checks") or []
+        if checks:
+            lines += ["| 约束 | 通过 | 说明 |", "|------|------|------|"]
+            for c in checks:
+                desc = str(c.get("desc") or "").replace("|", "\\|")[:120]
+                mark = "✓" if c.get("passed") else "✗"
+                lines.append(f"| {c.get('type')} | {mark} | {desc} |")
+            lines.append("")
     md = "\n".join(lines)
     return PlainTextResponse(
         md, media_type="text/markdown; charset=utf-8",

@@ -57,6 +57,15 @@ class EvalDatasetItem(Base):
     scoring_config = Column(JSON, default=dict)   # 评分参数（keywords/regex/pattern 等）
     item_metadata = Column("metadata", JSON, default=dict)  # 外部基准的原始 id/难度等
 
+    # 复杂任务体系：客观能力对照维度（评测 Agent 能执行多复杂的任务）
+    # 复杂度分级：L1 直接回答 / L2 单步工具或简单推理 / L3 多步推理或多工具协同 / L4 长程复合·对抗鲁棒
+    complexity = Column(String(16), nullable=False, default="L2")
+    # 任务类型：direct_qa / multi_step_reasoning / tool_use / instruction_following / multi_turn / adversarial
+    task_type = Column(String(32), nullable=False, default="direct_qa")
+    required_tools = Column(JSON, default=list)       # 任务设计要求使用的工具（客观对照，可空）
+    expected_min_steps = Column(Integer, nullable=True)  # 期望最少执行步数（客观对照，可空）
+    turns = Column(JSON, default=list)                # 多轮任务的后续用户消息（input 为首轮）
+
     created_at = Column(DateTime, nullable=False, server_default=func.now())
     updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
 
@@ -109,6 +118,10 @@ class EvalRunItem(Base):
     snap_criteria = Column(Text, default="")
     snap_scoring_method = Column(String(24), nullable=False, default="llm_judge")
     snap_scoring_config = Column(JSON, default=dict)
+    # 复杂任务体系快照（历史测评不受数据集后续改动影响）
+    snap_complexity = Column(String(16), nullable=False, default="L2")
+    snap_task_type = Column(String(32), nullable=False, default="direct_qa")
+    snap_meta = Column(JSON, default=dict)  # required_tools / expected_min_steps / turns / metadata
 
     # 关联的 AgentRun（每用例一次真实 Run）；失败/跳过时为空
     run_id = Column(String(36), nullable=True, index=True)

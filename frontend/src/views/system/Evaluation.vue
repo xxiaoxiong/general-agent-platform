@@ -91,6 +91,74 @@
               <div class="metric-value">{{ resultRun.aggregate?.total_tokens ?? 0 }}</div>
             </el-card>
           </div>
+          <!-- 能力画像（纯客观数据：分层表现 + 工具使用 + 问题用例） -->
+          <div class="cap-grid">
+            <el-card shadow="never">
+              <h4>能力画像 · 按复杂度</h4>
+              <div v-for="r in capRows" :key="r.lvl" class="cap-row">
+                <span class="cap-name">{{ r.text }}</span>
+                <el-progress :percentage="pctNum(r.pass_rate)" :stroke-width="10" class="cap-bar" />
+                <span class="cap-detail">{{ r.passed }}/{{ r.total }} · 均分 {{ r.avg_score ?? '—' }} · 均 {{ r.avg_steps ?? '—' }} 步</span>
+              </div>
+              <div v-if="!capRows.length" class="hint">暂无数据</div>
+              <h4 style="margin-top:12px;">按任务类型</h4>
+              <div v-for="r in taskTypeRows" :key="r.tt" class="cap-row">
+                <span class="cap-name">{{ r.text }}</span>
+                <el-progress :percentage="pctNum(r.pass_rate)" :stroke-width="10" class="cap-bar" />
+                <span class="cap-detail">{{ r.passed }}/{{ r.total }} · 均分 {{ r.avg_score ?? '—' }} · 均 {{ r.avg_steps ?? '—' }} 步</span>
+              </div>
+              <div v-if="!taskTypeRows.length" class="hint">暂无数据</div>
+            </el-card>
+            <el-card shadow="never">
+              <h4>能力事实（客观）</h4>
+              <ul class="cap-facts">
+                <li>平均步数：{{ capFacts.avg_steps ?? '—' }}（最大 {{ capFacts.max_steps ?? 0 }}）</li>
+                <li>多步执行用例（步数≥2）：{{ capFacts.multi_step_count ?? 0 }}</li>
+                <li>全程未用工具用例：{{ capFacts.zero_tool_count ?? 0 }}</li>
+                <li>工具错误率：{{ pct(capFacts.tool_error_rate) }}</li>
+                <li>未调用必需工具用例：{{ capFacts.missing_required_tools_count ?? 0 }}</li>
+                <li>超出执行上限用例：{{ capFacts.limit_exceeded_count ?? 0 }}</li>
+                <li>平均输出字数：{{ capFacts.avg_output_chars ?? '—' }}（最大 {{ capFacts.max_output_chars ?? 0 }}）</li>
+                <li>客观约束达成率：{{ pct(capFacts.constraint_ratio) }}
+                  （{{ capFacts.constraint_passed ?? 0 }}/{{ capFacts.constraint_total ?? 0 }}，
+                  覆盖 {{ capFacts.constraint_items ?? 0 }} 条用例）</li>
+              </ul>
+              <h4 style="margin-top:12px;">工具使用统计</h4>
+              <el-table v-if="toolUsageRows.length" :data="toolUsageRows" size="small" stripe max-height="200">
+                <el-table-column prop="name" label="工具" min-width="120" />
+                <el-table-column prop="calls" label="调用" width="70" />
+                <el-table-column prop="failed" label="失败" width="70" />
+              </el-table>
+              <div v-else class="hint">暂无工具调用</div>
+            </el-card>
+          </div>
+          <el-card v-if="problemRows.length" shadow="never" class="problem-card">
+            <h4>问题用例清单（客观事实，供开发分析）</h4>
+            <el-table :data="problemRows" size="small" stripe max-height="260">
+              <el-table-column prop="position" label="#" width="50" />
+              <el-table-column label="复杂度" width="70">
+                <template #default="{ row }">{{ row.complexity }}</template>
+              </el-table-column>
+              <el-table-column label="任务类型" width="92">
+                <template #default="{ row }">{{ taskTypeText[row.task_type] || row.task_type }}</template>
+              </el-table-column>
+              <el-table-column label="状态" width="80">
+                <template #default="{ row }">{{ itemStatusText(row.status) }}</template>
+              </el-table-column>
+              <el-table-column label="问题" min-width="180">
+                <template #default="{ row }">
+                  <el-tag v-for="p in row.problems" :key="p" size="small" type="danger"
+                    style="margin-right:4px;">{{ problemText[p] || p }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="步数/工具" width="100">
+                <template #default="{ row }">{{ row.steps ?? '-' }} / {{ row.tool_calls ?? '-' }}</template>
+              </el-table-column>
+              <el-table-column label="未用工具" min-width="120">
+                <template #default="{ row }">{{ (row.missing_tools || []).join('、') || '-' }}</template>
+              </el-table-column>
+            </el-table>
+          </el-card>
           <el-table :data="resultItems" v-loading="loading" size="small" stripe
             @row-click="(row: EvalRunItemBrief) => openItem(row)">
             <el-table-column prop="position" label="#" width="50">
@@ -103,6 +171,29 @@
             </el-table-column>
             <el-table-column label="得分" width="80">
               <template #default="{ row }">{{ row.score ?? '-' }}</template>
+            </el-table-column>
+            <el-table-column label="复杂度" width="80">
+              <template #default="{ row }">
+                <el-tag :type="complexityTagType(row.complexity)" size="small">{{ row.complexity }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="任务类型" width="92">
+              <template #default="{ row }">{{ taskTypeText[row.task_type] || row.task_type }}</template>
+            </el-table-column>
+            <el-table-column label="步数" width="64">
+              <template #default="{ row }">{{ row.steps ?? '-' }}</template>
+            </el-table-column>
+            <el-table-column label="工具" width="110">
+              <template #default="{ row }">
+                <el-tooltip v-if="row.used_tools?.length" :content="row.used_tools.join('、')" placement="top">
+                  <span>{{ row.tool_calls ?? 0 }} 次</span>
+                </el-tooltip>
+                <span v-else>-</span>
+                <el-tag v-if="row.missing_tools?.length" type="danger" size="small" style="margin-left:4px;">缺工具</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="输出字数" width="86">
+              <template #default="{ row }">{{ row.output_chars ?? '-' }}</template>
             </el-table-column>
             <el-table-column prop="input_preview" label="输入" min-width="200" show-overflow-tooltip />
             <el-table-column prop="output_preview" label="实际输出" min-width="200" show-overflow-tooltip />
@@ -123,7 +214,7 @@
           <el-button type="primary" @click="openDatasetDialog()">新建数据集</el-button>
           <el-button @click="importVisible = true">导入 JSONL</el-button>
           <el-button type="success" :loading="loading" @click="seedCommunity">导入社区通用数据集</el-button>
-          <span class="hint">社区数据集：GSM8K（数学推理）/ BFCL（函数调用·工具选择），注明出处</span>
+          <span class="hint">社区数据集：GSM8K / BBH（多步推理）/ BFCL（函数调用·对抗）/ IFEval（指令遵循）/ 工具链·多轮·对抗鲁棒 + 长程任务（工程构建 / 长文档生成修改 / 复杂数学 / 深度研究），标注复杂度 L1-L4</span>
         </div>
         <el-table :data="datasets" v-loading="loading" size="small" stripe>
           <el-table-column prop="id" label="ID" width="60" />
@@ -409,16 +500,88 @@
     </el-dialog>
 
     <!-- 用例结果详情 -->
-    <el-dialog v-model="itemVisible" title="用例结果详情" width="760px" top="6vh">
+    <el-dialog v-model="itemVisible" title="用例结果详情" width="820px" top="5vh">
       <el-descriptions v-if="currentItem" :column="2" border size="small">
         <el-descriptions-item label="状态">{{ itemStatusText(currentItem.status) }}</el-descriptions-item>
         <el-descriptions-item label="得分">{{ currentItem.score ?? '-' }}</el-descriptions-item>
+        <el-descriptions-item label="复杂度">
+          <el-tag :type="complexityTagType(currentItem.complexity)" size="small">
+            {{ complexityText[currentItem.complexity] || currentItem.complexity }}
+          </el-tag>
+        </el-descriptions-item>
+        <el-descriptions-item label="任务类型">{{ taskTypeText[currentItem.task_type] || currentItem.task_type }}</el-descriptions-item>
         <el-descriptions-item label="评分方式">{{ currentItem.snap_scoring_method }}</el-descriptions-item>
         <el-descriptions-item label="Run">{{ currentItem.run_id || '-' }}</el-descriptions-item>
-        <el-descriptions-item label="耗时(s)">{{ currentItem.stats?.duration_s ?? '-' }}</el-descriptions-item>
-        <el-descriptions-item label="Tokens">{{ currentItem.stats?.tokens ?? '-' }}</el-descriptions-item>
       </el-descriptions>
       <template v-if="currentItem">
+        <h4>执行事实（客观）</h4>
+        <div class="fact-grid">
+          <span>步数：<b>{{ currentItem.stats?.steps ?? '-' }}</b></span>
+          <span>模型调用：{{ currentItem.stats?.model_calls ?? '-' }}</span>
+          <span>工具调用：<b>{{ currentItem.stats?.tool_calls ?? '-' }}</b></span>
+          <span>Tokens：{{ currentItem.stats?.tokens ?? '-' }}</span>
+          <span>耗时：{{ currentItem.stats?.duration_s ?? '-' }}s</span>
+          <span>输出字数：<b>{{ currentItem.stats?.output_chars ?? '-' }}</b></span>
+          <span v-if="currentItem.stats?.turns_count">轮次：{{ currentItem.stats.turns_count }}</span>
+          <span>工具成功率：{{ currentItem.stats?.tool_success_rate != null ? pct(currentItem.stats.tool_success_rate) : '-' }}</span>
+          <span>使用工具：{{ (currentItem.stats?.used_tools || []).join('、') || '无' }}</span>
+          <span v-if="currentItem.snap_meta?.required_tools?.length">
+            必需工具：{{ currentItem.snap_meta.required_tools.join('、') }}
+            <b v-if="currentItem.stats?.missing_tools?.length" class="warn">
+              （未调用：{{ currentItem.stats.missing_tools.join('、') }}）
+            </b>
+            <b v-else class="ok">（已调用）</b>
+          </span>
+          <span v-if="currentItem.snap_meta?.expected_min_steps">
+            期望最少步数：{{ currentItem.snap_meta.expected_min_steps }}
+            <b :class="currentItem.stats?.steps_met === false ? 'warn' : 'ok'">
+              （{{ currentItem.stats?.steps_met === false ? '未达到' : '已达到' }}）
+            </b>
+          </span>
+          <span v-if="currentItem.stats?.limit_exceeded" class="warn">超出执行上限</span>
+        </div>
+        <!-- 客观约束检查清单（constraint 评分） -->
+        <template v-if="constraintChecks.length">
+          <h4>客观约束检查（{{ constraintPassedCount }}/{{ constraintChecks.length }} 通过）</h4>
+          <el-table :data="constraintChecks" size="small" stripe max-height="220">
+            <el-table-column prop="type" label="约束类型" width="130" />
+            <el-table-column label="结果" width="70">
+              <template #default="{ row }">
+                <el-tag :type="row.passed ? 'success' : 'danger'" size="small">{{ row.passed ? '通过' : '未过' }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="说明" min-width="240">
+              <template #default="{ row }">{{ row.desc }}</template>
+            </el-table-column>
+          </el-table>
+        </template>
+        <template v-if="currentItem.stats?.tool_chain?.length">
+          <h4>工具调用链</h4>
+          <el-table :data="currentItem.stats.tool_chain" size="small" stripe max-height="220">
+            <el-table-column prop="tool_name" label="工具" width="130" />
+            <el-table-column label="状态" width="96">
+              <template #default="{ row }">
+                <el-tag :type="row.status === 'succeeded' ? 'success' : 'danger'" size="small">{{ row.status }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="attempt_count" label="尝试" width="60" />
+            <el-table-column prop="duration_s" label="耗时(s)" width="80" />
+            <el-table-column label="参数（摘录）" min-width="200">
+              <template #default="{ row }">{{ row.args || '-' }}</template>
+            </el-table-column>
+            <el-table-column label="错误" min-width="140">
+              <template #default="{ row }">{{ row.error || '-' }}</template>
+            </el-table-column>
+          </el-table>
+        </template>
+        <template v-if="(currentItem.stats?.turns || []).length > 1">
+          <h4>多轮对话（逐轮）</h4>
+          <div v-for="t in currentItem.stats.turns" :key="t.turn" class="turn-block">
+            <div class="turn-title">第 {{ t.turn }} 轮 · {{ itemStatusText(t.status) }} · {{ t.steps ?? '-' }} 步 · {{ t.tool_calls ?? 0 }} 次工具</div>
+            <pre class="block">用户：{{ t.input }}
+助手：{{ t.output }}</pre>
+          </div>
+        </template>
         <h4>输入</h4>
         <pre class="block">{{ currentItem.snap_input }}</pre>
         <h4>期望输出</h4>
@@ -431,6 +594,27 @@
           <h4>错误</h4>
           <pre class="block error">{{ currentItem.error }}</pre>
         </template>
+        <div class="toolbar" style="margin-top:12px;">
+          <el-button size="small" :loading="traceLoading" @click="loadTrace">查看执行轨迹（事件时间线）</el-button>
+          <span class="hint">来源：AgentRunEvent / AgentToolExecution 事实表</span>
+        </div>
+        <template v-if="itemTrace">
+          <div v-for="rt in itemTrace.runs" :key="rt.run_id" class="trace-block">
+            <h4>Run {{ rt.run_id }}</h4>
+            <el-table v-if="rt.events.length" :data="rt.events" size="small" stripe max-height="240">
+              <el-table-column prop="sequence" label="#" width="56" />
+              <el-table-column prop="event_type" label="事件" width="150" show-overflow-tooltip />
+              <el-table-column label="载荷（摘录）" min-width="240">
+                <template #default="{ row }">{{ row.payload || '-' }}</template>
+              </el-table-column>
+              <el-table-column label="时间" width="150">
+                <template #default="{ row }">{{ formatDate(row.created_at) }}</template>
+              </el-table-column>
+            </el-table>
+            <div v-else class="hint">无事件记录</div>
+          </div>
+          <div v-if="!itemTrace.runs.length" class="hint">无轨迹数据</div>
+        </template>
       </template>
     </el-dialog>
 
@@ -442,6 +626,14 @@
       </div>
       <el-table :data="currentDataset?.items || []" size="small" stripe max-height="480">
         <el-table-column prop="position" label="#" width="50" />
+        <el-table-column label="复杂度" width="76">
+          <template #default="{ row }">
+            <el-tag :type="complexityTagType(row.complexity)" size="small">{{ row.complexity }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="任务类型" width="92">
+          <template #default="{ row }">{{ taskTypeText[row.task_type] || row.task_type }}</template>
+        </el-table-column>
         <el-table-column prop="input" label="输入" min-width="220" show-overflow-tooltip />
         <el-table-column prop="expected" label="期望" min-width="160" show-overflow-tooltip />
         <el-table-column prop="scoring_method" label="评分" width="100">
@@ -467,6 +659,36 @@
         </el-form-item>
         <el-form-item label="评分标准">
           <el-input v-model="itemForm.criteria" type="textarea" :rows="2" placeholder="给 LLM 裁判的补充说明" />
+        </el-form-item>
+        <el-form-item label="复杂度">
+          <el-select v-model="itemForm.complexity" style="width:100%;">
+            <el-option label="L1 简单（直接回答）" value="L1" />
+            <el-option label="L2 中等（单步工具/简单推理）" value="L2" />
+            <el-option label="L3 复杂（多步推理/多工具协同）" value="L3" />
+            <el-option label="L4 困难（长程复合/对抗鲁棒）" value="L4" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="任务类型">
+          <el-select v-model="itemForm.task_type" style="width:100%;">
+            <el-option label="直接问答" value="direct_qa" />
+            <el-option label="多步推理" value="multi_step_reasoning" />
+            <el-option label="工具使用" value="tool_use" />
+            <el-option label="指令遵循" value="instruction_following" />
+            <el-option label="多轮任务" value="multi_turn" />
+            <el-option label="对抗鲁棒" value="adversarial" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="必需工具">
+          <el-input v-model="itemForm.required_tools_text"
+            placeholder="任务声明要求调用的工具名，逗号分隔（客观校验），如：calculator,datetime_now" />
+        </el-form-item>
+        <el-form-item label="期望步数">
+          <el-input-number v-model="itemForm.expected_min_steps" :min="0" :max="20" />
+          <span class="hint" style="margin-left:8px;">期望最少执行步数，0 = 不限</span>
+        </el-form-item>
+        <el-form-item label="多轮消息">
+          <el-input v-model="itemForm.turns_text" type="textarea" :rows="3"
+            placeholder="多轮任务：每行一条后续用户消息（「输入」为首轮）" />
         </el-form-item>
         <el-form-item label="评分方式">
           <el-select v-model="itemForm.scoring_method" clearable placeholder="数据集默认" style="width:100%;">
@@ -563,7 +785,7 @@ import dayjs from 'dayjs'
 import {
   evaluationApi,
   type EvalDataset, type EvalDatasetItem,
-  type EvalRun, type EvalRunItemBrief, type EvalRunItemDetail,
+  type EvalRun, type EvalRunItemBrief, type EvalRunItemDetail, type EvalRunItemTrace,
 } from '@/api/evaluation'
 import {
   evolutionApi,
@@ -592,6 +814,8 @@ const resultRun = ref<EvalRun | null>(null)
 const resultItems = ref<EvalRunItemBrief[]>([])
 const itemVisible = ref(false)
 const currentItem = ref<EvalRunItemDetail | null>(null)
+const itemTrace = ref<EvalRunItemTrace | null>(null)
+const traceLoading = ref(false)
 
 // ── 数据集 ──
 const datasetVisible = ref(false)
@@ -599,7 +823,11 @@ const currentDataset = ref<EvalDataset | null>(null)
 const datasetEditVisible = ref(false)
 const datasetForm = ref({ id: 0, name: '', description: '', category: 'general', scoring_method: 'llm_judge', reference: '' })
 const itemEditVisible = ref(false)
-const itemForm = ref({ id: 0, input: '', expected: '', criteria: '', scoring_method: '' })
+const itemForm = ref({
+  id: 0, input: '', expected: '', criteria: '', scoring_method: '',
+  complexity: 'L2', task_type: 'direct_qa',
+  required_tools_text: '', expected_min_steps: 0, turns_text: '',
+})
 const importVisible = ref(false)
 const importForm = ref({ dataset_id: undefined as number | undefined, name: '', content: '' })
 const scoringMethods = ['llm_judge', 'exact_match', 'contains', 'keyword', 'regex', 'none']
@@ -641,6 +869,39 @@ const verdictDist = computed(() => {
 
 // ── 工具函数 ──
 function pct(v: any) { return v == null ? '-' : `${(v * 100).toFixed(1)}%` }
+function pctNum(v: any) { return v == null ? 0 : Math.round(v * 100) }
+const complexityText: Record<string, string> = {
+  L1: 'L1 简单', L2: 'L2 中等', L3: 'L3 复杂', L4: 'L4 困难',
+}
+function complexityTagType(c: string) {
+  return (({ L1: 'success', L2: 'info', L3: 'warning', L4: 'danger' } as any)[c] || 'info')
+}
+const taskTypeText: Record<string, string> = {
+  direct_qa: '直接问答', multi_step_reasoning: '多步推理', tool_use: '工具使用',
+  instruction_following: '指令遵循', multi_turn: '多轮任务', adversarial: '对抗鲁棒',
+  project_build: '工程构建', long_document: '长文档生成修改', complex_math: '复杂数学',
+  deep_research: '深度研究',
+}
+const problemText: Record<string, string> = {
+  error: '执行异常', failed: '未通过', missing_required_tools: '未用必需工具',
+  below_expected_steps: '未达期望步数',
+}
+// 能力画像（纯客观，直接消费 aggregate）
+const capRows = computed(() => Object.entries(resultRun.value?.aggregate?.by_complexity || {})
+  .map(([lvl, s]) => ({ lvl, text: complexityText[lvl] || lvl, ...s })))
+const taskTypeRows = computed(() => Object.entries(resultRun.value?.aggregate?.by_task_type || {})
+  .map(([tt, s]) => ({ tt, text: taskTypeText[tt] || tt, ...s })))
+const toolUsageRows = computed(() => Object.entries(resultRun.value?.aggregate?.tool_usage || {})
+  .map(([name, u]) => ({ name, ...u })))
+const capFacts = computed(() => resultRun.value?.aggregate?.capability || {})
+const problemRows = computed(() => resultRun.value?.aggregate?.problem_items || [])
+// 客观约束检查清单（constraint 评分明细）
+const constraintChecks = computed(() => {
+  const d = currentItem.value?.score_detail as any
+  return Array.isArray(d?.checks) ? d.checks : []
+})
+const constraintPassedCount = computed(
+  () => constraintChecks.value.filter((c: any) => c.passed).length)
 function formatDate(d: string | null) { return d ? dayjs(d).format('YYYY-MM-DD HH:mm') : '-' }
 function openUrl(url: string) { window.open(url, '_blank') }
 function datasetName(id: number) { return datasets.value.find(d => d.id === id)?.name || `#${id}` }
@@ -798,7 +1059,17 @@ async function loadResultItems() {
 }
 async function openItem(row: EvalRunItemBrief) {
   currentItem.value = await evaluationApi.getRunItem(row.id)
+  itemTrace.value = null
   itemVisible.value = true
+}
+async function loadTrace() {
+  if (!currentItem.value) return
+  traceLoading.value = true
+  try {
+    itemTrace.value = await evaluationApi.getRunItemTrace(currentItem.value.id)
+  } finally {
+    traceLoading.value = false
+  }
 }
 
 // ── 数据集操作 ──
@@ -840,15 +1111,34 @@ async function viewDataset(row: EvalDataset) {
 }
 function openItemDialog(row?: EvalDatasetItem) {
   itemForm.value = row
-    ? { id: row.id, input: row.input, expected: row.expected, criteria: row.criteria, scoring_method: row.scoring_method || '' }
-    : { id: 0, input: '', expected: '', criteria: '', scoring_method: '' }
+    ? {
+        id: row.id, input: row.input, expected: row.expected, criteria: row.criteria,
+        scoring_method: row.scoring_method || '',
+        complexity: row.complexity || 'L2', task_type: row.task_type || 'direct_qa',
+        required_tools_text: (row.required_tools || []).join(','),
+        expected_min_steps: row.expected_min_steps ?? 0,
+        turns_text: (row.turns || []).join('\n'),
+      }
+    : {
+        id: 0, input: '', expected: '', criteria: '', scoring_method: '',
+        complexity: 'L2', task_type: 'direct_qa',
+        required_tools_text: '', expected_min_steps: 0, turns_text: '',
+      }
   itemEditVisible.value = true
 }
 async function saveItem() {
   if (!currentDataset.value) return
   loading.value = true
   try {
-    const payload = { ...itemForm.value, scoring_method: itemForm.value.scoring_method || null }
+    const f = itemForm.value
+    const payload = {
+      input: f.input, expected: f.expected, criteria: f.criteria,
+      scoring_method: f.scoring_method || null,
+      complexity: f.complexity, task_type: f.task_type,
+      required_tools: f.required_tools_text.split(/[,，]/).map(s => s.trim()).filter(Boolean),
+      expected_min_steps: f.expected_min_steps || null,
+      turns: f.turns_text.split('\n').map(s => s.trim()).filter(Boolean),
+    }
     if (itemForm.value.id) {
       await evaluationApi.updateItem(currentDataset.value.id, itemForm.value.id, payload)
     } else {
@@ -893,10 +1183,13 @@ async function seedCommunity() {
   loading.value = true
   try {
     const res = await evaluationApi.seedCommunity()
-    if (res.created.length) {
-      ElMessage.success(`已导入：${res.created.join('、')}`)
+    const parts: string[] = []
+    if (res.created.length) parts.push(`新增：${res.created.join('、')}`)
+    if (res.updated.length) parts.push(`刷新：${res.updated.join('、')}`)
+    if (parts.length) {
+      ElMessage.success(parts.join('；'))
     } else {
-      ElMessage.info('社区数据集已全部导入过（按名称幂等）')
+      ElMessage.info('社区数据集无变化（按名称幂等）')
     }
     await loadDatasets()
   } finally {
@@ -1063,4 +1356,20 @@ onMounted(async () => {
   font-family: inherit;
 }
 .block.error { background: #fef0f0; color: #c45656; }
+/* 能力画像 */
+.cap-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+.cap-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.cap-name { width: 110px; flex-shrink: 0; font-size: 12px; color: #606266; }
+.cap-bar { flex: 1; }
+.cap-detail { width: 190px; flex-shrink: 0; font-size: 12px; color: #909399; }
+.cap-facts { margin: 0; padding-left: 18px; font-size: 13px; color: #303133; }
+.cap-facts li { margin-bottom: 4px; }
+.problem-card { margin-bottom: 12px; }
+/* 执行事实 / 轨迹 */
+.fact-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px; font-size: 13px; margin-bottom: 8px; }
+.warn { color: #c45656; }
+.ok { color: #67c23a; }
+.turn-block { margin-bottom: 8px; }
+.turn-title { font-size: 12px; color: #909399; margin-bottom: 4px; }
+.trace-block { margin-top: 8px; }
 </style>

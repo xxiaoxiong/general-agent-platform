@@ -13,10 +13,11 @@ from sqlalchemy import create_engine, delete, select
 from sqlalchemy.orm import Session
 
 from app.core.database import AsyncSessionLocal, engine, init_db
-from app.models.agent import Agent, AgentRun
+from app.models.agent import Agent, AgentRun, AgentRunEvent, AgentToolExecution
 from app.models.evaluation import EvalDataset, EvalDatasetItem, EvalRun, EvalRunItem
 
-_CLEAN = (EvalRunItem, EvalRun, EvalDatasetItem, EvalDataset, AgentRun, Agent)
+_CLEAN = (EvalRunItem, EvalRun, EvalDatasetItem, EvalDataset,
+          AgentToolExecution, AgentRunEvent, AgentRun, Agent)
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -117,6 +118,74 @@ class TestScoringBasics:
             assert r["score"] is None and r["passed"] is None
 
     @pytest.mark.asyncio
+    async def test_constraint_scoring(self):
+        """客观约束清单校验（长程任务评分）：确定性、无 LLM。"""
+        from app.services.evaluation.scoring import ScoringError, score_output
+
+        doc = "## 需求分析\n" + "内容" * 200 + "\n## 架构设计\n蓝绿部署\n## 部署方案\n"
+        config = {
+            "constraints": [
+                {"type": "min_headings", "value": 3},
+                {"type": "contains", "value": "蓝绿部署"},
+                {"type": "not_contains", "value": "TODO"},
+                {"type": "min_length", "value": 100},
+            ],
+            "pass_mode": "all",
+        }
+        async with AsyncSessionLocal() as s:
+            ok = await score_output(
+                s, method="constraint", config=config,
+                input_text="q", expected="", criteria="", actual_output=doc)
+            assert ok["passed"] is True and ok["score"] == 10.0
+            assert ok["detail"]["passed_constraints"] == 4
+
+            bad_config = {"constraints": [
+                {"type": "contains", "value": "回滚预案"},
+                {"type": "min_headings", "value": 3},
+            ]}
+            bad = await score_output(
+                s, method="constraint", config=bad_config,
+                input_text="q", expected="", criteria="", actual_output=doc)
+            assert bad["passed"] is False
+            assert bad["score"] == 5.0
+            assert bad["detail"]["checks"][0]["passed"] is False
+
+            # threshold 模式：比例达标即通过
+            thr = await score_output(
+                s, method="constraint",
+                config={**bad_config, "pass_mode": "threshold", "min_ratio": 0.5},
+                input_text="q", expected="", criteria="", actual_output=doc)
+            assert thr["passed"] is True
+
+            with pytest.raises(ScoringError):
+                await score_output(
+                    s, method="constraint", config={"constraints": []},
+                    input_text="q", expected="", criteria="", actual_output=doc)
+
+    @pytest.mark.asyncio
+    async def test_constraint_answer_extract(self):
+        from app.services.evaluation.scoring import score_output
+
+        out = "推导过程……\n最终答案：42"
+        config = {"constraints": [
+            {"type": "answer", "values": ["42"],
+             "pattern": r"最终答案[:：]\s*([\d./-]+)"},
+            {"type": "min_length", "value": 5},
+        ]}
+        async with AsyncSessionLocal() as s:
+            ok = await score_output(
+                s, method="constraint", config=config,
+                input_text="q", expected="42", criteria="", actual_output=out)
+            assert ok["passed"] is True
+            wrong = await score_output(
+                s, method="constraint",
+                config={"constraints": [
+                    {"type": "answer", "values": ["43"],
+                     "pattern": r"最终答案[:：]\s*([\d./-]+)"}]},
+                input_text="q", expected="43", criteria="", actual_output=out)
+            assert wrong["passed"] is False
+
+    @pytest.mark.asyncio
     async def test_llm_judge(self, monkeypatch):
         from app.services.evaluation import scoring as sp
         from app.services.model_service import ModelService
@@ -167,29 +236,101 @@ class TestCommunityDatasets:
         from app.services.evaluation.community import load_community_datasets
 
         defs = load_community_datasets()
-        assert len(defs) == 3
+        assert len(defs) >= 5
         names = [d["name"] for d in defs]
         assert any("GSM8K" in n for n in names)
         assert any("BFCL" in n for n in names)
+        # 复杂任务数据集（多步推理 / 工具链 / 多轮 / 对抗）
+        assert any("BBH" in n for n in names)
+        assert any("工具链" in n for n in names)
+        assert any("多轮" in n for n in names)
+        # 长程复杂任务数据集（工程构建 / 长文档 / 复杂数学 / 深度研究）
+        assert any("工程项目构建" in n for n in names)
+        assert any("长文档" in n for n in names)
+        assert any("复杂数学" in n for n in names)
+        assert any("深度研究" in n for n in names)
         for d in defs:
-            assert len(d["items"]) == 20
+            assert len(d["items"]) >= 6
             assert d.get("reference"), "社区数据集必须注明出处"
             for it in d["items"]:
                 assert it["input"]
+                # 复杂任务维度标注（客观对照）
+                assert it["complexity"] in ("L1", "L2", "L3", "L4")
+                assert it["task_type"] in (
+                    "direct_qa", "multi_step_reasoning", "tool_use",
+                    "instruction_following", "multi_turn", "adversarial",
+                    "project_build", "long_document", "complex_math",
+                    "deep_research")
+                assert isinstance(it.get("turns", []), list)
+                assert isinstance(it.get("required_tools", []), list)
+                # constraint 评分用例必须带客观约束清单
+                if it.get("scoring_method") == "constraint":
+                    cons = (it.get("scoring_config") or {}).get("constraints") or []
+                    assert cons, f"{d['name']} constraint 用例缺少约束清单"
 
     @pytest.mark.asyncio
     async def test_seed_idempotent(self):
-        from app.services.evaluation.community import seed_community_datasets
+        from app.services.evaluation.community import (
+            load_community_datasets, seed_community_datasets,
+        )
 
+        n = len(load_community_datasets())
         async with AsyncSessionLocal() as s:
             r1 = await seed_community_datasets(s)
             r2 = await seed_community_datasets(s)
-        assert len(r1["created"]) == 3 and r1["skipped"] == []
-        assert r2["created"] == [] and len(r2["skipped"]) == 3
+        assert len(r1["created"]) == n and r1["updated"] == []
+        # 已存在的 community 数据集会被整体刷新（升级基准版本）
+        assert r2["created"] == [] and len(r2["updated"]) == n
         async with AsyncSessionLocal() as s:
             total = len((await s.execute(
                 select(EvalDataset))).scalars().all())
-        assert total == 3
+        assert total == n
+
+    @pytest.mark.asyncio
+    async def test_seed_skips_manual_dataset(self):
+        from app.services.evaluation.community import (
+            load_community_datasets, seed_community_datasets,
+        )
+
+        name = load_community_datasets()[0]["name"]
+        async with AsyncSessionLocal() as s:
+            s.add(EvalDataset(name=name, source="manual", scoring_method="none"))
+            await s.commit()
+            r = await seed_community_datasets(s)
+        assert name in r["skipped"] and name not in r["created"] and name not in r["updated"]
+
+    @pytest.mark.asyncio
+    async def test_refresh_releases_item_references(self):
+        """刷新社区数据集时，历史结果行解除用例外键引用但保留完整快照。"""
+        from app.services.evaluation.community import (
+            load_community_datasets, seed_community_datasets,
+        )
+        from app.services.evaluation.runner import create_eval_run
+
+        name = load_community_datasets()[0]["name"]
+        async with AsyncSessionLocal() as s:
+            await seed_community_datasets(s)
+            ds = (await s.execute(
+                select(EvalDataset).where(EvalDataset.name == name))).scalars().one()
+            agent = Agent(name=f"agent-{uuid.uuid4().hex[:8]}", system_prompt="t",
+                          tools=[], is_active=True)
+            s.add(agent)
+            await s.commit()
+            run = await create_eval_run(
+                s, name="刷新引用测试", dataset_id=ds.id, agent_id=agent.id,
+                created_by=None, config={"limit": 2})
+            run_id = run.id
+
+        async with AsyncSessionLocal() as s:
+            r = await seed_community_datasets(s)   # 触发整体替换路径
+        assert name in r["updated"]
+
+        async with AsyncSessionLocal() as s:
+            items = (await s.execute(select(EvalRunItem).where(
+                EvalRunItem.eval_run_id == run_id))).scalars().all()
+        assert len(items) == 2
+        assert all(i.dataset_item_id is None for i in items)   # 外键已解除
+        assert all(i.snap_input for i in items)                # 快照仍完整
 
 
 # ────────────────────────────── 运行器 ──────────────────────────────
@@ -205,10 +346,18 @@ class _FakeStream:
 
 
 class _FakeRuntime:
-    """假 Runtime：起 Run 时直接落 AgentRun 行并返回即完成的事件流。"""
+    """假 Runtime：起 Run 时直接落 AgentRun 行并返回即完成的事件流。
 
-    def __init__(self, final_texts=None, error: Exception | None = None):
+    - final_texts: 用户消息 → final_text（按当前轮 user_message 匹配）；
+    - tool_calls: 用户消息 → [工具名]，落 AgentToolExecution 事实行（可表征工具使用）；
+    - steps: 每 Run 的 budget_steps（默认 1）。
+    """
+
+    def __init__(self, final_texts=None, error: Exception | None = None,
+                 tool_calls=None, steps: int = 1):
         self.final_texts = final_texts or {}   # input → final_text
+        self.tool_calls = tool_calls or {}     # input → [tool_name]
+        self.steps = steps
         self.error = error
         self.started = []
 
@@ -219,15 +368,22 @@ class _FakeRuntime:
                                      user_message=None, **kw):
         if self.error is not None:
             raise self.error
-        user_input = (messages[0] or {}).get("content", "")
+        user_input = ((user_message or {}).get("content")
+                      or (messages[-1] or {}).get("content", ""))
         final_text = self.final_texts.get(user_input, user_input)
         run_id = f"evalfake-{uuid.uuid4().hex[:12]}"
         self.started.append(run_id)
+        tools = self.tool_calls.get(user_input, [])
         async with AsyncSessionLocal() as s:
             s.add(AgentRun(
                 id=run_id, agent_id=agent_config.get("id"), thread_id=f"t-{run_id}",
                 status="completed", final_text=final_text,
-                budget_steps=1, budget_model_calls=1, budget_tokens=10))
+                budget_steps=self.steps, budget_model_calls=self.steps,
+                budget_tool_calls=len(tools), budget_tokens=10))
+            for i, name in enumerate(tools):
+                s.add(AgentToolExecution(
+                    run_id=run_id, tool_call_id=f"call-{i}", tool_name=name,
+                    status="succeeded", attempt_count=1))
             await s.commit()
         return run_id, None, _FakeStream([{"type": "done", "status": "completed"}])
 
@@ -251,6 +407,22 @@ async def _mk_dataset_and_agent(items) -> tuple:
             s.add(EvalDatasetItem(
                 dataset_id=ds.id, position=pos, input=inp, expected=exp,
                 scoring_method=method))
+        agent = Agent(name=f"agent-{uuid.uuid4().hex[:8]}",
+                      system_prompt="测评测试", tools=[], is_active=True)
+        s.add(agent)
+        await s.commit()
+        return ds.id, agent.id
+
+
+async def _mk_complex_dataset_and_agent(items: list) -> tuple:
+    """items: EvalDatasetItem 构造 kwargs 列表（复杂任务维度）。"""
+    async with AsyncSessionLocal() as s:
+        ds = EvalDataset(name=f"ds-{uuid.uuid4().hex[:8]}", source="manual",
+                         scoring_method="exact_match")
+        s.add(ds)
+        await s.flush()
+        for pos, kw in enumerate(items):
+            s.add(EvalDatasetItem(dataset_id=ds.id, position=pos, **kw))
         agent = Agent(name=f"agent-{uuid.uuid4().hex[:8]}",
                       system_prompt="测评测试", tools=[], is_active=True)
         s.add(agent)
@@ -370,6 +542,166 @@ class TestRunner:
         assert run.aggregate["completed"] == 2
 
 
+class TestComplexityAndCapability:
+    """复杂任务体系：多轮执行 / 工具能力客观校验 / 聚合分层。"""
+
+    @pytest.mark.asyncio
+    async def test_multi_turn_execution(self, monkeypatch):
+        from app.services.evaluation.runner import (
+            create_eval_run, execute_eval_run,
+        )
+
+        fake = _FakeRuntime(final_texts={"第一轮问题": "第一轮回答",
+                                         "第二轮追问": "最终答案 42"})
+        _fake_runtime_module(monkeypatch, fake)
+        ds_id, agent_id = await _mk_complex_dataset_and_agent([{
+            "input": "第一轮问题", "expected": "最终答案 42",
+            "complexity": "L4", "task_type": "multi_turn",
+            "turns": ["第二轮追问"],
+        }])
+        async with AsyncSessionLocal() as s:
+            run = await create_eval_run(
+                s, name="多轮测试", dataset_id=ds_id, agent_id=agent_id,
+                created_by=None, config={})
+            run_id = run.id
+        await execute_eval_run(run_id)
+        async with AsyncSessionLocal() as s:
+            item = (await s.execute(select(EvalRunItem).where(
+                EvalRunItem.eval_run_id == run_id))).scalars().one()
+        assert item.status == "passed"           # 评分针对最终轮输出
+        assert item.snap_complexity == "L4" and item.snap_task_type == "multi_turn"
+        turns = item.stats["turns"]
+        assert len(turns) == 2
+        assert turns[0]["output"] == "第一轮回答" and turns[1]["output"] == "最终答案 42"
+        assert turns[0]["run_id"] != turns[1]["run_id"]   # 每轮独立 Run（可追溯）
+        assert item.run_id == turns[-1]["run_id"]
+        assert len(fake.started) == 2
+
+    @pytest.mark.asyncio
+    async def test_required_tools_enforced(self, monkeypatch):
+        from app.services.evaluation.runner import (
+            create_eval_run, execute_eval_run,
+        )
+
+        # 输出正确但全程没用要求的工具 → 客观校验判不通过
+        fake = _FakeRuntime(final_texts={"用工具算 17*23": "391"})
+        _fake_runtime_module(monkeypatch, fake)
+        ds_id, agent_id = await _mk_complex_dataset_and_agent([{
+            "input": "用工具算 17*23", "expected": "391",
+            "complexity": "L3", "task_type": "tool_use",
+            "required_tools": ["calculator"], "expected_min_steps": 2,
+        }])
+        async with AsyncSessionLocal() as s:
+            run = await create_eval_run(
+                s, name="工具校验", dataset_id=ds_id, agent_id=agent_id,
+                created_by=None, config={})
+            run_id = run.id
+        await execute_eval_run(run_id)
+        async with AsyncSessionLocal() as s:
+            item = (await s.execute(select(EvalRunItem).where(
+                EvalRunItem.eval_run_id == run_id))).scalars().one()
+        assert item.passed is False and item.score == 10.0   # 质量分保留、通过判定被校验覆盖
+        check = item.score_detail["capability_check"]
+        assert check["missing_tools"] == ["calculator"]
+        assert item.stats["missing_tools"] == ["calculator"]
+        assert item.stats["steps_met"] is False              # 1 步 < 期望 2 步
+
+        # 调用了要求工具 → 通过
+        fake2 = _FakeRuntime(final_texts={"用工具算 17*23": "391"},
+                             tool_calls={"用工具算 17*23": ["calculator"]}, steps=2)
+        _fake_runtime_module(monkeypatch, fake2)
+        async with AsyncSessionLocal() as s:
+            run2 = await create_eval_run(
+                s, name="工具校验2", dataset_id=ds_id, agent_id=agent_id,
+                created_by=None, config={})
+            run2_id = run2.id
+        await execute_eval_run(run2_id)
+        async with AsyncSessionLocal() as s:
+            item2 = (await s.execute(select(EvalRunItem).where(
+                EvalRunItem.eval_run_id == run2_id))).scalars().one()
+        assert item2.passed is True
+        assert item2.stats["used_tools"] == ["calculator"]
+        assert item2.stats["tool_chain"][0]["tool_name"] == "calculator"
+        assert item2.stats["steps_met"] is True
+
+    @pytest.mark.asyncio
+    async def test_forbid_tools(self, monkeypatch):
+        from app.services.evaluation.runner import (
+            create_eval_run, execute_eval_run,
+        )
+
+        fake = _FakeRuntime(final_texts={"只许心算": "59"},
+                            tool_calls={"只许心算": ["calculator"]})
+        _fake_runtime_module(monkeypatch, fake)
+        ds_id, agent_id = await _mk_complex_dataset_and_agent([{
+            "input": "只许心算", "expected": "59",
+            "complexity": "L4", "task_type": "adversarial",
+            "scoring_config": {"forbid_tools": True},
+        }])
+        async with AsyncSessionLocal() as s:
+            run = await create_eval_run(
+                s, name="禁工具", dataset_id=ds_id, agent_id=agent_id,
+                created_by=None, config={})
+            run_id = run.id
+        await execute_eval_run(run_id)
+        async with AsyncSessionLocal() as s:
+            item = (await s.execute(select(EvalRunItem).where(
+                EvalRunItem.eval_run_id == run_id))).scalars().one()
+        assert item.passed is False
+        assert "forbid_tools" not in item.stats   # 统计不含配置键
+        assert item.score_detail["capability"]["forbid_tools"] is True
+
+    def test_aggregate_layers(self):
+        from app.services.evaluation.runner import compute_aggregate
+
+        def mk(pos, complexity, task_type, status, score, stats, detail=None):
+            return EvalRunItem(
+                position=pos, snap_complexity=complexity, snap_task_type=task_type,
+                status=status, score=score, stats=stats, score_detail=detail,
+                snap_meta={"required_tools": ["calculator"]})
+
+        items = [
+            mk(0, "L3", "tool_use", "passed", 10.0, {
+                "steps": 3, "tool_calls": 2, "used_tools": ["calculator", "python_exec"],
+                "output_chars": 2000,
+                "tool_chain": [{"tool_name": "calculator", "status": "succeeded"},
+                               {"tool_name": "python_exec", "status": "failed"}]}),
+            mk(1, "L3", "tool_use", "failed", 2.0, {
+                "steps": 1, "tool_calls": 0, "used_tools": [], "output_chars": 500,
+                "missing_tools": ["calculator"], "tool_chain": []}),
+            mk(2, "L4", "adversarial", "error", None, {}),
+            mk(3, "L4", "long_document", "passed", 7.5, {
+                "steps": 4, "tool_calls": 0, "used_tools": [], "output_chars": 3000},
+             {"method": "constraint", "total_constraints": 8,
+              "passed_constraints": 6, "checks": []}),
+        ]
+        agg = compute_aggregate(items)
+        assert agg["total"] == 4 and agg["passed"] == 2
+        assert agg["by_complexity"]["L3"]["total"] == 2
+        assert agg["by_complexity"]["L3"]["passed"] == 1
+        assert agg["by_complexity"]["L4"]["error"] == 1
+        assert agg["by_task_type"]["tool_use"]["pass_rate"] == 0.5
+        assert agg["by_task_type"]["long_document"]["total"] == 1
+        assert agg["tool_usage"]["calculator"] == {"calls": 1, "failed": 0}
+        assert agg["tool_usage"]["python_exec"] == {"calls": 1, "failed": 1}
+        cap = agg["capability"]
+        assert cap["multi_step_count"] == 2
+        assert cap["zero_tool_count"] == 2
+        assert cap["tool_error_rate"] == 0.5
+        assert cap["missing_required_tools_count"] == 1
+        # 长程任务客观指标：输出规模 + 约束达成
+        assert cap["avg_output_chars"] == round(5500 / 3, 3)
+        assert cap["max_output_chars"] == 3000
+        assert cap["constraint_items"] == 1
+        assert cap["constraint_total"] == 8 and cap["constraint_passed"] == 6
+        assert cap["constraint_ratio"] == 0.75
+        # 问题用例：failed+缺工具、error（未持久化行 id 为 None，按问题清单逐条断言）
+        problem_lists = [p["problems"] for p in agg["problem_items"]]
+        assert len(problem_lists) == 2
+        assert ["failed", "missing_required_tools"] in problem_lists
+        assert ["error"] in problem_lists
+
+
 # ────────────────────────────── API ──────────────────────────────
 
 
@@ -450,14 +782,25 @@ class TestDatasetApi:
         assert r.status_code == 200
         assert len(r.json()["items"]) == 2
 
-        # 用例增改删
+        # 用例增改删（含复杂任务维度字段）
         r = client.post(f"/api/v2/evaluation/datasets/{ds['id']}/items",
-                        headers=h, json={"input": "q3", "expected": "a3"})
+                        headers=h, json={"input": "q3", "expected": "a3",
+                                         "complexity": "L4", "task_type": "tool_use",
+                                         "required_tools": ["calculator"],
+                                         "expected_min_steps": 2,
+                                         "turns": ["追问轮"]})
         item_id = r.json()["id"]
         assert r.json()["position"] == 2
+        assert r.json()["complexity"] == "L4"
+        assert r.json()["required_tools"] == ["calculator"]
+        assert r.json()["turns"] == ["追问轮"]
         r = client.put(f"/api/v2/evaluation/datasets/{ds['id']}/items/{item_id}",
-                       headers=h, json={"input": "q3x", "expected": "a3x"})
+                       headers=h, json={"input": "q3x", "expected": "a3x",
+                                        "complexity": "L3", "task_type": "multi_turn",
+                                        "required_tools": [], "expected_min_steps": None,
+                                        "turns": []})
         assert r.json()["input"] == "q3x"
+        assert r.json()["complexity"] == "L3"
         r = client.delete(
             f"/api/v2/evaluation/datasets/{ds['id']}/items/{item_id}", headers=h)
         assert r.json()["deleted"] is True
@@ -494,7 +837,7 @@ class TestDatasetApi:
         h = _auth(users["admin_id"])
         r = client.post("/api/v2/evaluation/datasets/seed-community", headers=h)
         assert r.status_code == 200, r.text
-        assert len(r.json()["created"]) == 3
+        assert len(r.json()["created"]) >= 5
         r = client.get("/api/v2/evaluation/datasets", headers=h)
         names = [d["name"] for d in r.json()["items"]]
         assert any("GSM8K" in n for n in names)
@@ -562,3 +905,49 @@ class TestRunApi:
         r = client.post("/api/v2/evaluation/runs", headers=h, json={
             "dataset_id": 999999, "agent_id": 999999})
         assert r.status_code == 422
+
+    def test_run_item_trace(self, client, users, monkeypatch):
+        """执行轨迹端点：事件时间线 + 工具执行账本（纯客观）。"""
+        h = _auth(users["admin_id"])
+
+        async def _noop(eval_run_id):
+            return None
+
+        import app.services.evaluation.runner as runner_mod
+        monkeypatch.setattr(runner_mod, "start_eval_run_background", _noop)
+
+        r = client.post("/api/v2/evaluation/datasets", headers=h, json={
+            "name": f"轨迹数据集-{uuid.uuid4().hex[:6]}",
+            "scoring_method": "exact_match",
+            "items": [{"input": "tq1", "expected": "ta1"}]})
+        ds_id = r.json()["id"]
+        agent_id = _mk_agent_sync()
+        r = client.post("/api/v2/evaluation/runs", headers=h, json={
+            "name": "轨迹任务", "dataset_id": ds_id, "agent_id": agent_id})
+        run_id = r.json()["id"]
+        r = client.get(f"/api/v2/evaluation/runs/{run_id}/items", headers=h)
+        item_id = r.json()["items"][0]["id"]
+
+        # 落事实行：AgentRun + 事件 + 工具执行，并关联到结果行
+        fake_run_id = f"trace-{uuid.uuid4().hex[:12]}"
+        with Session(_sync()) as s:
+            s.add(AgentRun(id=fake_run_id, agent_id=agent_id,
+                           thread_id=f"t-{fake_run_id}", status="completed",
+                           final_text="ta1"))
+            s.add(AgentRunEvent(run_id=fake_run_id, thread_id=f"t-{fake_run_id}",
+                                sequence=1, event_type="run.started",
+                                payload={"k": 1}))
+            s.add(AgentToolExecution(run_id=fake_run_id, tool_call_id="call-0",
+                                     tool_name="calculator", status="succeeded",
+                                     attempt_count=1))
+            s.query(EvalRunItem).filter(EvalRunItem.id == item_id).update(
+                {"run_id": fake_run_id})
+            s.commit()
+
+        r = client.get(f"/api/v2/evaluation/run-items/{item_id}/trace", headers=h)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["item_id"] == item_id
+        assert body["runs"][0]["run_id"] == fake_run_id
+        assert body["runs"][0]["events"][0]["event_type"] == "run.started"
+        assert body["runs"][0]["tools"][0]["tool_name"] == "calculator"

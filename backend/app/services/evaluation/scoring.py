@@ -6,6 +6,8 @@
 - keyword：config.keywords 全部/任一命中（config.match = all/any，默认 all）；
 - regex：config.pattern 正则命中实际输出；
 - llm_judge：LLM 裁判按期望与评分标准打分（0~10 + 通过判定 + 理由）；
+- constraint：客观约束清单校验（长度/章节/关键词/正则/代码块/链接/答案提取等，
+  全部确定性计算，无 LLM、无主观判断），score = 10 × 通过约束数/约束总数；
 - none：不评分，只收集输出（score/passed 均为 None）。
 
 统一返回：{"score": 0~10 或 None, "passed": bool 或 None, "detail": {...}}。
@@ -24,7 +26,8 @@ from app.schemas.model_provider import ChatMessage, ChatRequest
 
 logger = logging.getLogger(__name__)
 
-SCORING_METHODS = ("exact_match", "contains", "keyword", "regex", "llm_judge", "none")
+SCORING_METHODS = ("exact_match", "contains", "keyword", "regex",
+                   "constraint", "llm_judge", "none")
 
 # llm_judge 默认通过线（0~10）
 DEFAULT_PASS_THRESHOLD = 6.0
@@ -135,6 +138,110 @@ async def _pick_judge_model(db: AsyncSession) -> Tuple[ModelProvider, ModelConfi
     return provider, mc, mc.id
 
 
+def _check_constraint(c: Dict[str, Any], actual: str) -> Tuple[bool, str]:
+    """单条客观约束校验（纯字符串/正则运算）。返回 (是否通过, 约束描述)。"""
+    ctype = str(c.get("type") or "").strip()
+    value = c.get("value")
+    if ctype == "min_length":
+        ok = len(actual) >= int(value or 0)
+        desc = f"输出长度 ≥ {value}（实际 {len(actual)}）"
+    elif ctype == "max_length":
+        ok = len(actual) <= int(value or 0)
+        desc = f"输出长度 ≤ {value}（实际 {len(actual)}）"
+    elif ctype == "min_headings":
+        n = len(re.findall(r"(?m)^#{1,6}\s+\S", actual))
+        ok = n >= int(value or 0)
+        desc = f"markdown 标题数 ≥ {value}（实际 {n}）"
+    elif ctype == "min_code_blocks":
+        n = actual.count("```") // 2
+        ok = n >= int(value or 0)
+        desc = f"代码块数 ≥ {value}（实际 {n}）"
+    elif ctype == "min_urls":
+        n = len(re.findall(r"https?://", actual))
+        ok = n >= int(value or 0)
+        desc = f"引用链接数 ≥ {value}（实际 {n}）"
+    elif ctype == "contains":
+        ok = str(value or "") in actual
+        desc = f"包含「{value}」"
+    elif ctype == "not_contains":
+        ok = str(value or "") not in actual
+        desc = f"不包含「{value}」"
+    elif ctype == "keyword_all":
+        kws = [str(k) for k in (c.get("keywords") or []) if str(k).strip()]
+        hit = [k for k in kws if k in actual]
+        ok = len(hit) == len(kws) and bool(kws)
+        desc = f"关键词全部包含 {kws}（命中 {hit}）"
+    elif ctype == "keyword_any":
+        kws = [str(k) for k in (c.get("keywords") or []) if str(k).strip()]
+        hit = [k for k in kws if k in actual]
+        ok = bool(hit)
+        desc = f"关键词任一包含 {kws}（命中 {hit}）"
+    elif ctype == "regex":
+        pattern = str(c.get("pattern") or "")
+        try:
+            m = re.search(pattern, actual, re.IGNORECASE | re.MULTILINE)
+        except re.error as e:
+            raise ScoringError(f"constraint regex 表达式非法: {e}")
+        ok = bool(m)
+        desc = f"正则匹配 /{pattern[:80]}/"
+    elif ctype == "answer":
+        values = [normalize_text(str(v)) for v in (c.get("values") or []) if str(v).strip()]
+        pattern = str(c.get("pattern") or "").strip()
+        extracted = None
+        if pattern:
+            try:
+                m = re.search(pattern, actual, re.IGNORECASE | re.MULTILINE)
+            except re.error as e:
+                raise ScoringError(f"constraint answer 正则非法: {e}")
+            if m:
+                extracted = m.group(1) if m.groups() else m.group(0)
+        else:
+            nums = re.findall(r"-?\d+(?:\.\d+)?", actual)
+            extracted = nums[-1] if nums else None
+        ok = bool(values) and normalize_text(extracted or "") in values
+        desc = f"提取答案「{extracted}」∈ {values}"
+    else:
+        raise ScoringError(f"constraint 未知约束类型: {ctype}")
+    return ok, desc
+
+
+def _score_constraints(config: Dict[str, Any], actual: str) -> Dict[str, Any]:
+    """客观约束清单校验（长程任务评分）：全部确定性计算。
+
+    config.constraints: [{type, value/pattern/keywords/values}, ...]
+    config.pass_mode: "all"（默认，全部满足才通过）或 "threshold"（比例达标即可）；
+    config.min_ratio: threshold 模式下的通过比例（默认 0.8）。
+    score = 10 × 通过约束数/约束总数。
+    """
+    constraints = [dict(c) for c in (config.get("constraints") or []) if isinstance(c, dict)]
+    if not constraints:
+        raise ScoringError("constraint 评分缺少 constraints")
+    checks: List[Dict[str, Any]] = []
+    for c in constraints:
+        ok, desc = _check_constraint(c, actual)
+        checks.append({"type": str(c.get("type") or ""), "passed": bool(ok), "desc": desc})
+    hit = sum(1 for c in checks if c["passed"])
+    ratio = hit / len(checks)
+    pass_mode = str(config.get("pass_mode") or "all").lower()
+    if pass_mode == "threshold":
+        min_ratio = float(config.get("min_ratio") or 0.8)
+        passed = ratio >= min_ratio
+    else:
+        passed = hit == len(checks)
+    return {
+        "score": round(ratio * 10, 2),
+        "passed": passed,
+        "detail": {
+            "method": "constraint",
+            "pass_mode": pass_mode,
+            "total_constraints": len(checks),
+            "passed_constraints": hit,
+            "constraint_ratio": round(ratio, 4),
+            "checks": checks,
+        },
+    }
+
+
 def resolve_method(item_method: Optional[str], dataset_method: Optional[str]) -> str:
     """评分方式解析：用例级覆盖数据集默认；非法取值回落 llm_judge。"""
     method = (item_method or dataset_method or "llm_judge").strip().lower()
@@ -193,6 +300,9 @@ async def score_output(
             raise ScoringError(f"regex 表达式非法: {e}")
         return _binary(bool(m), {"method": "regex", "pattern": pattern[:200],
                                  "matched": (m.group(0)[:200] if m else None)})
+
+    if method == "constraint":
+        return _score_constraints(config, actual)
 
     if method == "llm_judge":
         return await _llm_judge(db, input_text=input_text, expected=expected,
