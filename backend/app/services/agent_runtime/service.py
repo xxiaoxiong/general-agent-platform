@@ -67,6 +67,7 @@ from .events import (
     EventBus,
     LegacyEventAdapter,
     RuntimeEvent,
+    redact_secrets,
     redact_sensitive,
     wait_wakeup,
 )
@@ -1502,7 +1503,9 @@ class AgentRuntimeService:
                                             "tool": tc_name,
                                             "tool_call_id": (tc.get("id") or "") if isinstance(tc, dict) else "",
                                             "internal": True,
-                                            "input": redact_sensitive(
+                                            # 工具输入是执行证据（评测交付物采集来源）：
+                                            # 只脱敏不截断，持久化统一按事件类型截断
+                                            "input": redact_secrets(
                                                 (tc.get("args") or {}) if isinstance(tc, dict) else {}
                                             ),
                                         },

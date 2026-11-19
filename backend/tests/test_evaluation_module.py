@@ -186,6 +186,44 @@ class TestScoringBasics:
             assert wrong["passed"] is False
 
     @pytest.mark.asyncio
+    async def test_constraint_length_scope_separates_output_and_artifacts(self):
+        """长度约束口径：min_length 测产出规模（回答+交付物），max_length 仅测最终回答。
+
+        防止交付物规模扭曲测量：全写文件、正文简短的实干型交付不被 min_length
+        误判过短，大交付物也不被 max_length 误判回答冗长。
+        """
+        from app.services.evaluation.scoring import score_output
+
+        cfg = {"constraints": [
+            {"type": "min_length", "value": 1000},
+            {"type": "max_length", "value": 1000},
+        ]}
+        async with AsyncSessionLocal() as s:
+            # 交付物 3000 + 回答 200：min 按合并文本 3200 通过，max 按回答 200 通过
+            r = await score_output(
+                s, method="constraint", config=cfg,
+                input_text="q", expected="", criteria="",
+                actual_output="x" * 3000 + "y" * 200, output_text="y" * 200)
+            assert r["passed"] is True
+            assert r["detail"]["checks"][0]["passed"] is True   # min_length 合并 3200
+            assert r["detail"]["checks"][1]["passed"] is True   # max_length 仅回答 200
+
+            # 回答本身超长：max 仅看回答，如实判失败
+            r2 = await score_output(
+                s, method="constraint", config=cfg,
+                input_text="q", expected="", criteria="",
+                actual_output="y" * 5000, output_text="y" * 5000)
+            assert r2["passed"] is False
+            assert r2["detail"]["checks"][1]["passed"] is False
+
+            # 不传 output_text（无交付物并入）：max 回落到评分文本本身
+            r3 = await score_output(
+                s, method="constraint", config=cfg,
+                input_text="q", expected="", criteria="",
+                actual_output="y" * 5000)
+            assert r3["detail"]["checks"][1]["passed"] is False
+
+    @pytest.mark.asyncio
     async def test_llm_judge(self, monkeypatch):
         from app.services.evaluation import scoring as sp
         from app.services.model_service import ModelService
@@ -737,6 +775,147 @@ class TestComplexityAndCapability:
         assert "print('built')" in text
         assert "def broken(): pass" not in text
         assert "/workspace/a.py" in text
+
+    @pytest.mark.asyncio
+    async def test_collect_artifact_text_from_internal_tool_events(self):
+        """内部工具（write_file 等）不经账本：交付物从事件日志采集。
+
+        事件里的写入内容必须完整（>400 字符不截断——历史 400 字符截断会让
+        长代码约束假失败）；失败/无终态的内部调用不算交付物。
+        """
+        from app.services.evaluation.runner import _collect_artifact_text
+
+        run_id = f"evalfake-{uuid.uuid4().hex[:12]}"
+        long_content = "def add_task(name):\n    return name\n" + "# pad line\n" * 200
+        async with AsyncSessionLocal() as s:
+            agent = Agent(name=f"agent-{uuid.uuid4().hex[:8]}",
+                          system_prompt="t", tools=[], is_active=True)
+            s.add(agent)
+            await s.flush()
+            s.add(AgentRun(
+                id=run_id, agent_id=agent.id, thread_id=f"t-{run_id}",
+                status="completed", final_text="x"))
+            # 成功的内部 write_file（无账本行，证据只在事件日志）
+            s.add(AgentRunEvent(
+                run_id=run_id, thread_id=f"t-{run_id}", sequence=1,
+                event_type="tool_started",
+                payload={"tool": "write_file", "tool_call_id": "i1",
+                         "internal": True,
+                         "input": {"path": "/tmp/p/task_manager.py",
+                                   "content": long_content}}))
+            s.add(AgentRunEvent(
+                run_id=run_id, thread_id=f"t-{run_id}", sequence=2,
+                event_type="tool_completed",
+                payload={"tool": "write_file", "tool_call_id": "i1",
+                         "internal": True, "output": "ok"}))
+            # 失败的内部 write_file：不算交付物
+            s.add(AgentRunEvent(
+                run_id=run_id, thread_id=f"t-{run_id}", sequence=3,
+                event_type="tool_started",
+                payload={"tool": "write_file", "tool_call_id": "i2",
+                         "internal": True,
+                         "input": {"path": "/tmp/p/broken.py",
+                                   "content": "def broken(): pass"}}))
+            s.add(AgentRunEvent(
+                run_id=run_id, thread_id=f"t-{run_id}", sequence=4,
+                event_type="tool_failed",
+                payload={"tool": "write_file", "tool_call_id": "i2",
+                         "internal": True, "error": "path invalid"}))
+            # 只有 started、无终态：结果未确认，不算交付物
+            s.add(AgentRunEvent(
+                run_id=run_id, thread_id=f"t-{run_id}", sequence=5,
+                event_type="tool_started",
+                payload={"tool": "write_file", "tool_call_id": "i3",
+                         "internal": True,
+                         "input": {"path": "/tmp/p/pending.py",
+                                   "content": "def pending(): pass"}}))
+            await s.commit()
+            text = await _collect_artifact_text(s, [run_id])
+        assert long_content in text  # 完整内容（>400 字符）不被截断
+        assert "/tmp/p/task_manager.py" in text
+        assert "def broken(): pass" not in text
+        assert "def pending(): pass" not in text
+
+    @pytest.mark.asyncio
+    async def test_collect_artifact_text_prefers_longer_source(self):
+        """同一调用账本/事件两份交付物内容取更完整（更长）的一份（抗单一口径截断）。"""
+        from app.services.evaluation.runner import _collect_artifact_text
+
+        run_id = f"evalfake-{uuid.uuid4().hex[:12]}"
+        full = "def add_task():\n    pass\n" + "# tail\n" * 100
+        async with AsyncSessionLocal() as s:
+            agent = Agent(name=f"agent-{uuid.uuid4().hex[:8]}",
+                          system_prompt="t", tools=[], is_active=True)
+            s.add(agent)
+            await s.flush()
+            s.add(AgentRun(
+                id=run_id, agent_id=agent.id, thread_id=f"t-{run_id}",
+                status="completed", final_text="x"))
+            # 账本参数被截断（旧数据 400 字符截断形态），事件里是完整内容
+            s.add(AgentToolExecution(
+                run_id=run_id, tool_call_id="c1", tool_name="python_exec",
+                status="succeeded", attempt_count=1,
+                args_snapshot={"code": full[:120]},
+            ))
+            s.add(AgentRunEvent(
+                run_id=run_id, thread_id=f"t-{run_id}", sequence=1,
+                event_type="tool_started",
+                payload={"tool": "python_exec", "tool_call_id": "c1",
+                         "input": {"code": full}}))
+            s.add(AgentRunEvent(
+                run_id=run_id, thread_id=f"t-{run_id}", sequence=2,
+                event_type="tool_completed",
+                payload={"tool": "python_exec", "tool_call_id": "c1",
+                         "output": "ok"}))
+            await s.commit()
+            text = await _collect_artifact_text(s, [run_id])
+        assert full in text
+        assert text.count("def add_task") == 1  # 同调用只保留一份（不重复计）
+
+    @pytest.mark.asyncio
+    async def test_collect_run_facts_merges_internal_tool_events(self):
+        """工具链双口径合并：内部工具与未入账本的拒绝调用不得漏报，按事件序号排序。"""
+        from app.services.evaluation.runner import _collect_run_facts
+
+        run_id = f"evalfake-{uuid.uuid4().hex[:12]}"
+        async with AsyncSessionLocal() as s:
+            agent = Agent(name=f"agent-{uuid.uuid4().hex[:8]}",
+                          system_prompt="t", tools=[], is_active=True)
+            s.add(agent)
+            await s.flush()
+            s.add(AgentRun(
+                id=run_id, agent_id=agent.id, thread_id=f"t-{run_id}",
+                status="completed", final_text="x"))
+            # 账本：python_exec 一次成功（平台工具，事件与账本都有 → 同 tool_call_id 去重）
+            s.add(AgentToolExecution(
+                run_id=run_id, tool_call_id="p1", tool_name="python_exec",
+                status="succeeded", attempt_count=1,
+                args_snapshot={"code": "print('built')"}))
+            for seq, etype, payload in (
+                (1, "tool_started", {"tool": "python_exec", "tool_call_id": "p1",
+                                     "input": {"code": "print('built')"}}),
+                (2, "tool_completed", {"tool": "python_exec", "tool_call_id": "p1",
+                                       "output": "built"}),
+                (3, "tool_started", {"tool": "write_file", "tool_call_id": "i1",
+                                     "internal": True,
+                                     "input": {"path": "/tmp/a.py", "content": "x = 1"}}),
+                (4, "tool_completed", {"tool": "write_file", "tool_call_id": "i1",
+                                       "internal": True, "output": "ok"}),
+                (5, "tool_failed", {"tool": "web_search", "tool_call_id": "w1",
+                                    "error": "策略拒绝"}),
+            ):
+                s.add(AgentRunEvent(
+                    run_id=run_id, thread_id=f"t-{run_id}", sequence=seq,
+                    event_type=etype, payload=payload))
+            await s.commit()
+            facts = await _collect_run_facts(s, run_id)
+        assert facts["used_tools"] == ["python_exec", "web_search", "write_file"]
+        assert facts["tool_total"] == 3  # 账本 1 + 事件独有 2（同 p1 去重）
+        assert facts["tool_failed"] == 1  # web_search 策略拒绝那次
+        assert [e["tool_name"] for e in facts["tool_chain"]] == \
+            ["python_exec", "write_file", "web_search"]  # 按事件序号
+        internal = [e for e in facts["tool_chain"] if e.get("internal")]
+        assert [e["tool_name"] for e in internal] == ["write_file"]
 
     def test_aggregate_layers(self):
         from app.services.evaluation.runner import compute_aggregate

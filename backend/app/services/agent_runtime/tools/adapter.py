@@ -61,7 +61,6 @@ from ..events import (
     EventBus,
     RuntimeEvent,
     redact_secrets,
-    redact_sensitive,
 )
 from ..lifecycle import RunExecutionLease
 from ..repositories import PersistenceError, ToolExecutionRepository
@@ -372,10 +371,12 @@ class ToolAdapterFactory:
             raise
 
         # 2) 工具生命周期开始 + 执行预算记账（FR-10.7：预算超限显式终止）
+        #    工具输入是执行证据（评测交付物采集来源）：只脱敏不截断（§15.2 E），
+        #    持久化统一按事件类型截断，SSE 线缆仍由 LegacyEventAdapter 截断预览
         await self.bus.publish(RuntimeEvent(
             type=TOOL_STARTED,
             run_id=self.ctx.run_id,
-            data={"tool": name, "tool_call_id": tool_call_id, "input": redact_sensitive(args)},
+            data={"tool": name, "tool_call_id": tool_call_id, "input": redact_secrets(args)},
         ))
         self.ctx.tool_calls += 1
         reason = self.ctx.budget.exhausted_reason(
@@ -398,7 +399,7 @@ class ToolAdapterFactory:
             tool_call_id=tool_call_id,
             tool_name=name,
             args_hash=_args_hash(args),
-            args_snapshot=redact_sensitive(dict(args)),
+            args_snapshot=redact_secrets(dict(args)),
             idempotency_key=idempotency_key,
         )
 
@@ -429,7 +430,7 @@ class ToolAdapterFactory:
                 tool_call_id=tool_call_id,
                 tool_name=name,
                 args_hash=_args_hash(args),
-                args_snapshot=redact_sensitive(dict(args)),
+                args_snapshot=redact_secrets(dict(args)),
                 idempotency_key=idempotency_key,
             )
             if fresh.status == TOOL_EXEC_SUCCEEDED:

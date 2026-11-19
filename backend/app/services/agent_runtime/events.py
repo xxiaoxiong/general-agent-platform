@@ -150,13 +150,27 @@ def _redact(value: Any, max_len: Optional[int]) -> Any:
 
 
 def redact_secrets(value: Any) -> Any:
-    """统一脱敏（仅打码、不截断）：工具输出 / 错误信息 / Ledger 写入使用。"""
+    """统一脱敏（仅打码、不截断）：工具输入证据 / 工具输出 / 错误信息 / Ledger 写入使用。"""
     return _redact(value, max_len=None)
 
 
 def redact_sensitive(value: Any, max_len: int = 400) -> Any:
     """对外事件脱敏：截断长参数并遮蔽疑似密钥字段。"""
     return _redact(value, max_len=max_len)
+
+
+# 持久化截断策略：文本型事件（模型增量/最终结果）与工具调用证据（工具 args /
+# 输出：write_file 写入内容、python_exec 代码等）按大上限入库——400 字符截断
+# 会破坏最终文本重建，并让事件日志里的执行证据失真（评测交付物漏采、约束假
+# 失败）；其余事件（计划/审批/状态类）仍 400 上限防事件表膨胀。密钥遮蔽一律保留。
+_FULL_PAYLOAD_EVENTS = frozenset(
+    {MODEL_DELTA, RUN_COMPLETED, TOOL_STARTED, TOOL_COMPLETED, TOOL_FAILED})
+_FULL_PAYLOAD_MAX_LEN = 100_000
+
+
+def _persist_max_len(ev_type: str) -> int:
+    """按事件类型取持久化截断上限（仅长文本上限不同，脱敏遮蔽一律保留）。"""
+    return _FULL_PAYLOAD_MAX_LEN if ev_type in _FULL_PAYLOAD_EVENTS else 400
 
 
 # ── 旧 SSE 契约适配 ──────────────────────────────────────────────────────────
@@ -394,9 +408,10 @@ class EventBus:
         from app.core.database import AsyncSessionLocal
         from .repositories import EventRepository, PersistenceError
 
-        # 脱敏入库：密钥遮蔽一律保留；文本型事件（模型增量/最终结果）不截断，
-        # 否则回放/最终文本重建会静默丢失文本（FR-09.5）
-        max_len = 100_000 if ev.type in (MODEL_DELTA, RUN_COMPLETED) else 400
+        # 脱敏入库：密钥遮蔽一律保留；文本型事件与工具调用证据按大上限入库
+        # （模型增量/最终结果截断会丢失文本 FR-09.5；工具 args 截断会丢失执行
+        # 证据——评测交付物采集/约束判定失真），其余事件 400 上限防表膨胀
+        max_len = _persist_max_len(ev.type)
         payload = redact_sensitive(ev.data or {}, max_len=max_len)
         try:
             async with AsyncSessionLocal() as db:
@@ -498,8 +513,8 @@ class EventBus:
                 repo = EventRepository(db)
                 seqs: List[int] = []
                 for ev in events:
-                    # 与 _persist 相同的脱敏规则：文本型事件不截断，保证最终文本重建完整
-                    max_len = 100_000 if ev.type in (MODEL_DELTA, RUN_COMPLETED) else 400
+                    # 与 _persist 相同的脱敏规则：文本/工具证据不截断，保证最终文本重建与执行证据完整
+                    max_len = _persist_max_len(ev.type)
                     payload = redact_sensitive(ev.data or {}, max_len=max_len)
                     seq = await repo.append(
                         ev.run_id, ev.type, payload, thread_id=ev.thread_id or "",

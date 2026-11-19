@@ -138,16 +138,24 @@ async def _pick_judge_model(db: AsyncSession) -> Tuple[ModelProvider, ModelConfi
     return provider, mc, mc.id
 
 
-def _check_constraint(c: Dict[str, Any], actual: str) -> Tuple[bool, str]:
-    """单条客观约束校验（纯字符串/正则运算）。返回 (是否通过, 约束描述)。"""
+def _check_constraint(c: Dict[str, Any], actual: str, output_text: str) -> Tuple[bool, str]:
+    """单条客观约束校验（纯字符串/正则运算）。返回 (是否通过, 约束描述)。
+
+    长度约束口径（防交付物规模扭曲测量）：
+    - min_length 测产出规模（最终回答 + 交付物合并文本）——交付物是长程任务的
+      实质产出，全写文件、正文简短的实干型交付不应被误判过短；
+    - max_length 仅测最终回答——约束本义是防回答冗长灌水，交付物规模由任务
+      需求决定，不计入「输出长度」。
+    其余内容类约束（关键词/正则/结构）测合并文本，保证交付物证据可被校验。
+    """
     ctype = str(c.get("type") or "").strip()
     value = c.get("value")
     if ctype == "min_length":
         ok = len(actual) >= int(value or 0)
-        desc = f"输出长度 ≥ {value}（实际 {len(actual)}）"
+        desc = f"输出规模（含交付物）≥ {value}（实际 {len(actual)}）"
     elif ctype == "max_length":
-        ok = len(actual) <= int(value or 0)
-        desc = f"输出长度 ≤ {value}（实际 {len(actual)}）"
+        ok = len(output_text) <= int(value or 0)
+        desc = f"输出长度（仅最终回答）≤ {value}（实际 {len(output_text)}）"
     elif ctype == "min_headings":
         n = len(re.findall(r"(?m)^#{1,6}\s+\S", actual))
         ok = n >= int(value or 0)
@@ -205,20 +213,22 @@ def _check_constraint(c: Dict[str, Any], actual: str) -> Tuple[bool, str]:
     return ok, desc
 
 
-def _score_constraints(config: Dict[str, Any], actual: str) -> Dict[str, Any]:
+def _score_constraints(config: Dict[str, Any], actual: str, output_text: str) -> Dict[str, Any]:
     """客观约束清单校验（长程任务评分）：全部确定性计算。
 
     config.constraints: [{type, value/pattern/keywords/values}, ...]
     config.pass_mode: "all"（默认，全部满足才通过）或 "threshold"（比例达标即可）；
     config.min_ratio: threshold 模式下的通过比例（默认 0.8）。
     score = 10 × 通过约束数/约束总数。
+    actual 为合并文本（回答+交付物），output_text 为最终回答（长度约束口径见
+    _check_constraint）。
     """
     constraints = [dict(c) for c in (config.get("constraints") or []) if isinstance(c, dict)]
     if not constraints:
         raise ScoringError("constraint 评分缺少 constraints")
     checks: List[Dict[str, Any]] = []
     for c in constraints:
-        ok, desc = _check_constraint(c, actual)
+        ok, desc = _check_constraint(c, actual, output_text)
         checks.append({"type": str(c.get("type") or ""), "passed": bool(ok), "desc": desc})
     hit = sum(1 for c in checks if c["passed"])
     ratio = hit / len(checks)
@@ -257,10 +267,17 @@ async def score_output(
     expected: str,
     criteria: str,
     actual_output: str,
+    output_text: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """对实际输出评分。返回 {"score", "passed", "detail"}（none 方法前两者为 None）。"""
+    """对实际输出评分。返回 {"score", "passed", "detail"}（none 方法前两者为 None）。
+
+    actual_output 为评分合并文本（最终回答 + 交付物，include_artifacts 口径）；
+    output_text 为最终回答原文，供 constraint 长度约束区分口径（缺省时回落
+    actual_output，即无交付物并入的场景）。
+    """
     config = config or {}
     actual = actual_output or ""
+    output_only = actual if output_text is None else (output_text or "")
 
     if method == "none":
         return {"score": None, "passed": None, "detail": {"method": "none"}}
@@ -302,7 +319,7 @@ async def score_output(
                                  "matched": (m.group(0)[:200] if m else None)})
 
     if method == "constraint":
-        return _score_constraints(config, actual)
+        return _score_constraints(config, actual, output_only)
 
     if method == "llm_judge":
         return await _llm_judge(db, input_text=input_text, expected=expected,

@@ -2652,3 +2652,34 @@ async def test_p16_final_text_complete_after_batching():
     rebuilt = await svc._load_prior_final_text(run_id)
     assert "".join(rebuilt) == full_text, "批量持久化后最终文本重建须完整（不丢 Token）"
     assert len(rebuilt) == 10, f"每 Token 仍是一条独立事件（不合并行），实得 {len(rebuilt)}"
+
+
+@pytest.mark.asyncio
+async def test_p16_tool_event_args_persist_full_evidence():
+    """工具事件持久化不截断长 args：write_file 写入内容（>400 字符）完整入库，
+    作为工具调用执行证据（评测交付物采集来源），且密钥遮蔽仍保留。"""
+    from app.services.agent_runtime.events import (
+        TOOL_STARTED,
+        EventBus,
+        RuntimeEvent,
+    )
+
+    run_id, _lease, _ = await _budget_seed("w-p16-7")
+    content = "def add_task(name):\n    return name\n" + "# pad\n" * 100  # > 400 字符
+    bus = EventBus(persist=True)
+    bus.bind_run(thread_id=f"t-{run_id[:6]}", agent_id=1, trace_id=run_id)
+    await bus.publish(RuntimeEvent(
+        type=TOOL_STARTED, run_id=run_id,
+        data={"tool": "write_file", "tool_call_id": "evfull1", "internal": True,
+              "input": {"path": "/workspace/task_manager.py", "content": content,
+                        "api_key": "sk-SECRET-XYZ"}},
+    ))
+    async with AsyncSessionLocal() as s:
+        rows = (await s.execute(
+            select(AgentRunEvent).where(AgentRunEvent.run_id == run_id)
+            .where(AgentRunEvent.event_type == TOOL_STARTED)
+        )).scalars().all()
+    assert rows, "tool_started 事件须持久化"
+    payload = rows[-1].payload or {}
+    assert payload["input"]["content"] == content  # 完整证据（无 400 字符截断）
+    assert "sk-SECRET-XYZ" not in str(payload)     # 密钥遮蔽仍保留

@@ -6,7 +6,7 @@
   多轮用例（turns）逐轮执行，同 Session 累积对话历史，评分针对最终输出；
 - 逐条 claim（UPDATE ... WHERE status='pending'）防并发重复执行；
 - 评分走 scoring.score_output；执行事实（步数/工具链/tokens 等）从平台事实表
-  采集为纯客观数据（不改事实表、无 LLM、无主观判断）；
+  （工具执行账本 + 运行事件日志）采集为纯客观数据（不改事实表、无 LLM、无主观判断）；
 - 工具能力客观校验：用例声明 required_tools 时，未调用要求工具即判不通过
   （scoring_config.enforce_required_tools=false 可关闭），供「Agent 能力」评测；
 - 支持取消（pending→skipped）与恢复（重跑未完成用例）。
@@ -20,8 +20,9 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import AsyncSessionLocal
-from app.models.agent import Agent, AgentRun, AgentToolExecution
+from app.models.agent import Agent, AgentRun, AgentRunEvent, AgentToolExecution
 from app.models.evaluation import EvalDataset, EvalDatasetItem, EvalRun, EvalRunItem
+from app.services.agent_runtime.events import TOOL_COMPLETED, TOOL_FAILED, TOOL_STARTED
 
 from .scoring import ScoringError, resolve_method, score_output
 
@@ -314,8 +315,68 @@ async def _drain_stream(stream) -> None:
             break
 
 
+async def _collect_event_tool_calls(
+    db: AsyncSession, run_ids: List[str],
+) -> List[Dict[str, Any]]:
+    """从运行事件日志采集工具调用事实（含不经账本的内部工具），按事件序号排序。
+
+    deepagents 内部工具（write_file / write_todos / task 等）不经
+    ToolAdapterFactory、不落 agent_tool_executions 账本，只在 agent_run_events
+    有 TOOL 事件——工具链统计与交付物采集必须合并事件口径，否则内部工具调用
+    整体漏报。返回元素（同 tool_call_id 的 started/completed/failed 合并一条，
+    终态后者覆盖）：
+    {run_id, tool_call_id, tool_name, status, internal, args, error, seq}，
+    仅有 started 无终态的调用 status=unknown（结果未确认）。
+    """
+    if not run_ids:
+        return []
+    ev_rows = (await db.execute(
+        select(AgentRunEvent.run_id, AgentRunEvent.sequence,
+               AgentRunEvent.event_type, AgentRunEvent.payload)
+        .where(AgentRunEvent.run_id.in_(run_ids))
+        .where(AgentRunEvent.event_type.in_(
+            (TOOL_STARTED, TOOL_COMPLETED, TOOL_FAILED)))
+    )).all()
+    merged: Dict[tuple, Dict[str, Any]] = {}
+    order: List[tuple] = []
+    for row_run_id, seq, etype, payload in sorted(
+            ev_rows, key=lambda r: (r.run_id, int(r.sequence))):
+        p = dict(payload or {})
+        tcid = str(p.get("tool_call_id") or "")
+        key = (row_run_id, tcid or f"ev:{seq}")
+        call = merged.get(key)
+        if call is None:
+            call = {
+                "run_id": row_run_id, "tool_call_id": tcid, "seq": int(seq),
+                "tool_name": str(p.get("tool") or "?"),
+                "status": "unknown",
+                "internal": bool(p.get("internal")),
+                "args": p.get("input"),
+            }
+            merged[key] = call
+            order.append(key)
+        if p.get("tool"):
+            call["tool_name"] = str(p["tool"])
+        if etype == TOOL_STARTED:
+            if p.get("input") is not None:
+                call["args"] = p.get("input")
+        elif etype == TOOL_COMPLETED:
+            call["status"] = "succeeded"
+        elif etype == TOOL_FAILED:
+            call["status"] = "failed"
+            if p.get("error"):
+                call["error"] = str(p["error"])[:200]
+    return [merged[k] for k in order]
+
+
 async def _collect_run_facts(db: AsyncSession, run_id: str) -> Dict[str, Any]:
-    """采集单 Run 的客观执行事实（工具链/步数/tokens 等，只读事实表）。"""
+    """采集单 Run 的客观执行事实（工具链/步数/tokens 等，只读事实表）。
+
+    工具链双口径合并：账本（agent_tool_executions，平台工具，权威状态/耗时/参数）
+    + 事件日志（agent_run_events，含 write_file 等内部工具与未入账本的拒绝调用），
+    同 tool_call_id 去重——否则内部工具调用整体漏报，工具链/used_tools/成功率失真。
+    排序：有事件序号的调用按真实执行顺序（事件序号），无事件的账本行按开始时间殿后。
+    """
     run = (await db.execute(
         select(AgentRun).where(AgentRun.id == run_id))).scalar_one_or_none()
     if run is None:
@@ -324,7 +385,11 @@ async def _collect_run_facts(db: AsyncSession, run_id: str) -> Dict[str, Any]:
         select(AgentToolExecution).where(AgentToolExecution.run_id == run_id)
     )).scalars().all()
     rows = sorted(rows, key=lambda r: (r.started_at or r.created_at or datetime.min))
-    tool_chain = []
+    ev_calls = await _collect_event_tool_calls(db, [run_id])
+    ev_by_id = {c["tool_call_id"]: c for c in ev_calls if c["tool_call_id"]}
+
+    ordered: List[tuple] = []
+    matched: set = set()
     for r in rows:
         entry: Dict[str, Any] = {
             "tool_name": r.tool_name,
@@ -341,7 +406,35 @@ async def _collect_run_facts(db: AsyncSession, run_id: str) -> Dict[str, Any]:
             entry["error"] = str(r.error)[:200]
         if r.args_snapshot:
             entry["args"] = str(r.args_snapshot)[:200]
-        tool_chain.append(entry)
+        ev = ev_by_id.get(r.tool_call_id or "")
+        if ev is not None:
+            matched.add(r.tool_call_id)
+            sort_key = (0, ev["seq"])
+            if not entry.get("args") and ev.get("args") is not None:
+                entry["args"] = str(ev["args"])[:200]
+            if ev.get("internal"):
+                entry["internal"] = True
+        else:
+            sort_key = (1, r.started_at or r.created_at or datetime.min)
+        ordered.append((sort_key, entry))
+    # 事件独有调用（内部工具 / 策略拒绝等未入账本的调用）按事件序号并入
+    for c in ev_calls:
+        if c["tool_call_id"] and c["tool_call_id"] in matched:
+            continue
+        entry = {
+            "tool_name": c["tool_name"],
+            "status": c["status"],
+            "attempt_count": 1,
+        }
+        if c.get("internal"):
+            entry["internal"] = True
+        if c.get("args") is not None:
+            entry["args"] = str(c["args"])[:200]
+        if c.get("error"):
+            entry["error"] = c["error"]
+        ordered.append(((0, c["seq"]), entry))
+    ordered.sort(key=lambda kv: kv[0])
+    tool_chain = [e for _, e in ordered]
 
     duration_s = None
     if run.started_at and run.finished_at:
@@ -349,8 +442,9 @@ async def _collect_run_facts(db: AsyncSession, run_id: str) -> Dict[str, Any]:
             duration_s = round((run.finished_at - run.started_at).total_seconds(), 2)
         except Exception:  # noqa: BLE001
             duration_s = None
-    used_tools = sorted({r.tool_name for r in rows})
-    tool_failed = sum(1 for r in rows if r.status != "succeeded")
+    used_tools = sorted({e["tool_name"] for e in tool_chain})
+    tool_failed = sum(1 for e in tool_chain if e["status"] != "succeeded")
+    tool_total = len(tool_chain)
     return {
         "run_status": run.status or "",
         "duration_s": duration_s,
@@ -359,10 +453,10 @@ async def _collect_run_facts(db: AsyncSession, run_id: str) -> Dict[str, Any]:
         "tool_calls": int(run.budget_tool_calls or 0),
         "tokens": int(run.budget_tokens or 0),
         "limit_exceeded": (run.status == "limit_exceeded"),
-        "tool_total": len(rows),
+        "tool_total": tool_total,
         "tool_failed": tool_failed,
-        "tool_success_rate": round((len(rows) - tool_failed) / len(rows), 4)
-        if rows else None,
+        "tool_success_rate": round((tool_total - tool_failed) / tool_total, 4)
+        if tool_chain else None,
         "used_tools": used_tools,
         "tool_chain": tool_chain,
     }
@@ -415,24 +509,54 @@ async def _collect_artifact_text(db: AsyncSession, run_ids: List[str]) -> str:
     工程构建类长程任务的交付物在工作区文件 / 代码执行里而非最终回复文本中，
     评分覆盖交付物才能客观反映构建能力。仅统计 succeeded 的调用（失败尝试
     不算交付物，防止「调了工具但没建成」误判为交付）。
+
+    双口径合并（只读事实表）：
+    - 账本口径：agent_tool_executions 中 succeeded 平台工具的参数快照；
+    - 事件口径：agent_run_events 的 tool_started 输入——write_file/edit_file 等
+      内部工具不经账本，交付物内容只在事件里。
+    同一 tool_call_id 两份内容取更完整（更长）的一份，避免单一口径被截断时
+    约束误判为未达成。
     """
     if not run_ids:
         return ""
     rows = (await db.execute(
-        select(AgentToolExecution.tool_name, AgentToolExecution.args_snapshot)
+        select(AgentToolExecution.tool_name, AgentToolExecution.args_snapshot,
+               AgentToolExecution.tool_call_id)
         .where(AgentToolExecution.run_id.in_(run_ids))
         .where(AgentToolExecution.status == "succeeded")
         .where(AgentToolExecution.tool_name.in_(list(_ARTIFACT_TOOLS)))
     )).all()
-    parts: List[str] = []
-    for tool_name, args in rows:
-        a = dict(args or {})
-        content = a.get("content") or a.get("new_string") or a.get("code") or ""
-        text = str(content)
+    ev_calls = await _collect_event_tool_calls(db, run_ids)
+
+    picked: Dict[str, tuple] = {}  # key -> (label, text)
+    order: List[str] = []
+
+    def _put(key: str, label: str, text: str) -> None:
         if not text.strip():
+            return
+        prev = picked.get(key)
+        if prev is None:
+            picked[key] = (label, text)
+            order.append(key)
+        elif len(text) > len(prev[1]):
+            picked[key] = (label, text)
+
+    for idx, (tool_name, args, tcid) in enumerate(rows):
+        a = dict(args or {})
+        text = str(a.get("content") or a.get("new_string") or a.get("code") or "")
+        label = f"{tool_name} {str(a.get('path') or '').strip()}".strip()
+        _put(tcid or f"ledger:{idx}", label, text)
+    for c in ev_calls:
+        if c["tool_name"] not in _ARTIFACT_TOOLS or c["status"] != "succeeded":
             continue
-        path = str(a.get("path") or "").strip()
-        label = f"{tool_name} {path}".strip()
+        a = dict(c.get("args") or {})
+        text = str(a.get("content") or a.get("new_string") or a.get("code") or "")
+        label = f"{c['tool_name']} {str(a.get('path') or '').strip()}".strip()
+        _put(c["tool_call_id"] or f"ev:{c['run_id']}:{c['seq']}", label, text)
+
+    parts: List[str] = []
+    for key in order:
+        label, text = picked[key]
         parts.append(f"\n\n[交付物: {label}]\n{text}")
     return "".join(parts)
 
@@ -542,6 +666,8 @@ async def _execute_item(
             expected=snap_expected,
             criteria=snap_criteria,
             actual_output=score_text,
+            # 最终回答原文：constraint 长度约束区分口径（min 测合并、max 仅测回答）
+            output_text=actual_output or "",
         )
 
         # 工具能力客观校验：要求工具未被调用 / 禁用工具却被调用即判不通过（可用配置关闭）
