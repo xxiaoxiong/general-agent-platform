@@ -12,6 +12,8 @@ export interface SkillItem {
   description: string
   version: string
   body: string
+  // 附属文件（标准 Skill 形态）：{相对 POSIX 路径: 文本内容}
+  files?: Record<string, string>
   enabled: boolean
   agent_ids: number[] | null // null=全局注入；[] = 不注入；[1,2]=仅指定 Agent
   scope: string

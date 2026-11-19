@@ -42,7 +42,7 @@ $projectId = $project.id
 Write-Host ("project: " + $projectId)
 
 # 5) API keys (secret shown only once, at creation)
-$key = Invoke-Trpc -Proc "projectApiKeys.create" -Json ('{"projectId":"' + $projectId + '","note":"general-agent-platform backend"}')
+$key = Invoke-Trpc -Proc "projectApiKeys.create" -Json ('{"projectId":"' + $projectId + '","note":"ai-generalplat backend"}')
 Write-Host ("PUBLIC_KEY=" + $key.publicKey)
 Write-Host ("SECRET_KEY=" + $key.secretKey)
 Write-Host "PROVISION_DONE"

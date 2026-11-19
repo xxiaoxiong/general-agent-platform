@@ -4,8 +4,10 @@
       <div>
         <h2>技能管理</h2>
         <p class="page-desc">
-          技能 = 可复用指令（SKILL.md），按 Agent 绑定注入 <code>/skills/**</code> 供模型按需加载；
-          技能只做指令注入，不携带任何工具授权（工具面由能力包与安全策略决定）。
+          技能 = 可复用指令（SKILL.md）+ 附属文件（scripts/、references/ 等，标准 Skill 多文件形态），
+          按 Agent 绑定注入 <code>/skills/**</code> 供模型按需加载；
+          技能只做文件注入，不携带任何工具授权（工具面由能力包与安全策略决定）；
+          附属脚本的执行需要沙箱（execute 能力），无执行能力时脚本可被读取作参考。
         </p>
       </div>
       <el-button type="primary" @click="openCreate">
@@ -22,6 +24,14 @@
       </el-table-column>
       <el-table-column prop="description" label="描述" min-width="180" show-overflow-tooltip />
       <el-table-column prop="version" label="版本" width="80" />
+      <el-table-column label="附属文件" width="90">
+        <template #default="{ row }">
+          <el-tag v-if="Object.keys(row.files || {}).length" size="small" type="info">
+            {{ Object.keys(row.files || {}).length }} 个
+          </el-tag>
+          <el-text v-else type="info" size="small">无</el-text>
+        </template>
+      </el-table-column>
       <el-table-column label="注入范围" width="150">
         <template #default="{ row }">
           <el-tag v-if="!row.managed" size="small" type="info">全局（内置）</el-tag>
@@ -88,6 +98,31 @@
             placeholder="YAML frontmatter（name/description/version）+ Markdown 正文；缺 frontmatter 时自动生成"
           />
         </el-form-item>
+        <el-form-item label="附属文件">
+          <div class="file-list">
+            <div v-for="(f, i) in fileRows" :key="i" class="file-row">
+              <el-input
+                v-model="f.path"
+                placeholder="相对路径，如 scripts/hello.py 或 references/guide.md"
+                class="file-path"
+              />
+              <el-input
+                v-model="f.content"
+                type="textarea"
+                :rows="4"
+                placeholder="文件文本内容（脚本/引用文档等）"
+              />
+              <el-button size="small" type="danger" text @click="fileRows.splice(i, 1)">删除</el-button>
+            </div>
+            <el-button size="small" @click="fileRows.push({ path: '', content: '' })">
+              <el-icon><Plus /></el-icon>添加附属文件
+            </el-button>
+            <div class="file-hint">
+              标准 Skill 形态：SKILL.md 里可引用这些文件（如 scripts/xxx.py）；
+              单文件 ≤ 256KB、单技能总量 ≤ 1MB、最多 50 个；路径禁止 ..、绝对路径与覆盖 SKILL.md。
+            </div>
+          </div>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
@@ -112,6 +147,13 @@ const dialogVisible = ref(false)
 const editingId = ref<number | null>(null)
 const bindMode = ref<'global' | 'agents' | 'none'>('global')
 const form = ref<Partial<SkillItem>>({})
+// 附属文件编辑行（提交时转 Record<string, string>）
+const fileRows = ref<{ path: string; content: string }[]>([])
+
+// 与后端 skills.py 注入上限同口径（仅提示用，后端为准）
+const MAX_FILE_BYTES = 256 * 1024
+const MAX_TOTAL_BYTES = 1024 * 1024
+const MAX_FILE_COUNT = 50
 
 async function load() {
   loading.value = true
@@ -126,6 +168,7 @@ function openCreate() {
   editingId.value = null
   bindMode.value = 'global'
   form.value = { name: '', description: '', version: '1.0', body: '', enabled: true, agent_ids: null }
+  fileRows.value = []
   dialogVisible.value = true
 }
 
@@ -133,13 +176,49 @@ function openEdit(row: any) {
   editingId.value = row.id
   bindMode.value = row.agent_ids === null ? 'global' : row.agent_ids.length ? 'agents' : 'none'
   form.value = { ...row, agent_ids: row.agent_ids ? [...row.agent_ids] : null }
+  fileRows.value = Object.entries(row.files || {}).map(([path, content]) => ({ path, content: String(content) }))
   dialogVisible.value = true
+}
+
+function buildFiles(): Record<string, string> | null {
+  const files: Record<string, string> = {}
+  const rows = fileRows.value.filter((f) => f.path.trim() || f.content)
+  if (rows.length > MAX_FILE_COUNT) {
+    ElMessage.warning(`附属文件数量超限（最多 ${MAX_FILE_COUNT} 个）`)
+    return null
+  }
+  let total = 0
+  for (const f of rows) {
+    const path = f.path.trim()
+    if (!path) {
+      ElMessage.warning('附属文件路径不能为空')
+      return null
+    }
+    if (path === 'SKILL.md' || path.includes('..') || path.startsWith('/') || path.includes('\\')) {
+      ElMessage.warning(`附属文件路径非法: ${path}`)
+      return null
+    }
+    const size = new TextEncoder().encode(f.content).length
+    if (size > MAX_FILE_BYTES) {
+      ElMessage.warning(`附属文件超出单文件上限（256KB）: ${path}`)
+      return null
+    }
+    total += size
+    files[path] = f.content
+  }
+  if (total > MAX_TOTAL_BYTES) {
+    ElMessage.warning('附属文件总量超限（1MB）')
+    return null
+  }
+  return files
 }
 
 async function handleSave() {
   if (!form.value.name) return ElMessage.warning('请填写技能名称')
+  const files = buildFiles()
+  if (files === null) return
   const agent_ids = bindMode.value === 'global' ? null : bindMode.value === 'none' ? [] : (form.value.agent_ids || [])
-  const payload = { ...form.value, agent_ids }
+  const payload = { ...form.value, agent_ids, files }
   saving.value = true
   try {
     if (editingId.value) {
@@ -206,5 +285,23 @@ onMounted(async () => {
 .mt-8 {
   margin-top: 8px;
   width: 100%;
+}
+.file-list {
+  width: 100%;
+}
+.file-row {
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 8px;
+  margin-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.file-hint {
+  margin-top: 6px;
+  color: #9ca3af;
+  font-size: 12px;
+  line-height: 1.6;
 }
 </style>

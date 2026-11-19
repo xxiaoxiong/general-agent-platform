@@ -1937,16 +1937,24 @@ class AgentRuntimeService:
             return await load_mcp_runtime(db, agent_id, agent_config)
 
     async def _skill_files(self, db, agent_id: Optional[int]) -> Dict[str, Any]:
-        """技能注入：内置/目录技能（全局）+ 管理面 DB 技能（Agent 级绑定过滤）。"""
+        """技能注入：内置/目录技能（全局）+ 管理面 DB 技能（Agent 级绑定过滤）。
+
+        同名技能 DB **整目录覆盖** registry（不是只覆盖 SKILL.md 的杂交残留）：
+        先剔除 registry 中 /skills/<name>/ 前缀的键，再合并 DB 技能文件。
+        """
         from sqlalchemy import select
 
         from app.models.skill import Skill
 
-        from .skills import SkillRegistry, db_files_payload
+        from .skills import SkillRegistry, db_enabled_names, db_files_payload
 
         registry = SkillRegistry.from_settings()
         files = registry.files_payload()
         rows = (await db.execute(select(Skill))).scalars().all()
+        for name in db_enabled_names(rows, agent_id):
+            prefix = f"/skills/{name}/"
+            for key in [k for k in files if k.startswith(prefix)]:
+                del files[key]
         files.update(db_files_payload(rows, agent_id))
         return {"files": files} if files else {}
 

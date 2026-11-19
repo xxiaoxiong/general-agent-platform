@@ -1,7 +1,9 @@
 """Skill 管理模型（扩展性治理：技能管理模块）。
 
-Skill = 指令文本（SKILL.md：YAML frontmatter + 正文），只做 prompt 注入，
-不携带工具授权（工具面始终由 Capability Registry / ToolPolicy 决定）。
+Skill = SKILL.md 指令文本（YAML frontmatter + 正文）+ 附属文件
+（scripts/、references/ 等，标准 Agent Skills 多文件形态），只做
+/skills/** 文件注入，不携带工具授权（工具面始终由 Capability Registry /
+ToolPolicy 决定）。
 
 - 内置（builtin）与目录（AGENT_SKILLS_DIR）技能仍由 SkillRegistry 提供；
 - 本表承载**管理面创建的技能**（API 增删改查 + 启停 + Agent 级绑定）；
@@ -23,6 +25,9 @@ class Skill(Base):
     version = Column(String(20), default="1.0")
     # SKILL.md 全文（frontmatter + 正文）；frontmatter 缺失时服务层自动补齐
     body = Column(Text, nullable=False)
+    # 附属文件（标准 Agent Skills 形态）：{相对 POSIX 路径: 文本内容}，None = 无；
+    # 路径由 validate_skill_relpath 校验（禁 .. / 绝对路径 / 覆盖 SKILL.md）
+    files = Column(JSON, nullable=True, default=None)
     # 启用状态（禁用后不再注入任何 Agent）
     enabled = Column(Boolean, default=True, nullable=False)
     # Agent 级绑定：None = 全局注入（默认）；[] = 不注入任何 Agent；[1,2] = 仅注入指定 Agent
