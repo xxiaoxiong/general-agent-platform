@@ -735,7 +735,8 @@ async def export_markdown(run_id: int,
             f"（使用：{used}）"
             + (f"，未用必需工具：{missing}" if missing else ""),
             f"- 输出规模：{st.get('output_chars', '—')} 字；"
-            f"轮次：{st.get('turns_count', 1)}",
+            f"轮次：{st.get('turns_count', 1)}"
+            + (f"；交付物：{st.get('artifact_chars')} 字" if st.get('artifact_chars') else ""),
             f"- Run：{it.run_id or '—'}",
             "",
         ]

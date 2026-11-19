@@ -104,7 +104,12 @@ def execute_python_exec(params: dict) -> ToolResult:
     不是安全沙箱 —— 能力边界如实标注（任务书 §0.2）。
     """
     code = params.get("code", "").strip()
-    timeout_sec = min(int(params.get("timeout", 5)), 10)
+    # timeout 由模型生成，可能为 null/非数字：容错回退默认值（否则 int(None) 直接炸掉整次调用）
+    try:
+        timeout_sec = int(params.get("timeout") or 5)
+    except (TypeError, ValueError):
+        timeout_sec = 5
+    timeout_sec = min(timeout_sec, 10)
 
     if not code:
         return ToolResult.failed("错误：代码为空")

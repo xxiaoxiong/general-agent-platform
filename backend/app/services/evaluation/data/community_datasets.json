@@ -2340,7 +2340,8 @@
                 "value": "待补充"
               }
             ],
-            "pass_mode": "all"
+            "pass_mode": "all",
+            "include_artifacts": true
           },
           "metadata": {},
           "complexity": "L3",
@@ -2395,7 +2396,8 @@
                 "value": "待补充"
               }
             ],
-            "pass_mode": "all"
+            "pass_mode": "all",
+            "include_artifacts": true
           },
           "metadata": {},
           "complexity": "L4",
@@ -2451,7 +2453,8 @@
                 "value": "待补充"
               }
             ],
-            "pass_mode": "all"
+            "pass_mode": "all",
+            "include_artifacts": true
           },
           "metadata": {},
           "complexity": "L3",
@@ -2510,7 +2513,8 @@
                 "value": "待补充"
               }
             ],
-            "pass_mode": "all"
+            "pass_mode": "all",
+            "include_artifacts": true
           },
           "metadata": {},
           "complexity": "L4",
@@ -2566,7 +2570,8 @@
                 "value": "待补充"
               }
             ],
-            "pass_mode": "all"
+            "pass_mode": "all",
+            "include_artifacts": true
           },
           "metadata": {},
           "complexity": "L3",
@@ -2622,7 +2627,8 @@
                 "value": "待补充"
               }
             ],
-            "pass_mode": "all"
+            "pass_mode": "all",
+            "include_artifacts": true
           },
           "metadata": {},
           "complexity": "L4",
@@ -2677,7 +2683,8 @@
                 "value": "待补充"
               }
             ],
-            "pass_mode": "all"
+            "pass_mode": "all",
+            "include_artifacts": true
           },
           "metadata": {},
           "complexity": "L4",

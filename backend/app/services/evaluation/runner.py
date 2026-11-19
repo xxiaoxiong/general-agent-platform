@@ -405,6 +405,38 @@ def _merge_turn_facts(turn_stats: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+# 交付物类工具：其成功调用的参数即 Agent 实际产出的交付物内容
+_ARTIFACT_TOOLS = ("write_file", "edit_file", "python_exec", "execute")
+
+
+async def _collect_artifact_text(db: AsyncSession, run_ids: List[str]) -> str:
+    """采集用例交付物（纯客观）：文件工具写入内容 + 成功执行的代码脚本。
+
+    工程构建类长程任务的交付物在工作区文件 / 代码执行里而非最终回复文本中，
+    评分覆盖交付物才能客观反映构建能力。仅统计 succeeded 的调用（失败尝试
+    不算交付物，防止「调了工具但没建成」误判为交付）。
+    """
+    if not run_ids:
+        return ""
+    rows = (await db.execute(
+        select(AgentToolExecution.tool_name, AgentToolExecution.args_snapshot)
+        .where(AgentToolExecution.run_id.in_(run_ids))
+        .where(AgentToolExecution.status == "succeeded")
+        .where(AgentToolExecution.tool_name.in_(list(_ARTIFACT_TOOLS)))
+    )).all()
+    parts: List[str] = []
+    for tool_name, args in rows:
+        a = dict(args or {})
+        content = a.get("content") or a.get("new_string") or a.get("code") or ""
+        text = str(content)
+        if not text.strip():
+            continue
+        path = str(a.get("path") or "").strip()
+        label = f"{tool_name} {path}".strip()
+        parts.append(f"\n\n[交付物: {label}]\n{text}")
+    return "".join(parts)
+
+
 async def _execute_item(
     db: AsyncSession,
     eval_run_id: int,
@@ -493,6 +525,15 @@ async def _execute_item(
         else:
             judge_input = snap_input
 
+        # 交付物评分口径：工程构建类用例（include_artifacts）把工具交付物
+        # （文件写入内容 / 成功执行的代码）并入评分文本，评分覆盖真实交付物
+        artifact_text = ""
+        if snap_config.get("include_artifacts"):
+            artifact_text = await _collect_artifact_text(
+                db, [str(t.get("run_id")) for t in turn_stats if t.get("run_id")])
+        stats["artifact_chars"] = len(artifact_text)
+        score_text = (actual_output or "") + artifact_text
+
         result = await score_output(
             db,
             method=snap_method,
@@ -500,7 +541,7 @@ async def _execute_item(
             input_text=judge_input,
             expected=snap_expected,
             criteria=snap_criteria,
-            actual_output=actual_output,
+            actual_output=score_text,
         )
 
         # 工具能力客观校验：要求工具未被调用 / 禁用工具却被调用即判不通过（可用配置关闭）

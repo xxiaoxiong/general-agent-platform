@@ -349,7 +349,8 @@ class _FakeRuntime:
     """假 Runtime：起 Run 时直接落 AgentRun 行并返回即完成的事件流。
 
     - final_texts: 用户消息 → final_text（按当前轮 user_message 匹配）；
-    - tool_calls: 用户消息 → [工具名]，落 AgentToolExecution 事实行（可表征工具使用）；
+    - tool_calls: 用户消息 → [工具名 | (工具名, args)]，落 AgentToolExecution 事实行
+      （可表征工具使用；带 args 时写入 args_snapshot，供交付物采集）；
     - steps: 每 Run 的 budget_steps（默认 1）。
     """
 
@@ -380,10 +381,12 @@ class _FakeRuntime:
                 status="completed", final_text=final_text,
                 budget_steps=self.steps, budget_model_calls=self.steps,
                 budget_tool_calls=len(tools), budget_tokens=10))
-            for i, name in enumerate(tools):
+            for i, t in enumerate(tools):
+                name, args = (t, None) if isinstance(t, str) else t
                 s.add(AgentToolExecution(
                     run_id=run_id, tool_call_id=f"call-{i}", tool_name=name,
-                    status="succeeded", attempt_count=1))
+                    status="succeeded", attempt_count=1,
+                    args_snapshot=dict(args) if args else None))
             await s.commit()
         return run_id, None, _FakeStream([{"type": "done", "status": "completed"}])
 
@@ -650,6 +653,90 @@ class TestComplexityAndCapability:
         assert item.passed is False
         assert "forbid_tools" not in item.stats   # 统计不含配置键
         assert item.score_detail["capability"]["forbid_tools"] is True
+
+    @pytest.mark.asyncio
+    async def test_include_artifacts_scoring(self, monkeypatch):
+        """工程构建类用例：评分覆盖工具交付物（文件写入内容 / 成功执行的代码）。"""
+        from app.services.evaluation.runner import create_eval_run, execute_eval_run
+
+        # 最终回复只是交付总结，真正交付物（代码）在工具调用里
+        fake = _FakeRuntime(
+            final_texts={"构建任务库": "构建完成，交付物见工作区文件。"},
+            tool_calls={"构建任务库": [
+                ("python_exec", {"code": "def add_task():\n    return 1\n"}),
+            ]})
+        _fake_runtime_module(monkeypatch, fake)
+        ds_id, agent_id = await _mk_complex_dataset_and_agent([{
+            "input": "构建任务库",
+            "scoring_method": "constraint",
+            "scoring_config": {
+                "constraints": [{"type": "regex", "pattern": "def\\s+add_task"}],
+                "include_artifacts": True,
+            },
+        }])
+        async with AsyncSessionLocal() as s:
+            run = await create_eval_run(
+                s, name="交付物评分", dataset_id=ds_id, agent_id=agent_id,
+                created_by=None, config={})
+            run_id = run.id
+        await execute_eval_run(run_id)
+        async with AsyncSessionLocal() as s:
+            item = (await s.execute(select(EvalRunItem).where(
+                EvalRunItem.eval_run_id == run_id))).scalars().one()
+        assert item.passed is True
+        assert (item.stats or {}).get("artifact_chars", 0) > 0
+        # 不含交付物口径时同一输出不通过（交付物不在最终回复文本中）
+        ds2_id, _ = await _mk_complex_dataset_and_agent([{
+            "input": "构建任务库",
+            "scoring_method": "constraint",
+            "scoring_config": {
+                "constraints": [{"type": "regex", "pattern": "def\\s+add_task"}],
+            },
+        }])
+        async with AsyncSessionLocal() as s:
+            run2 = await create_eval_run(
+                s, name="纯文本评分", dataset_id=ds2_id, agent_id=agent_id,
+                created_by=None, config={})
+            run2_id = run2.id
+        await execute_eval_run(run2_id)
+        async with AsyncSessionLocal() as s:
+            item2 = (await s.execute(select(EvalRunItem).where(
+                EvalRunItem.eval_run_id == run2_id))).scalars().one()
+        assert item2.passed is False
+        assert (item2.stats or {}).get("artifact_chars") == 0
+
+    @pytest.mark.asyncio
+    async def test_collect_artifact_text_excludes_failed(self):
+        """交付物采集只统计 succeeded 调用：失败的工具尝试不算交付物。"""
+        from app.services.evaluation.runner import _collect_artifact_text
+
+        run_id = f"evalfake-{uuid.uuid4().hex[:12]}"
+        async with AsyncSessionLocal() as s:
+            agent = Agent(name=f"agent-{uuid.uuid4().hex[:8]}",
+                          system_prompt="t", tools=[], is_active=True)
+            s.add(agent)
+            await s.flush()
+            s.add(AgentRun(
+                id=run_id, agent_id=agent.id, thread_id=f"t-{run_id}",
+                status="completed", final_text="x"))
+            s.add(AgentToolExecution(
+                run_id=run_id, tool_call_id="c1", tool_name="write_file",
+                status="succeeded", attempt_count=1,
+                args_snapshot={"path": "/workspace/a.py", "content": "def ok(): pass"}))
+            s.add(AgentToolExecution(
+                run_id=run_id, tool_call_id="c2", tool_name="python_exec",
+                status="failed", attempt_count=1,
+                args_snapshot={"code": "def broken(): pass"}))
+            s.add(AgentToolExecution(
+                run_id=run_id, tool_call_id="c3", tool_name="python_exec",
+                status="succeeded", attempt_count=1,
+                args_snapshot={"code": "print('built')"}))
+            await s.commit()
+            text = await _collect_artifact_text(s, [run_id])
+        assert "def ok(): pass" in text
+        assert "print('built')" in text
+        assert "def broken(): pass" not in text
+        assert "/workspace/a.py" in text
 
     def test_aggregate_layers(self):
         from app.services.evaluation.runner import compute_aggregate

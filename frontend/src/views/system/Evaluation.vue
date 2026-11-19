@@ -522,6 +522,7 @@
           <span>Tokens：{{ currentItem.stats?.tokens ?? '-' }}</span>
           <span>耗时：{{ currentItem.stats?.duration_s ?? '-' }}s</span>
           <span>输出字数：<b>{{ currentItem.stats?.output_chars ?? '-' }}</b></span>
+          <span v-if="currentItem.stats?.artifact_chars">交付物字数：<b>{{ currentItem.stats.artifact_chars }}</b></span>
           <span v-if="currentItem.stats?.turns_count">轮次：{{ currentItem.stats.turns_count }}</span>
           <span>工具成功率：{{ currentItem.stats?.tool_success_rate != null ? pct(currentItem.stats.tool_success_rate) : '-' }}</span>
           <span>使用工具：{{ (currentItem.stats?.used_tools || []).join('、') || '无' }}</span>

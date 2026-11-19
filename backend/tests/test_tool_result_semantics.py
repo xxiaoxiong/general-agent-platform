@@ -504,3 +504,13 @@ async def test_smtp_does_not_block_event_loop(monkeypatch):
     gaps = [b - a for a, b in zip(ticks, ticks[1:])]
     assert gaps, "ticker 未运行"
     assert max(gaps) < 0.15, f"SMTP 同步调用阻塞了事件循环（Heartbeat）: max gap={max(gaps):.3f}s"
+
+
+def test_python_exec_timeout_coercion():
+    """python_exec 的 timeout 由模型生成（可能为 null/非数字）：
+    不得 int(None) 崩溃，应回退默认超时（长程测评暴露的工具缺陷）。"""
+    from app.services.tools.code_tools import execute_python_exec
+
+    for timeout in (None, "abc", 3):
+        r = execute_python_exec({"code": "print(7)", "timeout": timeout})
+        assert r.status == STATUS_SUCCEEDED, f"timeout={timeout!r} 应回退默认值执行成功: {r.error}"
