@@ -255,7 +255,7 @@ def trace_url(run_id: str) -> Optional[str]:
 @contextmanager
 def platform_span(name: str, *, run_id: str = "", trace_id: Optional[str] = None,
                   attributes: Optional[Dict[str, Any]] = None,
-                  input: Any = None, output: Any = None):
+                  input: Any = None, output: Any = None, record_exception_detail: bool = True):
     """平台级 Span（P1-03）：排队 / Claim / Lease / 审批 / 恢复 / 写回等阶段。
 
     - 未配置 Langfuse 或 Span 基础设施异常：退化为无操作上下文，绝不影响执行；
@@ -293,7 +293,13 @@ def platform_span(name: str, *, run_id: str = "", trace_id: Optional[str] = None
             yield span
         except BaseException as e:  # noqa: BLE001 业务异常原样传播，仅标记
             with contextlib.suppress(Exception):
-                span.update(output={"error": str(e)[:200]}, level="ERROR")
+                if type(e).__name__ != "GraphInterrupt":
+                    detail = str(e)[:200] if record_exception_detail else type(e).__name__
+                    span.update(output={"error": detail}, level="ERROR")
+            if not record_exception_detail:
+                # 正常退出 SDK 上下文，避免下层自动记录原始异常及其正文。
+                with contextlib.suppress(Exception):
+                    stack.close()
             raise
         if output is not None:
             try:

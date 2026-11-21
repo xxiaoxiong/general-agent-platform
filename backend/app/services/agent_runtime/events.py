@@ -40,6 +40,7 @@ SUBAGENT_STARTED = "subagent_started"
 SUBAGENT_COMPLETED = "subagent_completed"
 APPROVAL_REQUIRED = "approval_required"
 RUN_WAITING_APPROVAL = "run_waiting_approval"
+RUN_WAITING_INPUT = "run_waiting_input"
 STATE_CHANGED = "state_changed"
 RUN_COMPLETED = "run_completed"
 RUN_FAILED = "run_failed"
@@ -56,7 +57,8 @@ RUN_RECOVERING = "run_recovering"
 # 流边界事件：消费者收到即结束本次事件流（Run 可能稍后由其他 Worker 恢复，
 # 恢复后的执行产生新的事件流）。任务书 §12.2：SSE 消费者必须能终止。
 TERMINAL_EVENTS = (
-    RUN_COMPLETED, RUN_FAILED, RUN_CANCELLED, RUN_WAITING_APPROVAL, RUN_SUSPENDED,
+    RUN_COMPLETED, RUN_FAILED, RUN_CANCELLED, RUN_WAITING_APPROVAL,
+    RUN_WAITING_INPUT, RUN_SUSPENDED,
 )
 
 
@@ -130,17 +132,17 @@ def _mask_text(text: str) -> str:
     return text
 
 
-def _redact(value: Any, max_len: Optional[int]) -> Any:
+def _redact(value: Any, max_len: Optional[int], max_items: Optional[int] = 20) -> Any:
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
             if isinstance(k, str) and _SENSITIVE_KEY_RE.search(k):
                 out[k] = "***"
             else:
-                out[k] = _redact(v, max_len)
+                out[k] = _redact(v, max_len, max_items)
         return out
     if isinstance(value, list):
-        return [_redact(v, max_len) for v in value[:20]]
+        return [_redact(v, max_len, max_items) for v in value[:max_items]]
     if isinstance(value, str):
         text = _mask_text(value)
         if max_len is not None and len(text) > max_len:
@@ -262,9 +264,10 @@ class LegacyEventAdapter:
         if t == STATE_CHANGED:
             return []
 
-        if t == RUN_WAITING_APPROVAL:
+        if t in (RUN_WAITING_APPROVAL, RUN_WAITING_INPUT):
             out = self._ensure_final_start()
-            out.append({"type": "done", "status": "waiting_approval", "run_id": self.run_id})
+            status = "waiting_input" if t == RUN_WAITING_INPUT else "waiting_approval"
+            out.append({"type": "done", "status": status, "run_id": self.run_id})
             self.finished = True
             return out
 
@@ -403,22 +406,35 @@ class EventBus:
         self.trace_id = trace_id
 
     @staticmethod
+    async def persist_in_transaction(ev: RuntimeEvent, db) -> int:
+        """持久化与暂停或恢复状态必须原子提交的事件。"""
+        from .repositories import EventRepository
+
+        # 输入 schema 属于前端协议字段，递归脱敏会改变属性名和枚举。
+        # 提交值仅持久化至请求记录，不进入任何事件。
+        if ev.type == "input.required":
+            payload = {**ev.data, "prompt": redact_sensitive(ev.data.get("prompt", ""), 4000)}
+        elif ev.type == "document.profile_draft.created":
+            # 规范草稿须可完整编辑与确认，保留 Schema 允许的章节与说明。
+            payload = _redact(ev.data, max_len=None, max_items=None)
+        elif ev.type in {"document.edit.review_required", "document.edit.reviewed"}:
+            # 全部操作锚点需与等待输入的枚举一致，正文由鉴权后的审阅接口读取。
+            payload = _redact(ev.data, max_len=400, max_items=None)
+        else:
+            payload = redact_sensitive(ev.data or {}, max_len=_persist_max_len(ev.type))
+        return await EventRepository(db).append(
+            ev.run_id, ev.type, payload, thread_id=ev.thread_id or ""
+        )
+
+    @staticmethod
     async def _persist(ev: RuntimeEvent) -> int:
         """持久化事件并返回分配的 run 内序号（失败向上抛出 PersistenceError）。"""
         from app.core.database import AsyncSessionLocal
-        from .repositories import EventRepository, PersistenceError
+        from .repositories import PersistenceError
 
-        # 脱敏入库：密钥遮蔽一律保留；文本型事件与工具调用证据按大上限入库
-        # （模型增量/最终结果截断会丢失文本 FR-09.5；工具 args 截断会丢失执行
-        # 证据——评测交付物采集/约束判定失真），其余事件 400 上限防表膨胀
-        max_len = _persist_max_len(ev.type)
-        payload = redact_sensitive(ev.data or {}, max_len=max_len)
         try:
             async with AsyncSessionLocal() as db:
-                seq = await EventRepository(db).append(
-                    ev.run_id, ev.type, payload,
-                    thread_id=ev.thread_id or "",
-                )
+                seq = await EventBus.persist_in_transaction(ev, db)
                 await db.commit()
             return seq
         except PersistenceError:
@@ -465,6 +481,10 @@ class EventBus:
         else:
             self._seq += 1
             ev.sequence = self._seq
+        self._notify(ev)
+
+    def notify_persisted(self, ev: RuntimeEvent) -> None:
+        """提交跨表事务后唤醒消费者。"""
         self._notify(ev)
 
     def _notify(self, ev: RuntimeEvent) -> None:

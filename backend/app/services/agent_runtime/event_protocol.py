@@ -39,12 +39,14 @@ V2_EVENT_NAMES: Dict[str, str] = {
     "subagent_completed": "subagent.completed",
     "approval_required": "approval.required",
     "run_waiting_approval": "run.status_changed",
+    "run_waiting_input": "run.status_changed",
     "run_completed": "run.completed",
     "run_failed": "run.failed",
     "run_cancelled": "run.cancelled",
     "run_suspended": "run.suspended",
     # Phase 4 预留（Verification / Retry-Recovery）：
     "run_retrying": "run.retrying",
+    "document_retry_queued": "run.retrying",
     "run_recovering": "run.recovering",
     "verification_started": "verification.started",
     "verification_completed": "verification.completed",
@@ -58,7 +60,7 @@ V2_TERMINAL_EVENTS = frozenset(
 )
 
 # run.status_changed 中终止流的状态（暂停等待人工输入）
-_V2_BOUNDARY_STATUSES = frozenset({"waiting_approval", "needs_reconciliation"})
+_V2_BOUNDARY_STATUSES = frozenset({"waiting_approval", "waiting_input", "needs_reconciliation"})
 
 
 def _iso(ts: Optional[datetime]) -> str:
@@ -103,6 +105,8 @@ def _reshape_data(name: str, event_type: str, payload: Dict[str, Any]) -> Dict[s
         data = {"status": payload.get("status") or "waiting_approval"}
         if payload.get("actions") is not None:
             data["actions"] = payload.get("actions")
+        if payload.get("request_id") is not None:
+            data["request_id"] = payload["request_id"]
         return data
     if name == "run.completed":
         data = {"final_text": payload.get("final_text")}
@@ -110,7 +114,10 @@ def _reshape_data(name: str, event_type: str, payload: Dict[str, Any]) -> Dict[s
             data["summary"] = payload.get("summary")
         return data
     if name == "run.failed":
-        return {"error": payload.get("error") or "运行失败", "status": payload.get("status", "failed")}
+        data = {"error": payload.get("error") or "运行失败", "status": payload.get("status", "failed")}
+        if payload.get("document_retryable"):
+            data["document_retryable"] = True
+        return data
     if name == "run.suspended":
         return {"reason": payload.get("reason"), "status": payload.get("status", "suspended")}
     return dict(payload)
@@ -141,10 +148,10 @@ def is_terminal(envelope: Dict[str, Any]) -> bool:
     """v2 事件是否为流边界（消费者应终止本次 SSE）。"""
     name = envelope.get("event")
     if name in V2_TERMINAL_EVENTS:
-        return True
+        return not (envelope.get("data") or {}).get("historical")
     if name == "run.status_changed":
-        status = (envelope.get("data") or {}).get("status")
-        return status in _V2_BOUNDARY_STATUSES
+        data = envelope.get("data") or {}
+        return not data.get("historical") and data.get("status") in _V2_BOUNDARY_STATUSES
     return False
 
 
@@ -156,6 +163,7 @@ def synthetic_terminal_from_status(run_id: str, status: str, *, error: Optional[
         "limit_exceeded": "run.failed",
         "cancelled": "run.cancelled",
         "waiting_approval": "run.status_changed",
+        "waiting_input": "run.status_changed",
         "needs_reconciliation": "run.status_changed",
     }
     name = mapping.get(status, "run.suspended")
@@ -195,8 +203,12 @@ async def replay_events_v2(
     - 运行未终结时轮询新事件直至终止事件/终态合成（§12.2：消费者必然终止）。
     """
     from .repositories import EventRepository, RunRepository
+    from .document_retry import latest_document_retry_seq
     from .events import wait_wakeup
-    from .lifecycle import TERMINAL_STATUSES, STATUS_WAITING_APPROVAL, STATUS_NEEDS_RECONCILIATION
+    from .lifecycle import (
+        TERMINAL_STATUSES, STATUS_WAITING_APPROVAL, STATUS_WAITING_INPUT,
+        STATUS_NEEDS_RECONCILIATION,
+    )
 
     from app.core.database import AsyncSessionLocal
 
@@ -216,6 +228,9 @@ async def replay_events_v2(
     while True:
         async with AsyncSessionLocal() as db:
             rows = await EventRepository(db).list_after(run_id, db_seq)
+            retry_sequence = await latest_document_retry_seq(db, run_id) if any(
+                row.event_type == "run_failed" for row in rows
+            ) else 0
         if rows:
             for row in rows:
                 db_seq = row.sequence
@@ -227,7 +242,22 @@ async def replay_events_v2(
                     timestamp=row.created_at,
                     trace_id=run_id,
                 )
+                if envelope["event"] == "run.failed" and row.sequence < retry_sequence:
+                    envelope["data"]["historical"] = True
                 if _visible(envelope):
+                    if (
+                        envelope["event"] == "run.status_changed"
+                        and envelope["data"].get("status") == STATUS_WAITING_INPUT
+                    ):
+                        from .run_input import pending_input_payload
+
+                        async with AsyncSessionLocal() as db:
+                            current_pending = await pending_input_payload(db, run_id)
+                        if (
+                            current_pending is None
+                            or current_pending["request_id"] != envelope["data"].get("request_id")
+                        ):
+                            envelope["data"]["historical"] = True
                     yield envelope
                 if is_terminal(envelope):
                     return
@@ -240,7 +270,7 @@ async def replay_events_v2(
                 yield synthetic_terminal_from_status(run_id, "failed", error="运行不存在")
             return
         if run_row.status in TERMINAL_STATUSES or run_row.status in (
-            STATUS_WAITING_APPROVAL, STATUS_NEEDS_RECONCILIATION,
+            STATUS_WAITING_APPROVAL, STATUS_WAITING_INPUT, STATUS_NEEDS_RECONCILIATION,
         ):
             last_seq = int(getattr(run_row, "last_event_seq", 0) or 0)
             resuming = after_seq is not None and last_seq > 0 and db_seq >= last_seq
@@ -262,6 +292,8 @@ async def replay_events_v2(
             # 终态已提交但终止事件行尚未落库的间隙：先给一轮唤醒窗口等待真实
             # 终止事件（§12.2 终止事件必须带最终回答/最终状态），仍缺失才
             # 按状态合成兜底（合成事件缺 final_text，仅防消费端挂死）
+            if run_row.status == STATUS_WAITING_INPUT and db_seq >= last_seq and after_seq is not None:
+                return
             if not synth_graced:
                 synth_graced = True
                 await wait_wakeup(run_id, poll)

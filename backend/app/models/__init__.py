@@ -10,6 +10,9 @@ from app.models.evolution import AgentEvaluation, EvolutionReport, EvolutionChan
 from app.models.skill import Skill
 from app.models.mcp_server import MCPServer
 from app.models.evaluation import EvalDataset, EvalDatasetItem, EvalRun, EvalRunItem
+from app.models.document import (
+    DocumentAsset, DocumentProfile, DocumentProfileVersion, DocumentVersion, RunInputRequest,
+)
 
 __all__ = [
     "User", "Role", "Permission", "UserRole", "RolePermission",
@@ -23,4 +26,5 @@ __all__ = [
     "AgentEvaluation", "EvolutionReport", "EvolutionChangeLog",
     "Skill", "MCPServer",
     "EvalDataset", "EvalDatasetItem", "EvalRun", "EvalRunItem",
+    "DocumentAsset", "DocumentProfile", "DocumentProfileVersion", "DocumentVersion", "RunInputRequest",
 ]

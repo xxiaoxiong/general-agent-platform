@@ -103,7 +103,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
+import { confirmDestructive } from '@/lib/confirmation'
 import { Blocks, Bot, CircleAlert, MessageSquare, Play, Search, Send, Workflow as WorkflowIcon } from '@lucide/vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
@@ -302,7 +303,7 @@ async function saveEdit() {
 
 async function deleteInstance(inst: AppInstance) {
   try {
-    await ElMessageBox.confirm(`删除应用「${inst.name}」？`, '删除应用', { type: 'warning', confirmButtonText: '删除' })
+    await confirmDestructive(`删除应用「${inst.name}」？`, '删除应用')
     await appApi.deleteInstance(inst.id)
     instances.value = instances.value.filter(instance => instance.id !== inst.id)
     ElMessage.success('应用已删除')

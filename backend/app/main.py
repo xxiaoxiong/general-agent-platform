@@ -18,6 +18,7 @@ from app.api.v2 import artifacts as v2_artifacts
 from app.api.v2 import assistants as v2_assistants
 from app.api.v2 import capabilities as v2_capabilities
 from app.api.v2 import conversations as v2_conversations
+from app.api.v2 import documents as v2_documents
 from app.api.v2 import evolution as v2_evolution
 from app.api.v2 import evaluation as v2_evaluation
 from app.api.v2 import files as v2_files
@@ -25,6 +26,8 @@ from app.api.v2 import mcp as v2_mcp
 from app.api.v2 import runs as v2_runs
 from app.api.v2 import skills as v2_skills
 from app.api.v2 import workspace as v2_workspace
+from app.services.audit_capture import install_audit_capture
+from app.services.audit_http import AuditHTTPMiddleware
 
 logger = get_logger("main")
 
@@ -208,14 +211,17 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"],
 )
+install_audit_capture()
+app.add_middleware(AuditHTTPMiddleware)
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     # P0-03：详细异常只进入服务端日志，响应仅返回安全错误码与 request_id
     # AgentLogger 不支持 exc_info，这里用同名 stdlib logger 保留完整堆栈
-    request_id = uuid4().hex
+    request_id = getattr(request.state, "request_id", None) or uuid4().hex
     logging.getLogger("ai_plat.main").error(
         "unhandled exception request_id=%s path=%s: %s",
         request_id, request.url.path, exc, exc_info=True,
@@ -223,6 +229,7 @@ async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
         status_code=500,
         content={"code": 500, "message": "服务器内部错误", "request_id": request_id},
+        headers={"X-Request-ID": request_id},
     )
 
 
@@ -245,6 +252,8 @@ app.include_router(v2_workspace.router, prefix=API_V2_PREFIX)
 app.include_router(v2_capabilities.router, prefix=API_V2_PREFIX)
 app.include_router(v2_assistants.router, prefix=API_V2_PREFIX)
 app.include_router(v2_conversations.router, prefix=API_V2_PREFIX)
+app.include_router(v2_documents.documents, prefix=API_V2_PREFIX)
+app.include_router(v2_documents.profiles, prefix=API_V2_PREFIX)
 app.include_router(v2_files.router, prefix=API_V2_PREFIX)
 app.include_router(v2_runs.router, prefix=API_V2_PREFIX)
 app.include_router(v2_artifacts.router, prefix=API_V2_PREFIX)

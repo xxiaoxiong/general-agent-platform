@@ -1,8 +1,8 @@
-import request from '@/utils/request'
+import request, { createRequest } from '@/utils/request'
 import type { AxiosProgressEvent } from 'axios'
 import type {
   User, ModelProvider, ModelConfig, KnowledgeBase, KnowledgeDocument,
-  Workflow, WorkflowExecution, AppTemplate, AppInstance, AuditLog, PageResponse, ChatMessage
+  Workflow, WorkflowExecution, AppTemplate, AppInstance, AuditLog, AuditLogDetail, AuditLogQuery, PageResponse, ChatMessage
 } from '@/types'
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
@@ -104,8 +104,12 @@ export const appApi = {
 }
 
 // ─── Audit ────────────────────────────────────────────────────────────────────
+const auditRequest = createRequest('/api/v1', { inlineErrors: true })
 export const auditApi = {
-  list: (params?: any) => request.get<any, PageResponse<AuditLog>>('/audit', { params }),
+  list: (params: AuditLogQuery, signal?: AbortSignal) =>
+    auditRequest.get<unknown, PageResponse<AuditLog>>('/audit', { params, signal }),
+  get: (id: number, signal?: AbortSignal) =>
+    auditRequest.get<unknown, AuditLogDetail>(`/audit/${id}`, { signal }),
 }
 
 // ─── Database Connections ─────────────────────────────────────────────────────

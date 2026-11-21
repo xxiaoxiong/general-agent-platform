@@ -53,6 +53,8 @@ def conversation_to_dict(
         "id": s.id,
         "assistant_id": s.agent_id,
         "title": s.title or "新对话",
+        "is_pinned": s.pinned_at is not None,
+        "pinned_at": s.pinned_at.isoformat() if s.pinned_at else None,
         "message_count": (
             len(s.messages or []) if message_count is None else int(message_count)
         ),

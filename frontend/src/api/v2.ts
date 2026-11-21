@@ -6,8 +6,11 @@
  * SSE 标准 id:/event:/data: 帧，Last-Event-ID 断线续传（§8.4）。
  */
 import { createRequest } from '@/utils/request'
+import { isPausedRunStatus, shouldReplayPastPause } from '@/features/run/runReplay'
+import type { DocumentMode, InputRequest } from './documents'
 
 const request2 = createRequest('/api/v2')
+const inlineRequest = createRequest('/api/v2', { inlineErrors: true })
 
 // ── Workspace ─────────────────────────────────────────────────────────────────
 
@@ -31,11 +34,15 @@ export interface Conversation {
   id: number
   assistant_id: number
   title: string
+  is_pinned: boolean
+  pinned_at: string | null
   message_count: number
   active_run_id: string | null
   created_at: string | null
   updated_at: string | null
 }
+
+export type ConversationMetadata = Partial<Pick<Conversation, 'title' | 'is_pinned'>>
 
 export interface RunInfo {
   run_id: string
@@ -45,6 +52,9 @@ export interface RunInfo {
   error: string | null
   cancel_requested: boolean
   pending_actions?: any[]
+  pending_input?: InputRequest | null
+  last_event_seq?: number
+  document_retryable?: boolean
   created_at: string | null
   finished_at: string | null
   /** Langfuse Trace 关联（未配置 Langfuse 时缺省，前端隐藏入口） */
@@ -100,8 +110,11 @@ export const workspaceApi = {
 export const conversationApi = {
   list: (params?: any) =>
     request2.get<any, { items: Conversation[]; total: number }>('/conversations', { params }),
+  get: (id: number) => inlineRequest.get<unknown, Conversation>(`/conversations/${id}`),
   create: (data: { assistant_id?: number; title?: string } = {}) =>
     request2.post<any, Conversation>('/conversations', data),
+  update: (id: number, data: ConversationMetadata) =>
+    inlineRequest.patch<unknown, Conversation>(`/conversations/${id}`, data),
   messages: (id: number) => request2.get<any, { items: any[] }>(`/conversations/${id}/messages`),
   delete: (id: number) => request2.delete(`/conversations/${id}`),
   /** 上传会话附件（写入会话工作区 uploads/，二进制文档同步抽取文本副本） */
@@ -122,7 +135,11 @@ export const conversationApi = {
     ),
   /** 通用工作区文件预览元数据（path 可为 uploads/xx 或 Agent 产物相对路径） */
   filePreview: (id: number, path: string) =>
-    request2.get<any, FilePreview>(`/conversations/${id}/file-preview`, { params: { path } }),
+    inlineRequest.get<unknown, FilePreview>(`/conversations/${id}/file-preview`, { params: { path, layout_only: true } }),
+  filePreviewPdf: (id: number, path: string, signal?: AbortSignal) =>
+    inlineRequest.get<unknown, Blob>(`/conversations/${id}/file-preview-pdf`, {
+      params: { path }, responseType: 'blob', signal,
+    }),
   /** 通用工作区文件字节（图片 / PDF 预览、二进制下载） */
   fileBytes: (id: number, path: string) =>
     request2.get<any, Blob>(`/conversations/${id}/file-bytes`, {
@@ -142,6 +159,10 @@ export const runApi = {
     approval_mode?: 'manual' | 'auto'
     /** 手动选模型（仅本次 Run 生效；缺省 = 助手默认模型） */
     model_config_id?: number
+    task_mode?: DocumentMode
+    document_profile_id?: number
+    document_id?: number
+    task_options?: Record<string, unknown>
     /** 会话附件（上传接口返回的项） */
     attachments?: Array<{ name: string; path: string; text_path?: string | null }>
   }) =>
@@ -153,6 +174,13 @@ export const runApi = {
     request2.post<any, { run_id: string; status: string; message: string }>(`/runs/${runId}/cancel`, { reason }),
   resume: (runId: string, decisions: Array<{ type: string; message?: string; action_id?: string | null }>) =>
     request2.post<any, { run_id: string; status: string; message: string }>(`/runs/${runId}/resume`, { decisions }),
+  submitInput: (runId: string, requestId: string, values: Record<string, unknown>) =>
+    inlineRequest.post<unknown, { run_id: string; status: string }>(`/runs/${runId}/input`, { request_id: requestId, values }),
+  retryDocument: (runId: string, lastSequence?: number) =>
+    inlineRequest.post<unknown, { run_id: string; status: string; after_seq: number }>(
+      `/runs/${runId}/retry`, undefined,
+      { headers: lastSequence ? { 'X-Document-Failure-Seq': String(lastSequence) } : undefined },
+    ),
 }
 
 // ── Artifacts ─────────────────────────────────────────────────────────────────
@@ -172,6 +200,8 @@ export interface RunStreamOptions {
   onReconnecting?: (attempt: number) => void
   /** 起始序号（续传）；缺省从头 */
   afterSeq?: number
+  /** 历史重建跨过已恢复的暂停，从相同 Run 继续读取。 */
+  replayPastPauses?: boolean
   signal?: AbortSignal
   maxRetries?: number
 }
@@ -181,10 +211,11 @@ const TERMINAL_EVENTS = new Set([
 ])
 
 function isBoundary(envelope: RunEventEnvelope): boolean {
+  if (envelope.data?.historical) return false
   if (TERMINAL_EVENTS.has(envelope.event)) return true
   if (envelope.event === 'run.status_changed') {
     const s = envelope.data?.status
-    return s === 'waiting_approval' || s === 'needs_reconciliation'
+    return isPausedRunStatus(s)
   }
   return false
 }
@@ -216,38 +247,51 @@ export async function consumeRunEvents(runId: string, options: RunStreamOptions)
         throw new Error(`HTTP ${response.status}`)
       }
 
-      attempt = 0 // 连接成功重置退避
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
-      let terminated = false
+      let boundary: RunEventEnvelope | undefined
+      try {
+        while (!boundary) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          const frames = buffer.split('\n\n')
+          buffer = frames.pop() || ''
 
-      while (!terminated) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        const frames = buffer.split('\n\n')
-        buffer = frames.pop() || ''
-
-        for (const frame of frames) {
-          const dataLine = frame.split('\n').find((l) => l.startsWith('data: '))
-          if (!dataLine) continue
-          try {
-            const envelope = JSON.parse(dataLine.slice(6)) as RunEventEnvelope
-            if (typeof envelope.sequence === 'number' && envelope.sequence > lastSeq) {
-              lastSeq = envelope.sequence
+          for (const frame of frames) {
+            const dataLine = frame.split('\n').find((l) => l.startsWith('data: '))
+            if (!dataLine) continue
+            let envelope: RunEventEnvelope
+            try {
+              envelope = JSON.parse(dataLine.slice(6)) as RunEventEnvelope
+            } catch (e) {
+              // §8.4 7：解析失败记录诊断信息，不中断流。
+              console.warn('[run-events] JSON 解析失败，已跳过:', (e as Error).message)
+              continue
             }
+            if (envelope.sequence > 0 && envelope.sequence <= lastSeq) continue
+            if (envelope.sequence > lastSeq) lastSeq = envelope.sequence
+            attempt = 0
             options.onEvent(envelope)
-            if (isBoundary(envelope)) {
-              terminated = true
-              options.onDone?.(envelope.event)
-              return
-            }
-          } catch (e) {
-            // §8.4 7：解析失败记录诊断信息，不中断流
-            console.warn('[run-events] JSON 解析失败，已跳过:', (e as Error).message)
+            if (!isBoundary(envelope)) continue
+            boundary = envelope
+            break
           }
         }
+      } finally {
+        await reader.cancel().catch(() => {})
+        reader.releaseLock()
+      }
+
+      if (boundary) {
+        const pause = boundary.event === 'run.status_changed' ? boundary.data.status : undefined
+        if (options.replayPastPauses && isPausedRunStatus(pause)) {
+          const current = await runApi.get(runId)
+          if (shouldReplayPastPause(pause, lastSeq, current.status, current.last_event_seq)) continue
+        }
+        options.onDone?.(boundary.event)
+        return
       }
 
       // 流被服务端正常关闭但未见终止事件（如 Run 仍在执行中轮询边界）：
@@ -257,6 +301,7 @@ export async function consumeRunEvents(runId: string, options: RunStreamOptions)
         options.onDone?.(info.status)
         return
       }
+      throw new Error('事件流提前关闭')
     } catch (e) {
       if (options.signal?.aborted) return
       attempt += 1
@@ -271,8 +316,7 @@ export async function consumeRunEvents(runId: string, options: RunStreamOptions)
 }
 
 export function isTerminalStatus(status: string): boolean {
-  return ['completed', 'failed', 'cancelled', 'limit_exceeded',
-    'waiting_approval', 'needs_reconciliation'].includes(status)
+  return ['completed', 'failed', 'cancelled', 'suspended', 'limit_exceeded'].includes(status) || isPausedRunStatus(status)
 }
 
 export default request2

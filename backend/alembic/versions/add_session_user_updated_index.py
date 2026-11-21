@@ -28,6 +28,14 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
-    existing = {ix["name"] for ix in sa.inspect(bind).get_indexes("agent_sessions")}
-    if "ix_agent_sessions_user_updated" in existing:
-        op.drop_index("ix_agent_sessions_user_updated", table_name="agent_sessions")
+    indexes = sa.inspect(bind).get_indexes("agent_sessions")
+    composite = "ix_agent_sessions_user_updated"
+    if not any(index["name"] == composite for index in indexes):
+        return
+    if bind.dialect.name == "mysql" and not any(
+        index["name"] != composite and index.get("column_names", [])[:1] == ["user_id"]
+        for index in indexes
+    ):
+        # InnoDB 可能用复合索引替换原隐式外键索引，回滚时先恢复覆盖 user_id 的索引。
+        op.create_index("ix_agent_sessions_user_id", "agent_sessions", ["user_id"])
+    op.drop_index(composite, table_name="agent_sessions")

@@ -1,5 +1,5 @@
 import {
-  Activity, Boxes, Braces, Cpu, Database, FileClock, FlaskConical, LibraryBig, MessageSquare,
+  Activity, Boxes, Braces, Cpu, Database, FileClock, Files, FlaskConical, LibraryBig, MessageSquare,
   PanelsTopLeft, Plug, SquarePen, Store, UsersRound, Workflow,
 } from '@lucide/vue'
 import type { Component } from 'vue'
@@ -24,6 +24,7 @@ export interface NavigationGroup {
 const groups: { title: string; entries: Entry[] }[] = [
   { title: '工作空间', entries: [
     { name: 'Workspace', icon: MessageSquare, keywords: '聊天 对话 会话 agent chat' },
+    { name: 'Documents', icon: Files, keywords: '文档 版本 编写 规范 Word docx' },
     { name: 'Dashboard', icon: PanelsTopLeft, keywords: '首页 工作台 dashboard' },
     { name: 'AppMarket', icon: Store, keywords: '应用市场 商店 marketplace' },
     { name: 'AppInstances', icon: Boxes, keywords: '部署 实例 apps' },

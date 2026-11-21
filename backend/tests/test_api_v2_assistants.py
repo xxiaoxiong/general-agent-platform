@@ -176,3 +176,119 @@ class TestConversations:
         resp = client.get("/api/v2/conversations", headers=headers)
         assert resp.status_code == 200
         assert resp.json()["total"] >= 1
+
+    def test_pin_rename_unpin_and_paginate_owned_conversations(self, client, user_setup):
+        headers = _auth(user_setup["user_id"])
+        paths = []
+
+        def create(title):
+            result = client.post("/api/v2/conversations", headers=headers, json={"title": title})
+            assert result.status_code == 200
+            body = result.json()
+            paths.append(f"/api/v2/conversations/{body['id']}")
+            assert body["is_pinned"] is False and body["pinned_at"] is None
+            return body
+
+        def change(index, metadata):
+            result = client.patch(paths[index], headers=headers, json=metadata)
+            assert result.status_code == 200
+            return result.json()
+
+        def page(number):
+            response = client.get("/api/v2/conversations", headers=headers, params={"page": number, "page_size": 1})
+            assert response.status_code == 200
+            return response.json()["items"][0]
+
+        try:
+            first = create("旧会话")
+            second = create("较早会话")
+            recent = create("最近会话")
+            pinned = change(0, {"title": "  制造周报  ", "is_pinned": True})
+            assert pinned["title"] == "制造周报" and pinned["is_pinned"] is True
+            assert pinned["pinned_at"] and pinned["updated_at"] == first["updated_at"]
+            assert pinned["message_count"] == 0
+            assert page(1)["id"] == first["id"]
+            change(1, {"is_pinned": True})
+            assert page(1)["id"] == second["id"] and page(2)["id"] == first["id"]
+            # 重复置顶请求不会调整之前确定的顺序。
+            assert change(0, {"is_pinned": True})["pinned_at"] == pinned["pinned_at"]
+            assert page(1)["id"] == second["id"]
+            unpinned = change(0, {"is_pinned": False})
+            assert unpinned["is_pinned"] is False and unpinned["pinned_at"] is None
+            assert unpinned["title"] == "制造周报" and unpinned["updated_at"] == first["updated_at"]
+            assert page(2)["id"] == recent["id"]
+            assert client.get(paths[0], headers=headers).json() == unpinned
+
+            for invalid in ({}, {"title": "  "}, {"title": "长" * 201}, {"title": None},
+                            {"is_pinned": "true"}, {"is_pinned": None}, {"position": 1}):
+                assert client.patch(paths[0], headers=headers, json=invalid).status_code == 422
+        finally:
+            for path in paths:
+                client.delete(path, headers=headers)
+
+    def test_other_user_cannot_modify_conversation_metadata(self, client, user_setup):
+        import os
+
+        from app.models.user import User
+
+        headers = _auth(user_setup["user_id"])
+        created = client.post("/api/v2/conversations", headers=headers, json={"title": "个人记录"}).json()
+        path = f"/api/v2/conversations/{created['id']}"
+        engine = create_engine(os.environ["DATABASE_SYNC_URL"])
+        try:
+            with Session(engine) as session:
+                other = User(username="ast_meta_other", email="ast_meta_other@test.dev", hashed_password="x")
+                session.add(other)
+                session.commit()
+                other_headers = _auth(other.id)
+                try:
+                    assert client.patch(path, headers=other_headers, json={"title": "越权修改", "is_pinned": True}).status_code == 404
+                    assert client.get(path, headers=headers).json() == created
+                finally:
+                    session.delete(other)
+                    session.commit()
+        finally:
+            engine.dispose()
+            client.delete(path, headers=headers)
+
+
+@pytest.mark.asyncio
+async def test_runtime_preserves_manually_reset_title_and_pinned_state(tmp_path):
+    import app.models  # 确保关联表在 metadata 中注册
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.core.database import Base
+    from app.models.agent import Agent, AgentSession
+    from app.models.user import User
+    from app.services.agent_runtime.repositories.session_repository import SessionRepository
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'metadata.db'}")
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as db:
+            db.add_all([
+                Agent(id=1, name="测试助手"),
+                User(id=1, username="meta_owner", email="meta_owner@test.dev", hashed_password="x"),
+                AgentSession(id=1, agent_id=1, user_id=1, title="之前的标题", messages=[]),
+                AgentSession(id=2, agent_id=1, user_id=1, messages=[]),
+            ])
+            await db.commit()
+            repo = SessionRepository(db)
+            assert await repo.update_metadata(1, 1, title="新对话", is_pinned=True)
+            await db.commit()
+
+        async with sessions() as db:
+            repo = SessionRepository(db)
+            message = {"role": "user", "content": "用户的新内容", "message_id": "new-message"}
+            await repo.append_messages(1, [message], title="自动生成的名称")
+            await repo.append_messages(2, [message], title="初次生成的名称")
+            await db.commit()
+            manual = await db.get(AgentSession, 1, populate_existing=True)
+            default = await db.get(AgentSession, 2, populate_existing=True)
+            assert manual.title == "新对话" and manual.title_edited and manual.pinned_at
+            assert manual.messages == [message] and manual.version == 1
+            assert default.title == "初次生成的名称" and not default.title_edited
+    finally:
+        await engine.dispose()

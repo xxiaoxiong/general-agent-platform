@@ -15,12 +15,15 @@ from app.schemas.user import (
 )
 from app.api.deps import get_current_user
 from app.services.audit import log_action
+from app.services.audit_context import bind_audit_actor
+from app.services.audit_http import bind_audit_route
 
 router = APIRouter(prefix="/auth", tags=["认证"])
 
 
 @router.post("/login", response_model=TokenResponse)
 async def login(request: Request, body: LoginRequest, db: AsyncSession = Depends(get_db)):
+    bind_audit_route(request.scope)
     result = await db.execute(
         select(User).where(
             (User.username == body.username) | (User.email == body.username)
@@ -31,6 +34,7 @@ async def login(request: Request, body: LoginRequest, db: AsyncSession = Depends
         await log_action(db, None, None, "login_failed", "auth", detail={"username": body.username},
                          ip=request.client.host, status="failed", error_msg="用户名或密码错误")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误")
+    bind_audit_actor(user.id, user.username)
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="账号已被禁用")
 
@@ -46,7 +50,8 @@ async def login(request: Request, body: LoginRequest, db: AsyncSession = Depends
 
 
 @router.post("/refresh", response_model=TokenResponse)
-async def refresh_token(refresh_token_str: str, db: AsyncSession = Depends(get_db)):
+async def refresh_token(request: Request, refresh_token_str: str, db: AsyncSession = Depends(get_db)):
+    bind_audit_route(request.scope)
     payload = decode_token(refresh_token_str)
     if not payload or payload.get("type") != "refresh":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh Token无效")
@@ -55,6 +60,7 @@ async def refresh_token(refresh_token_str: str, db: AsyncSession = Depends(get_d
     user = result.scalar_one_or_none()
     if not user or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户不存在或已禁用")
+    bind_audit_actor(user.id, user.username)
     access_token = create_access_token(user.id)
     new_refresh_token = create_refresh_token(user.id)
     return TokenResponse(
@@ -85,7 +91,8 @@ async def change_password(
 
 
 @router.post("/register", response_model=UserOut)
-async def register(body: UserCreate, db: AsyncSession = Depends(get_db)):
+async def register(request: Request, body: UserCreate, db: AsyncSession = Depends(get_db)):
+    bind_audit_route(request.scope)
     result = await db.execute(select(User).where(User.username == body.username))
     if result.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="用户名已存在")

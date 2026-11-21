@@ -7,7 +7,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, or_
+from sqlalchemy import select, func, and_, or_, update
 from sqlalchemy.orm import defer
 from sqlalchemy.orm.attributes import flag_modified
 from pydantic import BaseModel
@@ -383,8 +383,12 @@ async def agent_chat(
     # 请求不产生孤立 Session（Run 唯一约束冲突随事务回滚）
     messages = list(session.messages or []) if session is not None else []
     messages.append(user_message)
-    if session is not None and (not session.title or session.title == "新对话"):
-        session.title = body.message[:50]
+    if session is not None and not session.title_edited and (not session.title or session.title == "新对话"):
+        await db.execute(
+            update(AgentSession)
+            .where(AgentSession.id == session.id, AgentSession.auto_title_allowed())
+            .values(title=body.message[:50])
+        )
         await db.commit()
 
     # 数据库连接信息注入：让 Agent 知道它连接的是哪个数据库
@@ -796,13 +800,13 @@ async def _save_session(
     try:
         async with AsyncSessionLocal() as save_db:
             res = await save_db.execute(
-                select(AgentSession).where(AgentSession.id == session_id)
+                select(AgentSession).where(AgentSession.id == session_id).with_for_update()
             )
             s = res.scalar_one_or_none()
             if s:
                 s.messages = messages
                 flag_modified(s, "messages")
-                if new_title:
+                if new_title and not s.title_edited:
                     s.title = new_title
                 await save_db.commit()
                 logger.info(f"会话 {session_id} 已保存，共 {len(messages)} 条消息")

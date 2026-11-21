@@ -18,6 +18,11 @@ RUN pip install --no-cache-dir -i ${PIP_INDEX_URL} -r requirements.txt
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+# Word 预览按原版式渲染并提供中文字体回退。
+RUN apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends libreoffice-writer fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY backend/ /app/
 COPY docker/backend-entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh \

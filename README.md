@@ -1,277 +1,164 @@
 # General Agent Platform
 
-企业级 AI 通用能力大平台与业务落地平台（v2.0）—— 可私有化部署的通用 Agent 平台：多模型对话、Agent 智能体、企业知识库（RAG）、可视化流程编排、提示词工程、应用市场，以及 **Langfuse 全链路可观测** 与 **Agent 自进化闭环**。
+General Agent Platform 是可私有化部署的智能体工作台。团队可以在同一界面管理对话和附件、生成和审阅 Word 文档、用知识库检索企业资料，以及在画布上编排业务流程。任务运行支持流式事件、人工审批与断点续跑，管理员可以通过执行轨迹、测评和开发简报查看运行情况。
 
-| | |
-|---|---|
-| 后端 | FastAPI + SQLAlchemy (async) + Alembic + MySQL + Redis + ChromaDB |
-| Agent 引擎 | LangChain / LangGraph 执行内核 + Durable Execution（PostgreSQL Checkpointer 断点续跑） |
-| 推理层 | OpenAI 兼容 API + 连接池 + 并发队列 + 30B 模型优化 |
-| 前端 | Vue 3 + Element Plus + Vite + TypeScript + Pinia |
-| 可观测 | Langfuse（Trace / 评估回写）+ OpenTelemetry + Prometheus / Grafana |
-| 部署 | Docker Compose |
-
----
+[界面预览](#界面预览) · [功能与使用入口](#功能与使用入口) · [Docker 部署](#docker-部署) · [本地开发](#本地开发) · [技术架构](#技术架构) · [MIT License](LICENSE)
 
 ## 界面预览
 
-### 登录与工作台
+以下截图取自当前版本的演示环境，使用模拟业务数据。
 
-| 登录 | 概览工作台 |
-|---|---|
-| ![登录](docs/screenshots/01-login.png) | ![概览](docs/screenshots/02-dashboard.png) |
+### 智能体对话
 
-### 核心能力
+左侧的「已置顶」与「最近对话」分区展示。可在会话菜单中置顶、取消置顶和重命名。主区支持流式回答、文件粘贴、本地语音听写、工具执行卡和侧栏文件预览。
 
-**智能体对话** — 流式对话、工具调用、多模型切换、人机协同审批：
+![智能体对话工作台，包含置顶会话、对话内容和附件操作](docs/screenshots/current/01-conversation.png)
 
-![智能体对话](docs/screenshots/03-workspace.png)
+### 文档修改审阅
 
-**模型配置** — 多供应商接入（OpenAI 兼容）、连接测试、统一管控：
+同一章节的修改稿在左，原文在右。结合实际正文、表格和图片检查建议，按章节或可独立应用的改动保存新版本。
 
-![模型配置](docs/screenshots/04-models.png)
+![文档章节审阅，左侧显示最新修改稿，右侧显示原文](docs/screenshots/current/02-document-review.png)
 
-**企业知识库** — 文档上传（PDF / Word / Excel / PPT / TXT）、向量化、RAG 语义检索：
+### 文档资产、工作流和知识库
 
-![知识库](docs/screenshots/05-knowledge.png)
+| 文档中心 · 管理文档、规范与版本 | 流程编排 · 连接任务节点并配置运行参数 |
+| --- | --- |
+| [![文档中心的文档资产和版本信息](docs/screenshots/current/03-document-center.png)](docs/screenshots/current/03-document-center.png) | [![流程编辑器中的节点、连线与配置面板](docs/screenshots/current/04-workflow.png)](docs/screenshots/current/04-workflow.png) |
+| **知识库 · 管理资料、索引与检索** | **概览 · 查看已部署资源和常用入口** |
+| [![知识库文件与索引状态](docs/screenshots/current/05-knowledge.png)](docs/screenshots/current/05-knowledge.png) | [![平台概览、统计卡和常用入口](docs/screenshots/current/06-dashboard.png)](docs/screenshots/current/06-dashboard.png) |
 
-**可视化流程编排** — 拖拽节点设计自动化工作流（AI / 条件 / HTTP / 知识检索节点）：
+### 运行与测评
 
-![流程编排](docs/screenshots/06-workflows.png)
+从同一管理界面维护评测数据集、查看运行结果和定位执行问题。开发简报汇总执行、工具与审批等客观指标，并支持导出 Markdown。
 
-**提示词工程** — 模板管理 + 在线调试，沉淀团队最佳实践：
+![Agent 测评与运行观测界面](docs/screenshots/current/07-evolution.png)
 
-![提示词工程](docs/screenshots/07-prompts.png)
+### 操作审计
 
-### Agent 自进化闭环
+系统管理员可以在「审计日志」筛选操作者、资源、时间和处理结果。数据变更详情支持逐字段对照，并可沿请求 ID 找到同一请求的处理结果。
 
-基于执行过程客观数据的迭代支撑体系：确定性指标（工具错误率 / 重试 / 重复调用 / HITL 驳回 / 预算消耗）、LLM 六维裁判评估、进化报告与配置变更回滚、**开发迭代简报**（纯客观数据，可直接喂给开发 AI）。
+![会话重命名和置顶的审计记录，显示字段的操作前后值](docs/screenshots/current/08-audit.png)
 
-![Agent 自进化](docs/screenshots/08-evolution.png)
+## 功能与使用入口
 
-开发简报——按窗口汇总执行概览 / 失败 Run / 工具统计 / HITL 数据 / 分版本趋势 / 评估数据 / 变更审计，一键导出 Markdown：
+| 入口 | 能做什么 |
+| --- | --- |
+| **智能体对话** | 管理历史会话，上传或粘贴附件，切换模型和审批模式。图片、Word 和 PDF 可在可拖宽的侧栏查看。配置本地转写服务后，录音可转换成可编辑的消息文本。 |
+| **文档中心** | 从资料提取可复用规范，按规范生成 DOCX，或者把已有对话文稿导出为 Word。支持章节进度、文档续跑、修改审阅、版本历史和文件下载。原始 DOCX 可按版式预览，也支持针对原文段落和图片提出修改。 |
+| **知识库与模型配置** | 接入 OpenAI 兼容的模型服务，在知识库中上传和索引资料，通过检索页面验证召回，并将知识库用于智能体和工作流。 |
+| **流程编排与应用市场** | 在画布上连接条件、AI 对话、知识检索、HTTP 请求、数据处理和文档输出等节点。通过提示词库管理模板和在线调试，或从应用市场部署已有模板。 |
+| **Agent 测评** | 管理数据集、触发测试运行和查看逐项得分。支持 Langfuse Trace 跳转、评估回写、建议应用与回滚。开发简报提供可筛选的运行数据。 |
+| **系统管理** | 管理员可管理用户、角色、技能、MCP 工具服务和数据库连接。审计日志记录业务请求及处理结果，可按操作者、资源和请求 ID 查询已落库的字段变更，对照操作前后的数据。 |
 
-![开发简报](docs/screenshots/09-dev-briefing.png)
+## Docker 部署
 
-### Langfuse 全链路可观测
+需要 Docker Engine 或 Docker Desktop，以及 Docker Compose v2。以下命令在仓库根目录执行。
 
-每次 Agent 运行上报确定性 trace_id 的完整 Trace（模型调用、工具执行、中间件 span、token / 耗时），平台内一键跳转：
+1. 首次安装时复制部署配置，再填写密码和密钥。
 
-![Langfuse Traces](docs/screenshots/10-langfuse-traces.png)
+   ```bash
+   cp docker/.env.example docker/.env
+   openssl rand -hex 32
+   ```
 
-Trace 详情内的完整执行过程 span 树（模型输入输出、工具调用、耗时与 token 开销）：
+   将随机值填入 `SECRET_KEY`，并设置 `MYSQL_ROOT_PASSWORD`、`MYSQL_PASSWORD`、`POSTGRES_PASSWORD` 和至少 12 位的强密码 `ADMIN_PASSWORD`。数据库密码可使用独立生成的随机十六进制字符串，便于直接插入连接串。Windows PowerShell 可用 `Copy-Item docker/.env.example docker/.env` 复制。管理员首次登录使用 `ADMIN_USERNAME`（默认 `admin`）与配置中的密码。
 
-![Langfuse Trace 详情](docs/screenshots/11-langfuse-trace-detail.png)
+2. 准备 Compose 引用的外部 Docker 网络。
 
----
+   已部署 Langfuse 时沿用其 `langfuse-deploy_default` 网络。独立部署平台时先用 `docker network inspect langfuse-deploy_default` 检查，网络缺失时执行以下命令。
 
-## 功能模块
+   ```bash
+   docker network create langfuse-deploy_default
+   ```
 
-| 模块 | 功能 |
-|---|---|
-| 🔐 认证管理 | JWT 登录、Token 刷新、修改密码、RBAC 权限 |
-| 🤖 模型管理 | 多供应商接入（OpenAI 兼容）、模型配置、连接测试 |
-| 💬 AI 对话 | 流式对话、知识库 RAG 增强、多模型切换 |
-| 📚 知识库 | 文档上传（PDF/Word/Excel/PPT/TXT）、向量化、语义检索 |
-| ⚙️ 流程编排 | 可视化画布、多节点类型（AI/条件/HTTP/知识检索）、流程执行 |
-| 🏪 应用市场 | 内置 10+ 行业应用模板、一键部署、应用实例管理 |
-| 👥 用户管理 | 用户 CRUD、角色分配、启用/禁用 |
-| 📋 审计日志 | 操作记录、多维度过滤、详情查看 |
-| 🧠 Agent 智能体 | 增强 ReAct 引擎、结构化记忆、幻觉抑制、执行轨迹追踪、断点续跑 |
-| 📊 性能监控 | 推理延迟、工具成功率、token 吞吐、慢请求告警、Prometheus 指标 |
-| 🔍 可观测 | Langfuse Trace 上报与 Trace 链接、LLM 裁判评估回写 |
-| 🔄 Agent 自进化 | 确定性指标 + 评估聚合 + 进化报告 + 配置变更 / 回滚 + 开发简报 |
+3. 构建镜像并启动服务。
 
----
+   ```bash
+   docker compose --env-file docker/.env -f docker/docker-compose.yml up -d --build
+   docker compose --env-file docker/.env -f docker/docker-compose.yml ps
+   ```
 
-## 本地开发启动
+   后端入口先执行 Alembic 迁移，再启动服务。首次启动 ASR 时会下载 CPU 语音模型，包括 SenseVoice 和 VAD。需要检查迁移或语音服务时，可在下列命令中分别指定 `backend` 或 `asr`。
 
-### 前置条件
-- Python 3.11+
-- Node.js 20+
-- MySQL（本地 3306 或 Docker 3308）
-- Redis（可选，降级为内存模式）
+   ```bash
+   docker compose --env-file docker/.env -f docker/docker-compose.yml logs -f backend
+   ```
+
+| 服务 | 地址与用途 |
+| --- | --- |
+| 平台 | [http://localhost](http://localhost) |
+| 后端 | [健康检查](http://localhost:8000/api/health) · [OpenAPI 文档](http://localhost:8000/api/docs) · [Prometheus 指标](http://localhost:8000/metrics) |
+| MySQL / Redis / PostgreSQL | 宿主机回环地址 `127.0.0.1`，分别使用 `3308`、`6379` 与 `5433` |
+| ASR | Docker 项目网络中的 `http://asr:8000`，由平台后端转发 |
+
+登录后在「模型配置」登记模型服务、访问密钥和模型名称，再到「智能体对话」选择可用模型。启用 Langfuse 时，在 `docker/.env` 配置 `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` 和可访问的服务地址，浏览器跳转地址由 `LANGFUSE_PUBLIC_URL` 控制。语音服务的检查与停用见 [本地语音转写服务](deploy/asr/README.md)。
+
+## 本地开发
+
+后端使用 Python 3.11，推荐在虚拟环境内安装依赖。前端开发和测试使用 Node.js 22。可沿用 Docker Compose 的 MySQL、Redis、PostgreSQL 服务，并让前后端进程在宿主机运行。
+
+```bash
+docker compose --env-file docker/.env -f docker/docker-compose.yml up -d mysql redis checkpoint_pg
+```
 
 ### 后端
 
+从仓库根目录进入 `backend/`。首次配置时将 `.env.example` 复制为 `.env`，按照数据库实际端口和账户填写 `DATABASE_URL` 与 `DATABASE_SYNC_URL`，并设置本地管理员凭据。使用 Compose 的 MySQL 时连接 `127.0.0.1:3308`。单进程开发可沿用模板中的 SQLite Checkpointer，跨进程恢复使用共享 PostgreSQL 的 `AGENT_CHECKPOINT_DSN`。配置完成后执行以下命令。
+
 ```bash
 cd backend
-
-# 1. 安装依赖
-pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-
-# 2. 配置环境变量（复制并修改）
-cp .env.example .env
-# 修改 DATABASE_URL 中的密码
-
-# 3. 创建数据库
-python -c "import pymysql; conn=pymysql.connect(host='localhost',port=3306,user='root',password='YOUR_PWD'); conn.cursor().execute('CREATE DATABASE IF NOT EXISTS ai_plat CHARACTER SET utf8mb4'); conn.commit(); conn.close()"
-
-# 4. 运行数据库迁移
+python -m pip install -r requirements.txt
 python -m alembic upgrade head
-
-# 5. 启动后端（开发模式）
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8002 --reload
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8002 --reload
 ```
 
-后端启动后访问：
-- API 文档：http://localhost:8002/api/docs
-- 健康检查：http://localhost:8002/api/health
+宿主机开发需要安装 LibreOffice 才能验证 Word 版式预览。启用语音输入时安装 FFmpeg，并给 `ASR_BASE_URL` 配置后端可访问的转写地址。Docker 后端镜像已包含 LibreOffice Writer 和 FFmpeg。
 
-### 前端
+### 前端与测试
+
+另开一个终端，从仓库根目录进入 `frontend/`。
 
 ```bash
 cd frontend
-
-# 1. 安装依赖
-npm install --registry https://registry.npmmirror.com
-
-# 2. 启动开发服务器
+npm ci
 npm run dev
 ```
 
-前端默认在 http://localhost:5173 启动（端口被占用会自动递增）。
+开发入口默认是 [http://localhost:5173](http://localhost:5173)，Vite 将 `/api` 代理到 `127.0.0.1:8002`。
 
-> **注意**：`vite.config.mts` 中的代理目标需与后端端口一致，默认配置为 `http://127.0.0.1:8002`。
+| 检查 | 运行目录与命令 |
+| --- | --- |
+| 后端全量测试 | `backend/` 内运行 `python -m pytest -q` |
+| 前端交互测试 | `frontend/` 内运行 `npm test` |
+| 前端类型检查和生产构建 | `frontend/` 内运行 `npm run build` |
 
-### 默认账号
-- 用户名：`admin`
-- 密码：`Admin@123456`
+## 技术架构
 
-### 运行测试
-
-```bash
-# 后端全量回归（必须在 backend/ 目录下执行）
-cd backend && python -m pytest -q
-
-# 前端类型检查 + 构建
-cd frontend && npm run build
+```mermaid
+flowchart LR
+  Browser["Vue 3 工作台"] --> API["FastAPI / REST + SSE"]
+  API --> Data["MySQL · 会话、任务、版本与权限"]
+  API --> Runtime["LangGraph · 模型、工具、审批与文档任务"]
+  Runtime --> State["PostgreSQL · Checkpointer 与记忆"]
+  Runtime --> Retrieval["ChromaDB · 知识库检索"]
+  Runtime --> Model["OpenAI 兼容模型服务"]
+  Runtime --> Trace["Langfuse · Trace 与评估"]
+  API --> ASR["本地 FunASR · 语音转写"]
 ```
 
----
+Vue 3、TypeScript、Vite 与 Element Plus 提供工作台。FastAPI 和异步 SQLAlchemy 管理 API 与数据。模型执行事件写入 MySQL，通过 SSE 回放给浏览器。LangGraph 使用 PostgreSQL 持久化状态，配合执行租约恢复中断的任务。文档链路管理 Word 草稿、审阅决定和交付版本。平台运行指标通过 Prometheus 暴露，Grafana 仪表盘定义位于 [docker/grafana/](docker/grafana/)。
 
-## Docker Compose 一键部署
+| 路径 | 内容 |
+| --- | --- |
+| [backend/app/api/](backend/app/api/) | v1 业务接口与 v2 工作台 API |
+| [backend/app/services/agent_runtime/](backend/app/services/agent_runtime/) | 智能体任务、Worker、流式事件和检查点 |
+| [backend/app/services/documents/](backend/app/services/documents/) | 文档规范、生成、编辑、审阅和预览 |
+| [frontend/src/](frontend/src/) | 工作台页面、文档组件、API 与导航 |
+| [docker/](docker/) · [deploy/asr/](deploy/asr/) | Compose 部署、镜像、监控和语音服务 |
 
-```bash
-# 构建并启动平台、数据库、Checkpointer 和语音转写服务
-docker compose -f docker/docker-compose.yml up -d --build
+## 项目资料与许可
 
-# 查看日志
-docker compose -f docker/docker-compose.yml logs -f backend
-
-# 停止
-docker compose -f docker/docker-compose.yml down
-```
-
-访问：http://localhost（前端），http://localhost:8000（后端 API）
-
-部署说明：
-- 启动前先准备 `docker/.env`（参考 `docker/.env.example`），所有凭据经环境变量注入。
-- 后端启动入口（`docker/backend-entrypoint.sh`）先执行一次 `alembic upgrade head`，
-  迁移失败则服务不启动；随后以多 Worker 启动 Uvicorn。
-- Durable Execution 使用共享 PostgreSQL Checkpointer（`checkpoint_pg` 服务，
-  宿主机端口 5433），多 Worker / 重启后可恢复 Graph State；生产环境禁止
-  `AGENT_CHECKPOINT_DSN=memory`（启动即拒绝）。
-- 可选：Langfuse 自托管栈（`langfuse-deploy`）用于 Trace 可观测，配置
-  `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_PROJECT_ID` 后自动上报。
-
----
-
-## v2.0 Agent 平台架构
-
-### 核心增强（针对 30B 模型优化）
-
-```
-app/services/agent/               # Agent 智能体引擎包
-├── engine.py                     # ReAct 核心执行引擎（增强版）
-│   ├── 严格终止条件（迭代上限 + 死循环检测 + 意图漂移防护）
-│   ├── 多级容错解析（正则 + 模糊匹配 + JSON 自动修复）
-│   ├── 工具执行（超时 + 重试 + 权限 + 依赖）
-│   ├── 幻觉抑制校验（事实核查 + 来源引用 + 自我校验）
-│   └── 流式输出 + 执行轨迹记录
-├── output_parser.py              # 输出解析 + JSON 修复
-├── prompt_builder.py             # 30B 优化提示词工程
-├── context_manager.py            # 滑动窗口 + 摘要压缩 + 关键信息置顶
-├── memory_manager.py             # 短期/长期/结构化记忆（fact/rule/skill）
-├── hallucination.py              # 幻觉抑制（伪造检测 + 自洽性 + 不确定性标注）
-├── tool_executor.py              # 增强工具执行（超时/重试/权限/调用限制）
-├── trace.py                      # 执行轨迹 + 性能监控 + 意图漂移检测
-└── checkpoint.py                 # 断点续跑 + 错误恢复
-
-app/services/evolution/           # Agent 自进化闭环
-├── metrics.py                    # 确定性指标（工具错误率/重试/重复调用/HITL/预算）
-├── judge.py                      # LLM 六维裁判评估
-├── evolution_advisor.py          # 进化报告 + 配置变更/回滚 + 验证
-└── dev_briefing.py               # 开发迭代简报（纯客观数据汇总 → Markdown）
-
-app/observability/                # 可观测
-├── langfuse_tracing.py           # Langfuse Trace 构建/上报/Trace URL
-└── otel_tracing.py               # OpenTelemetry 导出
-
-app/services/inference/           # 推理层管理
-├── model_manager.py              # 模型连接池 + 健康检查 + 热重载
-└── queue.py                      # 请求排队 + 并发控制 + 背压机制
-```
-
-### 30B 模型十大生存线
-
-| # | 生存线 | 实现模块 |
-|---|---|---|
-| 1 | 输出格式强约束（严格 JSON） | `output_parser.py` — 多级 JSON 修复 |
-| 2 | 思考模板固定化 | `prompt_builder.py` — 30B 专用 ReAct 模板 |
-| 3 | 滑动窗口上下文管理 | `context_manager.py` — 自动压缩 + 关键信息置顶 |
-| 4 | 推理速度 ≥25 token/s | `inference/queue.py` — 并发控制 + KV Cache 配置 |
-| 5 | 工具参数强校验 | `tool_executor.py` — 类型检查 + 必填校验 |
-| 6 | 幻觉抑制 | `hallucination.py` — 伪造检测 + 来源引用 |
-| 7 | 死循环/无限递归防护 | `engine.py` + `checkpoint.py` — 相似度检测 + 强制终止 |
-| 8 | 失败重试与错误恢复 | `tool_executor.py` + `checkpoint.py` — 指数退避 + 断点续跑 |
-| 9 | 记忆持久化与结构化 | `memory_manager.py` — SQLite + fact/rule/skill 分类 |
-| 10 | 执行轨迹可追溯 | `trace.py` — 每步记录 + 性能统计 |
-
----
-
-## 项目结构
-
-```
-general-agent-platform/
-├── backend/                       # FastAPI 后端
-│   ├── app/
-│   │   ├── api/                   # API 路由（v1 + v2）
-│   │   ├── core/                  # 配置、数据库、安全、日志
-│   │   ├── models/                # SQLAlchemy 模型
-│   │   ├── schemas/               # Pydantic 模式
-│   │   ├── services/              # 业务逻辑
-│   │   │   ├── agent/             # Agent 智能体引擎包
-│   │   │   ├── evolution/         # 自进化闭环（指标/评估/报告/简报）
-│   │   │   ├── inference/         # 推理层管理（连接池 + 队列）
-│   │   │   └── tools/             # 工具注册表与执行器
-│   │   └── observability/         # Langfuse / OTel 可观测
-│   ├── alembic/                   # 数据库迁移
-│   ├── tests/                     # pytest 测试套件
-│   └── requirements.txt
-├── frontend/                      # Vue 3 前端
-│   └── src/
-│       ├── api/                   # API 封装
-│       ├── layouts/               # 布局组件
-│       ├── router/                # 路由配置
-│       ├── stores/                # Pinia 状态
-│       └── views/                 # 页面组件
-├── docker/
-│   ├── backend-entrypoint.sh      # 迁移 + 多 Worker 启动入口
-│   ├── backend.Dockerfile
-│   ├── frontend.Dockerfile
-│   ├── docker-compose.yml         # MySQL + Redis + checkpoint_pg + 后端 + 前端
-│   └── grafana/                   # Grafana 仪表盘
-├── docs/                          # 设计文档 / 任务书 / 交付说明 / 截图
-├── AGENTS.md                      # AI 编码代理协作指南
-└── log/                           # 运行日志（不入库）
-```
-
----
-
-## 相关文档
-
-- [AGENTS.md](AGENTS.md) — AI 编码代理协作指南（架构约定、常用命令、已知陷阱）
-- [docs/](docs/) — 需求与设计文档、各阶段交付说明、Agent Runtime 架构文档
-- [UI/UX 改造交付](docs/ui-ux-delivery.md) — 页面覆盖、工程验收和实机对比截图。
-- [智能体语音听写](docs/asr-dictation-delivery.md) — 本地 ASR 启停、配置与实测结果。
+- [开发协作指南](AGENTS.md)
+- [历史设计、任务书与交付文档](docs/historyFile/)
+- [MIT License](LICENSE)

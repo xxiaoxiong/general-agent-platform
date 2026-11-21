@@ -1,8 +1,9 @@
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, BigInteger, String, Text, Boolean, DateTime,
-    ForeignKey, JSON, UniqueConstraint, Index, func,
+    ForeignKey, JSON, UniqueConstraint, Index, false, func, or_,
 )
+from sqlalchemy.dialects.mysql import DATETIME
 from app.models.base import Base
 
 
@@ -74,12 +75,16 @@ class AgentSession(Base):
         # 会话列表 WHERE user_id=? ORDER BY updated_at DESC 走索引序扫描，
         # 消除 filesort（大 messages JSON 参与排序会撑爆 sort buffer 报 1038）
         Index("ix_agent_sessions_user_updated", "user_id", "updated_at"),
+        Index("ix_agent_sessions_user_pinned_updated", "user_id", "pinned_at", "updated_at", "id"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
     agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     title = Column(String(200), default="新对话")
+    # 用户可以把标题改回「新对话」，此时仍以手动标题为准。
+    title_edited = Column(Boolean, nullable=False, default=False, server_default=false())
+    pinned_at = Column(DateTime().with_variant(DATETIME(fsp=6), "mysql", "mariadb"), nullable=True)
 
     # 完整对话历史（含 ReAct 思考链）
     messages = Column(JSON, default=list)
@@ -92,6 +97,10 @@ class AgentSession(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    @classmethod
+    def auto_title_allowed(cls):
+        return cls.title_edited.is_(False) & or_(cls.title.is_(None), cls.title == "", cls.title == "新对话")
 
 
 def session_message_count_expr(dialect_name: str):

@@ -32,6 +32,12 @@ const router = createRouter({
           meta: { title: '概览' },
         },
         {
+          path: 'documents',
+          name: 'Documents',
+          component: () => import('@/views/documents/DocumentCenter.vue'),
+          meta: { title: '文档中心' },
+        },
+        {
           path: 'models',
           name: 'Models',
           component: () => import('@/views/models/ModelList.vue'),

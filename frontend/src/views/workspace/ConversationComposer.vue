@@ -28,6 +28,7 @@
     </div>
 
     <form class="composer-box" @submit.prevent="submit">
+      <slot name="document-context" />
       <ul v-if="attachments.length" class="attachment-list" aria-label="待发送附件">
         <li v-for="(file, index) in attachments" :key="file.path" class="attachment">
           <button type="button" class="attachment-preview" :title="file.name" @click="$emit('preview', file.path, file.name)">
@@ -49,14 +50,16 @@
         aria-label="消息"
         placeholder="给智能体发送消息…"
         @keydown="onKeydown"
+        @paste="onPaste"
       />
 
       <div class="composer-bar">
         <div class="composer-options">
           <input ref="picker" hidden type="file" multiple @change="filesSelected" />
-          <button type="button" class="button-icon" :disabled="locked" aria-label="上传附件" title="上传附件" @click="picker?.click()">
+          <button type="button" class="button-icon" :disabled="locked" aria-label="上传附件" title="上传附件，也可粘贴文件或图片" @click="picker?.click()">
             <Paperclip :size="18" />
           </button>
+          <slot name="document-task" />
           <DropdownMenuRoot>
             <DropdownMenuTrigger as-child>
               <button type="button" class="selector" aria-label="审批模式">
@@ -131,7 +134,7 @@ import {
   DropdownMenuContent, DropdownMenuItemIndicator, DropdownMenuPortal, DropdownMenuRadioGroup,
   DropdownMenuRadioItem, DropdownMenuRoot, DropdownMenuTrigger,
 } from 'reka-ui'
-import { isSendKey } from './interactions'
+import { clipboardFiles, isSendKey } from './interactions'
 import { asrApi } from '@/api/asr'
 import { appendTranscript, useDictation } from './dictation'
 
@@ -239,6 +242,14 @@ function filesSelected() {
   const files = Array.from(picker.value.files || [])
   picker.value.value = ''
   if (files.length) emit('upload', files)
+}
+
+function onPaste(event: ClipboardEvent) {
+  if (props.locked || event.defaultPrevented) return
+  const files = clipboardFiles(event.clipboardData)
+  if (!files.length) return
+  event.preventDefault()
+  emit('upload', files)
 }
 
 defineExpose({ focus: () => textarea.value?.focus(), cancelDictation })

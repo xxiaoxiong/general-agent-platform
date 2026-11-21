@@ -151,6 +151,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
 import type { RouteLocationNormalized } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { confirmDestructive } from '@/lib/confirmation'
 import { ArrowLeft, FlaskConical, LoaderCircle, LocateFixed, PackagePlus, PanelLeftOpen, Play, Plus, RadioTower, Save, Search, Workflow as WorkflowIcon, X } from '@lucide/vue'
 import type { Connection } from '@vue-flow/core'
 import { appApi, knowledgeApi, modelApi, promptApi, workflowApi } from '@/api'
@@ -280,8 +281,8 @@ async function removeItems(nodeIds: string[], edgeIndices: number[]) {
   const nodesToRemove = new Set(nodeIds)
   const linksToRemove = new Set(edgeIndices.map(index => edges.value[index]))
   try {
-    await ElMessageBox.confirm(nodeIds.length ? `将删除 ${nodeIds.length} 个节点及其连线。` : `将删除 ${edgeIndices.length} 条连线。`,
-      '确认删除', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' })
+    await confirmDestructive(nodeIds.length ? `将删除 ${nodeIds.length} 个节点及其连线。` : `将删除 ${edgeIndices.length} 条连线。`,
+      '删除流程元素')
   } catch { return }
   nodes.value = nodes.value.filter(node => !nodesToRemove.has(node.id))
   edges.value = edges.value.filter(edge => {

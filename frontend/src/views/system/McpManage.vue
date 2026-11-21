@@ -174,7 +174,8 @@ import PageHeader from '@/components/layout/PageHeader.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import ErrorState from '@/components/ui/ErrorState.vue'
 import { onMounted, ref } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
+import { confirmDestructive } from '@/lib/confirmation'
 import { Plus } from '@lucide/vue'
 import {
   agentOptionApi,
@@ -317,7 +318,7 @@ async function saveToolSettings() {
 }
 
 async function handleDelete(row: any) {
-  await ElMessageBox.confirm(`确认删除 MCP 服务「${row.name}」？绑定的 Agent 将失去其工具。`, '提示', { type: 'warning' })
+  await confirmDestructive(`确认删除 MCP 服务「${row.name}」？绑定的 Agent 将失去其工具。`, '删除 MCP 服务')
   await mcpApi.remove(row.id)
   ElMessage.success('已删除')
   await load()

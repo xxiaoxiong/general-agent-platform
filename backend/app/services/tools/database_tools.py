@@ -91,7 +91,7 @@ def _rows_to_markdown(cols: list, rows: list) -> str:
 
 async def execute_db_schema(db, params: dict) -> str:
     """查看数据库表结构：列出所有表或指定表的列信息"""
-    table = params.get("table", "").strip()
+    table = (params.get("table") or "").strip()
 
     try:
         if not table:
@@ -162,7 +162,7 @@ async def execute_db_schema(db, params: dict) -> str:
 async def execute_db_query(db, params: dict) -> str:
     """执行 SELECT 查询，返回 Markdown 表格"""
     sql = params.get("sql", "").strip()
-    limit = min(int(params.get("limit", 20)), 50)
+    limit = max(1, min(int(params.get("limit") or 20), 50))
 
     if not re.match(r"^\s*select\b", sql, re.IGNORECASE):
         return ToolResult.failed("错误：只允许 SELECT 查询")

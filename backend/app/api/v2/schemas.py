@@ -1,9 +1,9 @@
 """API v2 Pydantic Schema（任务书 §7 契约）。"""
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints, model_validator
 
 
 # ── Assistants ────────────────────────────────────────────────────────────────
@@ -51,6 +51,19 @@ class ConversationCreate(BaseModel):
     title: str = "新对话"
 
 
+class ConversationPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: Annotated[str, StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=200)] | None = None
+    is_pinned: StrictBool | None = None
+
+    @model_validator(mode="after")
+    def validate_changes(self):
+        if not self.model_fields_set or any(getattr(self, field) is None for field in self.model_fields_set):
+            raise ValueError("请提供有效的会话标题或置顶状态")
+        return self
+
+
 # ── Runs ──────────────────────────────────────────────────────────────────────
 
 class RunCreate(BaseModel):
@@ -64,6 +77,13 @@ class RunCreate(BaseModel):
     model_config_id: Optional[int] = None
     # 会话附件（uploads/ 下的相对路径），随用户消息注入读取注记
     attachments: List[Dict[str, Any]] = Field(default_factory=list)
+    task_mode: Literal[
+        "auto", "chat", "document_analyze", "profile_extract",
+        "document_generate", "document_edit",
+    ] = "auto"
+    document_profile_id: Optional[int] = Field(None, gt=0)
+    document_id: Optional[int] = Field(None, gt=0)
+    task_options: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ApprovalDecisionIn(BaseModel):
@@ -74,6 +94,11 @@ class ApprovalDecisionIn(BaseModel):
 
 class RunResumeRequest(BaseModel):
     decisions: List[ApprovalDecisionIn] = Field(default_factory=list)
+
+
+class RunInputSubmission(BaseModel):
+    request_id: str = Field(min_length=1, max_length=64)
+    values: Dict[str, Any]
 
 
 class RunCancelRequest(BaseModel):

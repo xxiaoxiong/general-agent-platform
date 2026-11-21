@@ -26,9 +26,10 @@ def build_chat_model(
     streaming: bool = True,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    require_tools: bool = True,
 ) -> ChatOpenAI:
     """由平台 ModelProvider/ModelConfig 构造 LangChain ChatOpenAI。"""
-    if not model_config.get("supports_function_call", False):
+    if require_tools and not model_config.get("supports_function_call", False):
         raise ModelCapabilityError(
             f"模型 '{model_config.get('name')}' 未启用原生工具调用（supports_function_call=false）。"
             "DeepAgents 内核要求 Tool Calling 能力，请在模型配置中启用或更换模型；"

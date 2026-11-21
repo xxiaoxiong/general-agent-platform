@@ -20,8 +20,9 @@ from app.models.evolution import AgentEvaluation
 from app.models.user import User
 from app.services.agent_runtime.lifecycle import TERMINAL_STATUSES
 from app.services.agent_runtime.repositories.run_repository import _sql_now
+from app.services.agent_runtime.repositories.session_repository import SessionRepository
 
-from .schemas import ConversationCreate
+from .schemas import ConversationCreate, ConversationPatch
 from .serializers import conversation_to_dict
 
 router = APIRouter(prefix="/conversations", tags=["conversations-v2"])
@@ -57,12 +58,16 @@ async def list_conversations(
     if assistant_id is not None:
         cond = and_(cond, AgentSession.agent_id == assistant_id)
     total = (await db.execute(select(func.count(AgentSession.id)).where(cond))).scalar()
-    msg_count = session_message_count_expr(db.get_bind().dialect.name)
+    dialect = db.get_bind().dialect.name
+    msg_count = session_message_count_expr(dialect)
+    pin_order = AgentSession.pinned_at.desc()
+    if dialect == "postgresql":
+        pin_order = pin_order.nulls_last()
     res = await db.execute(
         select(AgentSession, msg_count.label("message_count"))
         .options(defer(AgentSession.messages))
         .where(cond)
-        .order_by(AgentSession.updated_at.desc())
+        .order_by(pin_order, AgentSession.updated_at.desc(), AgentSession.id.desc())
         .offset((page - 1) * page_size).limit(page_size)
     )
     sessions = res.all()
@@ -101,6 +106,41 @@ async def create_conversation(
     await db.commit()
     await db.refresh(session)
     return conversation_to_dict(session)
+
+
+@router.get("/{session_id}")
+async def get_conversation(
+    session_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """按 ID 读取当前用户的会话，支持从文档历史打开原会话。"""
+    return conversation_to_dict(await _get_owned_session(db, session_id, current_user))
+
+
+@router.patch("/{session_id}")
+async def update_conversation(
+    session_id: int,
+    body: ConversationPatch,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """在活动任务期间也可调整会话标题及置顶状态。"""
+    updated = await SessionRepository(db).update_metadata(
+        session_id, current_user.id, title=body.title, is_pinned=body.is_pinned,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    msg_count = session_message_count_expr(db.get_bind().dialect.name)
+    row = await db.execute(
+        select(AgentSession, msg_count.label("message_count"))
+        .options(defer(AgentSession.messages))
+        .where(AgentSession.id == session_id)
+    )
+    session, count = row.one()
+    result = conversation_to_dict(session, message_count=count)
+    await db.commit()
+    return result
 
 
 @router.get("/{session_id}/messages")

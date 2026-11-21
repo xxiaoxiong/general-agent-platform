@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
+from app.services.audit_capture import worker_audit_context
 
 from .events import (
     APPROVAL_REQUIRED,
@@ -41,6 +42,7 @@ from .lifecycle import (
     STATUS_PENDING,
     STATUS_RUNNING,
     STATUS_WAITING_APPROVAL,
+    STATUS_WAITING_INPUT,
     RunHandle,
 )
 from .repositories import (
@@ -53,6 +55,7 @@ from .repositories import (
 )
 from .repositories.session_repository import SessionRepository
 from .repositories.errors import RunLeaseLost
+from .task_router import DOCUMENT_GRAPH_TYPES
 
 if TYPE_CHECKING:  # pragma: no cover - 仅类型标注，避免循环导入
     from .service import AgentRuntimeService
@@ -77,6 +80,8 @@ class RunJob:
     agent_config: Optional[Dict[str, Any]] = None
     use_memory_context: str = ""
     db_info: Optional[Dict[str, Any]] = None
+    execution_context: Optional[Dict[str, Any]] = None
+    audit_origin: Optional[Dict[str, Any]] = None
 
 
 def default_worker_id() -> str:
@@ -252,7 +257,7 @@ class RunWorker:
         handle.worker_id = self.worker_id
         handle.lease_expires_at = row.lease_expires_at
         handle.attempt = row.attempt or 0
-        if handle.status == STATUS_PENDING:
+        if handle.status in (STATUS_PENDING, STATUS_WAITING_INPUT):
             handle.transition(STATUS_RUNNING)
 
         # 显式恢复（HITL resume）不得跳过 Checkpoint 校验直接 RECOVERY_FRESH（P1-03 D
@@ -287,7 +292,8 @@ class RunWorker:
                 await self._pause_run(handle, STATUS_WAITING_APPROVAL, actions=actions)
                 return
 
-        if mode == RECOVERY_CONTINUE and not is_resume:
+        document_run = (job.execution_context or {}).get("task_type") in DOCUMENT_GRAPH_TYPES
+        if mode == RECOVERY_CONTINUE and not is_resume and not document_run:
             job = replace(job, messages=None, resume=None)
         elif job.messages is None and job.resume is None:
             # 恢复路径：从数据库输入快照重建请求输入
@@ -298,6 +304,7 @@ class RunWorker:
                 agent_config=job.agent_config or db_job.agent_config,
                 use_memory_context=job.use_memory_context or db_job.use_memory_context,
                 db_info=job.db_info if job.db_info is not None else db_job.db_info,
+                execution_context=job.execution_context or db_job.execution_context,
             )
 
         await self.supervise(handle, LegacyEventAdapter(handle.run_id), job)
@@ -336,7 +343,8 @@ class RunWorker:
 
     def supervise(self, handle: RunHandle, adapter: LegacyEventAdapter, job: RunJob) -> asyncio.Task:
         """驱动执行并提供租约保护。返回监督任务（已登记，参与优雅关闭）。"""
-        return self._spawn(self._supervise(handle, adapter, job))
+        handle.supervisor = self._spawn(self._supervise(handle, adapter, job))
+        return handle.supervisor
 
     async def _supervise(
         self, handle: RunHandle, adapter: LegacyEventAdapter, job: RunJob
@@ -352,7 +360,8 @@ class RunWorker:
             use_memory_context=job.use_memory_context,
             db_info=job.db_info,
             user_id=job.user_id,
-        ))
+            **({"execution_context": job.execution_context} if job.execution_context is not None else {}),
+        ), context=worker_audit_context(job.audit_origin))
         handle.task = drive_task
         hb_task = asyncio.create_task(self._heartbeat_loop(handle, lease_version, drive_task))
         try:
@@ -365,11 +374,15 @@ class RunWorker:
             if not hb_task.done():
                 hb_task.cancel()
             results = await asyncio.gather(drive_task, hb_task, return_exceptions=True)
-            await self._release(handle, lease_version)
             self._active.pop(handle.run_id, None)
             # P1-04 §12：Run 终态后释放 Registry 热数据（Task 已完成），避免长期运行
             # 进程内 _runs/_by_idem 线性增长；状态真相恒在 DB，释放不影响查询/回放/幂等。
-            self.service.registry.release(handle.run_id)
+            # 文档输入也完全持久化，先移除旧句柄再交还租约，避免续跑复用旧任务。
+            self.service.registry.release(
+                handle.run_id,
+                persisted=(job.execution_context or {}).get("task_type") in DOCUMENT_GRAPH_TYPES,
+            )
+            await self._release(handle, lease_version)
         exc = drive_task.exception() if not drive_task.cancelled() else None
         if exc is not None:
             if isinstance(exc, RunLeaseLost):
@@ -559,6 +572,8 @@ class RunWorker:
             agent_config=row.agent_config_snapshot,
             use_memory_context=payload.get("use_memory_context", ""),
             db_info=payload.get("db_info"),
+            execution_context=payload.get("execution_context"),
+            audit_origin=payload.get("audit_origin"),
         )
 
 

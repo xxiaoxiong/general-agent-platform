@@ -118,7 +118,8 @@
 <script setup lang="ts">
 import { computed, reactive, ref, onUnmounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
+import { confirmDestructive } from '@/lib/confirmation'
 import { ArrowLeft, CircleAlert, FileText, Link, RefreshCw, Upload, X } from '@lucide/vue'
 import { knowledgeApi } from '@/api'
 import PageHeader from '@/components/layout/PageHeader.vue'
@@ -225,7 +226,7 @@ async function sendUpload(base: number, file: File, item: UploadEntry) {
 async function deleteDoc(doc: KnowledgeDocument) {
   const base = kbId.value
   try {
-    await ElMessageBox.confirm(`删除文档「${doc.filename}」及其索引？`, '删除文档', { type: 'warning', confirmButtonText: '删除' })
+    await confirmDestructive(`删除文档「${doc.filename}」及其索引？`, '删除文档')
     await knowledgeApi.deleteDocument(base, doc.id)
     ElMessage.success('文档已删除')
     if (disposed || kbId.value !== base) return

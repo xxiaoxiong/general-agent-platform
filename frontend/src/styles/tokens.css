@@ -20,6 +20,7 @@
   --ui-warning-soft: #fdf1d9;
   --ui-danger: #a23845;
   --ui-danger-soft: #fcecef;
+  --ui-on-danger: #fff;
   --ui-info: #315f94;
   --ui-info-soft: #eaf2fc;
   --ui-code-bg: #222233;
@@ -93,6 +94,7 @@
   --ui-warning-soft: #453620;
   --ui-danger: #f0a0aa;
   --ui-danger-soft: #472a36;
+  --ui-on-danger: #2b1520;
   --ui-info: #99c2f0;
   --ui-info-soft: #26374f;
   --ui-code-bg: #171720;

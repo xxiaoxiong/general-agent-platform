@@ -1,5 +1,5 @@
 <template>
-  <section class="workspace-home" :class="{ 'has-preview': preview }" aria-label="智能体工作空间">
+  <section class="workspace-home" :class="{ 'has-preview': preview || documentPreview }" aria-label="智能体工作空间">
     <button v-if="historyOpen" type="button" class="history-overlay" aria-label="关闭会话历史" @click="closeHistory()"></button>
     <ConversationHistory
       v-show="historyOpen"
@@ -10,9 +10,13 @@
       :failed="historyFailed"
       :creating="creatingConversation"
       :deleting-id="deletingId"
+      :has-more="hasMoreConversations"
+      :loading-more="historyLoadingMore"
       :status="conversationStatus"
+      :update-metadata="updateConversationMetadata"
       @close="closeHistory"
       @retry="loadConversations()"
+      @load-more="loadMoreConversations"
       @create="newConversation"
       @select="selectConversation"
       @remove="removeConversation"
@@ -78,7 +82,7 @@
                     type="button"
                     class="msg-file"
                     :title="file.name"
-                    @click="openPreview('uploads/' + file.name, file.name)"
+                    @click="openPreview(file.path, file.name)"
                   >
                     <img v-if="file.previewUrl" :src="file.previewUrl" alt="" />
                     <FileText v-else :size="16" />
@@ -89,7 +93,7 @@
               </div>
             </article>
 
-            <article v-else class="msg-assistant" aria-label="助手消息">
+            <article v-else class="msg-assistant" aria-label="助手消息" :data-run-id="m.runId">
               <div class="assistant-mark"><Bot :size="16" /></div>
               <div class="msg-content">
                 <div class="msg-heading">
@@ -97,9 +101,41 @@
                   <span v-if="runState(m)" class="run-state" :data-state="runState(m)?.tone">{{ runState(m)?.label }}</span>
                   <span v-if="taskTimeText(m)" class="run-duration">{{ taskTimeText(m) }}</span>
                 </div>
-                <template v-for="(block, blockIdx) in messageBlocks[idx]" :key="block.kind === 'tool' ? block.key : blockIdx">
+                <template v-for="(block, blockIdx) in messageBlocks[idx]"
+                  :key="block.kind === 'tool' ? block.key : block.kind === 'input_request' ? block.request.request_id
+                    : block.kind === 'document_edit_review' ? `review-${block.review.ordinal}` : blockIdx">
                   <MessageMarkdown v-if="block.kind === 'text'" :text="block.text" />
                   <ToolStep v-else-if="block.kind === 'tool'" :tool="block" @preview="openPreview" />
+                  <DocumentArtifactCard
+                    v-else-if="block.kind === 'document_artifact'" :artifact="block.artifact"
+                    :downloading="downloadingDocuments.has(block.artifact.document_version_id)"
+                    @preview="openDocumentPreview(block.artifact)" @download="downloadArtifact(block.artifact)"
+                    @edit="continueDocument(block.artifact)"
+                  />
+                  <ProfileDraftCard v-else-if="block.kind === 'document_profile_draft'"
+                    :definition="block.definition" :uncertainties="block.uncertainties" :warnings="block.warnings"
+                    :saved="block.saved" :input="profileConfirmation(m)" :busy="documentInputsBusy.has(m.runId || '')"
+                    :error="documentInputErrors.get(m.runId || '')"
+                    @confirm="confirmProfile(m, $event)" @cancel="cancelDocumentInput(m)"
+                  />
+                  <DocumentEditReviewCard v-else-if="block.kind === 'document_edit_review'"
+                    :review="block.review" :decision="block.decision"
+                    :applied="m.blocks.some((item) => item.kind === 'document_artifact')"
+                    :state="['failed', 'cancelled', 'suspended', 'limit_exceeded'].includes(m.runStatus || '')
+                      ? 'closed' : (documentReviewInput(m, block)?.state ?? (m.streaming ? undefined : 'closed'))"
+                    :busy="documentInputsBusy.has(m.runId || '')" :error="documentInputErrors.get(m.runId || '')"
+                    @submit="submitDocumentReview(m, block, $event)"
+                  />
+                  <InputRequestCard
+                    v-else-if="block.kind === 'input_request' && !isInlineProfileConfirmation(m, block.request)
+                      && !isDocumentReviewInput(block.request)"
+                    :request="block.request" :state="block.state" :busy="documentInputsBusy.has(m.runId || '')"
+                    :error="documentInputErrors.get(m.runId || '')"
+                    @submit="submitDocumentInput(m, block.request.request_id, $event)" @cancel="cancelDocumentInput(m)"
+                  />
+                  <div v-else-if="block.kind === 'document_stage'" class="document-stage" :data-tone="block.tone">
+                    <FileText :size="14" /><span>{{ block.label }}<template v-if="block.detail"> · {{ block.detail }}</template></span>
+                  </div>
 
                   <details v-else-if="block.kind === 'plan'" class="process-disclosure" open>
                     <summary><ListTodo :size="15" />任务计划 <span>{{ planItems(block.todos).length }} 项</span></summary>
@@ -143,6 +179,10 @@
                   <button v-if="m.runId" type="button" class="trace-link" @click="openTrace(m.runId)">
                     <ExternalLink :size="14" /> 执行 Trace
                   </button>
+                  <button v-if="m.documentRetryable && m.runStatus === 'failed'" type="button" class="trace-link"
+                    :disabled="documentInputsBusy.has(m.runId || '')" @click="retryFailedDocument(m)">
+                    <RotateCcw :size="14" /> 继续文档任务
+                  </button>
                   <button v-if="m.error && messages[idx - 1]?.role === 'user'" type="button" class="trace-link" @click="editRetry(idx - 1)">
                     <RotateCcw :size="14" /> 编辑并重试
                   </button>
@@ -172,7 +212,7 @@
           :attachments="attachments"
           :uploading="uploading"
           :sending="sending"
-          :stoppable="streaming"
+          :stoppable="streaming || !!historyRun"
           :blocked-reason="blockedReason"
           :locked="loadingMessages || messagesFailed"
           @send="sendMessage"
@@ -180,12 +220,24 @@
           @upload="uploadAttachments"
           @remove="removeAttachment"
           @preview="openPreview"
-        />
+        >
+          <template v-if="documentContext" #document-context>
+            <div class="document-context">
+              <FileText :size="15" /><span>{{ documentContext }}</span>
+              <button type="button" @click="resetDocumentTask" aria-label="清除文档任务"><X :size="14" /></button>
+            </div>
+          </template>
+          <template #document-task>
+            <DocumentTaskPicker v-model="documentTask" :disabled="!!blockedReason || loadingMessages || messagesFailed" />
+          </template>
+        </ConversationComposer>
       </div>
     </section>
 
+    <DocumentPreviewPanel v-if="documentPreview" :artifact="documentPreview"
+      @close="closePreview" @download="downloadArtifact(documentPreview)" />
     <FilePreviewPanel
-      v-if="preview"
+      v-else-if="preview"
       :data="preview.data"
       :name="preview.name"
       :loading="preview.loading"
@@ -211,32 +263,45 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from
 import { useRoute, useRouter } from 'vue-router'
 import {
   ArrowDown, Bot, ChartNoAxesCombined, Circle, CircleAlert, CircleCheck, CircleDot,
-  Copy, ExternalLink, FilePenLine, FileText, Layers, ListTodo, LoaderCircle, PanelLeft, RotateCcw, Search,
+  Copy, ExternalLink, FilePenLine, FileText, Layers, ListTodo, LoaderCircle, PanelLeft, RotateCcw, Search, X,
 } from '@lucide/vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
+import { confirmDestructive } from '@/lib/confirmation'
 import { modelApi } from '@/api'
 import {
   conversationApi, consumeRunEvents, runApi, workspaceApi,
-  type Assistant, type Conversation, type PreviewContent,
+  type Assistant, type Conversation, type ConversationMetadata, type PreviewContent,
 } from '@/api/v2'
 import {
-  applyRunEvent, finalizeRunMessage, hasVisibleText,
-  type MsgBlock, type RunStreamMessage, type ToolBlock,
+  acceptDocInput, addDocInput, applyRunEvent, documentReviewInput, finalizeRunMessage, hasVisibleText,
+  isDocumentReviewInput, pendingDocInput, recordDocumentReview,
+  type DocumentEditReviewBlock, type MsgBlock, type RunStreamMessage, type ToolBlock,
 } from '@/features/run/blocks'
 import ToolStep from '@/features/run/ToolStep.vue'
 import ApprovalPanel from '@/features/run/ApprovalPanel.vue'
 import MessageMarkdown from '@/features/run/MessageMarkdown.vue'
 import FilePreviewPanel from '@/features/preview/FilePreviewPanel.vue'
+import { filePreviewError } from '@/features/preview/previewError'
+import DocumentArtifactCard from '@/features/documents/DocumentArtifactCard.vue'
+import DocumentEditReviewCard from '@/features/documents/DocumentEditReviewCard.vue'
+import DocumentPreviewPanel from '@/features/documents/DocumentPreviewPanel.vue'
+import DocumentTaskPicker from '@/features/documents/DocumentTaskPicker.vue'
+import InputRequestCard from '@/features/documents/InputRequestCard.vue'
+import ProfileDraftCard from '@/features/documents/ProfileDraftCard.vue'
+import { isProfileConfirmation } from '@/features/documents/inputRequest'
+import { documentTaskPayload, type DocumentTaskSelection } from '@/features/documents/taskModes'
+import { documentError, documentProfilesApi, documentsApi, downloadDocument, type DocumentArtifact, type InputRequest, type ProfileDefinition } from '@/api/documents'
 import ConversationComposer from './ConversationComposer.vue'
 import ConversationHistory from './ConversationHistory.vue'
+import { messageAttachments, type MessageAttachment } from './attachmentHistory'
 import { hasScrolledAway, isNearLatest } from './interactions'
 
 interface ChatMessage extends RunStreamMessage {
   role: 'user' | 'assistant'
   content: string
   runId?: string
-  /** 用户消息携带的附件（历史回放时从附件注记恢复；图片带本地预览 URL） */
-  files?: Array<{ name: string; previewUrl?: string }>
+  task?: DocumentTaskSelection
+  files?: MessageAttachment[]
 }
 
 /** 折叠后的连续工具步骤组（完成后折叠防刷屏） */
@@ -262,12 +327,28 @@ const threadRef = ref<HTMLElement>()
 const inputText = ref('')
 const route = useRoute()
 const router = useRouter()
+const documentTask = ref<DocumentTaskSelection>({ mode: 'auto' })
+const documentContext = computed(() => {
+  const { documentId, profileId, title, version } = documentTask.value
+  if (documentId) return `修改「${title || `文档 #${documentId}`}」${version ? ` · v${version}` : ''}`
+  if (profileId) return `按「${title || `规范 #${profileId}`}」生成`
+  return ''
+})
+const documentPreview = ref<DocumentArtifact | null>(null)
+const downloadingDocuments = reactive(new Set<number>())
+const documentInputsBusy = reactive(new Set<string>())
+const documentInputErrors = reactive(new Map<string, string>())
 const composer = ref<InstanceType<typeof ConversationComposer>>()
 const historyToggle = ref<HTMLButtonElement>()
 const historyMedia = window.matchMedia('(min-width: 850px)')
 const historyOpen = ref(historyMedia.matches)
 const historyLoading = ref(false)
 const historyFailed = ref(false)
+const historyLoadingMore = ref(false)
+const historyTotal = ref(0)
+const historyLoadedPages = ref(1)
+const historyPageSize = 50
+const hasMoreConversations = computed(() => historyLoadedPages.value * historyPageSize < historyTotal.value)
 const creatingConversation = ref(false)
 const deletingId = ref<number | null>(null)
 const loadingMessagesFor = reactive(new Set<number>())
@@ -279,6 +360,7 @@ const sending = ref(false)
 const uploading = ref(0)
 let creating: Promise<Conversation> | undefined
 let historyRevision = 0
+let requestedHistoryPages = 1
 let inactive = false
 
 const examples = [
@@ -292,17 +374,56 @@ function syncConversationUrl(id?: number) {
   const query = { ...route.query }
   if (id) query.conversation = String(id)
   else delete query.conversation
+  if (query.run) delete query.run
   void router.replace({ query })
 }
 
-function openLinkedConversation() {
-  const id = route.query.conversation
-  if (typeof id !== 'string' || historyLoading.value || historyFailed.value || inactive) return
-  const item = conversations.value.find((conversation) => String(conversation.id) === id)
-  if (item && currentConversation.value?.id !== item.id) void selectConversation(item)
+async function openLinkedConversation() {
+  const id = numericQuery(route.query.conversation)
+  if (!id || historyLoading.value || inactive) return
+  if (currentConversation.value?.id === id) {
+    if (route.query.run) void focusLinkedRun()
+    return
+  }
+  const known = conversations.value.find((conversation) => conversation.id === id)
+  if (known) {
+    await selectConversation(known)
+    return
+  }
+  try {
+    const item = await conversationApi.get(id)
+    if (inactive || numericQuery(route.query.conversation) !== id) return
+    if (!conversations.value.some((conversation) => conversation.id === id)) conversations.value.push(item)
+    await selectConversation(item)
+  } catch {
+    if (!inactive && numericQuery(route.query.conversation) === id) ElMessage.error('无法打开关联会话')
+  }
 }
 
-watch(() => route.query.conversation, openLinkedConversation)
+watch(() => [route.query.conversation, route.query.run], openLinkedConversation)
+
+function numericQuery(value: unknown) {
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) return undefined
+  const id = Number(value)
+  return Number.isSafeInteger(id) && id > 0 ? id : undefined
+}
+
+async function syncLinkedDocument() {
+  const id = numericQuery(route.query.document)
+  const profile = numericQuery(route.query.profile)
+  if (!id && !profile) return
+  const selection: DocumentTaskSelection = id
+    ? { mode: 'document_edit', documentId: id, version: numericQuery(route.query.version) }
+    : { mode: 'document_generate', profileId: profile }
+  documentTask.value = selection
+  const inserted = documentTask.value
+  try {
+    const title = id ? (await documentsApi.get(id)).title : profile ? (await documentProfilesApi.get(profile)).name : ''
+    if (documentTask.value === inserted) documentTask.value = { ...selection, title }
+  } catch { /* 仍展示链接中的文档或规范标识，任务创建会校验可见性。 */ }
+}
+
+watch(() => [route.query.document, route.query.version, route.query.profile], syncLinkedDocument, { immediate: true })
 
 function openHistory() {
   historyOpen.value = true
@@ -341,7 +462,14 @@ function clearActiveRun(convId: number, entry?: ActiveRun) {
 
 const streaming = computed(() =>
   !!currentConversation.value && runningConvIds.value.includes(currentConversation.value.id))
+const historyRun = computed(() => {
+  const runId = currentConversation.value?.active_run_id
+  if (!runId) return
+  return messages.value.find((m) => m.runId === runId && m.streaming && !m.pendingActions?.length && !pendingDocInput(m))
+})
 const blockedReason = computed(() => {
+  const request = messages.value.map(pendingDocInput).find(Boolean)?.request
+  if (request) return isDocumentReviewInput(request) ? '当前有修改稿待处理，可在消息中查看、保存或放弃。' : '请先处理消息中的文档补充请求。'
   if (streaming.value) return '任务运行中，可以停止生成。'
   if (messages.value.some((m) => m.pendingActions?.length)) return '请先处理消息中的审批请求。'
   if (messages.value.some((m) => m.streaming)) return '正在恢复执行进度…'
@@ -356,6 +484,8 @@ const currentAssistant = ref<Assistant | null>(null)
 function conversationStatus(c: Conversation) {
   if (runningConvIds.value.includes(c.id)) return '执行中'
   const cached = convMessages.get(c.id)
+  const request = cached?.map(pendingDocInput).find(Boolean)?.request
+  if (request) return isDocumentReviewInput(request) ? '等待审阅' : '等待补充'
   if (cached?.some((message) => message.pendingActions?.length)) return '等待审批'
   if (cached?.some((message) => message.streaming)) return '恢复进度中'
   return c.active_run_id && !cached ? '有活跃任务' : ''
@@ -410,6 +540,8 @@ const statuses: Record<string, { label: string; tone: string }> = {
   pending: { label: '排队中', tone: 'info' },
   running: { label: '执行中', tone: 'info' },
   waiting_approval: { label: '等待审批', tone: 'warning' },
+  waiting_input: { label: '等待补充', tone: 'warning' },
+  waiting_document_review: { label: '等待审阅', tone: 'warning' },
   needs_reconciliation: { label: '等待处理', tone: 'warning' },
   completed: { label: '已完成', tone: 'success' },
   failed: { label: '失败', tone: 'danger' },
@@ -419,6 +551,8 @@ const statuses: Record<string, { label: string; tone: string }> = {
 }
 
 function runState(message: ChatMessage) {
+  const request = pendingDocInput(message)?.request
+  if (request) return isDocumentReviewInput(request) ? statuses.waiting_document_review : statuses.waiting_input
   if (message.pendingActions?.length) return statuses.waiting_approval
   if (message.streaming && message.runStatus !== 'pending') return statuses.running
   if (message.error) return statuses.failed
@@ -491,6 +625,19 @@ async function forceScrollToBottom() {
     el.scrollTop = el.scrollHeight
     lastPinnedTop = el.scrollTop
   }
+}
+
+async function focusLinkedRun() {
+  const id = route.query.run
+  if (typeof id !== 'string') return false
+  await nextTick()
+  const target = Array.from(threadRef.value?.querySelectorAll<HTMLElement>('[data-run-id]') || [])
+    .find((message) => message.dataset.runId === id)
+  const viewport = messagesRef.value
+  if (!target || !viewport) return false
+  stickToBottom.value = false
+  viewport.scrollTop += target.getBoundingClientRect().top - viewport.getBoundingClientRect().top - 12
+  return true
 }
 
 // ── 提问锚点导航（右侧纵向圆点：点击跳转对应提问，悬浮气泡预览内容）────────
@@ -639,19 +786,51 @@ onUnmounted(() => {
 
 async function loadConversations(refresh = false) {
   const revision = ++historyRevision
+  const pageCount = requestedHistoryPages
   if (!refresh) historyLoading.value = true
   historyFailed.value = false
   try {
-    const res = await conversationApi.list()
+    const pages = await Promise.all(Array.from({ length: pageCount }, (_, index) => conversationApi.list({
+      page: index + 1, page_size: historyPageSize,
+    })))
     if (revision === historyRevision) {
-      conversations.value = res.items || []
+      const previous = currentConversation.value
+      const rows = pages.flatMap((page) => page.items || [])
+      conversations.value = [...new Map(rows.map((row) => [row.id, row])).values()]
+      historyTotal.value = pages[0].total
+      historyLoadedPages.value = pageCount
       const refreshed = conversations.value.find((item) => item.id === currentConversation.value?.id)
       if (refreshed) currentConversation.value = refreshed
+      else if (previous) conversations.value.push(previous)
     }
   } catch {
     if (revision === historyRevision && !conversations.value.length) historyFailed.value = true
   } finally {
     if (revision === historyRevision) historyLoading.value = false
+  }
+}
+
+async function loadMoreConversations() {
+  if (!hasMoreConversations.value || historyLoadingMore.value) return
+  historyLoadingMore.value = true
+  requestedHistoryPages = historyLoadedPages.value + 1
+  try {
+    await loadConversations(true)
+  } finally {
+    requestedHistoryPages = historyLoadedPages.value
+    historyLoadingMore.value = false
+  }
+}
+
+async function updateConversationMetadata(item: Conversation, changes: ConversationMetadata) {
+  try {
+    const updated = await conversationApi.update(item.id, changes)
+    if (inactive) return
+    conversations.value = conversations.value.map((row) => row.id === item.id ? updated : row)
+    if (currentConversation.value?.id === item.id) currentConversation.value = updated
+    void loadConversations(true)
+  } catch (error) {
+    throw new Error(documentError(error, changes.title !== undefined ? '重命名失败，请重试' : '更新置顶状态失败，请重试'))
   }
 }
 
@@ -670,6 +849,7 @@ function pushMsg(convId: number, msg: ChatMessage): ChatMessage {
 
 async function newConversation() {
   composer.value?.cancelDictation()
+  resetDocumentTask()
   try {
     const c = await createConversation()
     if (currentConversation.value?.id === c.id) focusConversation()
@@ -707,6 +887,9 @@ function switchConversation(c: Conversation | null) {
   composer.value?.cancelDictation()
   disposeAttachments()
   closePreview()
+  if (currentConversation.value && currentConversation.value.id !== c?.id) {
+    resetDocumentTask()
+  }
   currentConversation.value = c
   syncConversationUrl(c?.id)
   showJumpToLatest.value = false
@@ -723,12 +906,44 @@ function reloadMessages() {
 
 const historyStreams = new Map<string, AbortController>()
 
+function replayConversationRun(convId: number, runId: string, content = '') {
+  const msg = pushMsg(convId, {
+    role: 'assistant', content, blocks: [], runId, streaming: true, pendingActions: [],
+    lastActivity: 'other', lastEventAt: Date.now(), liveStatus: '正在恢复执行进度…',
+  })
+  const controller = new AbortController()
+  historyStreams.set(runId, controller)
+  void consumeRunEvents(runId, {
+    signal: controller.signal,
+    afterSeq: 0,
+    replayPastPauses: true,
+    onEvent: (envelope) => {
+      applyRunEvent(msg, envelope)
+      if (currentConversation.value?.id === convId) void scrollToBottom()
+    },
+    onDone: (reason) => {
+      finalizeRunMessage(msg, reason, msg.content)
+      if (msg.runStatus === 'failed') void refreshDocumentRetryability(msg)
+      if (msg.runStatus === 'waiting_input' && !pendingDocInput(msg)) {
+        void runApi.get(runId).then((run) => {
+          if (!controller.signal.aborted && run.pending_input) addDocInput(msg, run.pending_input)
+        }).catch(() => {})
+      }
+    },
+  }).catch(() => {
+    msg.streaming = false
+    msg.liveStatus = ''
+  }).finally(() => {
+    if (historyStreams.get(runId) === controller) historyStreams.delete(runId)
+  })
+}
+
 async function selectConversation(c: Conversation) {
   if (currentConversation.value?.id !== c.id) switchConversation(c)
   if (!historyMedia.matches) closeHistory()
   if (loadingMessagesFor.has(c.id)) return
   if (convMessages.has(c.id) && !failedMessagesFor.has(c.id)) {
-    await forceScrollToBottom()
+    if (!await focusLinkedRun()) await forceScrollToBottom()
     return
   }
   loadingMessagesFor.add(c.id)
@@ -738,9 +953,10 @@ async function selectConversation(c: Conversation) {
     if (inactive || !conversations.value.some((item) => item.id === c.id)) return
     const arr = convArr(c.id)
     const raw: any[] = res.items || []
+    const assistantRuns = new Set(raw.filter((item) => item.role === 'assistant').map((item) => item.source_run_id))
     for (const m of raw) {
       if (m.role === 'user') {
-        const { text, files } = splitAttachmentNote(m.content || '')
+        const { text, files } = messageAttachments(m.content || '', m.attachments)
         const msg = pushMsg(c.id, { role: 'user', content: text, blocks: [], files })
         // 图片附件懒加载预览（不阻塞历史渲染；经响应式代理赋值触发视图刷新）
         files.forEach((f, fi) => {
@@ -751,6 +967,11 @@ async function selectConversation(c: Conversation) {
             })
           }
         })
+        const documentRunId = m.document_run_id
+        if (typeof documentRunId === 'string' && !assistantRuns.has(documentRunId)) {
+          replayConversationRun(c.id, documentRunId)
+          assistantRuns.add(documentRunId)
+        }
         continue
       }
       const content = m.content || ''
@@ -764,57 +985,42 @@ async function selectConversation(c: Conversation) {
           runStatus: 'completed', pendingActions: [],
         })
       } else {
-        const msg = pushMsg(c.id, {
-          role: 'assistant', content, blocks: [], runId,
-          streaming: true, runStatus: '', pendingActions: [],
-          lastActivity: 'other', lastEventAt: Date.now(),
-          liveStatus: '正在恢复执行进度…',
-        })
-        const controller = new AbortController()
-        historyStreams.set(runId, controller)
-        void consumeRunEvents(runId, {
-          signal: controller.signal,
-          afterSeq: 0,
-          onEvent: (envelope) => {
-            applyRunEvent(msg, envelope)
-            if (currentConversation.value?.id === c.id) void scrollToBottom()
-          },
-          onDone: (reason) => finalizeRunMessage(msg, reason, msg.content),
-        }).catch(() => {
-          msg.streaming = false
-          msg.liveStatus = ''
-        }).finally(() => {
-          historyStreams.delete(runId)
-        })
+        replayConversationRun(c.id, runId, content)
       }
     }
+    if (c.active_run_id && !assistantRuns.has(c.active_run_id)) replayConversationRun(c.id, c.active_run_id)
   } catch {
     convMessages.delete(c.id)
     failedMessagesFor.add(c.id)
   } finally {
     loadingMessagesFor.delete(c.id)
-    if (currentConversation.value?.id === c.id && !failedMessagesFor.has(c.id)) await forceScrollToBottom()
+    if (currentConversation.value?.id === c.id && !failedMessagesFor.has(c.id) && !await focusLinkedRun()) await forceScrollToBottom()
   }
 }
 
+let confirmingDelete = false
+
 async function removeConversation(c: Conversation) {
-  if (deletingId.value !== null) return
-  deletingId.value = c.id
+  if (confirmingDelete || deletingId.value !== null) return
+  confirmingDelete = true
   try {
-    await ElMessageBox.confirm(`确定删除「${c.title || '新对话'}」？`, '删除对话', {
-      type: 'warning', confirmButtonText: '删除', cancelButtonText: '保留',
+    await confirmDestructive(`将从历史会话中删除「${c.title || '新对话'}」及其消息。`, '删除对话', {
+      cancelButtonText: '保留',
     })
   } catch {
-    deletingId.value = null
     return
+  } finally {
+    confirmingDelete = false
   }
+  deletingId.value = c.id
   try {
     const entry = activeRuns.get(c.id)
     if (entry && !entry.msg.runId) {
       ElMessage.info('任务正在创建，请稍后再删除对话')
       return
     }
-    const runId = entry?.msg.runId
+    const runId = entry?.msg.runId || convMessages.get(c.id)?.find((message) => message.streaming || pendingDocInput(message))?.runId
+      || c.active_run_id
     if (runId) await runApi.cancel(runId, '删除会话前取消任务')
     await conversationApi.delete(c.id)
     if (entry) {
@@ -842,23 +1048,6 @@ async function removeConversation(c: Conversation) {
 /** 图片扩展名（生成缩略图预览用） */
 function isImageName(name: string): boolean {
   return /\.(png|jpe?g|gif|bmp|webp|svg)$/i.test(name)
-}
-
-/** 剥离用户消息尾部的附件注记块（后端注入），还原正文与附件列表 */
-function splitAttachmentNote(content: string): {
-  text: string
-  files: Array<{ name: string; previewUrl?: string }>
-} {
-  const marker = '\n\n[附件]'
-  const idx = content.indexOf(marker)
-  if (idx < 0) return { text: content, files: [] }
-  const files = content
-    .slice(idx + marker.length)
-    .split('\n')
-    .map((l) => l.replace(/^-\s*/, '').replace(/（.*$/, '').replace(/^\/?workspace\//, '').trim())
-    .filter(Boolean)
-    .map((p) => ({ name: p.replace(/^uploads\//, '') }))
-  return { text: content.slice(0, idx), files }
 }
 
 /** 历史图片附件懒加载预览（Blob -> objectURL） */
@@ -919,35 +1108,53 @@ interface PreviewState {
 }
 const preview = ref<PreviewState | null>(null)
 let previewGeneration = 0
+let previewController: AbortController | undefined
 
 /** 打开右侧预览（path 为工作区相对路径；name 为展示名） */
 async function openPreview(path: string, name?: string) {
   const conv = currentConversation.value
   if (!conv || !path) return
-  const display = name || path.replace(/\\/g, '/').split('/').filter(Boolean).pop() || path
+  documentPreview.value = null
+  // 工具历史会指向抽取副本。用户点击 Word 时直接查看原文件版式。
+  const originalWord = /\.docx\.extracted\.txt$/i.test(path)
+  let sourcePath = originalWord ? path.slice(0, -'.extracted.txt'.length) : path
+  const display = (originalWord ? name?.replace(/\.extracted\.txt$/i, '') : name)
+    || sourcePath.replace(/\\/g, '/').split('/').filter(Boolean).pop() || sourcePath
+  previewController?.abort()
+  const controller = new AbortController()
+  previewController = controller
   const previousUrl = preview.value?.data?.objectUrl
   if (previousUrl) URL.revokeObjectURL(previousUrl)
   const generation = ++previewGeneration
-  preview.value = { name: display, path, loading: true, error: '', data: null }
+  preview.value = { name: display, path: sourcePath, loading: true, error: '', data: null }
+  let fallback: PreviewContent | null = null
   try {
-    const meta = await conversationApi.filePreview(conv.id, path)
+    const meta = await conversationApi.filePreview(conv.id, sourcePath).catch((cause) => {
+      if (!originalWord || cause?.response?.status !== 404) throw cause
+      sourcePath = path
+      return conversationApi.filePreview(conv.id, sourcePath)
+    })
     if (generation !== previewGeneration) return
+    fallback = meta
+    const word = /\.docx$/i.test(meta.name)
     let objectUrl: string | undefined
-    if (meta.kind === 'image' || meta.kind === 'pdf') {
-      const blob = await conversationApi.fileBytes(conv.id, path)
+    if (word || meta.kind === 'image' || meta.kind === 'pdf') {
+      const blob = word
+        ? await conversationApi.filePreviewPdf(conv.id, sourcePath, controller.signal)
+        : await conversationApi.fileBytes(conv.id, sourcePath)
       if (generation !== previewGeneration) return
       objectUrl = URL.createObjectURL(blob)
     }
     preview.value = {
-      name: meta.name || display, path: meta.path || path,
-      loading: false, error: '', data: { ...meta, objectUrl },
+      name: meta.name || display, path: meta.path || sourcePath,
+      loading: false, error: '', data: { ...meta, kind: word ? 'pdf' : meta.kind, objectUrl },
     }
-  } catch (e: any) {
+  } catch (cause) {
+    const error = await filePreviewError(cause, '无法加载文件预览')
     if (generation !== previewGeneration) return
-    const detail = e?.response?.data?.detail
     preview.value = {
-      name: display, path, loading: false,
-      error: typeof detail === 'string' ? detail : '无法加载文件预览', data: null,
+      name: fallback?.name || display, path: fallback?.path || sourcePath,
+      loading: false, error, data: fallback,
     }
   }
 }
@@ -955,9 +1162,52 @@ async function openPreview(path: string, name?: string) {
 /** 关闭预览（回收 objectURL，防内存泄漏） */
 function closePreview() {
   ++previewGeneration
+  previewController?.abort()
+  previewController = undefined
   const url = preview.value?.data?.objectUrl
   if (url) URL.revokeObjectURL(url)
   preview.value = null
+  documentPreview.value = null
+}
+
+function openDocumentPreview(artifact: DocumentArtifact) {
+  closePreview()
+  documentPreview.value = artifact
+}
+
+async function downloadArtifact(artifact: DocumentArtifact) {
+  const id = artifact.document_version_id
+  if (downloadingDocuments.has(id)) return
+  downloadingDocuments.add(id)
+  try {
+    await downloadDocument(artifact.document_id, artifact.version_no, artifact.filename)
+  } catch (error) {
+    ElMessage.error(documentError(error, 'Word 文档下载失败'))
+  } finally {
+    downloadingDocuments.delete(id)
+  }
+}
+
+function continueDocument(artifact: DocumentArtifact) {
+  if (blockedReason.value) {
+    ElMessage.info(blockedReason.value)
+    return
+  }
+  documentTask.value = {
+    mode: 'document_edit', documentId: artifact.document_id, version: artifact.version_no, title: artifact.title,
+  }
+  closePreview()
+  focusConversation()
+}
+
+function resetDocumentTask() {
+  documentTask.value = { mode: 'auto' }
+  if (route.name !== 'Workspace' || (!route.query.document && !route.query.profile)) return
+  const query = { ...route.query }
+  delete query.document
+  delete query.version
+  delete query.profile
+  void router.replace({ query })
 }
 
 /** 下载当前预览文件 */
@@ -983,7 +1233,7 @@ async function downloadPreview() {
 /** Esc 关闭预览（仅预览打开时拦截） */
 function onGlobalKeydown(e: KeyboardEvent) {
   if (e.key !== 'Escape' || e.defaultPrevented) return
-  if (preview.value) closePreview()
+  if (preview.value || documentPreview.value) closePreview()
   else if (historyOpen.value && !historyMedia.matches) closeHistory()
 }
 
@@ -998,6 +1248,7 @@ function editRetry(userMessageIndex: number) {
   const message = messages.value[userMessageIndex]
   if (message?.role !== 'user') return
   inputText.value = message.content
+  if (message.task) documentTask.value = message.task
   if (message.files?.length) ElMessage.info('请为重试重新选择附件')
   composer.value?.focus()
 }
@@ -1020,12 +1271,14 @@ async function sendMessage() {
   const sentFiles = attachments.value.map((a) => ({ ...a }))
   const sentModelId = selectedModelId.value
   const sentMode = approvalMode.value
+  const sentTask = { ...documentTask.value }
 
   inputText.value = ''
   attachments.value = []
+  resetDocumentTask()
   pushMsg(convId, {
-    role: 'user', content: text, blocks: [],
-    files: sentFiles.map((a) => ({ name: a.name, previewUrl: a.previewUrl })),
+    role: 'user', content: text, blocks: [], task: sentTask,
+    files: sentFiles.map(({ name, path, previewUrl }) => ({ name, path, previewUrl })),
   })
   const aMsg = pushMsg(convId, {
     role: 'assistant', content: '', blocks: [], streaming: true,
@@ -1044,6 +1297,7 @@ async function sendMessage() {
       approval_mode: sentMode,
       model_config_id: sentModelId || undefined,
       attachments: sentFiles,
+      ...documentTaskPayload(sentTask),
     })
     if (entry.stopped) {
       if (!inactive) runApi.cancel(created.run_id, '用户主动停止').catch(() => {
@@ -1077,7 +1331,10 @@ async function sendMessage() {
     aMsg.runStatus = 'failed'
     aMsg.error = '创建任务失败，可编辑原消息后重新发送。'
     clearActiveRun(convId, entry)
-    if (currentConversation.value?.id === convId && !inputText.value) inputText.value = text
+    if (currentConversation.value?.id === convId && !inputText.value) {
+      inputText.value = text
+      documentTask.value = sentTask
+    }
   }
 }
 
@@ -1085,6 +1342,7 @@ function finishRun(convId: number, entry: ActiveRun, reason: string) {
   if (activeRuns.get(convId) !== entry) return
   finalizeRunMessage(entry.msg, reason, entry.msg.content)
   clearActiveRun(convId, entry)
+  if (entry.msg.runStatus === 'failed') void refreshDocumentRetryability(entry.msg)
   void loadConversations(true) // 标题已规范化生成，刷新会话列表
   if (currentConversation.value?.id === convId) scrollToBottom()
 }
@@ -1108,7 +1366,17 @@ async function stopGeneration() {
   const convId = currentConversation.value?.id
   if (!convId) return
   const entry = activeRuns.get(convId)
-  if (!entry) return
+  if (!entry) {
+    const message = historyRun.value
+    if (!message?.runId) return
+    try {
+      const result = await runApi.cancel(message.runId, '用户主动停止')
+      ElMessage.info(result.message || '取消请求已发送')
+    } catch {
+      ElMessage.warning('取消请求失败，任务可能继续执行')
+    }
+    return
+  }
   entry.stopped = true
   entry.abort.abort()
   clearActiveRun(convId, entry)
@@ -1130,14 +1398,107 @@ async function decideApproval(convId: number, message: ChatMessage, type: 'appro
   pendingDecisions.set(runId, type)
   try {
     await runApi.resume(runId, message.pendingActions.map((action) => ({ type, action_id: action.action_id || null })))
-    if (!inactive && convMessages.get(convId)?.includes(message)) observeResumedRun(convId, message, type)
+    if (!inactive && convMessages.get(convId)?.includes(message)) {
+      observeResumedRun(convId, message, type === 'approve' ? '已批准，恢复执行…' : '已拒绝，恢复执行…')
+    }
   } catch { /* 请求层显示错误，保留待审批操作以便重试 */ }
   finally {
     pendingDecisions.delete(runId)
   }
 }
 
-function observeResumedRun(convId: number, aMsg: ChatMessage, type: 'approve' | 'reject') {
+function isInlineProfileConfirmation(message: ChatMessage, request: InputRequest) {
+  return isProfileConfirmation(request) && message.blocks.some((block) => block.kind === 'document_profile_draft')
+}
+
+function profileConfirmation(message: ChatMessage) {
+  const request = pendingDocInput(message)?.request
+  return request && isInlineProfileConfirmation(message, request) ? request : undefined
+}
+
+function confirmProfile(message: ChatMessage, definition: ProfileDefinition) {
+  const request = profileConfirmation(message)
+  if (request) void submitDocumentInput(message, request.request_id, { definition, confirm: true })
+}
+
+function submitDocumentReview(message: ChatMessage, block: DocumentEditReviewBlock, acceptedIds: string[]) {
+  if (documentReviewInput(message, block)?.state === 'pending' && block.requestId) {
+    void submitDocumentInput(message, block.requestId, { accepted_change_ids: acceptedIds })
+  }
+}
+
+async function submitDocumentInput(message: ChatMessage, requestId: string, values: Record<string, unknown>) {
+  const runId = message.runId
+  const convId = currentConversation.value?.id
+  if (!runId || !convId || documentInputsBusy.has(runId) || pendingDocInput(message)?.request.request_id !== requestId) return
+  documentInputsBusy.add(runId)
+  documentInputErrors.delete(runId)
+  try {
+    await runApi.submitInput(runId, requestId, values)
+    if (inactive || !convMessages.get(convId)?.includes(message)) return
+    const accepted = values.accepted_change_ids
+    if (Array.isArray(accepted)) recordDocumentReview(message, requestId, accepted)
+    acceptDocInput(message, requestId)
+    observeResumedRun(convId, message, Array.isArray(accepted) ? '审阅已提交，正在继续执行…' : '资料已提交，正在继续执行…')
+  } catch (error) {
+    documentInputErrors.set(runId, documentError(error, '提交失败，请重试'))
+  } finally {
+    documentInputsBusy.delete(runId)
+  }
+}
+
+async function cancelDocumentInput(message: ChatMessage) {
+  const runId = message.runId
+  const convId = currentConversation.value?.id
+  if (!runId || !convId || documentInputsBusy.has(runId) || !pendingDocInput(message)) return
+  documentInputsBusy.add(runId)
+  documentInputErrors.delete(runId)
+  try {
+    await runApi.cancel(runId, '用户取消文档任务')
+    if (!inactive && convMessages.get(convId)?.includes(message)) {
+      const input = pendingDocInput(message)
+      if (input) input.state = 'closed'
+      observeResumedRun(convId, message, '正在取消文档任务…')
+    }
+  } catch (error) {
+    documentInputErrors.set(runId, documentError(error, '取消失败，请重试'))
+  } finally {
+    documentInputsBusy.delete(runId)
+  }
+}
+
+async function refreshDocumentRetryability(message: ChatMessage) {
+  if (!message.runId || !message.blocks.some((block) => block.kind === 'document_stage')) return
+  try {
+    const run = await runApi.get(message.runId)
+    if (message.runStatus === 'failed') message.documentRetryable = run.document_retryable === true
+  } catch { /* 保留事件中已知的恢复状态 */ }
+}
+
+async function retryFailedDocument(message: ChatMessage) {
+  const runId = message.runId
+  const convId = currentConversation.value?.id
+  if (!runId || !convId || documentInputsBusy.has(runId)) return
+  if (activeRuns.has(convId)) {
+    ElMessage.warning('此会话正在执行任务，请等它完成后再继续')
+    return
+  }
+  documentInputsBusy.add(runId)
+  try {
+    const resumed = await runApi.retryDocument(runId, message.lastSeq)
+    if (inactive || !convMessages.get(convId)?.includes(message)) return
+    message.lastSeq = resumed.after_seq
+    message.error = undefined
+    message.documentRetryable = false
+    observeResumedRun(convId, message, '正在从文档断点继续…')
+  } catch (error) {
+    ElMessage.error(documentError(error, '暂时无法继续，请重试'))
+  } finally {
+    documentInputsBusy.delete(runId)
+  }
+}
+
+function observeResumedRun(convId: number, aMsg: ChatMessage, liveStatus: string) {
   if (!aMsg.runId) return
   const previous = activeRuns.get(convId)
   if (previous) {
@@ -1147,9 +1508,10 @@ function observeResumedRun(convId: number, aMsg: ChatMessage, type: 'approve' | 
   historyStreams.get(aMsg.runId)?.abort()
   aMsg.pendingActions = []
   aMsg.streaming = true
+  aMsg.runStatus = 'running'
   aMsg.lastActivity = 'other'
   aMsg.lastEventAt = Date.now()
-  aMsg.liveStatus = type === 'approve' ? '已批准，恢复执行…' : '已拒绝，恢复执行…'
+  aMsg.liveStatus = liveStatus
 
   const entry: ActiveRun = { abort: new AbortController(), stopped: false, msg: aMsg }
   setActiveRun(convId, entry)
@@ -1157,6 +1519,7 @@ function observeResumedRun(convId: number, aMsg: ChatMessage, type: 'approve' | 
   consumeRunEvents(aMsg.runId, {
     signal: entry.abort.signal,
     afterSeq: aMsg.lastSeq || 0,
+    replayPastPauses: true,
     onEvent: (envelope) => {
       if (entry.stopped) return
       applyRunEvent(aMsg, envelope)
@@ -1171,6 +1534,17 @@ function observeResumedRun(convId: number, aMsg: ChatMessage, type: 'approve' | 
 </script>
 
 <style scoped>
+.document-stage { display: flex; gap: 6px; align-items: center; color: var(--ui-muted); font-size: 12px; }
+.document-stage svg { flex: none; }
+.document-stage[data-tone="warning"] { color: var(--ui-warning); }
+.document-stage[data-tone="success"] { color: var(--ui-success); }
+.document-context {
+  display: flex; align-items: center; gap: 6px; margin: 3px 5px 2px; font-size: 12px;
+  color: var(--ui-accent); overflow-wrap: anywhere;
+}
+.document-context > svg { flex: none; }
+.document-context > button { display: grid; place-items: center; min-width: 28px; height: 28px; border: 0; border-radius: var(--ui-radius-sm); background: none; color: inherit; cursor: pointer; }
+.document-context > button:hover { background: var(--ui-accent-soft); }
 .workspace-home {
   --thread-gutter: clamp(16px, 4%, 48px);
   --thread-line: 720px;
@@ -1307,7 +1681,7 @@ function observeResumedRun(convId: number, aMsg: ChatMessage, type: 'approve' | 
 .latest-button:hover { color: var(--ui-accent); }
 .is-empty .composer-dock { padding-bottom: clamp(20px, 23vh, 218px); }
 .is-empty .ws-welcome { justify-content: end; }
-.has-preview .ws-history { flex-basis: 192px; }
+.has-preview .ws-history { flex: 0 1 192px; min-width: 0; overflow: hidden; }
 .spin { animation: rotate 1s linear infinite; }
 @keyframes rotate { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }

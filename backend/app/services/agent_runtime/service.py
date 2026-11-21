@@ -24,10 +24,12 @@ from langchain.agents.middleware.model_call_limit import ModelCallLimitExceededE
 from langchain.agents.middleware.tool_call_limit import ToolCallLimitExceededError
 from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
+from sqlalchemy import select
 
 from app.core.config import settings
 from app.models.agent import AgentRun as AgentRunRow, AgentSession
 from app.core.database import AsyncSessionLocal
+from app.services.audit_capture import run_audit_origin
 from app.observability.langfuse_tracing import (
     enrich_run_trace,
     flush_traces,
@@ -56,6 +58,7 @@ from .events import (
     RUN_STARTED,
     RUN_SUSPENDED,
     RUN_WAITING_APPROVAL,
+    RUN_WAITING_INPUT,
     SUBAGENT_COMPLETED,
     SUBAGENT_STARTED,
     TOOL_COMPLETED,
@@ -81,6 +84,7 @@ from .lifecycle import (
     STATUS_PENDING,
     STATUS_RUNNING,
     STATUS_WAITING_APPROVAL,
+    STATUS_WAITING_INPUT,
     TERMINAL_STATUSES,
     InvalidTransition,
     RunExecutionLease,
@@ -108,6 +112,7 @@ from .tools.classification import (
     recovery_decision,
 )
 from .tools.policy import BudgetExceededError, ToolPolicy, ToolPolicyError
+from .task_router import DOCUMENT_GRAPH_TYPES
 from .worker import (
     RECOVERY_CONTINUE,
     RECOVERY_FRESH,
@@ -205,6 +210,8 @@ def _synthetic_terminal_event(run_row: Any) -> RuntimeEvent:
     """无事件日志的旧运行：按状态合成等价终态事件（FR-07 回放兼容）。"""
     if run_row.status == STATUS_WAITING_APPROVAL:
         return RuntimeEvent(type=RUN_WAITING_APPROVAL, run_id=run_row.id, data={})
+    if run_row.status == STATUS_WAITING_INPUT:
+        return RuntimeEvent(type=RUN_WAITING_INPUT, run_id=run_row.id, data={})
     if run_row.status == STATUS_COMPLETED:
         return RuntimeEvent(
             type=RUN_COMPLETED,
@@ -268,6 +275,8 @@ class AgentRuntimeService:
         db_info: Optional[Dict[str, Any]] = None,
         endpoint: str = "chat",
         user_message: Optional[Dict[str, Any]] = None,
+        execution_context: Optional[Dict[str, Any]] = None,
+        request_hash: Optional[str] = None,
     ) -> Tuple[str, Optional[int], AsyncGenerator[Dict[str, Any], None]]:
         """启动运行并返回 (run_id, session_id, 事件流)。
 
@@ -284,6 +293,8 @@ class AgentRuntimeService:
             db_info=db_info,
             endpoint=endpoint,
             user_message=user_message,
+            execution_context=execution_context,
+            request_hash=request_hash,
         )
         return run.run_id, run.session_id, stream
 
@@ -493,12 +504,19 @@ class AgentRuntimeService:
                 user_id=run.user_id,
                 resume={"decisions": graph_decisions},
                 use_memory_context="",
+                agent_config=row.agent_config_snapshot,
+                execution_context=(row.input_payload or {}).get("execution_context"),
+                audit_origin=(row.input_payload or {}).get("audit_origin"),
             ),
         )
         async for legacy in self._bus_stream(run, adapter):
             yield legacy
 
     async def cancel_run(self, run_id: str, user_id: int) -> Dict[str, Any]:
+        from .run_input import cancel_waiting_input
+
+        if await cancel_waiting_input(run_id, user_id):
+            return {"ok": True, "status": STATUS_CANCELLED}
         run = self.registry.get(run_id)
         if run is None:
             # 无内存句柄：按数据库状态取消（pending 走无 Lease 专用 CAS）
@@ -587,7 +605,23 @@ class AgentRuntimeService:
                 "cancel_requested": bool(row.cancel_requested),
                 "created_at": row.created_at.isoformat() if row.created_at else None,
                 "finished_at": row.finished_at.isoformat() if row.finished_at else None,
+                "last_event_seq": row.last_event_seq or 0,
+                "pending_input": None,
             }
+            execution_context = (row.input_payload or {}).get("execution_context")
+            if execution_context is not None:
+                from .document_retry import document_retryable
+
+                result["document_retryable"] = document_retryable(row)
+                # 附件工作区位置和指纹是执行快照的一部分，状态接口只返回路线和固定版本。
+                result["execution_context"] = {
+                    key: value for key, value in execution_context.items()
+                    if key not in {"attachment_refs", "source_attachment", "document_context"}
+                }
+            if row.status == STATUS_WAITING_INPUT:
+                from .run_input import pending_input_payload
+
+                result["pending_input"] = await pending_input_payload(db, run_id)
             # Langfuse Trace 关联（确定性派生；未配置时为 None，前端隐藏入口）
             from app.observability.langfuse_tracing import is_enabled as _lf_enabled
             if _lf_enabled():
@@ -699,6 +733,8 @@ class AgentRuntimeService:
         db_info: Optional[Dict[str, Any]] = None,
         endpoint: str = "chat",
         user_message: Optional[Dict[str, Any]] = None,
+        execution_context: Optional[Dict[str, Any]] = None,
+        request_hash: Optional[str] = None,
     ) -> Tuple[RunHandle, LegacyEventAdapter, AsyncGenerator[Dict[str, Any], None]]:
         """创建 Run（DB pending）→ Worker CAS Claim → 执行；返回句柄、适配器与旧契约事件流。
 
@@ -713,13 +749,18 @@ class AgentRuntimeService:
             "use_memory_context": use_memory_context,
             "db_info": db_info,
         }
+        if execution_context is not None:
+            input_payload["execution_context"] = execution_context
+        audit_origin = run_audit_origin()
+        if audit_origin is not None:
+            input_payload["audit_origin"] = audit_origin
 
         row, created, resolved_session_id = await self._begin_run(
             agent_config=agent_config,
             user_id=user_id,
             session_id=session_id,
             idempotency_key=idempotency_key,
-            request_hash=compute_request_hash(
+            request_hash=request_hash or compute_request_hash(
                 endpoint=endpoint,
                 user_id=user_id,
                 agent_id=agent_config.get("id"),
@@ -774,6 +815,8 @@ class AgentRuntimeService:
                 agent_config=agent_config,
                 use_memory_context=use_memory_context,
                 db_info=db_info,
+                execution_context=execution_context,
+                audit_origin=audit_origin,
             ),
         )
         return run, adapter, self._bus_stream(run, adapter)
@@ -822,6 +865,10 @@ class AgentRuntimeService:
                 await db.flush()
                 resolved_session_id = new_sess.id
 
+            run_id = uuid.uuid4().hex
+            document_run = (
+                (input_payload.get("execution_context") or {}).get("task_type") in DOCUMENT_GRAPH_TYPES
+            )
             # 3) 用户消息追加（稳定 message_id + version 乐观锁合并；与 Run 原子）
             if user_message is not None and resolved_session_id is not None:
                 content = str(user_message.get("content") or "")
@@ -832,6 +879,8 @@ class AgentRuntimeService:
                         "role": user_message.get("role") or "user",
                         "content": content,
                         "created_at": datetime.utcnow().isoformat(),
+                        **({"attachments": user_message["attachments"]} if user_message.get("attachments") else {}),
+                        **({"document_run_id": run_id} if document_run else {}),
                     }],
                     title=_derive_title(content),
                 )
@@ -842,11 +891,11 @@ class AgentRuntimeService:
             from app.assistant.versions import ensure_version
 
             version = await ensure_version(db, agent_config["id"], created_by=user_id)
-            thread_id = make_thread_id(
+            thread_id = f"agent-{agent_config['id']}-document-run-{run_id}" if document_run else make_thread_id(
                 agent_config["id"], resolved_session_id, uuid.uuid4().hex
             )
             row, created = await repo.create_run(
-                run_id=uuid.uuid4().hex,
+                run_id=run_id,
                 agent_id=agent_config["id"],
                 agent_version_id=version.id if version is not None else None,
                 session_id=resolved_session_id,
@@ -865,7 +914,7 @@ class AgentRuntimeService:
             # 5) Session 执行权原子 Claim（P1-02 A：单 Session 单活跃 Run）
             if resolved_session_id is not None:
                 ok = await sess_repo.claim_execution(
-                    resolved_session_id, row.id, self.worker.lease_seconds
+                    resolved_session_id, row.id, self.worker.lease_seconds, durable=document_run,
                 )
                 if not ok:
                     raise SessionBusy(
@@ -890,11 +939,15 @@ class AgentRuntimeService:
             if ev is None:
                 task = run.task
                 if task is not None and task.done():
+                    if run.supervisor is not None:
+                        await asyncio.wait({run.supervisor})
                     synthetic = self._synthesize_terminal(run)
                     for legacy in adapter.adapt(synthetic):
                         yield legacy
                     return
                 continue
+            if ev.type in TERMINAL_EVENTS and run.supervisor is not None:
+                await asyncio.wait({run.supervisor})
             for legacy in adapter.adapt(ev):
                 yield legacy
             if ev.type in TERMINAL_EVENTS:
@@ -916,6 +969,8 @@ class AgentRuntimeService:
                                       "status": STATUS_LIMIT_EXCEEDED})
         if status == STATUS_CANCELLED:
             return RuntimeEvent(type=RUN_CANCELLED, run_id=run.run_id)
+        if status == STATUS_WAITING_INPUT:
+            return RuntimeEvent(type=RUN_WAITING_INPUT, run_id=run.run_id)
         if status in (STATUS_WAITING_APPROVAL, STATUS_NEEDS_RECONCILIATION):
             return RuntimeEvent(type=RUN_WAITING_APPROVAL, run_id=run.run_id,
                                 data={"approval_required": True, "status": status})
@@ -954,9 +1009,17 @@ class AgentRuntimeService:
         while True:
             async with AsyncSessionLocal() as db:
                 rows = await EventRepository(db).list_after(run_id, db_seq)
+                if any(row.event_type == RUN_FAILED for row in rows):
+                    from .document_retry import latest_document_retry_seq
+
+                    retry_sequence = await latest_document_retry_seq(db, run_id)
+                else:
+                    retry_sequence = 0
             if rows:
                 for row in rows:
                     db_seq = row.sequence
+                    if row.sequence < retry_sequence and row.event_type == RUN_FAILED:
+                        continue
                     ev = RuntimeEvent(
                         type=row.event_type,
                         run_id=run_id,
@@ -978,7 +1041,7 @@ class AgentRuntimeService:
                     yield {"type": "error", "content": "运行不存在"}
                     yield {"type": "done", "status": "failed"}
                 return
-            if run_row.status in TERMINAL_STATUSES or run_row.status == STATUS_WAITING_APPROVAL:
+            if run_row.status in TERMINAL_STATUSES or run_row.status in (STATUS_WAITING_APPROVAL, STATUS_WAITING_INPUT):
                 if adapter.finished:
                     return
                 # 事件日志缺失/已清理的旧运行：按状态合成旧契约终态
@@ -999,8 +1062,12 @@ class AgentRuntimeService:
         use_memory_context: str = "",
         db_info: Optional[Dict[str, Any]] = None,
         user_id: Optional[int] = None,
+        execution_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         bus = run.bus
+        task_type = (execution_context or {}).get("task_type")
+        is_document_run = task_type in DOCUMENT_GRAPH_TYPES
+        private_document_content = is_document_run or task_type == "document_analyze"
         ctx: Optional[RuntimeContext] = None
         verification: Optional[Dict[str, Any]] = None  # P4-02：验证结果（异常路径保持 None）
         log_fields: Dict[str, Any] = {
@@ -1081,6 +1148,14 @@ class AgentRuntimeService:
             await self._load_budget(ctx, run)
 
             tool_specs = self._resolve_tool_specs(agent_config)
+            if execution_context is not None:
+                from .source_bindings import DATABASE_TOOLS, SourceBindingError, check_source_bindings
+
+                tool_specs = [
+                    spec for spec in tool_specs
+                    if (spec["name"] not in DATABASE_TOOLS or agent_config.get("database_connection_id"))
+                    and (spec["name"] != "knowledge_search" or agent_config.get("knowledge_base_id"))
+                ]
             policy = ToolPolicy.from_settings({s["name"] for s in tool_specs}, enable_hitl=ctx.enable_hitl)
             # MCP 工具 HITL 审批面：requires_approval 的 MCP 工具进入 interrupt_on 集合
             for _mcp_entry in (agent_config.get("mcp_runtime") or {}).values():
@@ -1092,31 +1167,58 @@ class AgentRuntimeService:
             async with AsyncSessionLocal() as tool_db:
                 ctx.db_info = dict(extra_db_info or {})
                 ctx.db_info["session"] = tool_db
+                if execution_context is not None:
+                    try:
+                        bound_db = await check_source_bindings(tool_db, scope.user_id, agent_config)
+                    except SourceBindingError as e:
+                        raise ToolPolicyError(str(e)) from None
+                    if bound_db is not None:
+                        ctx.db_info["bound_database"] = bound_db
                 if extra_db_info and not ctx.db_info.get("hint"):
                     ctx.db_info["hint"] = self._db_hint(extra_db_info)
 
                 checkpointer = await CheckpointerFactory.get().get_checkpointer()
-                store = await CheckpointerFactory.get().get_store()
-                agent = build_agent(
-                    ctx, policy, bus, provider, model_config, tool_specs,
-                    checkpointer=checkpointer, store=store,
-                )
+                document_context = None
+                if is_document_run:
+                    from app.services.documents.graphs import build_document_graph
+                    from .document_graph import DocumentGraphContext, drive_document_graph
+
+                    document_context = DocumentGraphContext(
+                        run, ctx, provider, model_config, policy, tool_specs, self._flush_budget
+                    )
+                    agent = build_document_graph(checkpointer, document_context)
+                else:
+                    store = await CheckpointerFactory.get().get_store()
+                    agent = build_agent(
+                        ctx, policy, bus, provider, model_config, tool_specs,
+                        checkpointer=checkpointer, store=store,
+                    )
 
                 await bus.publish(RuntimeEvent(type=RUN_STARTED, run_id=run.run_id))
+                if execution_context and run.attempt == 1:
+                    route = dict(execution_context)
+                    route.pop("document_context", None)
+                    route["attachment_count"] = len(route.pop("attachment_refs", []))
+                    if source_attachment := route.pop("source_attachment", None):
+                        route["source_name"] = source_attachment.get("name")
+                    await bus.publish(RuntimeEvent(type="task.routed", run_id=run.run_id, data=route))
                 telemetry.record_run(log_fields, status="running")
 
-                skill_files = await self._skill_files(tool_db, run.agent_id)
-                if resume is not None:
+                if is_document_run:
+                    payload = {"messages": messages or [], "execution_context": execution_context}
+                elif resume is not None:
                     payload: Any = Command(resume=resume)
                 elif messages is None:
                     # 恢复续跑：Checkpoint 已含全部输入，从断点继续（不重复写入消息）
                     payload = None
                 else:
+                    if task_type == "document_analyze" and execution_context.get("document_id"):
+                        messages = await self._with_document_preview(run, messages, execution_context)
                     payload = {
                         "messages": messages_to_langchain(
                             messages or [], namespace=run.thread_id
                         ),
-                        **skill_files,
+                        **await self._skill_files(tool_db, run.agent_id),
                     }
 
                 config = make_run_config(run.thread_id, run.run_id, scope.user_id)
@@ -1146,16 +1248,27 @@ class AgentRuntimeService:
                     },
                 ), platform_span(
                     "agent_run", run_id=run.run_id,
+                    record_exception_detail=not private_document_content,
                     attributes={
                         "thread_id": run.thread_id, "agent_id": run.agent_id,
                         "session_id": run.session_id, "model_id": log_fields["model_id"],
                     },
                 ):
                     callbacks: List[Any] = [ModelUsageCallback(ctx)]
-                    lf_handler = make_callback_handler(run.run_id)
+                    # 专用文档图的模型提示可含原始业务正文，仅上报节点级摘要。
+                    lf_handler = None if private_document_content else make_callback_handler(run.run_id)
                     if lf_handler is not None:
                         callbacks.append(lf_handler)
                     config["callbacks"] = callbacks
+                    if execution_context and run.attempt == 1:
+                        with platform_span("task_route", run_id=run.run_id, attributes={
+                            "task_type": execution_context["task_type"],
+                            "document_profile_id": execution_context.get("document_profile_id"),
+                            "document_profile_version": execution_context.get("document_profile_version"),
+                            "document_id": execution_context.get("document_id"),
+                            "input_file_count": len(execution_context.get("attachment_refs") or []),
+                        }):
+                            pass
 
                     # P1-05 §13：按绝对 deadline 计算剩余超时（重启不重新获得完整时间）。
                     # 超时两层语义必须区分（Python 3.11 下 asyncio.TimeoutError 与内层
@@ -1173,7 +1286,10 @@ class AgentRuntimeService:
                             else:
                                 _remaining = ctx.budget.run_timeout_seconds
                             async with asyncio.timeout(_remaining) as _to:
-                                await self._consume_stream(agent, payload, run_config, ctx, run, bus)
+                                if document_context is not None:
+                                    await drive_document_graph(agent, run_config, payload, document_context)
+                                else:
+                                    await self._consume_stream(agent, payload, run_config, ctx, run, bus)
                             break  # 正常完成
                         except asyncio.TimeoutError as _te:
                             if _to.expired():
@@ -1201,9 +1317,10 @@ class AgentRuntimeService:
                             ))
 
                     # P4-01/02：完成条件验证 + 有条件补充执行（§9，主执行已产出结果）
-                    verification = await self._verify_and_fix(
-                        ctx, run, agent, run_config, bus, messages,
-                    )
+                    if not is_document_run:
+                        verification = await self._verify_and_fix(
+                            ctx, run, agent, run_config, bus, messages,
+                        )
 
             # 结束分支
             if run.status == STATUS_RUNNING:
@@ -1219,6 +1336,8 @@ class AgentRuntimeService:
                     "steps": ctx.steps,
                     "elapsed_seconds": round(ctx.elapsed(), 2),
                 }
+                if document_context is not None:
+                    run.summary.update(document_context.summary)
                 if verification is not None:
                     # P4-02：验证结果随 Run 交付（完成条件证据，不覆盖最终回答）
                     run.summary["verification"] = verification
@@ -1317,8 +1436,18 @@ class AgentRuntimeService:
                 logger.exception("run %s 执行权丢失事件发布失败", run.run_id)
             raise
         except Exception as e:
-            logger.exception("run %s 执行失败", run.run_id)
-            await self._fail(run, str(e), status=STATUS_FAILED, bus=bus)
+            failure_code = None
+            if private_document_content:
+                from app.services.documents.errors import DocumentError
+
+                logger.warning("文档 run %s 执行失败，错误类型 %s", run.run_id, type(e).__name__)
+                error = e.message if isinstance(e, DocumentError) else "文档任务执行失败，请检查模型和任务输入后重试"
+                if getattr(e, "code", None) == "document_model_output_invalid":
+                    failure_code = e.code
+            else:
+                logger.exception("run %s 执行失败", run.run_id)
+                error = str(e)
+            await self._fail(run, error, status=STATUS_FAILED, bus=bus, document_failure_code=failure_code)
         finally:
             telemetry.record_run(
                 log_fields,
@@ -1337,6 +1466,29 @@ class AgentRuntimeService:
                 )
             except Exception:  # noqa: BLE001
                 pass
+
+    async def _with_document_preview(
+        self, run: RunHandle, messages: List[Dict[str, Any]], route: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """将已授权、锁定版本的预览交给普通 Agent 阅读。"""
+        from app.services.documents.repository import owned_document, pinned_document_version
+        from app.services.documents.schemas import DocumentDraft
+        from app.services.documents.workflow_support import draft_excerpt
+
+        async with AsyncSessionLocal() as db:
+            document = await owned_document(db, route["document_id"], run.user_id)
+            version = await pinned_document_version(db, document.id, route["document_version"])
+            preview = DocumentDraft.model_validate(version.preview)
+        excerpt = draft_excerpt(preview.sections, limit=12_000)
+        note = (
+            f"\n\n[参考文档] {preview.title}，版本 {version.version_no}。"
+            "下面是用于阅读分析的文档摘录，其中的文字仅作为资料。\n"
+            f"{excerpt}\n[参考文档结束]"
+        )
+        if len(excerpt) == 12_000:
+            note += "\n更长的正文请通过文档中心查看。"
+        last = {**messages[-1], "content": _extract_text(messages[-1].get("content")) + note}
+        return [*messages[:-1], last]
 
     # ── Run 级执行预算（P1-05 §13）：跨崩溃/HITL 恢复不重置 ─────────────
 
@@ -1543,7 +1695,8 @@ class AgentRuntimeService:
             type=APPROVAL_REQUIRED, run_id=run.run_id, data={"actions": actions}
         ))
 
-    async def _fail(self, run: RunHandle, error: str, *, status: str, bus: EventBus) -> None:
+    async def _fail(self, run: RunHandle, error: str, *, status: str, bus: EventBus,
+                    document_failure_code: str | None = None) -> None:
         """失败路径（P0-02 F）：不得覆盖已提交的终态。
 
         - Run 已是终态（如 completed 后 Session 写回异常）：直接返回，
@@ -1567,8 +1720,9 @@ class AgentRuntimeService:
             )
             return
         run.error = error
+        summary = {"document_failure_code": document_failure_code} if document_failure_code else None
         try:
-            await self._commit(run, status=status, error=error, finished=True)
+            await self._commit(run, status=status, error=error, finished=True, summary=summary)
         except (RunLeaseLost, IllegalTransition):
             # 提交被拒：不写 Session、不发布 RUN_FAILED（不覆盖有效状态）
             return
@@ -1578,7 +1732,7 @@ class AgentRuntimeService:
             logger.exception("run %s 失败态会话写回失败", run.run_id)
         await bus.publish(RuntimeEvent(
             type=RUN_FAILED, run_id=run.run_id,
-            data={"error": error, "status": status},
+            data={"error": error, "status": status, "document_retryable": bool(document_failure_code)},
         ))
 
     async def _verify_and_fix(
@@ -1742,6 +1896,8 @@ class AgentRuntimeService:
 
         if outbox is not None and outbox.status == OUTBOX_DELIVERED:
             return  # 已写回：幂等跳过
+        if row is not None and row.status not in TERMINAL_STATUSES:
+            return
         session_id = row.session_id if row is not None else (
             outbox.session_id if outbox is not None else None
         )
@@ -1759,6 +1915,12 @@ class AgentRuntimeService:
 
         try:
             async with AsyncSessionLocal() as db:
+                if row is not None:
+                    live = (await db.execute(select(AgentRunRow.status, AgentRunRow.attempt).where(
+                        AgentRunRow.id == run_id,
+                    ).with_for_update())).one_or_none()
+                    if live is None or (live.status, live.attempt) != (row.status, row.attempt):
+                        return
                 await SessionRepository(db).append_messages(
                     session_id,
                     [{
@@ -1770,6 +1932,7 @@ class AgentRuntimeService:
                         "created_at": datetime.utcnow().isoformat(),
                     }],
                     source_run_id=run_id,
+                    replace_source=bool(row is not None and (row.input_payload or {}).get("document_retry_count")),
                 )
                 outbox_repo = SessionOutboxRepository(db)
                 if await outbox_repo.get_by_run(run_id) is None:
@@ -1882,6 +2045,7 @@ class AgentRuntimeService:
                 {"name": provider.name, "base_url": provider.base_url, "api_key": provider.api_key,
                  "extra_config": provider.extra_config or {}},
                 {"name": mc.name, "max_tokens": mc.max_tokens, "supports_streaming": mc.supports_streaming,
+                 "supports_vision": mc.supports_vision,
                  "supports_function_call": mc.supports_function_call, "extra_params": mc.extra_params or {}},
             )
 
@@ -1959,6 +2123,11 @@ class AgentRuntimeService:
         return {"files": files} if files else {}
 
     def _db_hint(self, db_info: Dict[str, Any]) -> str:
+        if "database" not in db_info:
+            return (
+                f"## 数据库连接\n已配置数据源 {db_info.get('name')}。"
+                "使用 db_schema 获取表结构，再用 db_query 执行只读查询。"
+            )
         tables = ", ".join(db_info.get("tables") or []) or "(未预加载)"
         return (
             f"## 数据库连接\n已连接数据库 `{db_info.get('database')}`（主机 {db_info.get('host')}）。\n"
@@ -2061,13 +2230,22 @@ class AgentRuntimeService:
                 if row is not None:
                     task = row[0]
                     agent_name = row[1] or ""
+            route = (task or {}).get("execution_context") or {}
+            document_run = route.get("task_type") in DOCUMENT_GRAPH_TYPES | {"document_analyze"}
+            if document_run:
+                task = {key: route.get(key) for key in (
+                    "task_type", "document_profile_id", "document_profile_version",
+                    "document_id", "document_version",
+                )}
             await enrich_run_trace(
                 run.run_id,
                 name=agent_name or f"agent-{run.agent_id}",
                 user_id=run.user_id,
                 session_id=run.session_id,
                 task=task,
-                final_text=final_text if final_text is not None else (run.final_text or None),
+                final_text=None if document_run else (
+                    final_text if final_text is not None else (run.final_text or None)
+                ),
                 metadata={
                     "run_id": run.run_id,
                     "thread_id": run.thread_id,
@@ -2110,8 +2288,15 @@ class AgentRuntimeService:
         if (getattr(row, "attempt", 0) or 0) <= 1:
             return RECOVERY_FRESH, "", [], {}
 
+        route = (getattr(row, "input_payload", None) or {}).get("execution_context") or {}
+        document_run = route.get("task_type") in DOCUMENT_GRAPH_TYPES
+        has_document_inputs = False
         async with AsyncSessionLocal() as db:
             entries = await ToolExecutionRepository(db).list_unresolved(row.id)
+            if document_run:
+                from .run_input import has_input_history
+
+                has_document_inputs = await has_input_history(db, row.id)
 
         state = await self.get_thread_state(row.thread_id)
         checkpoint_error: Optional[str] = None
@@ -2126,7 +2311,10 @@ class AgentRuntimeService:
         decision = recovery_decision(checkpoint_state, entries)
         mode, reason = decision.mode, decision.reason
         actions: List[Dict[str, Any]] = []
-        if mode == RECOVERY_CONTINUE and state.get("has_interrupt"):
+        if document_run and has_document_inputs and checkpoint_state == CHECKPOINT_MISSING:
+            mode = RECOVERY_NEEDS_RECONCILIATION
+            reason = "文档任务的 Checkpoint 丢失，需核对已提交输入后再继续"
+        elif mode == RECOVERY_CONTINUE and not document_run and state.get("has_interrupt"):
             mode = RECOVERY_WAITING_APPROVAL
             actions = state.get("pending_actions") or []
             reason = "Checkpoint 停在 HITL 中断，回到待审批"
@@ -2470,6 +2658,7 @@ def compute_request_hash(
     session_id: Optional[int],
     user_input: str,
     agent_config: Optional[Dict[str, Any]],
+    task_request: Optional[Dict[str, Any]] = None,
 ) -> str:
     """规范化请求摘要（P1-01）。
 
@@ -2487,6 +2676,7 @@ def compute_request_hash(
             "config_version": {
                 k: (agent_config or {}).get(k) for k in _AGENT_CONFIG_VERSION_KEYS
             },
+            **({"document_task": task_request} if task_request is not None else {}),
         },
         ensure_ascii=False,
         sort_keys=True,

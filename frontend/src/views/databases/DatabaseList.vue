@@ -96,7 +96,8 @@ import PageHeader from '@/components/layout/PageHeader.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import EmptyState from '@/components/ui/EmptyState.vue'
 import ErrorState from '@/components/ui/ErrorState.vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
+import { confirmDestructive } from '@/lib/confirmation'
 import { databaseApi } from '@/api'
 
 const connections = ref<any[]>([])
@@ -198,7 +199,7 @@ async function testConn(conn: any) {
 
 async function deleteConn(conn: any) {
   try {
-    await ElMessageBox.confirm(`确定删除连接「${conn.name}」？`, '确认', { type: 'warning' })
+    await confirmDestructive(`确定删除连接「${conn.name}」？`, '删除数据库连接')
     await databaseApi.delete(conn.id)
     ElMessage.success('已删除')
     await loadConnections()

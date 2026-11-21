@@ -4,6 +4,7 @@
  * 工具小步骤实时追加在对话流尾部（穿插在文本之间），而非聚堆在消息顶部。
  */
 import type { RunEventEnvelope } from '@/api/v2'
+import type { DocumentArtifact, DocumentEditReview, DocumentReviewDecision, InputRequest, ProfileDefinition } from '@/api/documents'
 
 export interface TextBlock {
   kind: 'text'
@@ -30,7 +31,41 @@ export interface ToolBlock {
   filePath?: string
 }
 
-export type MsgBlock = TextBlock | ToolBlock | PlanBlock
+export interface DocumentArtifactBlock {
+  kind: 'document_artifact'
+  artifact: DocumentArtifact
+}
+
+export interface ProfileDraftBlock {
+  kind: 'document_profile_draft'
+  definition: ProfileDefinition
+  uncertainties: string[]
+  warnings: string[]
+  saved?: { id: number; version?: number }
+}
+
+export interface InputRequestBlock {
+  kind: 'input_request'
+  request: InputRequest
+  state: 'pending' | 'submitted' | 'closed'
+}
+
+export interface DocumentEditReviewBlock {
+  kind: 'document_edit_review'
+  review: DocumentEditReview
+  requestId?: string
+  decision?: DocumentReviewDecision
+}
+
+export interface DocumentStageBlock {
+  kind: 'document_stage'
+  label: string
+  detail?: string
+  tone?: 'warning' | 'success'
+}
+
+export type MsgBlock = TextBlock | ToolBlock | PlanBlock | DocumentArtifactBlock | ProfileDraftBlock
+  | InputRequestBlock | DocumentStageBlock | DocumentEditReviewBlock
 
 /** 携带块流的运行消息（工具步骤实时穿插展示的最小状态） */
 export interface RunStreamMessage {
@@ -45,6 +80,9 @@ export interface RunStreamMessage {
   runStatus?: string
   pendingActions?: any[]
   finalText?: string
+  documentRetryable?: boolean
+  documentCompleted?: number
+  documentTotal?: number
   /** 运行起始/最近事件时间戳（事件 timestamp，供任务耗时计算） */
   runStartedAt?: number
   lastEventTs?: number
@@ -110,6 +148,74 @@ function gapFillText(msg: RunStreamMessage, finalText: string) {
   } else if (ft.length > joined.length && ft.startsWith(joined)) {
     msg.blocks.push({ kind: 'text', text: ft.slice(joined.length) })
   }
+}
+
+const DOCUMENT_TASK_LABELS: Record<string, string> = {
+  document_analyze: '文档分析',
+  profile_extract: '提炼文档规范',
+  document_generate: '生成文档',
+  document_edit: '修改文档',
+}
+
+export function pendingDocInput(msg: RunStreamMessage): InputRequestBlock | undefined {
+  return msg.blocks.find((b): b is InputRequestBlock => b.kind === 'input_request' && b.state === 'pending')
+}
+
+export function isDocumentReviewInput(request: InputRequest): boolean {
+  return request.input_schema.properties?.accepted_change_ids?.type === 'array'
+}
+
+export function documentReviewInput(msg: RunStreamMessage, review: DocumentEditReviewBlock): InputRequestBlock | undefined {
+  return msg.blocks.find((block): block is InputRequestBlock => block.kind === 'input_request'
+    && block.request.request_id === review.requestId)
+}
+
+function attachReviewInput(msg: RunStreamMessage, request: InputRequest) {
+  if (!isDocumentReviewInput(request)) return
+  const choices = request.input_schema.properties?.accepted_change_ids?.items?.enum
+  if (!choices?.length) return
+  const review = msg.blocks.find((block): block is DocumentEditReviewBlock =>
+    block.kind === 'document_edit_review' && !block.requestId && block.review.changes.length <= choices.length
+    && block.review.changes.every((change) => choices.includes(change.id)))
+  if (review) review.requestId = request.request_id
+}
+
+export function recordDocumentReview(msg: RunStreamMessage, requestId: string, accepted: string[]) {
+  const block = msg.blocks.find((item): item is DocumentEditReviewBlock => item.kind === 'document_edit_review'
+    && item.requestId === requestId)
+  if (!block) return
+  const all = documentReviewInput(msg, block)?.request.input_schema.properties?.accepted_change_ids?.items?.enum
+    ?.filter((id): id is string => typeof id === 'string')
+    ?? block.review.changes.map((change) => change.id)
+  block.decision = {
+    accepted_change_ids: all.filter((id) => accepted.includes(id)),
+    rejected_change_ids: all.filter((id) => !accepted.includes(id)),
+  }
+}
+
+export function addDocInput(msg: RunStreamMessage, request: InputRequest) {
+  if (msg.blocks.some((b) => b.kind === 'input_request' && b.request.request_id === request.request_id)) return
+  const existing = pendingDocInput(msg)
+  if (existing) existing.state = 'closed'
+  msg.blocks.push({ kind: 'input_request', request, state: 'pending' })
+  attachReviewInput(msg, request)
+  msg.runStatus = 'waiting_input'
+  msg.liveStatus = isDocumentReviewInput(request) ? '等待审阅文档改动…' : '等待补充信息…'
+  msg.lastActivity = 'other'
+}
+
+export function acceptDocInput(msg: RunStreamMessage, requestId: string) {
+  const block = msg.blocks.find((b): b is InputRequestBlock => b.kind === 'input_request' && b.request.request_id === requestId)
+  if (block) block.state = 'submitted'
+  if (!pendingDocInput(msg) && msg.runStatus === 'waiting_input') msg.runStatus = 'running'
+}
+
+function setDocumentStage(msg: RunStreamMessage, label: string, detail?: string, tone?: DocumentStageBlock['tone']) {
+  const stage = msg.blocks.find((b): b is DocumentStageBlock => b.kind === 'document_stage')
+  if (stage) Object.assign(stage, { label, detail, tone })
+  else msg.blocks.push({ kind: 'document_stage', label, detail, tone })
+  msg.liveStatus = label
+  msg.lastActivity = 'other'
 }
 
 /** v2 事件 -> 块流状态（实时与历史回放共用同一归约器） */
@@ -217,12 +323,138 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
       msg.lastActivity = 'other'
       break
 
+    case 'task.routed': {
+      const label = DOCUMENT_TASK_LABELS[String(data.task_type || '')]
+      if (label) setDocumentStage(msg, label)
+      break
+    }
+
+    case 'document.profile_extraction.started':
+      setDocumentStage(msg, '正在提炼文档规范')
+      break
+
+    case 'document.profile_draft.created':
+      if (data.definition?.sections?.length && !blocks.some((b) => b.kind === 'document_profile_draft')) {
+        blocks.push({
+          kind: 'document_profile_draft', definition: data.definition,
+          uncertainties: Array.isArray(data.uncertainties) ? data.uncertainties : [],
+          warnings: Array.isArray(data.warnings) ? data.warnings : [],
+        })
+        setDocumentStage(msg, '规范草稿已生成')
+      }
+      break
+
+    case 'document.profile_saved': {
+      const draft = blocks.find((b): b is ProfileDraftBlock => b.kind === 'document_profile_draft')
+      if (draft && Number.isSafeInteger(data.profile_id)) {
+        draft.saved = { id: data.profile_id, version: data.version_no }
+        if (data.definition?.sections?.length) draft.definition = data.definition
+      }
+      setDocumentStage(msg, '已保存文档规范', undefined, 'success')
+      break
+    }
+
+    case 'document.generation.started':
+      setDocumentStage(msg, '正在生成文档')
+      break
+
+    case 'document.section.started':
+    case 'document.section.completed':
+    case 'document.section.failed': {
+      if (Number.isInteger(data.completed)) msg.documentCompleted = data.completed
+      else if (ev.event === 'document.section.completed') msg.documentCompleted = (msg.documentCompleted ?? 0) + 1
+      if (Number.isInteger(data.total)) msg.documentTotal = data.total
+      const title = data.title || data.section_title || data.section_id
+      const progress = msg.documentTotal ? `已完成 ${msg.documentCompleted ?? 0}/${msg.documentTotal} 个部分` : ''
+      if (ev.event === 'document.section.failed') {
+        setDocumentStage(msg, '文档编写暂停', [progress, title].filter(Boolean).join(' · '), 'warning')
+      } else {
+        setDocumentStage(msg, progress || '正在编写文档', title)
+      }
+      break
+    }
+
+    case 'document.validation.started':
+      setDocumentStage(msg, '正在校验文档')
+      break
+
+    case 'document.validation.completed': {
+      const valid = data.valid ?? data.passed
+      setDocumentStage(msg, valid === false ? '文档校验发现问题' : '文档校验完成', undefined, valid === false ? 'warning' : 'success')
+      break
+    }
+
+    case 'document.edit.review_required': {
+      const ordinal = data.ordinal
+      const changes = Array.isArray(data.changes) ? data.changes : []
+      if (Number.isSafeInteger(ordinal) && changes.length
+        && changes.every((change) => typeof change?.id === 'string' && change.id)
+        && new Set(changes.map((change) => change.id)).size === changes.length
+        && !blocks.some((block) => block.kind === 'document_edit_review' && block.review.ordinal === ordinal)) {
+        blocks.push({ kind: 'document_edit_review', review: {
+          ...data as DocumentEditReview, context_url: `/api/v2/runs/${ev.run_id}/document-review/context`,
+        } })
+        const waiting = pendingDocInput(msg)
+        if (waiting) attachReviewInput(msg, waiting.request)
+        setDocumentStage(msg, '文档修改稿已准备好')
+      }
+      break
+    }
+
+    case 'document.edit.reviewed': {
+      const block = blocks.find((item): item is DocumentEditReviewBlock => item.kind === 'document_edit_review'
+        && item.review.ordinal === data.ordinal)
+      if (block && Array.isArray(data.accepted_change_ids) && Array.isArray(data.rejected_change_ids)) {
+        block.decision = {
+          accepted_change_ids: data.accepted_change_ids,
+          rejected_change_ids: data.rejected_change_ids,
+        }
+        setDocumentStage(msg, data.accepted_change_ids.length ? '文档改动已审阅' : '已拒绝全部文档改动')
+      }
+      break
+    }
+
+    case 'input.required':
+      if (typeof data.request_id === 'string' && data.input_schema) addDocInput(msg, data as InputRequest)
+      break
+
+    case 'input.received':
+      acceptDocInput(msg, data.request_id)
+      break
+
+    case 'artifact.created':
+    case 'document.artifact.created':
+      if (Number.isSafeInteger(data.document_id) && Number.isSafeInteger(data.document_version_id)
+        && Number.isSafeInteger(data.version_no)
+        && !blocks.some((b) => b.kind === 'document_artifact' && b.artifact.document_version_id === data.document_version_id)) {
+        blocks.push({ kind: 'document_artifact', artifact: data as DocumentArtifact })
+        setDocumentStage(msg, '文档已生成', undefined, 'success')
+      }
+      break
+
     case 'run.status_changed':
+      if (data.historical) {
+        const input = pendingDocInput(msg)
+        if (input && input.request.request_id === data.request_id) {
+          input.state = 'closed'
+          if (msg.runStatus === 'waiting_input') msg.runStatus = 'running'
+        }
+        break
+      }
       msg.runStatus = String(data.status || msg.runStatus || '')
       if (data.actions !== undefined) msg.pendingActions = (data.actions as any[]) || []
+      else if (msg.runStatus !== 'waiting_approval') msg.pendingActions = []
       break
 
     case 'run.retrying': {
+      if (data.manual) {
+        msg.error = undefined
+        msg.documentRetryable = false
+        msg.runStatus = 'running'
+        msg.streaming = true
+        setDocumentStage(msg, '正在从已保存的进度继续')
+        break
+      }
       // 断点重试：撤回上次未完成的半截文本（keep_chars 之后的字符全部丢弃）
       const keep = Number(data.keep_chars)
       if (Number.isFinite(keep) && keep >= 0) {
@@ -248,8 +480,13 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
       break
 
     case 'run.failed':
+      if (data.historical) break
       msg.error = String(data.error || '运行失败')
       msg.runStatus = 'failed'
+      msg.documentRetryable = data.document_retryable === true
+      if (blocks.some((block) => block.kind === 'document_stage') && !blocks.some(
+        (block) => block.kind === 'document_stage' && block.label === '文档编写暂停',
+      )) setDocumentStage(msg, '文档任务已暂停', msg.documentCompleted ? `已完成 ${msg.documentCompleted} 个部分` : undefined, 'warning')
       break
 
     case 'run.cancelled':
@@ -286,14 +523,18 @@ export function finalizeRunMessage(
     ? (msg.runStatus || 'failed')
     : (map[reason] || reason)
   if (fallbackText) gapFillText(msg, fallbackText)
-  if (!joinedText(msg).trim()) {
+  const hasDocumentResult = msg.blocks.some((b) => b.kind === 'document_artifact'
+    || (b.kind === 'document_profile_draft' && b.saved) || (b.kind === 'document_edit_review' && b.decision))
+  if (!hasDocumentResult && !joinedText(msg).trim()) {
     // 占位文本只在真正收尾时出现；待审批/挂起还有后续执行，不能宣告"已完成"
     if (msg.runStatus === 'cancelled') msg.blocks.push({ kind: 'text', text: '（已停止生成）' })
     else if (msg.runStatus === 'completed') msg.blocks.push({ kind: 'text', text: '（任务已完成，本次未生成文本回答）' })
   }
   // 终态收口：被中断/未回执的工具行不再永远"执行中"（待审批时保留，后续还会执行）
-  if (['completed', 'failed', 'cancelled', 'suspended'].includes(msg.runStatus || '')) {
+  if (['completed', 'failed', 'cancelled', 'suspended', 'limit_exceeded'].includes(msg.runStatus || '')) {
+    msg.pendingActions = []
     for (const b of msg.blocks) {
+      if (b.kind === 'input_request' && b.state === 'pending') b.state = 'closed'
       if (b.kind === 'tool' && b.state === 'running') {
         b.state = 'failed'
         if (!b.error) b.error = '（未收到执行结果，可能被中断）'

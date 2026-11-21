@@ -136,26 +136,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    if _has_table('eval_run_items'):
-        op.drop_index('ix_eval_run_item_run_pos', table_name='eval_run_items')
-        op.drop_index('ix_eval_run_items_status', table_name='eval_run_items')
-        op.drop_index('ix_eval_run_items_run_id', table_name='eval_run_items')
-        op.drop_index('ix_eval_run_items_eval_run_id', table_name='eval_run_items')
-        op.drop_index('ix_eval_run_items_id', table_name='eval_run_items')
-        op.drop_table('eval_run_items')
-    if _has_table('eval_runs'):
-        op.drop_index('ix_eval_run_dataset_created', table_name='eval_runs')
-        op.drop_index('ix_eval_runs_status', table_name='eval_runs')
-        op.drop_index('ix_eval_runs_agent_id', table_name='eval_runs')
-        op.drop_index('ix_eval_runs_dataset_id', table_name='eval_runs')
-        op.drop_index('ix_eval_runs_id', table_name='eval_runs')
-        op.drop_table('eval_runs')
-    if _has_table('eval_dataset_items'):
-        op.drop_index('ix_eval_dataset_item_dataset_pos', table_name='eval_dataset_items')
-        op.drop_index('ix_eval_dataset_items_dataset_id', table_name='eval_dataset_items')
-        op.drop_index('ix_eval_dataset_items_id', table_name='eval_dataset_items')
-        op.drop_table('eval_dataset_items')
-    if _has_table('eval_datasets'):
-        op.drop_index('ix_eval_datasets_id', table_name='eval_datasets')
-        op.drop_index('ix_eval_datasets_name', table_name='eval_datasets')
-        op.drop_table('eval_datasets')
+    # 从子表向父表删除。MySQL 会随表移除索引，先删索引可能破坏仍生效的外键。
+    for table in ('eval_run_items', 'eval_runs', 'eval_dataset_items', 'eval_datasets'):
+        if _has_table(table):
+            op.drop_table(table)

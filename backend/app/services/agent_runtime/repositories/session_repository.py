@@ -16,7 +16,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
-from sqlalchemy import select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import AgentSession, SessionResultOutbox
@@ -25,6 +25,8 @@ from .run_repository import _sql_future, _sql_now
 
 # 写回/追加的乐观锁重试上限（冲突时合并重试，不盲目覆盖）
 _MERGE_RETRIES = 5
+# 文档任务可以长时间暂停，恢复仍沿用同一个 Run；终止时显式释放会话。
+_DURABLE_LEASE_EXPIRY = datetime(9999, 1, 1)
 
 OUTBOX_PENDING = "pending"
 OUTBOX_DELIVERED = "delivered"
@@ -34,10 +36,27 @@ class SessionRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
+    async def update_metadata(
+        self, session_id: int, user_id: int, *, title: str | None = None, is_pinned: bool | None = None,
+    ) -> bool:
+        """只修改当前用户的会话元数据，保持消息版本及活动时间。"""
+        values = {"updated_at": AgentSession.updated_at}
+        if title is not None:
+            values.update(title=title, title_edited=True)
+        if is_pinned is not None:
+            # 重放已成功的置顶请求不会改变置顶顺序。
+            values["pinned_at"] = func.coalesce(AgentSession.pinned_at, datetime.utcnow()) if is_pinned else None
+        result = await self.session.execute(
+            update(AgentSession)
+            .where(AgentSession.id == session_id, AgentSession.user_id == user_id)
+            .values(**values)
+        )
+        return result.rowcount == 1
+
     # ── 执行权（P1-02 A：单 Session 单活跃 Run） ─────────────────────────
 
     async def claim_execution(
-        self, session_id: int, run_id: str, lease_seconds: int
+        self, session_id: int, run_id: str, lease_seconds: int, *, durable: bool = False
     ) -> bool:
         """原子获取 Session 执行权。成功/同 Run 刷新租约返回 True。
 
@@ -46,6 +65,14 @@ class SessionRepository:
         - 或原持有者租约已过期（Worker 故障过期接管）。
         其余情况返回 False（明确冲突，不得并发驱动同一 Session）。
         """
+        expiry = _DURABLE_LEASE_EXPIRY if durable else case(
+            (
+                (AgentSession.active_run_id == run_id)
+                & (AgentSession.active_run_lease_expires_at == _DURABLE_LEASE_EXPIRY),
+                _DURABLE_LEASE_EXPIRY,
+            ),
+            else_=_sql_future(self.session, lease_seconds),
+        )
         res = await self.session.execute(
             update(AgentSession)
             .where(
@@ -59,7 +86,7 @@ class SessionRepository:
             )
             .values(
                 active_run_id=run_id,
-                active_run_lease_expires_at=_sql_future(self.session, lease_seconds),
+                active_run_lease_expires_at=expiry,
                 updated_at=datetime.utcnow(),
             ),
             execution_options={"synchronize_session": False},
@@ -111,6 +138,7 @@ class SessionRepository:
         *,
         source_run_id: Optional[str] = None,
         title: Optional[str] = None,
+        replace_source: bool = False,
     ) -> int:
         """幂等追加消息并返回新 version。
 
@@ -134,11 +162,17 @@ class SessionRepository:
                 raise LookupError(f"session {session_id} 不存在")
 
             msgs = list(sess.messages or [])
-            if source_run_id and any(
-                isinstance(m, dict) and m.get("source_run_id") == source_run_id
-                for m in msgs
-            ):
-                return sess.version or 0  # 已写回：幂等跳过
+            existing = next((index for index, item in enumerate(msgs)
+                             if source_run_id and isinstance(item, dict) and item.get("source_run_id") == source_run_id), None)
+            if existing is not None:
+                if not replace_source:
+                    return sess.version or 0  # 已写回：幂等跳过
+                original = msgs[existing]
+                replacement = new_messages[0]
+                msgs[existing] = {**original, **replacement,
+                                  "message_id": original.get("message_id") or replacement["message_id"],
+                                  "created_at": original.get("created_at") or replacement["created_at"]}
+                new_messages = []
 
             existing_ids = {
                 m.get("message_id") for m in msgs if isinstance(m, dict) and m.get("message_id")
@@ -153,9 +187,8 @@ class SessionRepository:
                 "version": (sess.version or 0) + 1,
                 "updated_at": datetime.utcnow(),
             }
-            # 标题仅在初始标题（空 / "新对话"）时更新，不覆盖用户已改标题
-            if title and (not sess.title or sess.title == "新对话"):
-                values["title"] = title
+            if title:
+                values["title"] = case((AgentSession.auto_title_allowed(), title), else_=AgentSession.title)
             res = await self.session.execute(
                 update(AgentSession)
                 .where(

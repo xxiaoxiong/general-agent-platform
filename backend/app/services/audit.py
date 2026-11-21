@@ -1,6 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional, Dict, Any
 from app.models.audit import AuditLog
+from app.services.audit_context import bind_audit_actor, current_audit
 
 
 async def log_action(
@@ -18,6 +19,16 @@ async def log_action(
     error_msg: Optional[str] = None,
     duration_ms: Optional[int] = None,
 ):
+    context = current_audit.get()
+    if context is not None:
+        # 主应用已有请求审计。在此补充业务名称和已核验的操作人即可。
+        if user_id is not None and username is not None:
+            bind_audit_actor(user_id, username)
+        context.action = action
+        context.module = module
+        context.resource_type = resource_type
+        context.resource_id = str(resource_id)[:100] if resource_id is not None else None
+        return
     log = AuditLog(
         user_id=user_id,
         username=username,

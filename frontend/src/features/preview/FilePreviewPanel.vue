@@ -1,13 +1,18 @@
 <template>
   <div class="fp-backdrop" :class="{ visible: maximized }" aria-hidden="true" @click="closeOverlay"></div>
   <aside
+    ref="panel"
     class="file-preview"
     aria-label="文件预览"
-    :class="{ maximized }"
-    :style="maximized ? undefined : { width: panelWidth + 'px' }"
+    :class="{ maximized, resizing }"
+    :style="{ '--fp-width': visibleWidth + 'px' }"
   >
-    <!-- 左缘拖拽调宽 -->
-    <div class="fp-resize" title="拖动调整宽度" @mousedown="startResize"></div>
+    <div v-if="!maximized" ref="separator" class="fp-resize" role="separator" tabindex="0"
+      aria-label="调整预览宽度" aria-orientation="vertical" title="拖动调整预览宽度"
+      :aria-valuemin="minWidth" :aria-valuemax="availableWidth" :aria-valuenow="visibleWidth"
+      @pointerdown="startResize" @pointermove="moveResize" @pointerup="releaseResize"
+      @pointercancel="releaseResize" @lostpointercapture="releaseResize" @keydown="resizeWithKeyboard"
+    ></div>
 
     <!-- 头部：类型图标 + 文件名 + 徽标 + 大小 + 放大/还原 + 下载 + 关闭 -->
     <header class="fp-head">
@@ -65,8 +70,9 @@
       </div>
 
       <template v-else-if="data">
+        <slot v-if="$slots.document" name="document" />
         <!-- 图片：中性底 + contain 适配 + 点击放大（缩放/旋转） -->
-        <div v-if="data.kind === 'image'" class="fp-image-wrap">
+        <div v-else-if="data.kind === 'image'" class="fp-image-wrap">
           <el-image
             v-if="data.objectUrl"
             class="fp-image"
@@ -156,7 +162,7 @@
  * 按类型深度优化展示：表格(数据网格) / 代码(行号+高亮) / 文本 / Markdown /
  * 图片 / PDF / Office(段落) / 二进制兜底。
  */
-import { computed, onUnmounted, ref, type Component } from 'vue'
+import { computed, onMounted, onUnmounted, ref, type Component } from 'vue'
 import {
   CircleAlert, CodeXml, Download, File, FileText, Folder, Image as ImageIcon, Info, LoaderCircle,
   Maximize, Minimize, Notebook, Table, X,
@@ -176,41 +182,86 @@ const props = defineProps<{
 
 const emit = defineEmits<{ close: []; download: []; 'open-original': [path: string] }>()
 
-// ── 面板交互：拖拽调宽 + 放大（最大化）+ 代码块复制 ─────────────────────────
+const panel = ref<HTMLElement>()
+const separator = ref<HTMLElement>()
 const panelWidth = ref(460)
+const availableWidth = ref(panelWidth.value)
+const minWidth = computed(() => Math.min(320, availableWidth.value))
+const visibleWidth = computed(() => clampWidth(panelWidth.value))
 const maximized = ref(false)
-let endResize: (() => void) | undefined
+const resizing = ref(false)
+let sizeObserver: ResizeObserver | undefined
+let drag: { pointerId: number; startX: number; startWidth: number; cursor: string; userSelect: string } | undefined
 
 function closeOverlay() {
   if (maximized.value) maximized.value = false
   else emit('close')
 }
 
-/** 左缘调宽时为对话保留阅读空间。 */
-function startResize(e: MouseEvent) {
-  e.preventDefault()
-  const startX = e.clientX
-  const panel = (e.currentTarget as HTMLElement).parentElement
-  const startW = panel?.clientWidth || panelWidth.value
-  const maxW = Math.max(320, Math.min((panel?.parentElement?.clientWidth || window.innerWidth) * 0.45, 620))
-  const onMove = (ev: MouseEvent) => {
-    panelWidth.value = Math.min(maxW, Math.max(320, startW + (startX - ev.clientX)))
-  }
-  const onUp = () => {
-    window.removeEventListener('mousemove', onMove)
-    window.removeEventListener('mouseup', onUp)
-    document.body.style.cursor = ''
-    document.body.style.userSelect = ''
-    endResize = undefined
-  }
-  document.body.style.cursor = 'col-resize'
-  endResize = onUp
-  document.body.style.userSelect = 'none'
-  window.addEventListener('mousemove', onMove)
-  window.addEventListener('mouseup', onUp)
+function clampWidth(width: number) {
+  return Math.round(Math.min(availableWidth.value, Math.max(width, minWidth.value)))
 }
 
-onUnmounted(() => endResize?.())
+function startResize(event: PointerEvent) {
+  if (!event.isPrimary || event.button !== 0 || drag || !panel.value || !separator.value) return
+  event.preventDefault()
+  separator.value.focus({ preventScroll: true })
+  separator.value.setPointerCapture(event.pointerId)
+  drag = {
+    pointerId: event.pointerId, startX: event.clientX, startWidth: panel.value.getBoundingClientRect().width,
+    cursor: document.body.style.cursor, userSelect: document.body.style.userSelect,
+  }
+  resizing.value = true
+  document.body.style.cursor = 'col-resize'
+  document.body.style.userSelect = 'none'
+  window.addEventListener('blur', stopResize)
+}
+
+function moveResize(event: PointerEvent) {
+  if (drag?.pointerId === event.pointerId) {
+    panelWidth.value = clampWidth(drag.startWidth + drag.startX - event.clientX)
+  }
+}
+
+function releaseResize(event: PointerEvent) {
+  if (drag?.pointerId === event.pointerId) stopResize()
+}
+
+function stopResize() {
+  if (!drag) return
+  const { pointerId, cursor, userSelect } = drag
+  drag = undefined
+  resizing.value = false
+  document.body.style.cursor = cursor
+  document.body.style.userSelect = userSelect
+  window.removeEventListener('blur', stopResize)
+  if (separator.value?.hasPointerCapture(pointerId)) separator.value.releasePointerCapture(pointerId)
+}
+
+function resizeWithKeyboard(event: KeyboardEvent) {
+  const step = event.shiftKey ? 120 : 32
+  const sizes: Record<string, number> = {
+    ArrowLeft: visibleWidth.value + step, ArrowRight: visibleWidth.value - step,
+    Home: minWidth.value, End: availableWidth.value,
+  }
+  const size = sizes[event.key]
+  if (typeof size !== 'number') return
+  event.preventDefault()
+  panelWidth.value = clampWidth(size)
+}
+
+onMounted(() => {
+  const workspace = panel.value?.parentElement
+  if (!workspace) return
+  const updateWidth = () => { if (workspace.clientWidth) availableWidth.value = workspace.clientWidth }
+  updateWidth()
+  sizeObserver = new ResizeObserver(updateWidth)
+  sizeObserver.observe(workspace)
+})
+onUnmounted(() => {
+  sizeObserver?.disconnect()
+  stopResize()
+})
 
 /** 类型 -> 图标 / 标签 / 配色（头部视觉锚点） */
 const KIND_META: Record<PreviewContent['kind'], { label: string; icon: Component; color: string; bg: string }> = {
@@ -223,9 +274,11 @@ const KIND_META: Record<PreviewContent['kind'], { label: string; icon: Component
   office: { label: '文档', icon: FileText, color: 'var(--ui-warning)', bg: 'var(--ui-warning-soft)' },
   binary: { label: '文件', icon: Folder, color: 'var(--ui-secondary)', bg: 'var(--ui-subtle)' },
 }
-const meta = computed(() =>
-  (props.data && KIND_META[props.data.kind]) || KIND_META.binary,
-)
+const meta = computed(() => {
+  const data = props.data
+  if (data?.kind === 'pdf' && /\.docx$/i.test(data.name)) return { ...KIND_META.office, label: 'Word 版式' }
+  return (data && KIND_META[data.kind]) || KIND_META.binary
+})
 
 // ── 代码高亮 + 行号 ──────────────────────────────────────────────────────────
 const highlightedCode = computed(() => {
@@ -289,8 +342,10 @@ function formatSize(size: number): string {
 <style scoped>
 .file-preview {
   position: relative;
-  min-width: 320px;
-  max-width: min(45%, 620px);
+  flex: none;
+  width: var(--fp-width);
+  min-width: min(320px, 100%);
+  max-width: 100%;
   border-left: 1px solid var(--ui-border);
   background: var(--ui-surface);
   display: flex;
@@ -299,10 +354,15 @@ function formatSize(size: number): string {
 }
 /* 左缘拖拽调宽 */
 .fp-resize {
-  position: absolute; left: 0; top: 0; bottom: 0; width: 6px; z-index: 5;
-  cursor: col-resize; background: transparent;
+  position: absolute; left: 0; top: 0; bottom: 0; width: 12px; z-index: 5;
+  cursor: col-resize; touch-action: none; outline-offset: -2px;
 }
-.fp-resize:hover { background: var(--ui-accent-soft); }
+.fp-resize::after {
+  content: ''; position: absolute; inset: 0 auto 0 0; width: 2px; background: transparent;
+}
+.fp-resize:hover::after, .fp-resize:focus-visible::after, .resizing .fp-resize::after { background: var(--ui-accent); }
+/* 浏览器内置 PDF 查看器在拖动期间让出指针。 */
+.file-preview.resizing :deep(iframe) { pointer-events: none; }
 
 /* 放大（最大化）：覆盖式大面板 */
 .file-preview.maximized {
@@ -462,10 +522,10 @@ function formatSize(size: number): string {
 .mini-spin { flex: none; animation: fp-spin 1s linear infinite; }
 @keyframes fp-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .mini-spin { animation: none; } }
-@media (max-width: 1119px) {
+@media (max-width: 849px) {
   .file-preview, .file-preview.maximized {
     position: fixed; inset: var(--ui-header-height) 0 0 auto; z-index: var(--ui-z-dialog);
-    width: min(100vw, 540px); max-width: 100vw; min-width: 0; height: auto;
+    width: 100vw; max-width: 100vw; min-width: 0; height: auto;
     border-left: 1px solid var(--ui-border); border-radius: 0; box-shadow: var(--ui-shadow-md);
   }
   .fp-backdrop { display: block; }

@@ -35,10 +35,10 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.agent import AgentRun, AgentToolExecution
-from ..lifecycle import STATUS_RUNNING, RunExecutionLease
-from .errors import IllegalTransition, RunLeaseLost, ToolCallIdentityConflict
-from .run_repository import _sql_now
+from app.models.agent import AgentToolExecution
+from ..lifecycle import RunExecutionLease
+from .errors import IllegalTransition, ToolCallIdentityConflict
+from .run_repository import RunRepository
 
 TOOL_EXEC_PREPARED = "prepared"
 TOOL_EXEC_EXECUTING = "executing"
@@ -201,24 +201,7 @@ class ToolExecutionRepository:
         （SQLAlchemy SQLite 方言忽略 FOR UPDATE），由单写者串行化提供
         等价隔离；MySQL/PostgreSQL 生产库走真实行锁。
         """
-        res = await self.session.execute(
-            select(AgentRun.id)
-            .where(
-                AgentRun.id == lease.run_id,
-                AgentRun.worker_id == lease.worker_id,
-                AgentRun.lease_version == lease.lease_version,
-                AgentRun.status == STATUS_RUNNING,
-                AgentRun.lease_expires_at.isnot(None),
-                AgentRun.lease_expires_at > _sql_now(self.session),
-            )
-            .with_for_update()
-        )
-        if res.first() is None:
-            raise RunLeaseLost(
-                f"run {lease.run_id} 执行权校验失败"
-                f"（worker={lease.worker_id} lease_version={lease.lease_version}），"
-                "拒绝 Tool Ledger 写入"
-            )
+        await RunRepository(self.session).verify_running_lease(lease)
 
     async def mark_executing(
         self,

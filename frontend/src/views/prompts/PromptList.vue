@@ -139,6 +139,7 @@
 import { ref, reactive, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { confirmDestructive } from '@/lib/confirmation'
 import { CircleAlert, FileText, FlaskConical, History, Plus, Search } from '@lucide/vue'
 import { promptApi } from '@/api'
 import { useAuthStore } from '@/stores/auth'
@@ -246,7 +247,7 @@ async function saveTemplate() {
 
 async function deleteTemplate(tpl: PromptTemplate) {
   try {
-    await ElMessageBox.confirm(`删除模板「${tpl.name}」及其历史版本？`, '删除模板', { type: 'warning', confirmButtonText: '删除' })
+    await confirmDestructive(`删除模板「${tpl.name}」及其历史版本？`, '删除模板')
     await promptApi.delete(tpl.id)
     ElMessage.success('模板已删除')
     if (templates.value.length === 1 && page.value > 1) page.value -= 1

@@ -82,7 +82,8 @@
 
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
+import { confirmDestructive } from '@/lib/confirmation'
 import { CircleAlert, LibraryBig, Plus, Search } from '@lucide/vue'
 import { knowledgeApi } from '@/api'
 import PageHeader from '@/components/layout/PageHeader.vue'
@@ -170,9 +171,7 @@ async function save() {
 
 async function deleteKb(kb: KnowledgeBase) {
   try {
-    await ElMessageBox.confirm(`删除知识库「${kb.name}」及其中的文档和索引？此操作不可撤销。`, '删除知识库', {
-      type: 'warning', confirmButtonText: '删除',
-    })
+    await confirmDestructive(`删除知识库「${kb.name}」及其中的文档和索引？此操作不可撤销。`, '删除知识库')
     await knowledgeApi.deleteBase(kb.id)
     ElMessage.success('知识库已删除')
     retrievalRevision.value += 1

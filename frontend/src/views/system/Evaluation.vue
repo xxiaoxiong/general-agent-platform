@@ -802,6 +802,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { confirmDestructive } from '@/lib/confirmation'
 import { ClipboardList, Plus, RefreshCw } from '@lucide/vue'
 import PageHeader from '@/components/layout/PageHeader.vue'
 import UiButton from '@/components/ui/UiButton.vue'
@@ -1038,9 +1039,11 @@ function schedulePolling() {
 }
 onUnmounted(() => { if (pollTimer) window.clearTimeout(pollTimer) })
 
-async function confirmAction(message: string, title: string) {
-  return ElMessageBox.confirm(message, title, { type: 'warning', confirmButtonText: '确认', cancelButtonText: '取消' })
-    .then(() => true, () => false)
+async function confirmAction(message: string, title: string, destructive = false) {
+  const confirmation = destructive
+    ? confirmDestructive(message, title)
+    : ElMessageBox.confirm(message, title, { type: 'warning', confirmButtonText: '确认', cancelButtonText: '取消' })
+  return confirmation.then(() => true, () => false)
 }
 
 // ── 测评任务操作 ──
@@ -1176,7 +1179,7 @@ async function saveDataset() {
   }
 }
 async function deleteDataset(row: EvalDataset) {
-  if (!await confirmAction(`确认删除数据集「${row.name}」及其全部用例？`, '删除数据集')) return
+  if (!await confirmAction(`确认删除数据集「${row.name}」及其全部用例？`, '删除数据集', true)) return
   loading.value = true
   try {
     await evaluationApi.deleteDataset(row.id)
@@ -1239,7 +1242,7 @@ async function saveItem() {
 }
 async function deleteItem(row: EvalDatasetItem) {
   if (!currentDataset.value) return
-  if (!await confirmAction('确认删除该用例？', '删除用例')) return
+  if (!await confirmAction('确认删除该用例？', '删除用例', true)) return
   loading.value = true
   try {
     await evaluationApi.deleteItem(currentDataset.value.id, row.id)

@@ -88,6 +88,19 @@ class SkillMeta:
 
 
 BUILTIN_SKILLS: Dict[str, Dict[str, str]] = {
+    "document-authoring": {
+        "description": "按章节组织文档、核实来源、检查缺项，并生成或修订可验证的 DOCX。",
+        "body": (
+            "---\n"
+            "name: document-authoring\n"
+            "description: 提炼文档规范并按章节生成或修订 DOCX\n"
+            "version: 1.0\n"
+            "---\n\n"
+            "先根据样例结构或用户要求确定章节、必需内容、语言与排版。区分样例事实与通用写作要求。\n"
+            "用授权资料核实正文事实，遇到关键资料缺口时请用户补充。\n"
+            "编辑时按锚点修改目标章节，交付前重开 Word 并校验结构与内容。\n"
+        ),
+    },
     "chart-report": {
         "description": "生成数据图表与文字结合的分析小结（Markdown 表格 + 结论）。",
         "body": (
@@ -211,6 +224,9 @@ class SkillRegistry:
 
         files: Dict[str, Any] = {}
         for meta in self.enabled_skills():
+            if meta.name == "document-authoring" and meta.scope == "builtin":
+                # 由专用文档图按需使用，普通聊天的提示无需携带文档编修说明。
+                continue
             if meta.source == "builtin":
                 files[f"/skills/{meta.name}/SKILL.md"] = create_file_data(
                     content=self.get_skill_body(meta)

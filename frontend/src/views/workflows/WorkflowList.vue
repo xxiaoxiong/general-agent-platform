@@ -82,7 +82,8 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useDebounceFn } from '@vueuse/core'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
+import { confirmDestructive } from '@/lib/confirmation'
 import { Play, Plus, Search, SquarePen, Trash2, Workflow as WorkflowIcon } from '@lucide/vue'
 import dayjs from 'dayjs'
 import { workflowApi } from '@/api'
@@ -171,8 +172,7 @@ async function createWorkflow() {
 async function deleteWorkflow(workflow: Workflow) {
   if (deletingId.value !== null) return
   try {
-    await ElMessageBox.confirm(`确认删除流程「${workflow.name}」？`, '删除工作流',
-      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' })
+    await confirmDestructive(`确认删除流程「${workflow.name}」？`, '删除工作流')
   } catch { return }
   deletingId.value = workflow.id
   try {

@@ -49,6 +49,7 @@ class ModelConfigCreate(BaseModel):
     output_price: float = 0.0
     supports_streaming: bool = True
     supports_function_call: bool = False
+    supports_vision: bool = False
     description: Optional[str] = None
     extra_params: Optional[Dict[str, Any]] = None
 
@@ -63,6 +64,8 @@ class ModelConfigUpdate(BaseModel):
     output_price: Optional[float] = None
     is_active: Optional[bool] = None
     supports_streaming: Optional[bool] = None
+    supports_function_call: Optional[bool] = None
+    supports_vision: Optional[bool] = None
     description: Optional[str] = None
     extra_params: Optional[Dict[str, Any]] = None
 
@@ -80,6 +83,7 @@ class ModelConfigOut(BaseModel):
     is_active: bool
     supports_streaming: bool
     supports_function_call: bool
+    supports_vision: bool
     description: Optional[str] = None
     created_at: datetime
     model_config = {"from_attributes": True}

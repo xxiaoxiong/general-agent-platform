@@ -17,6 +17,7 @@ from app.core.config import settings
 
 def build_backend(user_id: int, agent_id: int, session_id: Optional[int], *, store: Optional[Any] = None):
     from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
+    from deepagents.backends.protocol import DeleteResult, EditResult, FileUploadResponse, WriteResult
 
     default_backend = StateBackend()
 
@@ -25,7 +26,37 @@ def build_backend(user_id: int, agent_id: int, session_id: Optional[int], *, sto
     root_dir = os.path.abspath(os.path.join(base, str(user_id), str(agent_id), session_part))
     os.makedirs(root_dir, exist_ok=True)
 
-    fs_backend = FilesystemBackend(
+    class WorkspaceFiles(FilesystemBackend):
+        def _protected(self, path: str) -> bool:
+            try:
+                root = self._resolve_path("/")
+                relative = self._resolve_path(path).relative_to(root)
+            except (ValueError, OSError, RuntimeError):
+                return True
+            return not relative.parts or relative.parts[0].casefold() == "uploads"
+
+        def write(self, file_path, content):
+            if self._protected(file_path) or file_path.casefold().endswith(".docx"):
+                return WriteResult(error="原始附件和抽取文本由平台管理。请用文档任务生成或修改 Word。")
+            return super().write(file_path, content)
+
+        def edit(self, file_path, old_string, new_string, replace_all=False):
+            if self._protected(file_path) or file_path.casefold().endswith(".docx"):
+                return EditResult(error="原始附件和抽取文本由平台管理。请用文档任务修改 Word。")
+            return super().edit(file_path, old_string, new_string, replace_all)
+
+        def delete(self, file_path):
+            if self._protected(file_path):
+                return DeleteResult(error="请在会话附件中管理已上传的文件。")
+            return super().delete(file_path)
+
+        def upload_files(self, files):
+            allowed = [item for item in files if not self._protected(item[0])]
+            results = iter(super().upload_files(allowed))
+            return [FileUploadResponse(path, error="permission_denied") if self._protected(path)
+                    else next(results) for path, _ in files]
+
+    fs_backend = WorkspaceFiles(
         root_dir=root_dir,
         virtual_mode=True,
         max_file_size_mb=getattr(settings, "AGENT_MAX_FILE_SIZE_MB", 10),

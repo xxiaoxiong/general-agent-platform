@@ -90,6 +90,15 @@ if _AVAILABLE:
         "agent_checkpoint_write_seconds", "Checkpoint 写入耗时", registry=REGISTRY,
         buckets=(0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5),
     )
+    DOCUMENT_STAGE_DURATION = Histogram(
+        "document_stage_duration_seconds", "文档任务节点耗时",
+        ["task_type", "stage", "outcome"], registry=REGISTRY,
+        buckets=(0.05, 0.1, 0.5, 1, 2, 5, 15, 30, 90, 300),
+    )
+    DOCUMENT_VALIDATION = Counter(
+        "document_validation_total", "文档质量检查结果",
+        ["task_type", "outcome"], registry=REGISTRY,
+    )
 
 
 def _safe(fn):
@@ -169,6 +178,16 @@ def observe_event_lag(seconds: float) -> None:
 @_safe
 def observe_checkpoint_write(seconds: float) -> None:
     AGENT_CHECKPOINT_WRITE.observe(max(0.0, seconds))
+
+
+@_safe
+def observe_document_stage(task_type: str, stage: str, outcome: str, seconds: float) -> None:
+    DOCUMENT_STAGE_DURATION.labels(task_type=task_type, stage=stage, outcome=outcome).observe(seconds)
+
+
+@_safe
+def record_document_validation(task_type: str, passed: bool) -> None:
+    DOCUMENT_VALIDATION.labels(task_type=task_type, outcome="passed" if passed else "failed").inc()
 
 
 def render() -> tuple[bytes, str]:

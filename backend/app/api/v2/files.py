@@ -2,18 +2,22 @@
 
 - 上传文件写入会话工作区 ``uploads/``（即 Agent 文件工具的 /workspace/uploads/），
   模型可用 read_file 直接读取处理；
-- 二进制文档（PDF/Word/Excel/PPT/音频）复用知识库解析器同步抽取文本副本
-  ``<名>.extracted.txt``，消息附件注记指向文本副本，模型无需解析二进制。
+- 常见文档和音频抽取文本副本 ``<名>.extracted.txt``，消息附件注记指向文本副本，
+  模型无需解析二进制。文档智能支持的二进制格式经过受限解析器校验。
 """
 from __future__ import annotations
 
+import asyncio
 import csv
+from contextlib import suppress
+from itertools import count
 import mimetypes
 import os
+from pathlib import Path
 import re
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
@@ -21,22 +25,28 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models.user import User
 from app.services.agent_runtime.backends import workspace_root
+from app.services.audit_context import record_attachment_change
+from app.services.documents.errors import DocumentError
+from app.services.documents.office_preview import render_docx_pdf
+from app.services.documents.parser import DocumentParseError, parse_document, validate_reference_file
 
 from .conversations import _get_owned_session
 
 router = APIRouter(prefix="/conversations", tags=["files-v2"])
 
-# 可文本抽取的二进制格式（复用知识库解析器）
-_EXTRACT_EXTS = {
-    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-    "mp3", "wav", "m4a", "ogg", "flac",
-}
+# 旧格式和音频保留知识库抽取流程。
+_DOCUMENT_EXTS = {"pdf", "docx", "xlsx", "pptx"}
+_LEGACY_OFFICE_EXTS = {"doc", "xls", "ppt"}
+_AUDIO_EXTS = {"mp3", "wav", "m4a", "ogg", "flac"}
+_EXTRACT_EXTS = _DOCUMENT_EXTS | _LEGACY_OFFICE_EXTS | _AUDIO_EXTS
 
 
 def _safe_name(name: str) -> str:
     """仅保留 basename 并清除路径分隔/控制字符，防路径穿越。"""
     base = os.path.basename((name or "").replace("\\", "/")).strip()
-    base = re.sub(r'[\x00-\x1f<>:"|?*]', "_", base)
+    base = re.sub(r'[\x00-\x1f\x7f<>:"|?*]', "_", base).rstrip(". ")
+    if re.fullmatch(r"(?:con|prn|aux|nul|com[1-9]|lpt[1-9])", base.partition(".")[0], re.I):
+        base = f"_{base}"
     return base or "file"
 
 
@@ -54,10 +64,9 @@ _CODE_LANG = {
 }
 _IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "ico"}
 _MD_EXTS = {"md", "markdown"}
-_TABLE_EXTS = {"csv", "xlsx", "xlsm"}
-_OFFICE_EXTS = {"doc", "docx", "ppt", "pptx", "xls"}  # 老格式走文本抽取
+_TABLE_EXTS = {"csv", "xlsx"}
+_OFFICE_EXTS = _LEGACY_OFFICE_EXTS | {"docx", "pptx"}
 _TEXT_EXTS = {"txt", "log", "text"}
-_AUDIO_EXTS = {"mp3", "wav", "m4a", "ogg", "flac"}
 
 _MAX_PREVIEW_TEXT = 200_000  # 预览文本截断阈值（字符）
 _MAX_PREVIEW_ROWS = 500  # 表格预览最大行数
@@ -70,6 +79,8 @@ def _classify(ext: str) -> tuple[str, str]:
         return "image", ""
     if e == "pdf":
         return "pdf", ""
+    if e in {"docm", "xlsm", "pptm"}:
+        return "binary", ""
     if e in _MD_EXTS:
         return "markdown", ""
     if e in _TABLE_EXTS:
@@ -117,7 +128,7 @@ def _looks_binary(path: str) -> bool:
 
 
 def _read_table(path: str, ext: str) -> tuple[list[list[str]], bool]:
-    """表格预览：csv / xlsx(xlsm) 解析为二维数组（截断行数）。"""
+    """表格预览按第一张工作表返回有界的二维数组。"""
     e = ext.lstrip(".").lower()
     if e == "csv":
         rows: list[list[str]] = []
@@ -127,33 +138,52 @@ def _read_table(path: str, ext: str) -> tuple[list[list[str]], bool]:
                     return rows, True
                 rows.append([str(c) for c in row])
         return rows, False
-    if e in ("xlsx", "xlsm"):
-        try:
-            import openpyxl
+    if e == "xlsx":
+        from openpyxl import load_workbook
 
-            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-            ws = wb.worksheets[0] if wb.worksheets else None
-            if ws is None:
-                return [], False
-            rows = []
-            for i, row in enumerate(ws.iter_rows(values_only=True)):
-                if i >= _MAX_PREVIEW_ROWS:
-                    return rows, True
-                rows.append(["" if c is None else str(c) for c in row])
-            return rows, False
-        except Exception:  # noqa: BLE001
-            return [], False
+        checked = validate_reference_file(path)
+        try:
+            workbook = load_workbook(checked, read_only=True, data_only=True, keep_links=False)
+            try:
+                sheet = workbook.worksheets[0] if workbook.worksheets else None
+                if sheet is None:
+                    return [], False
+                max_columns = 30
+                rows = []
+                remaining = _MAX_PREVIEW_TEXT
+                truncated = (sheet.max_column or 0) > max_columns
+                for row in sheet.iter_rows(max_col=min(sheet.max_column or max_columns, max_columns), values_only=True):
+                    if len(rows) >= _MAX_PREVIEW_ROWS or not remaining:
+                        return rows, True
+                    cells = []
+                    for cell in row:
+                        value = "" if cell is None else str(cell)
+                        preview = value[:min(2_000, remaining)]
+                        truncated |= len(preview) < len(value)
+                        remaining -= len(preview)
+                        cells.append(preview)
+                    rows.append(cells)
+                return rows, truncated
+            finally:
+                workbook.close()
+        except Exception as exc:
+            raise DocumentParseError("无法解析工作表，请检查文件格式") from exc
     return [], False
 
 
 async def _extract_office_text(path: str, ext: str) -> str:
-    """Office/音频 -> 抽取文本预览（复用知识库解析器；失败返回空）。"""
+    """旧 Office 格式和音频保留知识库解析器的文本预览。"""
     try:
         from app.services.knowledge_service import KnowledgeService
 
         return await KnowledgeService.extract_text(path, ext.lstrip(".").lower()) or ""
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _document_text(path: str | Path, mime: str | None = None) -> str:
+    parsed = parse_document(path, mime)
+    return "\n\n".join([parsed.as_text(), *parsed.warnings])
 
 
 @router.post("/{session_id}/files")
@@ -165,47 +195,80 @@ async def upload_conversation_file(
 ):
     """上传附件到会话工作区 ``uploads/``（重复名自动加序号；超限 413）。"""
     session = await _get_owned_session(db, session_id, current_user)
-    upload_dir = os.path.join(
-        workspace_root(current_user.id, session.agent_id, session.id), "uploads"
-    )
-    os.makedirs(upload_dir, exist_ok=True)
+    root = workspace_root(current_user.id, session.agent_id, session.id)
+    upload_dir = Path(_resolve_workspace_path(root, "uploads"))
+    upload_dir.mkdir(parents=True, exist_ok=True)
 
     name = _safe_name(file.filename or "")
+    if len(name.encode("utf-8")) > 230:
+        raise HTTPException(status_code=400, detail="文件名过长")
     stem, ext = os.path.splitext(name)
-    dest = os.path.join(upload_dir, name)
-    seq = 1
-    while os.path.exists(dest):
-        name = f"{stem}-{seq}{ext}"
-        dest = os.path.join(upload_dir, name)
-        seq += 1
+    ext_l = ext.lstrip(".").lower()
+    reserve_sidecar = ext_l in _EXTRACT_EXTS
+    extracted = None
+    for seq in count():
+        if seq:
+            name = f"{stem}-{seq}{ext}"
+        dest = upload_dir / name
+        sidecar = upload_dir / f"{name}.extracted.txt"
+        if dest.is_dir() or (reserve_sidecar and sidecar.is_dir()):
+            continue
+        try:
+            out = dest.open("xb")
+        except FileExistsError:
+            continue
+        if reserve_sidecar:
+            try:
+                extracted = sidecar.open("x", encoding="utf-8")
+            except FileExistsError:
+                out.close()
+                dest.unlink()
+                continue
+            except OSError:
+                out.close()
+                dest.unlink()
+                raise
+        break
 
+    text_path = None
     max_bytes = int(getattr(settings, "AGENT_MAX_FILE_SIZE_MB", 10) * 1024 * 1024)
     size = 0
-    with open(dest, "wb") as out:
-        while chunk := await file.read(1024 * 1024):
-            size += len(chunk)
-            if size > max_bytes:
-                out.close()
-                os.remove(dest)
-                raise HTTPException(status_code=413, detail="文件超过大小限制")
-            out.write(chunk)
+    try:
+        with out:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > max_bytes:
+                    raise HTTPException(status_code=413, detail="文件超过大小限制")
+                out.write(chunk)
 
-    # 二进制文档抽取文本副本（失败不阻断上传，仅无文本副本）
-    text_path = None
-    ext_l = ext.lstrip(".").lower()
-    if ext_l in _EXTRACT_EXTS:
-        try:
-            from app.services.knowledge_service import KnowledgeService
+        text = ""
+        if ext_l in _DOCUMENT_EXTS:
+            try:
+                text = await asyncio.to_thread(_document_text, dest, file.content_type)
+            except DocumentParseError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        elif ext_l in _EXTRACT_EXTS:
+            text = await _extract_office_text(str(dest), ext)
+        if extracted is not None:
+            has_text = bool(text) and not text.startswith(("[文档解析失败", "[音频转写"))
+            with extracted:
+                if has_text:
+                    extracted.write(text)
+            if has_text:
+                text_path = f"uploads/{sidecar.name}"
+            else:
+                sidecar.unlink()
+    except BaseException:
+        with suppress(OSError):
+            dest.unlink()
+        if extracted is not None:
+            with suppress(OSError):
+                extracted.close()
+            with suppress(OSError):
+                sidecar.unlink()
+        raise
 
-            text = await KnowledgeService.extract_text(dest, ext_l)
-        except Exception:  # noqa: BLE001
-            text = ""
-        if text and not text.startswith("[文档解析失败") and not text.startswith("[音频转写"):
-            tname = f"{name}.extracted.txt"
-            with open(os.path.join(upload_dir, tname), "w", encoding="utf-8") as f:
-                f.write(text)
-            text_path = f"uploads/{tname}"
-
+    record_attachment_change(session.id, after={"name": name, "size": size})
     return {"name": name, "path": f"uploads/{name}", "text_path": text_path, "size": size}
 
 
@@ -218,9 +281,8 @@ async def download_conversation_file(
 ):
     """下载已上传附件（前端图片预览用；仅限 uploads/ 目录内）。"""
     session = await _get_owned_session(db, session_id, current_user)
-    upload_dir = os.path.join(
-        workspace_root(current_user.id, session.agent_id, session.id), "uploads"
-    )
+    root = workspace_root(current_user.id, session.agent_id, session.id)
+    upload_dir = _resolve_workspace_path(root, "uploads")
     name = _safe_name(filename)
     target = os.path.realpath(os.path.join(upload_dir, name))
     if not target.startswith(os.path.realpath(upload_dir) + os.sep):
@@ -239,16 +301,21 @@ async def delete_conversation_file(
 ):
     """删除已上传附件（含文本副本；仅限 uploads/ 目录内）。"""
     session = await _get_owned_session(db, session_id, current_user)
-    upload_dir = os.path.join(
-        workspace_root(current_user.id, session.agent_id, session.id), "uploads"
-    )
+    root = workspace_root(current_user.id, session.agent_id, session.id)
+    upload_dir = _resolve_workspace_path(root, "uploads")
     name = _safe_name(filename)
-    for fname in (name, f"{name}.extracted.txt"):
+    names = [name]
+    if os.path.splitext(name)[1].lstrip(".").lower() in _EXTRACT_EXTS:
+        names.append(f"{name}.extracted.txt")
+    for fname in names:
         target = os.path.realpath(os.path.join(upload_dir, fname))
         if not target.startswith(os.path.realpath(upload_dir) + os.sep):
             raise HTTPException(status_code=400, detail="非法文件名")
         if os.path.isfile(target):
+            size = os.stat(target).st_size
             os.remove(target)
+            if fname == name:
+                record_attachment_change(session.id, before={"name": name, "size": size})
     return {"message": "已删除"}
 
 
@@ -256,6 +323,7 @@ async def delete_conversation_file(
 async def preview_conversation_file(
     session_id: int,
     path: str,
+    layout_only: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -288,20 +356,48 @@ async def preview_conversation_file(
         "name": name, "path": rel, "kind": kind, "size": size,
         "mime": mime, "language": language, "truncated": False,
     }
-    if kind in ("text", "code", "markdown"):
-        text, truncated = _read_text_capped(target)
-        data["text"] = text
-        data["truncated"] = truncated
-    elif kind == "table":
-        rows, truncated = _read_table(target, ext)
-        data["rows"] = rows
-        data["truncated"] = truncated
-        if not rows and ext.lstrip(".").lower() in ("xlsx", "xlsm"):
-            # xlsx 解析失败（缺 openpyxl / 损坏）兜底：尝试文本抽取
+    try:
+        if kind in ("text", "code", "markdown"):
+            data["text"], data["truncated"] = await asyncio.to_thread(_read_text_capped, target)
+        elif kind == "table":
+            data["rows"], data["truncated"] = await asyncio.to_thread(_read_table, target, ext)
+        elif kind == "office" and layout_only and ext.lower() == ".docx":
+            # 版式端点会统一校验并转换，预览元数据无需重复抽取全文。
+            pass
+        elif kind == "office" and ext.lstrip(".").lower() in _DOCUMENT_EXTS:
+            data["text"] = await asyncio.to_thread(_document_text, target)
+        elif kind == "office":
             data["text"] = await _extract_office_text(target, ext)
-    elif kind == "office":
-        data["text"] = await _extract_office_text(target, ext)
+        elif kind == "pdf":
+            await asyncio.to_thread(validate_reference_file, target)
+    except DocumentParseError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except csv.Error as exc:
+        raise HTTPException(status_code=422, detail="无法解析 CSV，请检查文件格式") from exc
     return data
+
+
+@router.get("/{session_id}/file-preview-pdf", response_class=Response)
+async def preview_conversation_word_layout(
+    session_id: int,
+    path: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """按原始版式渲染工作区中的 DOCX。"""
+    session = await _get_owned_session(db, session_id, current_user)
+    root = workspace_root(current_user.id, session.agent_id, session.id)
+    target = Path(_resolve_workspace_path(root, path))
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    await db.rollback()
+    try:
+        data = await render_docx_pdf(target)
+    except DocumentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    return Response(data, media_type="application/pdf", headers={
+        "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+    })
 
 
 @router.get("/{session_id}/file-bytes")

@@ -129,7 +129,7 @@ def test_fresh_mysql8_upgrades_to_head(mysql_dsn):
 
     # P1-02（Batch 5）：Session 乐观锁 / 执行权列 + Outbox 结构
     sess_cols = cols_map.get("agent_sessions", set())
-    for col in ("version", "active_run_id", "active_run_lease_expires_at"):
+    for col in ("version", "active_run_id", "active_run_lease_expires_at", "title_edited", "pinned_at"):
         assert col in sess_cols, f"agent_sessions 缺少列 {col}"
     for col in ("run_id", "session_id", "status", "attempts", "last_error"):
         assert col in cols_map.get("session_result_outbox", set()), \
@@ -140,6 +140,12 @@ def test_fresh_mysql8_upgrades_to_head(mysql_dsn):
     assert _has_unique(unique_map, "agent_runs", "idempotency_key", "user_id")
     assert _has_unique(unique_map, "agent_run_events", "run_id", "sequence")
     assert _has_unique(unique_map, "agent_tool_executions", "run_id", "tool_call_id")
+    assert {"document_profiles", "document_profile_versions", "document_assets",
+            "document_versions", "run_input_requests"} <= tables
+    assert _has_unique(unique_map, "document_profile_versions", "profile_id", "version_no")
+    assert _has_unique(unique_map, "document_versions", "document_id", "version_no")
+    assert _has_unique(unique_map, "document_versions", "created_by_run_id")
+    assert _has_unique(unique_map, "run_input_requests", "run_id", "ordinal")
 
 
 def test_pre_phase2_mysql8_upgrades_to_head(mysql_dsn):

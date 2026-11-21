@@ -4,7 +4,7 @@ Run 生命周期：状态机、幂等、并发安全。
 状态转移（单向 + 少量受控转移）：
   pending -> running -> completed / failed / cancelled / limit_exceeded
   running -> waiting_approval -> running（恢复后）/ cancelled / failed
-  waiting_approval 是唯一可恢复的暂停态
+  running -> waiting_input -> running（收到用户补充后）/ cancelled / failed
 
 进程内注册表保存活跃 run 句柄（含 asyncio.Task）；持久态在 agent_runs 表。
 """
@@ -23,6 +23,7 @@ from .events import EventBus
 STATUS_PENDING = "pending"
 STATUS_RUNNING = "running"
 STATUS_WAITING_APPROVAL = "waiting_approval"
+STATUS_WAITING_INPUT = "waiting_input"
 STATUS_NEEDS_RECONCILIATION = "needs_reconciliation"
 STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
@@ -38,16 +39,17 @@ RECOVERY_WAITING_APPROVAL = "waiting_approval"  # Checkpoint 停在 HITL 中断�
 RECOVERY_NEEDS_RECONCILIATION = "needs_reconciliation"  # 未决副作用：禁止自动重放
 
 # 暂停态：可被人工恢复，不会被 Worker 自动领取执行
-PAUSED_STATUSES = {STATUS_WAITING_APPROVAL, STATUS_NEEDS_RECONCILIATION}
+PAUSED_STATUSES = {STATUS_WAITING_APPROVAL, STATUS_WAITING_INPUT, STATUS_NEEDS_RECONCILIATION}
 
 ALLOWED_TRANSITIONS: Dict[str, Set[str]] = {
     STATUS_PENDING: {STATUS_RUNNING, STATUS_CANCELLED, STATUS_FAILED},
     STATUS_RUNNING: {
         STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED,
-        STATUS_LIMIT_EXCEEDED, STATUS_WAITING_APPROVAL,
+        STATUS_LIMIT_EXCEEDED, STATUS_WAITING_APPROVAL, STATUS_WAITING_INPUT,
         STATUS_NEEDS_RECONCILIATION,
     },
     STATUS_WAITING_APPROVAL: {STATUS_RUNNING, STATUS_CANCELLED, STATUS_FAILED},
+    STATUS_WAITING_INPUT: {STATUS_RUNNING, STATUS_CANCELLED, STATUS_FAILED},
     # 人工核对后可显式继续/终止；不得自动执行
     STATUS_NEEDS_RECONCILIATION: {STATUS_RUNNING, STATUS_CANCELLED, STATUS_FAILED},
     STATUS_COMPLETED: set(),
@@ -92,6 +94,7 @@ class RunHandle:
     pending_actions: list = field(default_factory=list)
     bus: EventBus = field(default_factory=lambda: EventBus(persist=True))
     task: Optional[asyncio.Task] = None
+    supervisor: Optional[asyncio.Task] = None
     # ── Durable Execution（Phase 2）：租约与执行尝试 ─────────────────────
     lease_version: Optional[int] = None   # 当前持有租约的 fencing token（未持有时为 None）
     worker_id: Optional[str] = None       # 当前租约持有者
@@ -217,14 +220,14 @@ class RunRegistry:
             self._by_idem[idempotency_key] = run_id
         return handle
 
-    def release(self, run_id: str) -> None:
+    def release(self, run_id: str, *, persisted: bool = False) -> None:
         """终态 run 移出活跃表（保留记录在 DB）。
 
         P1-04 §12：Run 终态后释放 Registry 热数据；Registry 不作状态真相源
         （状态真相恒在 DB）。
         """
         run = self._runs.get(run_id)
-        if run and run.is_terminal and (run.task is None or run.task.done()):
+        if run and (run.is_terminal or persisted) and (run.task is None or run.task.done()):
             self._runs.pop(run_id, None)
             if run.idempotency_key:
                 self._by_idem.pop(run.idempotency_key, None)

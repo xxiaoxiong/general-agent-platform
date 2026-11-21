@@ -136,7 +136,8 @@ import PageHeader from '@/components/layout/PageHeader.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import ErrorState from '@/components/ui/ErrorState.vue'
 import { onMounted, ref } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
+import { confirmDestructive } from '@/lib/confirmation'
 import { Plus } from '@lucide/vue'
 import { agentOptionApi, skillApi, type AgentOption, type SkillItem } from '@/api/extensions'
 
@@ -246,7 +247,7 @@ async function handleToggle(row: any) {
 }
 
 async function handleDelete(row: any) {
-  await ElMessageBox.confirm(`确认删除技能「${row.name}」？`, '提示', { type: 'warning' })
+  await confirmDestructive(`确认删除技能「${row.name}」？`, '删除技能')
   await skillApi.remove(row.id!)
   ElMessage.success('已删除')
   await load()

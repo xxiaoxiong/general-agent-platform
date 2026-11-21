@@ -23,7 +23,7 @@ TOOLS: List[Dict[str, Any]] = [
 
 async def execute_knowledge_search(db, agent_config: dict, params: dict) -> str:
     query = params.get("query", "")
-    top_k = int(params.get("top_k", 3))
+    top_k = max(1, min(int(params.get("top_k") or 3), 20))
     kb_id = agent_config.get("knowledge_base_id")
 
     if not kb_id:

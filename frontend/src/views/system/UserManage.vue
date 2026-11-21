@@ -108,6 +108,7 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { confirmDestructive } from '@/lib/confirmation'
 import { Plus, Search } from '@lucide/vue'
 import PageHeader from '@/components/layout/PageHeader.vue'
 import UiButton from '@/components/ui/UiButton.vue'
@@ -213,10 +214,7 @@ async function toggleActive(user: User) {
 
 async function deleteUser(user: User) {
   try {
-    await ElMessageBox.confirm(
-      `确认删除用户「${user.username}」？`, '删除用户',
-      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消', confirmButtonClass: 'el-button--danger' },
-    )
+    await confirmDestructive(`确认删除用户「${user.username}」？`, '删除用户')
     await userApi.delete(user.id)
     if (users.value.length === 1 && page.value > 1) page.value -= 1
     ElMessage.success('已删除用户')

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
@@ -21,11 +21,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
-from app.core.database import AsyncSessionLocal, get_db
-from app.models.agent import Agent, AgentSession
+from app.core.database import get_db
+from app.models.agent import Agent, AgentRun, AgentRunEvent, AgentSession
 from app.models.user import User
 
-from .schemas import RunCancelRequest, RunCreate, RunResumeRequest
+from .schemas import RunCancelRequest, RunCreate, RunInputSubmission, RunResumeRequest
 
 logger = logging.getLogger(__name__)
 
@@ -61,50 +61,6 @@ async def _load_agent_config(db: AsyncSession, agent: Agent, *, use_memory: bool
     return cfg
 
 
-async def _load_db_info(database_connection_id: Optional[int]) -> Optional[dict]:
-    """数据源注入（与 v1 chat 同口径）：预加载表列表，避免模型猜表名。"""
-    if not database_connection_id:
-        return None
-    try:
-        from app.models.database_connection import DatabaseConnection
-
-        async with AsyncSessionLocal() as db:
-            db_conn = (await db.execute(
-                select(DatabaseConnection).where(DatabaseConnection.id == database_connection_id)
-            )).scalar_one_or_none()
-        if db_conn is None:
-            return None
-        db_info = {
-            "name": db_conn.name,
-            "db_type": db_conn.db_type,
-            "database": db_conn.database,
-            "host": db_conn.host,
-            "tables": [],
-        }
-        import sqlalchemy as sa
-
-        db_type = db_conn.db_type
-        if db_type == "mysql":
-            sync_url = f"mysql+pymysql://{db_conn.username}:{db_conn.password}@{db_conn.host}:{db_conn.port}/{db_conn.database}"
-        elif db_type == "postgresql":
-            sync_url = f"postgresql+psycopg2://{db_conn.username}:{db_conn.password}@{db_conn.host}:{db_conn.port}/{db_conn.database}"
-        elif db_type == "sqlite":
-            sync_url = f"sqlite:///{db_conn.database}"
-        else:
-            return db_info
-        if db_conn.extra_params:
-            sync_url += f"?{db_conn.extra_params}"
-        sync_engine = sa.create_engine(sync_url, pool_pre_ping=True)
-        try:
-            db_info["tables"] = sa.inspect(sync_engine).get_table_names()[:50]
-        finally:
-            sync_engine.dispose()
-        return db_info
-    except Exception as e:  # noqa: BLE001
-        logger.warning("加载数据库连接信息失败: %s", e)
-        return None
-
-
 async def _drain_legacy_stream(stream) -> None:
     """后台排空旧契约事件流（执行由 Worker 驱动；事件已持久化，v2 经 /events 消费）。"""
     try:
@@ -136,6 +92,7 @@ def _attachment_note(attachments: List[Dict[str, Any]]) -> str:
     return (
         "\n\n[附件]（文件已存入会话工作区。回答前请务必先用 read_file 逐个读取以下文件——"
         "图片文件 read_file 后可直接看到图片内容——读完再基于内容回答；"
+        "原始附件与文本副本仅供读取。不要把文本副本当作新的 Word 成品。"
         "在未读取前不要猜测内容、不要让用户重新上传）\n" + "\n".join(lines)
     )
 
@@ -156,8 +113,14 @@ async def create_run(
     幂等（P1-01）：同 Key 同摘要复用原 Run；同 Key 不同摘要 409。
     """
     from app.services.agent_runtime import get_runtime_service
+    from app.services.agent_runtime.document_turn import document_turn, is_template_reference
     from app.services.agent_runtime.service import compute_request_hash
     from app.services.agent_runtime.repositories import IdempotencyConflict, SessionBusy
+    from app.services.agent_runtime.source_bindings import SourceBindingError, check_source_bindings
+    from app.services.agent_runtime.task_router import (
+        DOCUMENT_GRAPH_TYPES, choose_word_attachment, recent_word_attachments, resolve_attachment_refs,
+        route_task, word_candidates,
+    )
 
     # 1) 会话定位（仅限当前用户）
     session: Optional[AgentSession] = None
@@ -203,12 +166,36 @@ async def create_run(
     # ensure_version 可能写入 agent_versions（flush 持写锁）：先提交释放，
     # 避免与 start_run_with_session 的独立会话写入互相阻塞（SQLite 必需）
     await db.commit()
-    db_info = await _load_db_info(agent_config.get("database_connection_id"))
-    # 附件读取注记随消息持久化（多轮对话中模型始终可见文件位置）；
-    # 前端展示时剥离该注记块
-    note = _attachment_note(body.attachments)
-    user_message = {"role": "user", "content": body.message + note}
-    messages = (list(session.messages or []) if session is not None else []) + [user_message]
+    if any(
+        key not in {"profile_version_no", "document_version_no"}
+        or type(value) is not int or value < 1
+        for key, value in body.task_options.items()
+    ):
+        raise HTTPException(status_code=422, detail="任务选项仅支持正整数的规范或文档版本号")
+    try:
+        attachment_refs = await asyncio.to_thread(
+            resolve_attachment_refs, body.attachments, user_id=current_user.id,
+            agent_id=agent_id, session_id=body.conversation_id,
+        ) if body.attachments else []
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from None
+    except OSError:
+        raise HTTPException(status_code=404, detail="无法读取会话附件") from None
+
+    task_request = None
+    if body.task_mode != "auto" or body.document_profile_id or body.document_id or body.task_options or attachment_refs:
+        task_request = {
+            "task_mode": body.task_mode,
+            "document_profile_id": body.document_profile_id,
+            "document_id": body.document_id,
+            "attachment_refs": attachment_refs,
+            "task_options": body.task_options,
+        }
+    request_hash = compute_request_hash(
+        endpoint="chat", user_id=current_user.id, agent_id=agent_id,
+        session_id=body.conversation_id, user_input=body.message,
+        agent_config=agent_config, task_request=task_request,
+    )
 
     # 3) 幂等预查（P1-01）
     if idempotency_key:
@@ -216,14 +203,7 @@ async def create_run(
             existing = await get_runtime_service().lookup_idempotent(
                 current_user.id,
                 idempotency_key,
-                compute_request_hash(
-                    endpoint="chat",
-                    user_id=current_user.id,
-                    agent_id=agent_id,
-                    session_id=body.conversation_id,
-                    user_input=body.message,
-                    agent_config=agent_config,
-                ),
+                request_hash,
             )
         except IdempotencyConflict as e:
             raise HTTPException(status_code=409, detail=str(e))
@@ -237,6 +217,99 @@ async def create_run(
                 "events_url": f"/api/v2/runs/{existing.id}/events",
             }
 
+    history = list(session.messages or []) if session is not None else []
+    declared_refs = list(attachment_refs)
+    current_word = word_candidates(attachment_refs)
+    previous_word = recent_word_attachments(history) if session and not current_word else []
+    execution_context = route_task(
+        body.message, task_mode=body.task_mode,
+        document_profile_id=body.document_profile_id, document_id=body.document_id,
+        attachment_refs=attachment_refs,
+        has_document_context=any(message.get("document_run_id") for message in history if isinstance(message, dict)),
+        has_word_attachment=bool(previous_word),
+    )
+    execution_context, inherited, anchor_run = document_turn(body.message, history, execution_context)
+    context = execution_context.get("document_context")
+    if context is not None:
+        template_refs = current_word if is_template_reference(body.message) else []
+        known = {ref["path"] for ref in attachment_refs}
+        for ref in inherited if not template_refs else ():
+            if ref["path"] in known:
+                continue
+            try:
+                resolved = (await asyncio.to_thread(
+                    resolve_attachment_refs, [ref], user_id=current_user.id,
+                    agent_id=agent_id, session_id=body.conversation_id,
+                ))[0]
+            except (ValueError, OSError):
+                continue
+            attachment_refs.append(resolved)
+            template_refs.append(resolved)
+            known.add(resolved["path"])
+        context["template_paths"] = [ref["path"] for ref in template_refs]
+        if anchor_run:
+            from app.models.document import RunInputRequest
+
+            responses = (await db.scalars(select(RunInputRequest.response).join(
+                AgentRun, AgentRun.id == RunInputRequest.run_id,
+            ).where(AgentRun.id == anchor_run, AgentRun.user_id == current_user.id,
+                    AgentRun.session_id == body.conversation_id, RunInputRequest.status == "submitted")
+                .order_by(RunInputRequest.ordinal))).all()
+            context["carried_inputs"] = {
+                key: value for response in responses if isinstance(response, dict)
+                for key, value in response.items()
+            }
+    execution_context["attachment_refs"] = attachment_refs
+    if execution_context["task_type"] in DOCUMENT_GRAPH_TYPES or body.document_profile_id or body.document_id:
+        from app.services.documents.errors import DocumentError
+        from app.services.documents.repository import resolve_task_resources
+
+        try:
+            editing = execution_context["task_type"] == "document_edit" and not body.document_id
+            candidates = (current_word or previous_word) if editing else []
+            chosen = choose_word_attachment(body.message, candidates)
+            prefer_attachment = bool(current_word and editing) or bool(chosen and any(
+                term in body.message for term in ("原文件", "原附件", str(chosen.get("name") or chosen["path"]))
+            ))
+            resources = await resolve_task_resources(
+                db, user_id=current_user.id, is_superuser=current_user.is_superuser,
+                session_id=body.conversation_id, task_type=execution_context["task_type"],
+                message=context["request"] if context else body.message,
+                profile_id=body.document_profile_id, document_id=body.document_id,
+                task_options=body.task_options, prefer_attachment=prefer_attachment,
+                has_attachment=bool(candidates),
+            )
+            if editing and not resources.get("document_id") and candidates:
+                if chosen is None:
+                    raise DocumentError(422, "有多份 Word 可编辑，请在消息中写明一个文件名")
+                if not current_word:
+                    try:
+                        chosen = (await asyncio.to_thread(
+                            resolve_attachment_refs, [chosen], user_id=current_user.id,
+                            agent_id=agent_id, session_id=body.conversation_id,
+                        ))[0]
+                    except (ValueError, OSError):
+                        raise DocumentError(422, "之前的 Word 附件已不可用，请重新上传") from None
+                resources["source_attachment"] = chosen
+        except DocumentError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.message) from None
+        execution_context.update(resources)
+    # 附件注记随普通会话持久化；专用 Graph 从快照中的附件引用读取。
+    note = "" if execution_context["task_type"] in DOCUMENT_GRAPH_TYPES else _attachment_note(attachment_refs)
+    user_message = {"role": "user", "content": body.message + note}
+    if declared_refs:
+        user_message["attachments"] = [
+            {key: ref[key] for key in ("name", "path", "text_path", "size") if key in ref}
+            for ref in declared_refs
+        ]
+    messages = history + [user_message]
+    try:
+        db_conn = await check_source_bindings(db, current_user.id, agent_config)
+    except SourceBindingError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from None
+    db_info = {"name": db_conn.name, "db_type": db_conn.db_type} if db_conn is not None else None
+    await db.commit()
+
     # 4) 启动运行（Session 创建 + 用户消息追加 + Run 创建同事务原子提交）
     try:
         run_id, conversation_id, stream = await get_runtime_service().start_run_with_session(
@@ -248,6 +321,8 @@ async def create_run(
             db_info=db_info,
             endpoint="chat",
             user_message=user_message,
+            execution_context=execution_context,
+            request_hash=request_hash,
         )
     except IdempotencyConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -355,6 +430,8 @@ async def resume_run(
     )
 
     info = await _get_run_or_404(run_id, current_user.id)
+    if info.get("status") == "waiting_input":
+        raise HTTPException(status_code=409, detail="运行正在等待业务输入")
     decisions = [
         {"type": d.type, "message": d.message, "action_id": d.action_id}
         for d in body.decisions
@@ -388,6 +465,130 @@ async def resume_run(
         "message": "已恢复执行",
         "events_url": f"/api/v2/runs/{run_id}/events",
     }
+
+
+@router.post("/{run_id}/input")
+async def submit_input(
+    run_id: str,
+    body: RunInputSubmission,
+    current_user: User = Depends(get_current_user),
+):
+    """在同一 Run 中提交所需业务信息，并由 Worker 继续执行。"""
+    from app.services.agent_runtime.run_input import RunInputError, submit_run_input
+
+    try:
+        result = await submit_run_input(run_id, current_user.id, body.request_id, body.values)
+    except RunInputError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e)) from None
+    return {**result, "events_url": f"/api/v2/runs/{run_id}/events"}
+
+
+@router.post("/{run_id}/retry")
+async def retry_run(
+    run_id: str, current_user: User = Depends(get_current_user),
+    failed_event_seq: Optional[int] = Header(None, alias="X-Document-Failure-Seq"),
+):
+    from app.services.agent_runtime import get_runtime_service
+    from app.services.agent_runtime.document_retry import retry_document_run
+    from app.services.documents.errors import DocumentError
+
+    try:
+        result = await retry_document_run(
+            get_runtime_service(), run_id, current_user.id, expected_sequence=failed_event_seq,
+        )
+    except DocumentError as exc:
+        raise HTTPException(exc.status_code, exc.message) from None
+    return {**result, "events_url": f"/api/v2/runs/{run_id}/events"}
+
+
+@router.get("/{run_id}/document-review/context")
+async def document_review_context(
+    run_id: str, response: Response, db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """使用文档检查点而非事件摘要恢复原文、建议稿及接受范围。"""
+    from types import SimpleNamespace
+
+    from app.models.document import RunInputRequest
+    from app.services.documents.errors import DocumentError
+    from app.services.documents.review_context import build_context, saved_proposal
+
+    run = (await db.execute(select(AgentRun.agent_id, AgentRun.session_id, AgentRun.thread_id, AgentRun.input_payload).where(
+        AgentRun.id == run_id, AgentRun.user_id == current_user.id,
+    ))).one_or_none()
+    route = ((run.input_payload or {}).get("execution_context") or {}) if run else {}
+    if not run or not run.thread_id or route.get("task_type") != "document_edit":
+        raise HTTPException(404, "文档修改稿不存在")
+    decision = await db.scalar(select(RunInputRequest.response).where(
+        RunInputRequest.run_id == run_id, RunInputRequest.ordinal == 3, RunInputRequest.status == "submitted",
+    ))
+    scope = SimpleNamespace(user_id=current_user.id, agent_id=run.agent_id, session_id=run.session_id)
+    await db.rollback()
+    try:
+        state = await saved_proposal(run.thread_id)
+        result = await build_context(scope, route, state)
+    except DocumentError as exc:
+        raise HTTPException(exc.status_code, exc.message) from None
+    if isinstance(decision, dict) and isinstance(decision.get("accepted_change_ids"), list):
+        accepted = decision["accepted_change_ids"]
+        result["decision"] = {"accepted_change_ids": accepted, "rejected_change_ids": [
+            item["id"] for item in state["edit_changes"] if item["id"] not in accepted
+        ]}
+    response.headers["Cache-Control"] = "private, no-store"
+    return result
+
+
+@router.get("/{run_id}/document-review/{change_id}/{side}")
+async def document_review_image(
+    run_id: str, change_id: str, side: Literal["before", "after"],
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """读取审阅清单中存在的图片缩略图，锚点和资料都来自持久化的 Run。"""
+    from types import SimpleNamespace
+
+    from app.services.documents.errors import DocumentError
+    from app.services.documents.native_workflow import image_attachment_refs, office_base_path
+    from app.services.documents.office_edit import OfficeEditError, office_asset_thumbnail, office_image_bytes
+    from app.services.documents.parser import DocumentParseError
+    from app.services.documents.review_context import saved_proposal
+    from app.services.documents.workflow_support import verified_attachment
+
+    run = (await db.execute(select(AgentRun.agent_id, AgentRun.session_id, AgentRun.thread_id, AgentRun.input_payload).where(
+        AgentRun.id == run_id, AgentRun.user_id == current_user.id,
+    ))).one_or_none()
+    if run is None:
+        raise HTTPException(404, "文档审阅图片不存在")
+    proposal = await db.scalar(select(AgentRunEvent.payload).where(
+        AgentRunEvent.run_id == run_id, AgentRunEvent.event_type == "document.edit.review_required",
+    ).order_by(AgentRunEvent.sequence.desc()).limit(1))
+    route = (run.input_payload or {}).get("execution_context") or {}
+    context = SimpleNamespace(user_id=current_user.id, agent_id=run.agent_id, session_id=run.session_id)
+    await db.rollback()
+    try:
+        candidates = (proposal or {}).get("changes", [])
+        if len(candidates) == 20 and not any(item["id"] == change_id for item in candidates) and run.thread_id:
+            candidates = (await saved_proposal(run.thread_id))["edit_changes"]
+        change = next((item for item in candidates if item["id"] == change_id and item.get(f"{side}_image_url")), None)
+        if change is None:
+            raise DocumentError(404, "文档审阅图片不存在")
+        replacement_id = change.get("replacement_asset_id")
+        if side == "after" and replacement_id:
+            ref = image_attachment_refs(route).get(replacement_id)
+            if not ref:
+                raise DocumentError(404, "图片附件不可用")
+            path = await asyncio.to_thread(verified_attachment, context, ref)
+            data, mime = await asyncio.to_thread(office_asset_thumbnail, path)
+        elif change.get("image_anchor"):
+            path = await office_base_path(context, route)
+            data, mime = await asyncio.to_thread(
+                office_image_bytes, path, change["image_anchor"], thumbnail=True,
+            )
+        else:
+            raise DocumentError(404, "文档审阅图片不存在")
+    except (DocumentError, OfficeEditError, DocumentParseError, OSError):
+        raise HTTPException(404, "文档审阅图片不存在或源文件已变更") from None
+    return Response(data, media_type=mime, headers={"Cache-Control": "private, no-store",
+                                                    "X-Content-Type-Options": "nosniff"})
 
 
 async def _get_run_or_404(run_id: str, user_id: int) -> dict:

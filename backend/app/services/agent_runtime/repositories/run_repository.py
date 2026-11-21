@@ -28,9 +28,11 @@ from ..lifecycle import (
     ALLOWED_TRANSITIONS,
     PAUSED_STATUSES,
     STATUS_CANCELLED,
+    STATUS_NEEDS_RECONCILIATION,
     STATUS_PENDING,
     STATUS_RUNNING,
     STATUS_WAITING_APPROVAL,
+    STATUS_WAITING_INPUT,
     TERMINAL_STATUSES,
     RunExecutionLease,
 )
@@ -171,6 +173,24 @@ class RunRepository:
             .execution_options(populate_existing=True)
         )
         return res.scalar_one_or_none()
+
+    async def verify_running_lease(self, lease: RunExecutionLease) -> bool:
+        """锁住有效 Run 的执行权记录，返回是否已请求取消。"""
+        res = await self.session.execute(
+            select(AgentRun.cancel_requested)
+            .where(
+                AgentRun.id == lease.run_id,
+                AgentRun.worker_id == lease.worker_id,
+                AgentRun.lease_version == lease.lease_version,
+                AgentRun.status == STATUS_RUNNING,
+                AgentRun.lease_expires_at > _sql_now(self.session),
+            )
+            .with_for_update()
+        )
+        row = res.first()
+        if row is None:
+            raise RunLeaseLost(f"run {lease.run_id} 的执行租约已失效")
+        return bool(row.cancel_requested)
 
     # ── 状态更新（P0-02：全条件 Fencing + 数据库级状态机） ──────────────
 
@@ -476,7 +496,7 @@ class RunRepository:
             update(AgentRun)
             .where(
                 AgentRun.id == run_id,
-                AgentRun.status.in_(tuple(PAUSED_STATUSES)),
+                AgentRun.status.in_((STATUS_WAITING_APPROVAL, STATUS_NEEDS_RECONCILIATION)),
             )
             .values(
                 status=STATUS_RUNNING,
@@ -495,6 +515,21 @@ class RunRepository:
             select(AgentRun.lease_version).where(AgentRun.id == run_id)
         )
         return row.scalar_one()
+
+    async def queue_input_resume(self, run_id: str, user_id: int) -> bool:
+        """在提交输入的同一事务中恢复领取资格，保留尚在收尾的 Worker 租约。"""
+        res = await self.session.execute(
+            update(AgentRun)
+            .where(
+                AgentRun.id == run_id,
+                AgentRun.user_id == user_id,
+                AgentRun.status == STATUS_WAITING_INPUT,
+                AgentRun.cancel_requested.is_(False),
+            )
+            .values(status=STATUS_RUNNING, updated_at=datetime.utcnow()),
+            execution_options={"synchronize_session": False},
+        )
+        return res.rowcount == 1
 
     async def heartbeat(
         self, run_id: str, worker_id: str, lease_version: int, lease_seconds: int

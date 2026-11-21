@@ -22,6 +22,7 @@ from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.models.agent import Agent, AgentVersion
 from app.models.user import User
+from app.services.agent_runtime.source_bindings import SourceBindingError, check_source_bindings
 
 from .schemas import AssistantCreate, AssistantDraftRequest, AssistantPatch
 from .serializers import assistant_to_dict
@@ -68,6 +69,13 @@ def _bindings(knowledge_base_id, database_connection_id) -> dict:
         "knowledge_base": knowledge_base_id,
         "database_connection": database_connection_id,
     }
+
+
+async def _check_bindings(db: AsyncSession, user_id: int, config: dict) -> None:
+    try:
+        await check_source_bindings(db, user_id, config)
+    except SourceBindingError as e:
+        raise HTTPException(404, str(e)) from None
 
 
 @router.get("")
@@ -119,6 +127,10 @@ async def create_assistant(
         body.capability_ids,
         _bindings(body.knowledge_base_id, body.database_connection_id),
     )
+    await _check_bindings(db, current_user.id, {
+        "knowledge_base_id": body.knowledge_base_id,
+        "database_connection_id": body.database_connection_id,
+    })
     agent = Agent(
         name=body.name,
         description=body.description,
@@ -182,6 +194,11 @@ async def patch_assistant(
         )
     if "temperature" in data and data["temperature"] is not None:
         data["temperature"] = str(data["temperature"])
+    if {"knowledge_base_id", "database_connection_id"}.intersection(data):
+        await _check_bindings(db, current_user.id, {
+            key: data.get(key, getattr(agent, key))
+            for key in ("knowledge_base_id", "database_connection_id")
+        })
     for field, val in data.items():
         setattr(agent, field, val)
     await db.commit()
@@ -206,6 +223,10 @@ async def publish_assistant(
     agent = await _get_owned_agent(db, agent_id, current_user)
     from app.assistant.versions import publish_version
 
+    await _check_bindings(db, current_user.id, {
+        "knowledge_base_id": agent.knowledge_base_id,
+        "database_connection_id": agent.database_connection_id,
+    })
     capability_ids = None
     if body and body.capability_ids is not None:
         capability_ids = _validate_capability_ids(

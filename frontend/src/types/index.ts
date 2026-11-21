@@ -45,6 +45,7 @@ export interface ModelConfig {
   is_active: boolean
   supports_streaming: boolean
   supports_function_call: boolean
+  supports_vision: boolean
   description?: string
   created_at: string
 }
@@ -136,20 +137,51 @@ export interface AppInstance {
   created_at: string
 }
 
+export type AuditEventType = 'request' | 'change'
+export type AuditValue = string | number | boolean | null | AuditValue[] | { [key: string]: AuditValue }
+export type AuditSnapshot = Record<string, AuditValue>
+
 export interface AuditLog {
   id: number
-  user_id?: number
-  username?: string
+  user_id?: number | null
+  username?: string | null
   action: string
   module: string
+  resource_type?: string | null
+  resource_id?: string | null
+  ip_address?: string | null
+  status: string
+  duration_ms?: number | null
+  created_at: string
+  event_type?: AuditEventType | null
+  request_id?: string | null
+  http_method?: string | null
+  request_path?: string | null
+  status_code?: number | null
+  changed_fields?: string[] | null
+}
+
+export interface AuditLogDetail extends AuditLog {
+  before_data?: AuditSnapshot | null
+  after_data?: AuditSnapshot | null
+  detail?: AuditSnapshot | null
+  error_msg?: string | null
+  user_agent?: string | null
+}
+
+export interface AuditLogQuery {
+  page: number
+  page_size: number
+  username?: string
+  action?: string
+  module?: string
+  status?: string
+  event_type?: AuditEventType | 'legacy'
   resource_type?: string
   resource_id?: string
-  detail?: Record<string, any>
-  ip_address?: string
-  status: string
-  error_msg?: string
-  duration_ms?: number
-  created_at: string
+  request_id?: string
+  start_time?: string
+  end_time?: string
 }
 
 export interface PageResponse<T> {

@@ -39,6 +39,7 @@
                   <el-tag size="small" type="info">{{ modelTypes[row.model_type] || row.model_type }}</el-tag>
                   <el-tag v-if="row.supports_streaming" size="small" type="info" effect="plain">流式</el-tag>
                   <el-tag v-if="row.supports_function_call" size="small" type="info" effect="plain">工具调用</el-tag>
+                  <el-tag v-if="row.supports_vision" size="small" type="info" effect="plain">图片理解</el-tag>
                 </div>
               </template>
             </el-table-column>
@@ -165,6 +166,8 @@
         <el-form-item label="上下文长度"><el-input-number v-model="configForm.context_length" :min="512" :max="1000000" /></el-form-item>
         <el-form-item label="最大输出"><el-input-number v-model="configForm.max_tokens" :min="256" :max="32768" /></el-form-item>
         <el-form-item label="流式输出"><el-switch v-model="configForm.supports_streaming" /></el-form-item>
+        <el-form-item v-if="configForm.model_type === 'chat'" label="工具调用"><el-switch v-model="configForm.supports_function_call" /></el-form-item>
+        <el-form-item v-if="configForm.model_type === 'chat'" label="图片理解"><el-switch v-model="configForm.supports_vision" /></el-form-item>
         <el-form-item v-if="editingConfig" label="状态"><el-switch v-model="configForm.is_active" /></el-form-item>
       </el-form>
       <template #footer>
@@ -178,7 +181,8 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, reactive } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
+import { confirmDestructive } from '@/lib/confirmation'
 import { CircleAlert, Cpu, PlugZap, Plus, Search, Server } from '@lucide/vue'
 import { modelApi, type ModelProbeReport } from '@/api'
 import PageHeader from '@/components/layout/PageHeader.vue'
@@ -215,6 +219,7 @@ const editingConfig = ref<ModelConfig | null>(null)
 const configForm = reactive({
   provider_id: null as number | null, name: '', display_name: '', model_type: 'chat',
   context_length: 4096, max_tokens: 2048, supports_streaming: true, is_active: true,
+  supports_function_call: false, supports_vision: false,
 })
 
 const filteredConfigs = computed(() => {
@@ -298,7 +303,7 @@ async function deleteProvider(p: ModelProvider) {
     return
   }
   try {
-    await ElMessageBox.confirm(`删除供应商「${p.display_name}」？`, '删除供应商', { type: 'warning', confirmButtonText: '删除' })
+    await confirmDestructive(`删除供应商「${p.display_name}」？`, '删除供应商')
     await modelApi.deleteProvider(p.id)
     providers.value = providers.value.filter(provider => provider.id !== p.id)
     if (filterProviderId.value === p.id) filterProviderId.value = null
@@ -350,6 +355,8 @@ function openConfigDialog(c?: ModelConfig) {
     context_length: c?.context_length ?? 4096,
     max_tokens: c?.max_tokens ?? 2048,
     supports_streaming: c?.supports_streaming ?? true,
+    supports_function_call: c?.supports_function_call ?? false,
+    supports_vision: c?.supports_vision ?? false,
     is_active: c?.is_active ?? true,
   })
   configDialogVisible.value = true
@@ -383,7 +390,7 @@ async function saveConfig() {
 
 async function deleteConfig(c: ModelConfig) {
   try {
-    await ElMessageBox.confirm(`删除模型「${c.display_name}」？`, '删除模型', { type: 'warning', confirmButtonText: '删除' })
+    await confirmDestructive(`删除模型「${c.display_name}」？`, '删除模型')
     await modelApi.deleteConfig(c.id)
     configs.value = configs.value.filter(config => config.id !== c.id)
     ElMessage.success('模型已删除')

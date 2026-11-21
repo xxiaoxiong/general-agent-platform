@@ -35,6 +35,7 @@ import json
 import os
 import time
 import uuid
+from contextlib import AsyncExitStack
 from typing import Annotated, Any, Callable, Coroutine, Dict, List, Optional, Type
 
 from langchain_core.tools import InjectedToolCallId, StructuredTool
@@ -65,6 +66,7 @@ from ..events import (
 from ..lifecycle import RunExecutionLease
 from ..repositories import PersistenceError, ToolExecutionRepository
 from ..repositories.errors import IllegalTransition, RunLeaseLost
+from ..source_bindings import DATABASE_TOOLS, read_bound_database
 from ..repositories.tool_execution_repository import (
     TOOL_EXEC_NEEDS_RECONCILIATION,
     TOOL_EXEC_PREPARED,
@@ -244,12 +246,17 @@ def build_args_model(name: str, spec: Dict[str, Any]) -> Type[BaseModel]:
     required = set(spec.get("required") or [])
     fields: Dict[str, Any] = {}
     for pname, pspec in params.items():
-        ptype = _TYPE_MAP.get((pspec or {}).get("type", "string"), str)
-        desc = (pspec or {}).get("description", "")
+        pspec = pspec or {}
+        ptype = _TYPE_MAP.get(pspec.get("type", "string"), str)
+        desc = pspec.get("description", "")
         if pname in required:
             fields[pname] = (ptype, Field(description=desc))
         else:
-            fields[pname] = (Optional[ptype], Field(default=None, description=desc))
+            default = pspec.get("default")
+            fields[pname] = (
+                ptype if default is not None else Optional[ptype],
+                Field(default=default, description=desc),
+            )
     # 稳定工具调用身份：LangGraph ToolNode 运行时注入（对模型 schema 隐藏）
     fields["tool_call_id"] = (
         Annotated[Optional[str], InjectedToolCallId],
@@ -359,6 +366,10 @@ class ToolAdapterFactory:
                 self.policy.check_path(str(args.get("path") or args.get("file_path") or ""))
             if name == "db_query" and args.get("sql"):
                 self.policy.check_sql_readonly(str(args["sql"]))
+            if name in ("db_count", "db_aggregate") and (self.ctx.db_info or {}).get("bound_database"):
+                for field in ("condition", "column", "group_by"):
+                    if args.get(field):
+                        self.policy.check_sql_readonly(f"SELECT {args[field]}")
         except ToolPolicyError as e:
             await self.bus.publish(RuntimeEvent(
                 type=TOOL_FAILED,
@@ -449,17 +460,17 @@ class ToolAdapterFactory:
         # 6) 执行（在非 async 线程池跑 sync handler，不阻塞事件循环）
         #    P4-03：瞬态失败按风险策略有限重试（非幂等 retry_policy=none 不重试）
         try:
-            executor = ToolExecutor(
-                self.ctx.db_info.get("db") if self.ctx.db_info else None,
-                self.ctx.agent_config,
-            )
-            # db / agent handler 需要真实 db session：由 service 注入
-            executor.db = self.ctx.db_info.get("session") if self.ctx.db_info else None
-            result = await execute_with_retry(
-                name, args, executor,
-                bus=self.bus, run_id=self.ctx.run_id,
-                contract=get_side_effect_contract(name),
-            )
+            async with AsyncExitStack() as stack:
+                db_info = self.ctx.db_info or {}
+                db = db_info.get("session")
+                connection = db_info.get("bound_database")
+                if name in DATABASE_TOOLS and connection is not None:
+                    db = await stack.enter_async_context(read_bound_database(connection))
+                result = await execute_with_retry(
+                    name, args, ToolExecutor(db, self.ctx.agent_config),
+                    bus=self.bus, run_id=self.ctx.run_id,
+                    contract=get_side_effect_contract(name),
+                )
             tr: ToolResult = normalize(result)
             duration_ms = int((time.monotonic() - started) * 1000)
 
