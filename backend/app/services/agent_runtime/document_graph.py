@@ -46,6 +46,7 @@ class DocumentGraphContext:
         self.runtime = runtime
         self._flush_budget = flush_budget
         self.summary: dict[str, Any] = {}
+        self.team_brief = ""
         self.supports_vision = bool(model_config.get("supports_vision"))
         self.model = build_chat_model(
             provider, model_config, streaming=False,

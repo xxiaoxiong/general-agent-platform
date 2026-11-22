@@ -16,9 +16,12 @@
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional, Sequence
+from urllib.parse import urlsplit
 
 from .task_contract import TaskContract
 
@@ -26,14 +29,22 @@ STATUS_PASSED = "passed"
 STATUS_PARTIAL = "partial"
 STATUS_FAILED = "failed"
 
-_URL_RE = re.compile(r"https?://[^\s)\"'<>]+", re.IGNORECASE)
+_URL_RE = re.compile(r"https?://[^\s)）\"'<>，。；]+", re.IGNORECASE)
 _NUMBER_RE = re.compile(r"\d[\d,]*\.?\d*%?")
 
 _WRITE_TOOLS = {"write_file", "edit_file"}
-_DB_TOOLS = {"db_query", "db_count", "db_aggregate", "db_schema"}
+_DB_TOOLS = {"db_query", "db_count", "db_aggregate"}
 _EXEC_TOOLS = {"python_exec"}
 _WEB_TOOLS = {"web_search", "fetch_webpage", "http_get"}
 _SIDE_EFFECT_TOOLS = {"http_post", "send_email_tool", "webhook_notify"}
+_ROW_COUNTS = {
+    "raw_rows": re.compile(r"(?:原始记录|原始数据|输入记录|\b(?:raw|original) (?:rows|records)\b)(?:条数|行数|数|共计|共|为)?[ \t*`：:|=]*(\d+)(?=\s*(?:[条行|。.；]|$))", re.M | re.I),
+    "valid_rows": re.compile(r"(?:有效记录|有效数据|有效条数|有效行数|\bvalid (?:rows|records)\b)(?:条数|行数|数|共计|共|为)?[ \t*`：:|=]*(\d+)(?=\s*(?:[条行|。.；]|$))", re.M | re.I),
+}
+
+
+def _invalid_json_constant(value: str) -> None:
+    raise ValueError(value)
 
 
 @dataclass
@@ -44,6 +55,8 @@ class ToolEvidence:
     status: str = "succeeded"          # succeeded / failed / unknown
     external_operation_id: Optional[str] = None
     output: str = ""
+    path: str = ""                       # 已确认存在并可提交的产物相对路径
+    artifact_content: Any = None         # 用于内容验收，不能当作模型自报事实
 
 
 @dataclass
@@ -92,23 +105,85 @@ def _check_answer_present(final_text: str, _evidence: Sequence[ToolEvidence] = (
     return CheckResult("answer_present", True, "")
 
 
-def _check_citations_present(final_text: str, evidence: Sequence[ToolEvidence]) -> CheckResult:
-    urls = _URL_RE.findall(final_text or "")
-    web_used = any(e.tool_name in _WEB_TOOLS and e.status == "succeeded" for e in evidence)
-    tool_urls = [u for e in evidence for u in _URL_RE.findall(e.output or "")]
-    if urls or tool_urls:
+def _urls(text: str) -> set[tuple]:
+    urls = set()
+    for match in _URL_RE.findall(text):
+        try:
+            url = urlsplit(match.rstrip(".,;]}`"))
+            if url.hostname:
+                urls.add((url.hostname.casefold(), url.path.rstrip("/"), url.query))
+        except ValueError:
+            continue
+    return urls
+
+
+def _check_citations_present(final_text: str, evidence: Sequence[ToolEvidence], contract: TaskContract) -> CheckResult:
+    observed = _urls("\n".join(contract.supplied_urls))
+    for entry in evidence:
+        if entry.status == "succeeded" and entry.tool_name in _WEB_TOOLS:
+            observed.update(_urls(entry.output))
+    verified = len(_urls(final_text) & observed)
+    required = max(1, contract.source_count)
+    if verified >= required:
         return CheckResult("citations_present", True, "")
-    if not web_used:
-        # 未使用任何联网工具做研究：无法核验来源
-        return CheckResult("citations_present", False,
-                           "研究任务未提供来源 URL（也未使用联网工具核实）")
-    return CheckResult("citations_present", False, "使用了联网工具但结论未附来源 URL")
+    return CheckResult("citations_present", False, f"需要引用 {required} 个已读取或由用户提供的来源，当前验收 {verified} 个")
 
 
-def _check_artifact_produced(_final_text: str, evidence: Sequence[ToolEvidence]) -> CheckResult:
-    if _has_success(evidence, _WRITE_TOOLS):
-        return CheckResult("artifact_produced", True, "")
-    return CheckResult("artifact_produced", False, "未生成任何文件产物（写文件工具未成功执行）")
+def _check_artifact_produced(evidence: Sequence[ToolEvidence], contract: TaskContract) -> CheckResult:
+    valid = {item.path for item in evidence if item.tool_name in _WRITE_TOOLS and item.status == "succeeded" and item.path}
+    names = {PurePosixPath(path).name for path in valid}
+    suffixes = {PurePosixPath(path).suffix.removeprefix(".").casefold() for path in valid}
+    missing = [path for path in contract.artifact_paths if path not in (valid if "/" in path else names)]
+    missing.extend(f".{suffix} 文件" for suffix in contract.artifact_formats if suffix not in suffixes)
+    if missing:
+        return CheckResult("artifact_produced", False, "缺少可下载的交付文件 " + "、".join(missing[:12]))
+    if not valid:
+        return CheckResult("artifact_produced", False, "当前任务尚未在会话工作区保存可读取的交付文件")
+    return CheckResult("artifact_produced", True, f"已核对 {len(valid)} 份交付文件")
+
+
+def _check_table_facts(final_text: str, evidence: Sequence[ToolEvidence], contract: TaskContract) -> CheckResult:
+    facts = contract.table_facts
+    problems = []
+    raw_count, valid_count = facts.raw_rows, facts.valid_rows
+    text_parts = [("最终正文", final_text), *((row.path, row.artifact_content) for row in evidence
+                  if row.path and isinstance(row.artifact_content, str))]
+    matched_valid_count = False
+    for label, text in text_parts:
+        for field, expected in (("raw_rows", raw_count), ("valid_rows", valid_count)):
+            found = {int(value) for value in _ROW_COUNTS[field].findall(text)}
+            if field == "valid_rows" and expected in found:
+                matched_valid_count = True
+            if found - {expected}:
+                metric = "原始" if field == "raw_rows" else "有效"
+                problems.append(f"{label} 的{metric}记录数应为 {expected} 条")
+    if contract.expected_json:
+        verified_json = []
+        targets = {path for path in contract.artifact_paths if path.casefold().endswith(".json")}
+        for row in evidence:
+            if not row.path or not row.path.casefold().endswith(".json"):
+                continue
+            if targets and row.path not in targets and PurePosixPath(row.path).name not in targets:
+                continue
+            verified_json.append((row.path, row.artifact_content))
+        if "json_answer" in contract.completion_checks:
+            try:
+                verified_json.append(("最终 JSON", json.loads(final_text, parse_constant=_invalid_json_constant)))
+            except (ValueError, RecursionError):
+                pass
+        if not verified_json:
+            problems.append("缺少可核对条数和排除记录的 JSON 交付")
+        for label, data in verified_json:
+            for field, expected in contract.expected_json.items():
+                actual = data.get(field) if isinstance(data, dict) else None
+                equal = type(actual) is type(expected) and actual == expected
+                if isinstance(expected, list) and isinstance(actual, list) and all(isinstance(item, str) for item in actual):
+                    equal = sorted(actual) == sorted(expected)
+                if not equal:
+                    problems.append(f"{label} 的 {field} 应为 {json.dumps(expected, ensure_ascii=False)}")
+    elif not matched_valid_count:
+        problems.append(f"请在交付中写明从原始表格独立复算的有效记录数 {valid_count} 条")
+    return CheckResult("table_facts", not problems, "。".join(problems[:6]) if problems else f"已按原始表格复算 {raw_count} 条记录和 {valid_count} 条有效记录")
 
 
 def _check_computation_evidence(final_text: str, evidence: Sequence[ToolEvidence]) -> CheckResult:
@@ -149,8 +224,6 @@ def _check_side_effect_evidence(_final_text: str, evidence: Sequence[ToolEvidenc
 
 _CHECKS = {
     "answer_present": _check_answer_present,
-    "citations_present": _check_citations_present,
-    "artifact_produced": _check_artifact_produced,
     "computation_evidence": _check_computation_evidence,
     "db_evidence": _check_db_evidence,
     "exec_evidence": _check_exec_evidence,
@@ -162,6 +235,8 @@ def verify_task(
     contract: TaskContract,
     final_text: str,
     evidence: Sequence[ToolEvidence],
+    *,
+    execution_checks: Sequence[CheckResult] = (),
 ) -> VerificationResult:
     """执行验证（确定性，零模型调用）。
 
@@ -172,9 +247,26 @@ def verify_task(
     """
     checks: List[CheckResult] = []
     for cid in contract.completion_checks:
-        fn = _CHECKS.get(cid)
-        if fn is not None:
+        if cid == "citations_present":
+            checks.append(_check_citations_present(final_text, evidence, contract))
+        elif cid == "artifact_produced":
+            checks.append(_check_artifact_produced(evidence, contract))
+        elif cid == "table_facts" and contract.table_facts:
+            checks.append(_check_table_facts(final_text, evidence, contract))
+        elif cid == "minimum_chars":
+            count = sum(not char.isspace() for char in final_text)
+            checks.append(CheckResult(cid, count >= contract.minimum_chars, f"正文共 {count} 个非空白字符，要求至少 {contract.minimum_chars} 个"))
+        elif cid == "json_answer":
+            try:
+                json.loads(final_text, parse_constant=_invalid_json_constant)
+                valid = True
+            except (ValueError, RecursionError):
+                valid = False
+            checks.append(CheckResult(cid, valid, "" if valid else "回复需要是可直接解析的 JSON"))
+        elif fn := _CHECKS.get(cid):
             checks.append(fn(final_text, evidence))
+
+    checks.extend(execution_checks)
 
     answer = next((c for c in checks if c.id == "answer_present"), None)
     failed = [c for c in checks if not c.passed]

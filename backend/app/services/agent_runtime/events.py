@@ -53,6 +53,7 @@ VERIFICATION_COMPLETED = "verification_completed"
 # P4-03：Retry / Recovery（§7.1 run.retrying / run.recovering）
 RUN_RETRYING = "run_retrying"
 RUN_RECOVERING = "run_recovering"
+TEAM_UPDATED = "team.updated"
 
 # 流边界事件：消费者收到即结束本次事件流（Run 可能稍后由其他 Worker 恢复，
 # 恢复后的执行产生新的事件流）。任务书 §12.2：SSE 消费者必须能终止。
@@ -166,12 +167,14 @@ def redact_sensitive(value: Any, max_len: int = 400) -> Any:
 # 会破坏最终文本重建，并让事件日志里的执行证据失真（评测交付物漏采、约束假
 # 失败）；其余事件（计划/审批/状态类）仍 400 上限防事件表膨胀。密钥遮蔽一律保留。
 _FULL_PAYLOAD_EVENTS = frozenset(
-    {MODEL_DELTA, RUN_COMPLETED, TOOL_STARTED, TOOL_COMPLETED, TOOL_FAILED})
+    {MODEL_DELTA, RUN_COMPLETED, RUN_FAILED, TOOL_STARTED, TOOL_COMPLETED, TOOL_FAILED})
 _FULL_PAYLOAD_MAX_LEN = 100_000
 
 
 def _persist_max_len(ev_type: str) -> int:
     """按事件类型取持久化截断上限（仅长文本上限不同，脱敏遮蔽一律保留）。"""
+    if ev_type == TEAM_UPDATED:
+        return 4200
     return _FULL_PAYLOAD_MAX_LEN if ev_type in _FULL_PAYLOAD_EVENTS else 400
 
 
@@ -283,6 +286,8 @@ class LegacyEventAdapter:
 
         if t == RUN_FAILED:
             out = self._ensure_final_start()
+            if ev.data.get("final_text"):
+                out.append({"type": "final", "content": ev.data["final_text"]})
             out.append({"type": "error", "content": ev.data.get("error") or "运行失败"})
             out.append({"type": "done", "status": ev.data.get("status", "failed")})
             self.finished = True

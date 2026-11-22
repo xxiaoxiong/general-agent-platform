@@ -292,8 +292,9 @@ class RunWorker:
                 await self._pause_run(handle, STATUS_WAITING_APPROVAL, actions=actions)
                 return
 
-        document_run = (job.execution_context or {}).get("task_type") in DOCUMENT_GRAPH_TYPES
-        if mode == RECOVERY_CONTINUE and not is_resume and not document_run:
+        route = job.execution_context or {}
+        needs_original_input = route.get("task_type") in DOCUMENT_GRAPH_TYPES or route.get("team_mode") is True
+        if mode == RECOVERY_CONTINUE and not is_resume and not needs_original_input:
             job = replace(job, messages=None, resume=None)
         elif job.messages is None and job.resume is None:
             # 恢复路径：从数据库输入快照重建请求输入
@@ -378,9 +379,10 @@ class RunWorker:
             # P1-04 §12：Run 终态后释放 Registry 热数据（Task 已完成），避免长期运行
             # 进程内 _runs/_by_idem 线性增长；状态真相恒在 DB，释放不影响查询/回放/幂等。
             # 文档输入也完全持久化，先移除旧句柄再交还租约，避免续跑复用旧任务。
+            route = job.execution_context or {}
             self.service.registry.release(
                 handle.run_id,
-                persisted=(job.execution_context or {}).get("task_type") in DOCUMENT_GRAPH_TYPES,
+                persisted=route.get("task_type") in DOCUMENT_GRAPH_TYPES or route.get("team_mode") is True,
             )
             await self._release(handle, lease_version)
         exc = drive_task.exception() if not drive_task.cancelled() else None

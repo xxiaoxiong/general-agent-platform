@@ -62,6 +62,29 @@ class TestTaskContract:
         assert d["goal"] == "查询数据库销售数据"
         assert "db_evidence" in d["completion_checks"]
 
+    def test_completion_requirements_follow_explicit_deliverables(self):
+        contract = build_task_contract("深入核对表中给定的数据。保存为 `/workspace/audit/report.md` 与 `facts.json` 两个文件，不要联网。")
+        assert contract.artifact_paths == ("audit/report.md", "facts.json")
+        assert "artifact_produced" in contract.completion_checks
+        assert "citations_present" not in contract.completion_checks
+        assert build_task_contract("怎么用数据库验证统计结果", capability_ids=["data_analysis"]).completion_checks == ["answer_present"]
+
+    def test_table_counts_with_exactly_identical_duplicates_are_independently_recomputed(self):
+        prompt = (
+            "核对有效记录，按事件编号去重，忽略 VOID。保存为 facts.json，字段 valid_rows、duplicate_ids 和 void_ids。\n"
+            "格式为 编号,名称,状态：\nR1,琴,OK\nR2,棋,VOID\nR1,琴,OK\nR3,书,OK"
+        )
+        contract = build_task_contract(prompt)
+        assert contract.expected_json == {"valid_rows": 2, "duplicate_ids": ["R1"], "void_ids": ["R2"]}
+        assert contract.table_facts.raw_rows == 4
+        ev = [ToolEvidence("write_file", path="facts.json", artifact_content={**contract.expected_json, "valid_rows": 1})]
+        result = verify_task(contract, "有效记录 1 条。", ev)
+        assert {item.id for item in result.failed_checks} == {"table_facts"}
+        ev[0].artifact_content = contract.expected_json
+        assert verify_task(contract, "有效记录 2 条，原始记录 4 条。", ev).status == STATUS_PASSED
+        conflict = build_task_contract(prompt.replace("R1,琴,OK\nR3", "R1,画,OK\nR3"))
+        assert conflict.table_facts is None
+
 
 class TestVerification:
     def test_answer_present(self):
@@ -80,22 +103,25 @@ class TestVerification:
         ids = {x.id: x.passed for x in r.checks}
         assert ids["citations_present"] is False
 
-        # 回答带来源 URL：通过
+        # 模型自报来源不能替代真实读取。
         r2 = verify_task(c, "结论，来源：https://example.com/report", [])
-        assert {x.id: x.passed for x in r2.checks}["citations_present"] is True
+        assert {x.id: x.passed for x in r2.checks}["citations_present"] is False
 
         # 联工具有输出 URL：通过
         ev = [ToolEvidence(tool_name="web_search", status="succeeded",
                            output="详见 https://src.example.com/1")]
-        r3 = verify_task(c, "结论", ev)
+        assert verify_task(c, "结论未引用链接", ev).status == STATUS_FAILED
+        r3 = verify_task(c, "结论 https://src.example.com/1", ev)
         assert {x.id: x.passed for x in r3.checks}["citations_present"] is True
+        ev[0].status = "failed"
+        assert verify_task(c, "结论 https://src.example.com/1", ev).status == STATUS_FAILED
 
     def test_doc_artifact(self):
         c = build_task_contract("生成一份项目方案文档")
         r = verify_task(c, "已生成文档", [])
         assert {x.id: x.passed for x in r.checks}["artifact_produced"] is False
 
-        ev = [ToolEvidence(tool_name="write_file", status="succeeded")]
+        ev = [ToolEvidence(tool_name="write_file", status="succeeded", path="report.md")]
         r2 = verify_task(c, "已生成文档", ev)
         assert r2.status == STATUS_PASSED
 
@@ -129,7 +155,7 @@ class TestVerification:
             goal="x", task_type=TASK_RESEARCH,
             completion_checks=["answer_present", "citations_present", "artifact_produced"],
         )
-        ev = [ToolEvidence(tool_name="write_file", status="succeeded")]
+        ev = [ToolEvidence(tool_name="write_file", status="succeeded", path="report.md")]
         r = verify_task(contract, "有回答但没来源", ev)
         # 3 检查 1 失败 → partial
         assert r.status == STATUS_PARTIAL
@@ -200,10 +226,11 @@ class TestVerificationRuntimeIntegration:
         result = await svc.run_to_completion(
             agent_config={"id": 990301, "tools": [], "capability_ids": ["web_research"],
                           "system_prompt": "t", "temperature": "0.1"},
-            messages=[{"role": "user", "content": "研究行业趋势"}],
+            messages=[{"role": "user", "content": "研究行业趋势，来源资料 https://s.example.com/1"}],
             user_id=1,
         )
         assert result["status"] == "completed"
+        assert result["content"] == "修正结论，来源：https://s.example.com/1"
         # 验证通过结构化事件（verification.started/completed）
         assert result["run_id"]
 
@@ -231,7 +258,7 @@ class TestVerificationRuntimeIntegration:
         ver = (run.summary or {}).get("verification")
         assert ver is not None
         assert ver["task_type"] == "research"
-        assert ver["status"] in ("passed", "partial")
+        assert ver["status"] == "passed" and ver["fix_rounds"] == 1
 
     @pytest.mark.asyncio
     async def test_simple_qa_no_verification_burden(self, monkeypatch):

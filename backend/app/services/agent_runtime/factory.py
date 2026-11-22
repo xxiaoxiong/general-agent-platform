@@ -156,6 +156,11 @@ def build_agent(
     # 预算 <=0 = 不限制：不挂对应 Limit 中间件（防真死循环仍由重复调用防护兜底）
     # FilesystemMiddleware 替换基栈同名中间件（按名替换、保留顺序），继承 permissions
     middleware = [fs_middleware, TodoListMiddleware()]
+    if ctx.task_contract is not None:
+        from .completion import CompletionMiddleware
+
+        # after_model 按逆序执行，验收回到模型前已更新模型调用计数。
+        middleware.insert(0, CompletionMiddleware(ctx, ctx.task_contract))
     if ctx.budget.max_tool_calls > 0:
         middleware.append(
             ToolCallLimitMiddleware(run_limit=ctx.budget.max_tool_calls, exit_behavior="error")
@@ -203,6 +208,13 @@ def _compose_system_prompt(ctx: RuntimeContext) -> str:
         parts.append(ctx.db_info["hint"])
     if ctx.memory_context:
         parts.append("## 参考记忆\n" + ctx.memory_context)
+    if ctx.task_contract is not None and ctx.task_contract.is_complex:
+        from .completion import completion_prompt
+
+        parts.append("## 本次交付要求\n" + completion_prompt(ctx.task_contract))
+        if ctx.carried_artifacts:
+            parts.append("继续上次未完成的交付。先用 read_file 核对已有文件，沿用可用内容，只补上仍然缺失或需要修正的交付项。"
+                         "\n前一轮登记的工作文件 " + "、".join(ctx.carried_artifacts))
     parts.append(
         "## 执行约束\n"
         "- 始终使用用户提问所用的语言回答（用户用中文则用中文）。\n"

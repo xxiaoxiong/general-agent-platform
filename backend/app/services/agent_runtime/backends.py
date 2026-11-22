@@ -14,6 +14,8 @@ from typing import Any, Optional
 
 from app.core.config import settings
 
+RUN_ARTIFACT_FOLDER = ".run-artifacts"
+
 
 def build_backend(user_id: int, agent_id: int, session_id: Optional[int], *, store: Optional[Any] = None):
     from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
@@ -33,21 +35,21 @@ def build_backend(user_id: int, agent_id: int, session_id: Optional[int], *, sto
                 relative = self._resolve_path(path).relative_to(root)
             except (ValueError, OSError, RuntimeError):
                 return True
-            return not relative.parts or relative.parts[0].casefold() == "uploads"
+            return not relative.parts or relative.parts[0].casefold() in {"uploads", "team-projects", RUN_ARTIFACT_FOLDER}
 
         def write(self, file_path, content):
             if self._protected(file_path) or file_path.casefold().endswith(".docx"):
-                return WriteResult(error="原始附件和抽取文本由平台管理。请用文档任务生成或修改 Word。")
+                return WriteResult(error="原始附件和历史交付由平台管理。请将新文件保存到可编辑区域，Word 请使用文档任务。")
             return super().write(file_path, content)
 
         def edit(self, file_path, old_string, new_string, replace_all=False):
             if self._protected(file_path) or file_path.casefold().endswith(".docx"):
-                return EditResult(error="原始附件和抽取文本由平台管理。请用文档任务修改 Word。")
+                return EditResult(error="原始附件和历史交付由平台管理。请编辑工作文件，Word 请使用文档任务。")
             return super().edit(file_path, old_string, new_string, replace_all)
 
         def delete(self, file_path):
             if self._protected(file_path):
-                return DeleteResult(error="请在会话附件中管理已上传的文件。")
+                return DeleteResult(error="已上传的附件和历史交付由平台管理。")
             return super().delete(file_path)
 
         def upload_files(self, files):

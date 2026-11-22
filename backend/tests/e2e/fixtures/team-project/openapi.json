@@ -1,0 +1,15 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "巡检工单 API", "version": "1.0.0" },
+  "paths": {
+    "/api/tickets": {
+      "get": { "responses": { "200": { "description": "按搜索与状态筛选工单" } } },
+      "post": { "responses": { "201": { "description": "创建工单" }, "422": { "description": "标题无效" } } }
+    },
+    "/api/tickets/{id}": {
+      "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }],
+      "patch": { "responses": { "200": { "description": "变更状态" }, "404": { "description": "工单不存在" } } },
+      "delete": { "responses": { "200": { "description": "删除工单" }, "404": { "description": "工单不存在" } } }
+    }
+  }
+}

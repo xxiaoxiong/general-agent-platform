@@ -23,6 +23,11 @@ RUN apt-get -o Acquire::Retries=3 update \
     && apt-get -o Acquire::Retries=3 install -y --no-install-recommends libreoffice-writer fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
+# 工程验收使用 Node 解析 JavaScript 源码，不运行生成的项目。
+RUN apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY backend/ /app/
 COPY docker/backend-entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh \

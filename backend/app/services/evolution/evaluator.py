@@ -71,7 +71,7 @@ async def evaluate_run(db, run: AgentRun) -> Optional[int]:
                 ev.judge_scores = judged
                 ev.judge_model_config_id = judged.get("judge_model_config_id")
                 ev.overall = judged.get("overall")
-                ev.success = (judged.get("verdict") == "pass")
+                ev.success = ev.success and judged.get("verdict") == "pass"
             except JudgeError as e:
                 logger.warning("run %s judge 失败（保留确定性指标）: %s", run.id, e)
                 ev.error = f"judge_failed: {str(e)[:500]}"

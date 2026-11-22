@@ -3,6 +3,7 @@
 运行：
     pytest backend/tests/test_evaluation_module.py -q
 """
+import asyncio
 import os
 from threading import Event
 import uuid
@@ -394,12 +395,14 @@ class _FakeRuntime:
     """
 
     def __init__(self, final_texts=None, error: Exception | None = None,
-                 tool_calls=None, steps: int = 1):
+                 tool_calls=None, steps: int = 1, statuses=None):
         self.final_texts = final_texts or {}   # input → final_text
         self.tool_calls = tool_calls or {}     # input → [tool_name]
         self.steps = steps
         self.error = error
+        self.statuses = statuses or {}
         self.started = []
+        self.cancelled = []
 
     async def start_run_with_session(self, *, agent_config, messages,
                                      user_id, session_id=None,
@@ -411,23 +414,28 @@ class _FakeRuntime:
         user_input = ((user_message or {}).get("content")
                       or (messages[-1] or {}).get("content", ""))
         final_text = self.final_texts.get(user_input, user_input)
+        status = self.statuses.get(user_input, "completed")
         run_id = f"evalfake-{uuid.uuid4().hex[:12]}"
         self.started.append(run_id)
         tools = self.tool_calls.get(user_input, [])
         async with AsyncSessionLocal() as s:
             s.add(AgentRun(
                 id=run_id, agent_id=agent_config.get("id"), thread_id=f"t-{run_id}",
-                status="completed", final_text=final_text,
+                status=status, final_text=final_text,
                 budget_steps=self.steps, budget_model_calls=self.steps,
                 budget_tool_calls=len(tools), budget_tokens=10))
             for i, t in enumerate(tools):
-                name, args = (t, None) if isinstance(t, str) else t
+                name, args, *tool_status = (t, None) if isinstance(t, str) else t
                 s.add(AgentToolExecution(
                     run_id=run_id, tool_call_id=f"call-{i}", tool_name=name,
-                    status="succeeded", attempt_count=1,
+                    status=tool_status[0] if tool_status else "succeeded", attempt_count=1,
                     args_snapshot=dict(args) if args else None))
             await s.commit()
-        return run_id, None, _FakeStream([{"type": "done", "status": "completed"}])
+        return run_id, None, _FakeStream([{"type": "done", "status": status}])
+
+    async def cancel_run(self, run_id, user_id):
+        self.cancelled.append(run_id)
+        return {"ok": True, "status": "cancelling"}
 
 
 def _fake_runtime_module(monkeypatch, fake: _FakeRuntime):
@@ -618,6 +626,91 @@ class TestComplexityAndCapability:
         assert turns[0]["run_id"] != turns[1]["run_id"]   # 每轮独立 Run（可追溯）
         assert item.run_id == turns[-1]["run_id"]
         assert len(fake.started) == 2
+
+    @pytest.mark.parametrize("run_status", ["failed", "limit_exceeded", "waiting_input"])
+    @pytest.mark.asyncio
+    async def test_incomplete_turn_fails_even_when_output_matches(self, monkeypatch, run_status):
+        from app.services.evaluation.runner import create_eval_run, execute_eval_run
+
+        fake = _FakeRuntime(final_texts={"第一轮": "正确答案", "第二轮": "正确答案"},
+                            statuses={"第一轮": run_status})
+        _fake_runtime_module(monkeypatch, fake)
+        ds_id, agent_id = await _mk_complex_dataset_and_agent([{
+            "input": "第一轮", "expected": "正确答案",
+            "complexity": "L4", "task_type": "multi_turn", "turns": ["第二轮"],
+        }])
+        async with AsyncSessionLocal() as s:
+            run = await create_eval_run(
+                s, name="未完成的多轮任务", dataset_id=ds_id, agent_id=agent_id,
+                created_by=None, config={})
+            run_id = run.id
+        await execute_eval_run(run_id)
+        async with AsyncSessionLocal() as s:
+            item = (await s.scalars(select(EvalRunItem).where(
+                EvalRunItem.eval_run_id == run_id))).one()
+        assert item.status == "failed" and item.passed is False and item.score is None
+        assert item.actual_output == "正确答案"
+        assert item.score_detail["execution"]["turns_expected"] == 2
+        assert item.stats["turns_count"] == len(fake.started) == 1
+        assert item.stats["turns"][0]["status"] == run_status
+        assert fake.cancelled == (fake.started if run_status == "waiting_input" else [])
+
+    @pytest.mark.asyncio
+    async def test_multi_turn_deadline_cancels_active_run(self, monkeypatch):
+        from app.services.evaluation.runner import create_eval_run, execute_eval_run
+
+        class SlowRuntime(_FakeRuntime):
+            async def start_run_with_session(self, **kwargs):
+                run_id, session_id, stream = await super().start_run_with_session(**kwargs)
+
+                async def wait_for_turn():
+                    await asyncio.sleep(0.5 if len(self.started) == 1 else 0.7)
+                    async for event in stream:
+                        yield event
+
+                return run_id, session_id, wait_for_turn()
+
+        fake = SlowRuntime(statuses={"第二轮": "running"})
+        _fake_runtime_module(monkeypatch, fake)
+        ds_id, agent_id = await _mk_complex_dataset_and_agent([{
+            "input": "第一轮", "expected": "第二轮", "turns": ["第二轮"],
+        }])
+        async with AsyncSessionLocal() as s:
+            run = await create_eval_run(
+                s, name="多轮共享时限", dataset_id=ds_id, agent_id=agent_id,
+                created_by=None, config={"timeout_s": 1.0})
+            run_id = run.id
+        await execute_eval_run(run_id)
+        async with AsyncSessionLocal() as s:
+            item = (await s.scalars(select(EvalRunItem).where(
+                EvalRunItem.eval_run_id == run_id))).one()
+        assert len(fake.started) == 2
+        assert fake.cancelled == [fake.started[1]]
+        assert item.status == "error" and "用例执行超时" in item.error
+        assert item.score_detail["execution"]["cancellation_status"] == "cancelling"
+
+    @pytest.mark.asyncio
+    async def test_failed_required_tool_is_not_execution_evidence(self, monkeypatch):
+        from app.services.evaluation.runner import create_eval_run, execute_eval_run
+
+        fake = _FakeRuntime(final_texts={"请计算": "391"},
+                            tool_calls={"请计算": [("calculator", None, "failed")]})
+        _fake_runtime_module(monkeypatch, fake)
+        ds_id, agent_id = await _mk_complex_dataset_and_agent([{
+            "input": "请计算", "expected": "391", "required_tools": ["calculator"],
+        }])
+        async with AsyncSessionLocal() as s:
+            run = await create_eval_run(
+                s, name="工具执行失败", dataset_id=ds_id, agent_id=agent_id,
+                created_by=None, config={})
+            run_id = run.id
+        await execute_eval_run(run_id)
+        async with AsyncSessionLocal() as s:
+            item = (await s.scalars(select(EvalRunItem).where(
+                EvalRunItem.eval_run_id == run_id))).one()
+        assert item.status == "failed" and item.passed is False
+        assert item.stats["used_tools"] == item.stats["missing_tools"] == ["calculator"]
+        assert item.score_detail["capability"]["succeeded_tools"] == []
 
     @pytest.mark.asyncio
     async def test_required_tools_enforced(self, monkeypatch):

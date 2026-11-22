@@ -15,6 +15,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
+from .table_facts import TableFacts, derive_table_facts
+
 # 任务类型（§9 验证方式表）
 TASK_QA = "qa"                    # 普通知识问答
 TASK_RESEARCH = "research"        # 网络研究
@@ -45,23 +47,21 @@ _KEYWORD_TASK_TYPES = [
     (r"邮件|webhook|定时|自动化|审批|下单|外部系统|工单", TASK_BUSINESS),
 ]
 
-# 各任务类型的完成检查项（§9 验证方式表 → 结构化检查）
-_TASK_CHECKS = {
-    TASK_QA: ["answer_present"],
-    TASK_RESEARCH: ["answer_present", "citations_present"],
-    TASK_DOC: ["answer_present", "artifact_produced"],
-    TASK_DATA: ["answer_present", "computation_evidence"],
-    TASK_DB: ["answer_present", "db_evidence"],
-    TASK_CODE: ["answer_present", "exec_evidence"],
-    TASK_BUSINESS: ["answer_present", "side_effect_evidence"],
-    TASK_OTHER: ["answer_present"],
-}
-
-# 判定为"复杂任务"（启用 Verification 补充执行）的类型
-COMPLEX_TASK_TYPES = frozenset({
-    TASK_RESEARCH, TASK_DOC, TASK_DATA, TASK_DB, TASK_CODE, TASK_BUSINESS,
-})
-
+_ADVICE = re.compile(r"^\s*(?:请(?:问|解释|介绍)?\s*)?(?:如何|怎样|怎么|什么是|解释|介绍|示例|how\b|what\b|explain\b)", re.I)
+_TEXT_ONLY = re.compile(r"不用(?:真的)?(?:发送|执行|创建文件)|不(?:要|需要)(?:写入文件|生成(?:实际)?文件)|只(?:要|需|提供)\s*(?:思路|建议|方案|示例|代码片段)|\b(?:no files|outline only)\b", re.I)
+_DELIVER = re.compile(r"保存(?:到|为)|导出|输出|交付|生成|创建|写入|写成|写到|命名为|export|save (?:as|to)|deliver|create|write (?:to|a)", re.I)
+_FILE_INTENT = re.compile(r"可下载|落盘|文件|文档|打包|\b(?:download|files?|archive)\b", re.I)
+_FILE_NAME = re.compile(r"(?<![\w.@/-])(?:/workspace/)?((?:[\w-][\w.-]*/)*[\w-][\w.()-]*\.(?:md|txt|json|csv|tsv|xlsx|docx|pdf|pptx|zip|html|css|[mc]?js|ts|py|yaml|yml|sql))(?![\w./-])", re.I)
+_FORMATS = {"markdown": "md", "excel": "xlsx", "word": "docx", "powerpoint": "pptx"}
+_FORMAT = re.compile(r"\b(markdown|excel|word|powerpoint|md|txt|json|csv|tsv|xlsx|docx|pdf|pptx|zip)\b", re.I)
+_RESEARCH = re.compile(r"调研|研究.{0,25}(?:趋势|市场|行业|竞品|进展|现状|证据)|(?:交叉)?(?:核实|核验|核对|查证).{0,20}(?:资料|来源|事实)|\b(?:research|fact[- ]check)\b", re.I)
+_DATABASE = re.compile(r"(?:查询|核对|统计|分析).{0,24}(?:数据库|数据表)|从.{0,12}(?:数据库|数据表).{0,18}(?:查|取|读)|\bquery (?:the |a )?database\b", re.I)
+_EXTERNAL_ACTION = re.compile(r"(?:发送|发出|代发).{0,20}(?:邮件|通知|webhook)|\b(?:send (?:an? |the )?e-?mail|invoke (?:a |the )?webhook)\b", re.I)
+_DEPTH = re.compile(r"深入|深度|全面|端到端|交叉验证|逐项|分阶段|多阶段|\b(?:in.depth|end.to.end|comprehensive|cross.check)\b", re.I)
+_NUMBERED_STEP = re.compile(r"(?m)^\s*(?:\d{1,2}[.、)）]|[一二三四五六七八九十]+、)\s*\S")
+_MINIMUM_SOURCES = re.compile(r"至少\s*([1-9]|[一二两三四五六七八九十])\s*(?:个|条|份|篇|项)?\s*(?:独立|可核验|可靠|权威)?\s*(?:来源|信源|文献)|\bat least\s+([1-9])\s+(?:independent\s+)?(?:sources|references)\b", re.I)
+_CHAR_COUNT = re.compile(r"(?:至少|不少于|不低于)\s*(\d{2,5})\s*(?:个汉字|字)(?![段节])")
+_STRICT_JSON = re.compile(r"(?:仅|只)(?:能)?(?:返回|输出).{0,8}\bJSON\b|\b(?:return|output) only (?:valid )?JSON\b", re.I)
 
 @dataclass
 class TaskContract:
@@ -72,10 +72,18 @@ class TaskContract:
     completion_checks: List[str] = field(default_factory=list)  # 完成检查项 ID
     forbidden: List[str] = field(default_factory=list)          # 禁止操作（预留）
     source: str = "keyword"                    # 推导来源：capability / keyword / default
+    artifact_paths: tuple[str, ...] = ()
+    artifact_formats: tuple[str, ...] = ()
+    source_count: int = 0
+    supplied_urls: tuple[str, ...] = ()
+    minimum_chars: int = 0
+    deep: bool = False
+    table_facts: TableFacts | None = None
+    expected_json: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_complex(self) -> bool:
-        return self.task_type in COMPLEX_TASK_TYPES
+        return self.deep or len(self.completion_checks) > 1
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -84,6 +92,10 @@ class TaskContract:
             "completion_checks": list(self.completion_checks),
             "forbidden": list(self.forbidden),
             "source": self.source,
+            "artifact_paths": list(self.artifact_paths),
+            "artifact_formats": list(self.artifact_formats),
+            "source_count": self.source_count,
+            "minimum_chars": self.minimum_chars,
         }
 
 
@@ -127,11 +139,63 @@ def build_task_contract(
     goal_limit: int = 200,
 ) -> TaskContract:
     """用户目标 → 结构化任务契约（确定性，不调用模型）。"""
-    goal = (user_input or "").strip()[:goal_limit]
-    task_type, source = infer_task_type(user_input, capability_ids, tool_names=tool_names)
+    request = (user_input or "").split("\n\n[附件]", 1)[0].split("\n\n[参考文档]", 1)[0].strip()
+    goal = request[:goal_limit]
+    # 能力包负责提供工具。验收义务由本次用户要求确定，避免给咨询强加写入、查询或发送动作。
+    task_type, source = infer_task_type(request, capability_ids, tool_names=tool_names)
+    advisory = bool(_ADVICE.match(request))
+    text_only = bool(_TEXT_ONLY.search(request))
+    checks = ["answer_present"]
+    paths: dict[str, None] = {}
+    formats: dict[str, None] = {}
+    for clause in re.split(r"[。；;\n]", request) if not (advisory or text_only) else ():
+        verb = _DELIVER.search(clause)
+        if not verb:
+            continue
+        output = clause[verb.end():]
+        named = _FILE_NAME.findall(output)
+        for path in named:
+            paths[path.removeprefix("workspace/")] = None
+        if _FILE_INTENT.search(output):
+            checks.append("artifact_produced")
+            if not named:
+                for suffix in _FORMAT.findall(output):
+                    suffix = suffix.casefold()
+                    formats[_FORMATS.get(suffix, suffix)] = None
+    if paths:
+        checks.append("artifact_produced")
+    minimum_sources = _MINIMUM_SOURCES.search(request)
+    source_count = 0
+    if not advisory and (_RESEARCH.search(request) or minimum_sources):
+        source_count = 1
+        if minimum_sources:
+            value = minimum_sources.group(1) or minimum_sources.group(2)
+            chinese = {key: index for index, key in enumerate("零一二三四五六七八九十")}
+            source_count = int(value) if value.isdigit() else chinese.get(value, 2)
+        checks.append("citations_present")
+    if not (advisory or text_only) and _DATABASE.search(request):
+        checks.append("db_evidence")
+    if not (advisory or text_only) and _EXTERNAL_ACTION.search(request):
+        checks.append("side_effect_evidence")
+    minimum = _CHAR_COUNT.search(request)
+    minimum_chars = int(minimum.group(1)) if minimum and not paths and not formats else 0
+    if minimum_chars:
+        checks.append("minimum_chars")
+    if _STRICT_JSON.search(request) and not paths:
+        checks.append("json_answer")
+    facts = derive_table_facts(request) if not advisory else None
+    json_delivery = "json_answer" in checks or "json" in formats or any(path.casefold().endswith(".json") for path in paths)
+    expected_json = facts.declared_fields(request) if facts and json_delivery else {}
+    if facts:
+        checks.append("table_facts")
     return TaskContract(
         goal=goal,
         task_type=task_type,
-        completion_checks=list(_TASK_CHECKS.get(task_type, ["answer_present"])),
+        completion_checks=list(dict.fromkeys(checks)),
         source=source,
+        artifact_paths=tuple(paths), artifact_formats=tuple(formats), source_count=source_count,
+        supplied_urls=tuple(re.findall(r"https?://[^\s<>\"'）)。，；]+", request, re.I)),
+        minimum_chars=minimum_chars,
+        deep=bool(_DEPTH.search(request) or len(_NUMBERED_STEP.findall(request)) >= 3),
+        table_facts=facts, expected_json=expected_json,
     )

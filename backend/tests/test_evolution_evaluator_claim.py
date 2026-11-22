@@ -130,6 +130,25 @@ class TestEvaluateRun:
         assert ev.overall == ev.deterministic["deterministic_score"]
         assert "judge_failed" in (ev.error or "")
 
+    @pytest.mark.parametrize("status,verification", [
+        ("failed", None), ("completed", {"status": "partial"}), ("completed", {"status": "failed"}),
+    ])
+    @pytest.mark.asyncio
+    async def test_judge_pass_cannot_override_the_run_evidence(self, no_langfuse, monkeypatch, status, verification):
+        async def fake_judge(db, run, deterministic):
+            return {"verdict": "pass", "overall": 9.0}
+
+        monkeypatch.setattr("app.services.evolution.judge.judge_run", fake_judge)
+        run_id = await _mk_run("claim-incomplete", status=status)
+        async with AsyncSessionLocal() as s:
+            run = await s.get(AgentRun, run_id)
+            run.summary = {"verification": verification}
+            await evaluate_run(s, run)
+        async with AsyncSessionLocal() as s:
+            ev = (await s.scalars(select(AgentEvaluation))).one()
+        assert ev.deterministic["success"] is False
+        assert ev.judge_scores["verdict"] == "pass" and ev.success is False
+
     @pytest.mark.asyncio
     async def test_unexpected_error_marks_failed_and_retries(self, no_langfuse, monkeypatch):
         async def boom(db, run):

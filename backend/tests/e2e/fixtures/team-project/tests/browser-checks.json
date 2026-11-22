@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "scenarios": [
+    {
+      "name": "创建工单，筛选并核对刷新后的完成状态",
+      "steps": [
+        {"action": "open", "path": "/"},
+        {"action": "fill", "selector": "input[name=title]", "value": "浏览器验收工单"},
+        {"action": "click", "selector": "form button[type=submit]"},
+        {"action": "expect_response", "method": "POST", "path": "/api/tickets", "status": 201},
+        {"action": "expect_text", "selector": "#tickets", "value": "浏览器验收工单"},
+        {"action": "click", "selector": "#tickets li button:first-of-type"},
+        {"action": "expect_text", "selector": "#tickets li span", "value": "已完成"},
+        {"action": "select", "selector": "#filter", "value": "open"},
+        {"action": "expect_hidden", "selector": "#tickets li"},
+        {"action": "select", "selector": "#filter", "value": "done"},
+        {"action": "expect_visible", "selector": "#tickets li"},
+        {"action": "reload"},
+        {"action": "expect_text", "selector": "#tickets li span", "value": "已完成"}
+      ]
+    },
+    {
+      "name": "独立页面检查必填提示与重新提交",
+      "steps": [
+        {"action": "open", "path": "/"},
+        {"action": "expect_hidden", "selector": "#tickets li"},
+        {"action": "click", "selector": "form button[type=submit]"},
+        {"action": "expect_invalid", "selector": "input[name=title]"},
+        {"action": "fill", "selector": "input[name=title]", "value": "重新提交验收工单"},
+        {"action": "click", "selector": "form button[type=submit]"},
+        {"action": "expect_text", "selector": "#tickets", "value": "重新提交验收工单"}
+      ]
+    }
+  ]
+}

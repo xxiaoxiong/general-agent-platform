@@ -7,10 +7,36 @@
  */
 import { createRequest } from '@/utils/request'
 import { isPausedRunStatus, shouldReplayPastPause } from '@/features/run/runReplay'
+import { PROJECT_DOWNLOAD_PATH } from '@/features/run/projectDelivery'
 import type { DocumentMode, InputRequest } from './documents'
 
 const request2 = createRequest('/api/v2')
 const inlineRequest = createRequest('/api/v2', { inlineErrors: true })
+
+export async function downloadRunArtifact(path: string, filename: string, signal?: AbortSignal, requireZip = false) {
+  // 交付事件中的地址只用于本平台产物路由，访问令牌不发往动态外部地址。
+  const match = PROJECT_DOWNLOAD_PATH.exec(path)
+  if (!match) throw new Error('产物下载地址无效')
+  const blob = await inlineRequest.get<unknown, Blob>(`/artifacts/${match[1]}`, { responseType: 'blob', signal })
+  if (requireZip) {
+    const signature = new Uint8Array(await blob.slice(0, 4).arrayBuffer())
+    if (signature[0] !== 0x50 || signature[1] !== 0x4b || signature[2] !== 3 || signature[3] !== 4) {
+      throw new Error('服务器返回的内容无法识别为 ZIP 文件')
+    }
+  }
+  if (signal?.aborted) return
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  document.body.append(anchor)
+  anchor.click()
+  anchor.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+export const downloadProjectZip = (path: string, filename: string, signal: AbortSignal) =>
+  downloadRunArtifact(path, filename, signal, true)
 
 // ── Workspace ─────────────────────────────────────────────────────────────────
 
@@ -159,6 +185,8 @@ export const runApi = {
     approval_mode?: 'manual' | 'auto'
     /** 手动选模型（仅本次 Run 生效；缺省 = 助手默认模型） */
     model_config_id?: number
+    /** 当前会话手动启用团队协作时随本次 Run 提交 */
+    team_mode?: boolean
     task_mode?: DocumentMode
     document_profile_id?: number
     document_id?: number
@@ -180,6 +208,11 @@ export const runApi = {
     inlineRequest.post<unknown, { run_id: string; status: string; after_seq: number }>(
       `/runs/${runId}/retry`, undefined,
       { headers: lastSequence ? { 'X-Document-Failure-Seq': String(lastSequence) } : undefined },
+    ),
+  repairProject: (runId: string, modelId?: number, key?: string) =>
+    inlineRequest.post<unknown, { run_id: string; conversation_id: number; status: string; user_message: string }>(
+      `/runs/${runId}/project-repair`, { model_config_id: modelId },
+      { headers: key ? { 'Idempotency-Key': key } : undefined },
     ),
 }
 

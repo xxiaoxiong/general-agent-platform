@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>巡检工单台</title>
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <main>
+    <header><span>运维工作台</span><h1>巡检工单台</h1><p>记录巡检问题，跟踪处理和闭环。</p></header>
+    <form aria-label="新建工单">
+      <label>工单标题<input name="title" maxlength="120" required></label>
+      <button type="submit">创建工单</button>
+    </form>
+    <section aria-label="工单筛选">
+      <label>搜索工单<input type="search" id="search"></label>
+      <label>状态<select id="filter" aria-label="状态"><option value="">全部工单</option><option value="open">待处理</option><option value="done">已完成</option></select></label>
+    </section>
+    <p role="status" id="notice"></p>
+    <ul id="tickets" aria-label="工单列表"></ul>
+  </main>
+</body>
+</html>

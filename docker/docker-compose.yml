@@ -102,6 +102,7 @@ services:
       AGENT_RUN_TIMEOUT: ${AGENT_RUN_TIMEOUT:-1800.0}
       AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT: ${AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT:-false}
       AGENT_INNER_TIMEOUT_RETRIES: ${AGENT_INNER_TIMEOUT_RETRIES:-1}
+      AGENT_PROJECT_VERIFIER_DIR: ${AGENT_PROJECT_VERIFIER_DIR-/var/lib/project-verifier}
       # 代码执行逃生开关（仅开发/测评环境）：无外部沙箱时放行受限 python_exec，
       # 生产（APP_ENV=production）下代码强制忽略此开关
       AGENT_ALLOW_UNSAFE_PYTHON: ${AGENT_ALLOW_UNSAFE_PYTHON:-false}
@@ -115,6 +116,7 @@ services:
     volumes:
       - app_data:/app/data
       - ../log:/app/data/logs
+      - project_verifier_queue:/var/lib/project-verifier
     networks:
       - default
       - langfuse
@@ -125,6 +127,34 @@ services:
         condition: service_healthy
       checkpoint_pg:
         condition: service_healthy
+
+  project_verifier:
+    build:
+      context: ..
+      dockerfile: docker/project-verifier.Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+    restart: unless-stopped
+    init: true
+    network_mode: none
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - KILL
+      - SETGID
+      - SETUID
+    cpus: 1.5
+    mem_limit: 768m
+    pids_limit: 160
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777
+    volumes:
+      - project_verifier_queue:/var/lib/project-verifier
 
   asr:
     image: general-agent-platform-asr:local
@@ -172,6 +202,7 @@ volumes:
   # 沿用原独立部署的模型卷，新装环境由 Compose 创建。
   asr_model_cache:
     name: general-agent-platform-asr_model_cache
+  project_verifier_queue:
 
 networks:
   # 已部署的 Langfuse 栈（langfuse-deploy 项目）所在网络，用于 Trace 上报与评分回写

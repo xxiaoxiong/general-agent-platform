@@ -75,6 +75,8 @@ class RunCreate(BaseModel):
     approval_mode: str = "manual"
     # 会话内手动选模型：仅本次 Run 覆盖助手默认模型（None=助手默认）
     model_config_id: Optional[int] = None
+    # 每次运行须由调用方显式开启团队，省略时继续使用现有单助手路线。
+    team_mode: StrictBool = False
     # 会话附件（uploads/ 下的相对路径），随用户消息注入读取注记
     attachments: List[Dict[str, Any]] = Field(default_factory=list)
     task_mode: Literal[
@@ -84,6 +86,10 @@ class RunCreate(BaseModel):
     document_profile_id: Optional[int] = Field(None, gt=0)
     document_id: Optional[int] = Field(None, gt=0)
     task_options: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectRepairRequest(BaseModel):
+    model_config_id: Optional[int] = Field(None, gt=0)
 
 
 class ApprovalDecisionIn(BaseModel):

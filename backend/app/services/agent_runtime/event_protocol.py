@@ -117,6 +117,10 @@ def _reshape_data(name: str, event_type: str, payload: Dict[str, Any]) -> Dict[s
         data = {"error": payload.get("error") or "运行失败", "status": payload.get("status", "failed")}
         if payload.get("document_retryable"):
             data["document_retryable"] = True
+        if "final_text" in payload:
+            data["final_text"] = payload["final_text"]
+        if payload.get("summary") is not None:
+            data["summary"] = payload["summary"]
         return data
     if name == "run.suspended":
         return {"reason": payload.get("reason"), "status": payload.get("status", "suspended")}
@@ -155,7 +159,8 @@ def is_terminal(envelope: Dict[str, Any]) -> bool:
     return False
 
 
-def synthetic_terminal_from_status(run_id: str, status: str, *, error: Optional[str] = None) -> Dict[str, Any]:
+def synthetic_terminal_from_status(run_id: str, status: str, *, error: Optional[str] = None,
+                                   final_text: Optional[str] = None, summary: Optional[dict] = None) -> Dict[str, Any]:
     """无事件日志的旧运行：按 run 状态合成 v2 终止事件（保持行为兼容）。"""
     mapping = {
         "completed": "run.completed",
@@ -170,6 +175,10 @@ def synthetic_terminal_from_status(run_id: str, status: str, *, error: Optional[
     data: Dict[str, Any] = {"status": status}
     if error:
         data["error"] = error
+    if final_text is not None:
+        data["final_text"] = final_text
+    if summary is not None:
+        data["summary"] = summary
     return {
         "event": name,
         "run_id": run_id,
@@ -300,7 +309,8 @@ async def replay_events_v2(
                 continue
             # 事件日志缺失/已清理：按状态合成终止事件
             envelope = synthetic_terminal_from_status(
-                run_id, run_row.status, error=run_row.error
+                run_id, run_row.status, error=run_row.error,
+                final_text=run_row.final_text, summary=run_row.summary,
             )
             envelope["sequence"] = db_seq + 1
             if _visible(envelope):

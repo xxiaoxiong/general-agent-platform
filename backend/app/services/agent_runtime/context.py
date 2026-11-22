@@ -8,9 +8,12 @@ from __future__ import annotations
 import hashlib
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from langchain_core.callbacks import BaseCallbackHandler
+
+if TYPE_CHECKING:
+    from app.assistant.task_contract import TaskContract
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,9 @@ class RuntimeContext:
     agent_config: Dict[str, Any] = field(default_factory=dict)
     db_info: Optional[Dict[str, Any]] = None
     memory_context: str = ""
+    task_contract: Optional[TaskContract] = None
+    completion_review: Optional[Dict[str, Any]] = None
+    carried_artifacts: Dict[str, str] = field(default_factory=dict)
 
     # Worker 身份与 Fencing Token（工具账本执行权标记，Phase 2/3）
     worker_id: Optional[str] = None

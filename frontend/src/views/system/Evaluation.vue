@@ -536,7 +536,7 @@
           <span v-if="currentItem.snap_meta?.required_tools?.length">
             必需工具：{{ currentItem.snap_meta.required_tools.join('、') }}
             <b v-if="currentItem.stats?.missing_tools?.length" class="warn">
-              （未调用：{{ currentItem.stats.missing_tools.join('、') }}）
+              （未成功执行：{{ currentItem.stats.missing_tools.join('、') }}）
             </b>
             <b v-else class="ok">（已调用）</b>
           </span>

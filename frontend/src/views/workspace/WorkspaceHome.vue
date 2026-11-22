@@ -106,6 +106,14 @@
                     : block.kind === 'document_edit_review' ? `review-${block.review.ordinal}` : blockIdx">
                   <MessageMarkdown v-if="block.kind === 'text'" :text="block.text" />
                   <ToolStep v-else-if="block.kind === 'tool'" :tool="block" @preview="openPreview" />
+                  <TeamRunCard v-else-if="block.kind === 'team'" :progress="block.progress" :active="Boolean(m.streaming)" />
+                  <VerificationCard v-else-if="block.kind === 'verification'" :report="block" />
+                  <ProjectDeliveryCard v-else-if="block.kind === 'project'"
+                    :delivery="block.delivery" :progress="block.progress" :active="Boolean(m.streaming)"
+                    :repairable="!!m.runId && m.runStatus === 'failed' && block.delivery?.state === 'failed'"
+                    :repair-disabled="!!blockedReason || sending || loadingMessages || messagesFailed"
+                    :repairing="repairingProject === m.runId && !!m.runId" :repair-error="projectRepairErrors.get(m.runId || '')"
+                    @repair="repairProjectDraft(m)" />
                   <DocumentArtifactCard
                     v-else-if="block.kind === 'document_artifact'" :artifact="block.artifact"
                     :downloading="downloadingDocuments.has(block.artifact.document_version_id)"
@@ -158,7 +166,9 @@
                   </details>
                 </template>
 
-                <div v-if="m.streaming" class="live-status" role="status">
+                <div v-if="m.streaming && !m.blocks.some((block) => (block.kind === 'team' && teamPhaseLabels[block.progress.phase] === m.liveStatus)
+                    || (block.kind === 'project' && block.progress && !block.delivery && projectPhaseLabels[block.progress.phase] === m.liveStatus))"
+                  class="live-status" role="status">
                   <LoaderCircle class="spin" :size="14" />
                   {{ m.liveStatus || '正在处理…' }}
                 </div>
@@ -206,6 +216,7 @@
         <ConversationComposer
           ref="composer"
           v-model:text="inputText"
+          v-model:team-mode="teamMode"
           v-model:approval-mode="approvalMode"
           v-model:model="selectedModelId"
           :options="modelOptions"
@@ -280,6 +291,11 @@ import {
 import ToolStep from '@/features/run/ToolStep.vue'
 import ApprovalPanel from '@/features/run/ApprovalPanel.vue'
 import MessageMarkdown from '@/features/run/MessageMarkdown.vue'
+import TeamRunCard from '@/features/run/TeamRunCard.vue'
+import { teamPhaseLabels } from '@/features/run/teamProgress'
+import ProjectDeliveryCard from '@/features/run/ProjectDeliveryCard.vue'
+import VerificationCard from '@/features/run/VerificationCard.vue'
+import { projectPhaseLabels } from '@/features/run/projectDelivery'
 import FilePreviewPanel from '@/features/preview/FilePreviewPanel.vue'
 import { filePreviewError } from '@/features/preview/previewError'
 import DocumentArtifactCard from '@/features/documents/DocumentArtifactCard.vue'
@@ -291,6 +307,7 @@ import ProfileDraftCard from '@/features/documents/ProfileDraftCard.vue'
 import { isProfileConfirmation } from '@/features/documents/inputRequest'
 import { documentTaskPayload, type DocumentTaskSelection } from '@/features/documents/taskModes'
 import { documentError, documentProfilesApi, documentsApi, downloadDocument, type DocumentArtifact, type InputRequest, type ProfileDefinition } from '@/api/documents'
+import { useAuthStore } from '@/stores/auth'
 import ConversationComposer from './ConversationComposer.vue'
 import ConversationHistory from './ConversationHistory.vue'
 import { messageAttachments, type MessageAttachment } from './attachmentHistory'
@@ -357,6 +374,9 @@ const loadingMessages = computed(() => loadingMessagesFor.has(currentConversatio
 const messagesFailed = computed(() => failedMessagesFor.has(currentConversation.value?.id ?? -1))
 const showWelcome = computed(() => !messages.value.length && !loadingMessages.value && !messagesFailed.value)
 const sending = ref(false)
+const repairingProject = ref('')
+const projectRepairErrors = reactive(new Map<string, string>())
+const projectRepairKeys = new Map<string, string>()
 const uploading = ref(0)
 let creating: Promise<Conversation> | undefined
 let historyRevision = 0
@@ -478,6 +498,40 @@ const blockedReason = computed(() => {
 
 const conversations = ref<Conversation[]>([])
 const currentConversation = ref<Conversation | null>(null)
+const authStore = useAuthStore()
+const draftTeamMode = ref(false)
+const rememberedTeamModes = reactive(new Map<string, boolean>())
+
+function teamPreferenceKey(conversationId: number): string | undefined {
+  const userId = authStore.user?.id
+  if (userId !== undefined) return `workspace:team:${userId}:${conversationId}`
+}
+
+function rememberTeamMode(conversationId: number, enabled: boolean) {
+  const key = teamPreferenceKey(conversationId)
+  if (!key) return
+  rememberedTeamModes.set(key, enabled)
+  try {
+    if (enabled) sessionStorage.setItem(key, '1')
+    else sessionStorage.removeItem(key)
+  } catch { /* 浏览器禁用会话存储时仍使用当前页面状态 */ }
+}
+
+const teamMode = computed({
+  get() {
+    const conversation = currentConversation.value
+    if (!conversation) return draftTeamMode.value
+    const key = teamPreferenceKey(conversation.id)
+    if (!key) return false
+    const remembered = rememberedTeamModes.get(key)
+    if (remembered !== undefined) return remembered
+    try { return sessionStorage.getItem(key) === '1' } catch { return false }
+  },
+  set(enabled: boolean) {
+    if (currentConversation.value) rememberTeamMode(currentConversation.value.id, enabled)
+    else draftTeamMode.value = enabled
+  },
+})
 /** 当前对话使用的助手：固定为 bootstrap 下发的默认助手（不再提供助手管理入口） */
 const currentAssistant = ref<Assistant | null>(null)
 
@@ -555,6 +609,10 @@ function runState(message: ChatMessage) {
   if (request) return isDocumentReviewInput(request) ? statuses.waiting_document_review : statuses.waiting_input
   if (message.pendingActions?.length) return statuses.waiting_approval
   if (message.streaming && message.runStatus !== 'pending') return statuses.running
+  if (message.runStatus === 'limit_exceeded') return statuses.limit_exceeded
+  if (message.error && message.blocks.some(block => block.kind === 'verification' && block.state === 'incomplete')) {
+    return { label: '验收未通过', tone: 'warning' }
+  }
   if (message.error) return statuses.failed
   return message.runId ? statuses[message.runStatus || ''] : undefined
 }
@@ -857,14 +915,18 @@ async function newConversation() {
 }
 
 /** 无会话时（上传附件 / 首条消息）自动创建会话 */
-function createConversation(): Promise<Conversation> {
+function createConversation(transferDraftTeam = false): Promise<Conversation> {
   if (creating) return creating
   const origin = currentConversation.value?.id
+  const inheritTeam = transferDraftTeam && origin === undefined && draftTeamMode.value
   creatingConversation.value = true
   creating = conversationApi.create({ assistant_id: currentAssistant.value?.id }).then((c) => {
     conversations.value.unshift(c)
     convMessages.set(c.id, [])
-    if (currentConversation.value?.id === origin) switchConversation(c)
+    if (currentConversation.value?.id === origin) {
+      switchConversation(c)
+      if (inheritTeam) rememberTeamMode(c.id, true)
+    }
     void loadConversations(true)
     return c
   }).finally(() => {
@@ -875,7 +937,7 @@ function createConversation(): Promise<Conversation> {
 }
 
 function ensureConversation() {
-  return currentConversation.value ?? createConversation()
+  return currentConversation.value ?? createConversation(true)
 }
 
 function disposeAttachments() {
@@ -890,6 +952,7 @@ function switchConversation(c: Conversation | null) {
   if (currentConversation.value && currentConversation.value.id !== c?.id) {
     resetDocumentTask()
   }
+  draftTeamMode.value = false
   currentConversation.value = c
   syncConversationUrl(c?.id)
   showJumpToLatest.value = false
@@ -1023,6 +1086,7 @@ async function removeConversation(c: Conversation) {
       || c.active_run_id
     if (runId) await runApi.cancel(runId, '删除会话前取消任务')
     await conversationApi.delete(c.id)
+    rememberTeamMode(c.id, false)
     if (entry) {
       entry.stopped = true
       entry.abort.abort()
@@ -1253,6 +1317,40 @@ function editRetry(userMessageIndex: number) {
   composer.value?.focus()
 }
 
+async function repairProjectDraft(message: ChatMessage) {
+  const sourceId = message.runId
+  const convId = currentConversation.value?.id
+  if (!sourceId || !convId || message.runStatus !== 'failed' || blockedReason.value
+    || sending.value || loadingMessages.value || messagesFailed.value) return
+  const modelId = selectedModelId.value || undefined
+  const keyId = `${sourceId}:${modelId || 'default'}`
+  const key = projectRepairKeys.get(keyId) || globalThis.crypto?.randomUUID?.()
+  if (key) projectRepairKeys.set(keyId, key)
+  sending.value = true
+  repairingProject.value = sourceId
+  projectRepairErrors.delete(sourceId)
+  try {
+    const created = await runApi.repairProject(sourceId, modelId, key)
+    projectRepairKeys.delete(keyId)
+    if (inactive || created.conversation_id !== convId) return
+    pushMsg(convId, { role: 'user', content: created.user_message, blocks: [] })
+    const assistant = pushMsg(convId, {
+      role: 'assistant', content: '', blocks: [], runId: created.run_id, streaming: true,
+      lastActivity: 'other', lastEventAt: Date.now(), runStatus: 'pending', pendingActions: [],
+      liveStatus: '正在载入项目草稿…',
+    })
+    const entry: ActiveRun = { abort: new AbortController(), stopped: false, msg: assistant }
+    setActiveRun(convId, entry)
+    if (currentConversation.value?.id === convId) void forceScrollToBottom()
+    subscribeActiveRun(convId, entry, created.run_id)
+  } catch (error) {
+    projectRepairErrors.set(sourceId, documentError(error, '暂时无法继续修复草稿，请重试'))
+  } finally {
+    sending.value = false
+    repairingProject.value = ''
+  }
+}
+
 async function sendMessage() {
   const text = inputText.value.trim()
   if (!text || blockedReason.value || sending.value || uploading.value || loadingMessages.value || messagesFailed.value) return
@@ -1271,6 +1369,7 @@ async function sendMessage() {
   const sentFiles = attachments.value.map((a) => ({ ...a }))
   const sentModelId = selectedModelId.value
   const sentMode = approvalMode.value
+  const sentTeamMode = teamMode.value
   const sentTask = { ...documentTask.value }
 
   inputText.value = ''
@@ -1296,6 +1395,7 @@ async function sendMessage() {
       assistant_id: currentAssistant.value?.id,
       approval_mode: sentMode,
       model_config_id: sentModelId || undefined,
+      ...(sentTeamMode ? { team_mode: true } : {}),
       attachments: sentFiles,
       ...documentTaskPayload(sentTask),
     })
@@ -1306,24 +1406,7 @@ async function sendMessage() {
       return
     }
     aMsg.runId = created.run_id
-
-    consumeRunEvents(created.run_id, {
-      signal: entry.abort.signal,
-      afterSeq: 0,
-      onEvent: (envelope) => {
-        if (entry.stopped) return
-        applyRunEvent(aMsg, envelope)
-        if (currentConversation.value?.id === convId) scrollToBottom()
-      },
-      onReconnecting: (attempt) => {
-        if (entry.stopped) return
-        aMsg.liveStatus = `连接中断，正在重连（第 ${attempt} 次）…`
-      },
-      onDone: (reason) => {
-        if (entry.stopped) return
-        finishRun(convId, entry, reason)
-      },
-    }).catch(() => { /* 网络异常已由 onDone 兜底 */ })
+    subscribeActiveRun(convId, entry, created.run_id)
   } catch {
     if (entry.stopped) return
     aMsg.streaming = false
@@ -1336,6 +1419,25 @@ async function sendMessage() {
       documentTask.value = sentTask
     }
   }
+}
+
+function subscribeActiveRun(convId: number, entry: ActiveRun, runId: string) {
+  consumeRunEvents(runId, {
+    signal: entry.abort.signal,
+    afterSeq: 0,
+    onEvent: (envelope) => {
+      if (entry.stopped) return
+      applyRunEvent(entry.msg, envelope)
+      if (currentConversation.value?.id === convId) scrollToBottom()
+    },
+    onReconnecting: (attempt) => {
+      if (entry.stopped) return
+      entry.msg.liveStatus = `连接中断，正在重连（第 ${attempt} 次）…`
+    },
+    onDone: (reason) => {
+      if (!entry.stopped) finishRun(convId, entry, reason)
+    },
+  }).catch(() => { /* 网络异常已由 onDone 兜底 */ })
 }
 
 function finishRun(convId: number, entry: ActiveRun, reason: string) {

@@ -1,0 +1,35 @@
+"""以独立的 HTTP 请求验证可操作的工单项目。"""
+
+import json
+import os
+import unittest
+import urllib.error
+import urllib.request
+
+
+def request(path, method="GET", payload=None):
+    base = os.environ.get("TICKET_API", "http://127.0.0.1:8765")
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(base + path, data, {"Content-Type": "application/json"}, method=method)
+    try:
+        response = urllib.request.urlopen(req, timeout=5)
+    except urllib.error.HTTPError as error:
+        response = error
+    with response:
+        return response.status, json.load(response)
+
+
+class TicketsTest(unittest.TestCase):
+    def test_ticket_lifecycle(self):
+        self.assertEqual(request("/api/tickets", "POST", {"title": "  "})[0], 422)
+        status, ticket = request("/api/tickets", "POST", {"title": "验收工单"})
+        self.assertEqual(status, 201)
+        route = f"/api/tickets/{ticket['id']}"
+        try:
+            self.assertEqual(request(route, "PATCH", {"status": "done"}), (200, {"status": "done"}))
+            status, result = request("/api/tickets?status=done")
+            self.assertEqual(status, 200)
+            self.assertIn(ticket["id"], [item["id"] for item in result["items"]])
+        finally:
+            self.assertEqual(request(route, "DELETE")[0], 200)
+        self.assertEqual(request(route, "DELETE")[0], 404)

@@ -216,14 +216,15 @@ def _synthetic_terminal_event(run_row: Any) -> RuntimeEvent:
         return RuntimeEvent(
             type=RUN_COMPLETED,
             run_id=run_row.id,
-            data={"final_text": run_row.final_text or ""},
+            data={"final_text": run_row.final_text or "", "summary": run_row.summary},
         )
     if run_row.status == STATUS_CANCELLED:
         return RuntimeEvent(type=RUN_CANCELLED, run_id=run_row.id, data={})
     return RuntimeEvent(
         type=RUN_FAILED,
         run_id=run_row.id,
-        data={"error": run_row.error or "运行失败", "status": run_row.status},
+        data={"error": run_row.error or "运行失败", "status": run_row.status,
+              "final_text": run_row.final_text, "summary": run_row.summary},
     )
 
 
@@ -866,9 +867,8 @@ class AgentRuntimeService:
                 resolved_session_id = new_sess.id
 
             run_id = uuid.uuid4().hex
-            document_run = (
-                (input_payload.get("execution_context") or {}).get("task_type") in DOCUMENT_GRAPH_TYPES
-            )
+            execution = input_payload.get("execution_context") or {}
+            document_run = execution.get("task_type") in DOCUMENT_GRAPH_TYPES
             # 3) 用户消息追加（稳定 message_id + version 乐观锁合并；与 Run 原子）
             if user_message is not None and resolved_session_id is not None:
                 content = str(user_message.get("content") or "")
@@ -914,7 +914,8 @@ class AgentRuntimeService:
             # 5) Session 执行权原子 Claim（P1-02 A：单 Session 单活跃 Run）
             if resolved_session_id is not None:
                 ok = await sess_repo.claim_execution(
-                    resolved_session_id, row.id, self.worker.lease_seconds, durable=document_run,
+                    resolved_session_id, row.id, self.worker.lease_seconds,
+                    durable=document_run or execution.get("team_mode") is True,
                 )
                 if not ok:
                     raise SessionBusy(
@@ -960,13 +961,10 @@ class AgentRuntimeService:
         if status == STATUS_COMPLETED:
             return RuntimeEvent(type=RUN_COMPLETED, run_id=run.run_id,
                                 data={"final_text": run.final_text, "summary": run.summary})
-        if status == STATUS_FAILED:
+        if status in (STATUS_FAILED, STATUS_LIMIT_EXCEEDED):
             return RuntimeEvent(type=RUN_FAILED, run_id=run.run_id,
-                                data={"error": run.error or "执行链路异常结束"})
-        if status == STATUS_LIMIT_EXCEEDED:
-            return RuntimeEvent(type=RUN_FAILED, run_id=run.run_id,
-                                data={"error": run.error or "执行预算超限",
-                                      "status": STATUS_LIMIT_EXCEEDED})
+                                data={"error": run.error or "执行链路异常结束", "status": status,
+                                      "final_text": run.final_text, "summary": run.summary})
         if status == STATUS_CANCELLED:
             return RuntimeEvent(type=RUN_CANCELLED, run_id=run.run_id)
         if status == STATUS_WAITING_INPUT:
@@ -1067,9 +1065,12 @@ class AgentRuntimeService:
         bus = run.bus
         task_type = (execution_context or {}).get("task_type")
         is_document_run = task_type in DOCUMENT_GRAPH_TYPES
+        is_team_run = (execution_context or {}).get("team_mode") is True
         private_document_content = is_document_run or task_type == "document_analyze"
         ctx: Optional[RuntimeContext] = None
         verification: Optional[Dict[str, Any]] = None  # P4-02：验证结果（异常路径保持 None）
+        team_stats: dict[str, Any] = {}
+        team_incomplete: str | None = None
         log_fields: Dict[str, Any] = {
             "request_id": run.run_id,
             "trace_id": run.run_id,
@@ -1146,6 +1147,20 @@ class AgentRuntimeService:
 
             # P1-05 §13：加载 Run 级预算历史累计（跨恢复不重置），取绝对 deadline
             await self._load_budget(ctx, run)
+            if not (is_document_run or is_team_run) and settings.AGENT_VERIFICATION_ENABLED:
+                from app.assistant.task_contract import build_task_contract
+
+                original_messages = messages
+                if original_messages is None:
+                    async with AsyncSessionLocal() as db:
+                        saved = await db.scalar(select(AgentRunRow.input_payload).where(AgentRunRow.id == run.run_id))
+                    original_messages = (saved or {}).get("messages") or []
+                continued = (execution_context or {}).get("completion_resume") or {}
+                ctx.task_contract = build_task_contract(
+                    continued.get("request") or _last_user_input(original_messages),
+                    capability_ids=agent_config.get("capability_ids"),
+                )
+                ctx.carried_artifacts = dict(continued.get("artifacts") or {})
 
             tool_specs = self._resolve_tool_specs(agent_config)
             if execution_context is not None:
@@ -1179,6 +1194,14 @@ class AgentRuntimeService:
 
                 checkpointer = await CheckpointerFactory.get().get_checkpointer()
                 document_context = None
+                team = None
+                if is_team_run:
+                    from .team_runtime import TeamRun
+
+                    team = TeamRun(
+                        run, ctx, provider, model_config, policy, tool_specs, self._flush_budget,
+                        project_scope=execution_context.get("project_scope") if task_type == "software_project" else None,
+                    )
                 if is_document_run:
                     from app.services.documents.graphs import build_document_graph
                     from .document_graph import DocumentGraphContext, drive_document_graph
@@ -1187,7 +1210,7 @@ class AgentRuntimeService:
                         run, ctx, provider, model_config, policy, tool_specs, self._flush_budget
                     )
                     agent = build_document_graph(checkpointer, document_context)
-                else:
+                elif team is None:
                     store = await CheckpointerFactory.get().get_store()
                     agent = build_agent(
                         ctx, policy, bus, provider, model_config, tool_specs,
@@ -1195,6 +1218,9 @@ class AgentRuntimeService:
                     )
 
                 await bus.publish(RuntimeEvent(type=RUN_STARTED, run_id=run.run_id))
+                if ctx.task_contract and ctx.task_contract.is_complex and run.attempt == 1:
+                    await bus.publish(RuntimeEvent(type=VERIFICATION_STARTED, run_id=run.run_id,
+                                                   data=ctx.task_contract.to_dict()))
                 if execution_context and run.attempt == 1:
                     route = dict(execution_context)
                     route.pop("document_context", None)
@@ -1206,6 +1232,10 @@ class AgentRuntimeService:
 
                 if is_document_run:
                     payload = {"messages": messages or [], "execution_context": execution_context}
+                elif team is not None:
+                    if task_type == "document_analyze" and execution_context.get("document_id") and messages:
+                        messages = await self._with_document_preview(run, messages, execution_context)
+                    payload = None
                 elif resume is not None:
                     payload: Any = Command(resume=resume)
                 elif messages is None:
@@ -1218,6 +1248,7 @@ class AgentRuntimeService:
                         "messages": messages_to_langchain(
                             messages or [], namespace=run.thread_id
                         ),
+                        "todos": [],  # 会话复用线程时，每轮计划只针对当次请求。
                         **await self._skill_files(tool_db, run.agent_id),
                     }
 
@@ -1248,7 +1279,7 @@ class AgentRuntimeService:
                     },
                 ), platform_span(
                     "agent_run", run_id=run.run_id,
-                    record_exception_detail=not private_document_content,
+                    record_exception_detail=not (private_document_content or is_team_run),
                     attributes={
                         "thread_id": run.thread_id, "agent_id": run.agent_id,
                         "session_id": run.session_id, "model_id": log_fields["model_id"],
@@ -1256,7 +1287,7 @@ class AgentRuntimeService:
                 ):
                     callbacks: List[Any] = [ModelUsageCallback(ctx)]
                     # 专用文档图的模型提示可含原始业务正文，仅上报节点级摘要。
-                    lf_handler = None if private_document_content else make_callback_handler(run.run_id)
+                    lf_handler = None if private_document_content or is_team_run else make_callback_handler(run.run_id)
                     if lf_handler is not None:
                         callbacks.append(lf_handler)
                     config["callbacks"] = callbacks
@@ -1286,10 +1317,41 @@ class AgentRuntimeService:
                             else:
                                 _remaining = ctx.budget.run_timeout_seconds
                             async with asyncio.timeout(_remaining) as _to:
+                                if team is not None:
+                                    outcome = await team.drive(
+                                        checkpointer, messages or [], execution_context, synthesize=not is_document_run,
+                                    )
+                                    board = outcome["team"]
+                                    team_stats = {
+                                        "team_mode": True,
+                                        "team_task_count": len(board["tasks"]),
+                                        "team_completed_count": sum(task["status"] == "completed" for task in board["tasks"]),
+                                    }
+                                    if document_context is not None:
+                                        document_context.team_brief = outcome["team_brief"]
+                                    else:
+                                        answer = outcome.get("final_text") or ""
+                                        if answer:
+                                            await team.emit(MODEL_DELTA, {"text": answer})
+                                            run.final_text_parts = [answer]
+                                        if failure := outcome.get("failure"):
+                                            if answer:
+                                                team_incomplete = failure
+                                            else:
+                                                from .team_graph import TeamExecutionError
+
+                                                raise TeamExecutionError(failure)
+                                        if project := outcome.get("project"):
+                                            team_stats.update({
+                                                "project_files": project["file_count"],
+                                                "project_verification": project["state"],
+                                            })
                                 if document_context is not None:
                                     await drive_document_graph(agent, run_config, payload, document_context)
-                                else:
+                                elif team is None:
                                     await self._consume_stream(agent, payload, run_config, ctx, run, bus)
+                                    if ctx.task_contract is not None and run.status == STATUS_RUNNING:
+                                        verification = await self._read_completion_review(agent, run_config, ctx, run, bus)
                             break  # 正常完成
                         except asyncio.TimeoutError as _te:
                             if _to.expired():
@@ -1316,12 +1378,6 @@ class AgentRuntimeService:
                                 },
                             ))
 
-                    # P4-01/02：完成条件验证 + 有条件补充执行（§9，主执行已产出结果）
-                    if not is_document_run:
-                        verification = await self._verify_and_fix(
-                            ctx, run, agent, run_config, bus, messages,
-                        )
-
             # 结束分支
             if run.status == STATUS_RUNNING:
                 # FR-09：run.final_text 唯一权威收集在执行侧（_consume_stream 累积
@@ -1335,12 +1391,24 @@ class AgentRuntimeService:
                     "tokens_generated": ctx.tokens_generated,
                     "steps": ctx.steps,
                     "elapsed_seconds": round(ctx.elapsed(), 2),
+                    **team_stats,
                 }
                 if document_context is not None:
                     run.summary.update(document_context.summary)
+                if team_incomplete:
+                    await self._fail(run, team_incomplete, status=STATUS_FAILED, bus=bus, team_mode=True,
+                                     result_summary=run.summary, draft=run.final_text)
+                    return
                 if verification is not None:
-                    # P4-02：验证结果随 Run 交付（完成条件证据，不覆盖最终回答）
                     run.summary["verification"] = verification
+                    if verification["status"] != "passed":
+                        limited = verification.get("stop_reason") == "budget"
+                        await self._fail(
+                            run, "执行预算已用完，仍有交付项需要处理。" if limited else "任务仍有交付项未通过验收，已保存当前结果。",
+                            status=STATUS_LIMIT_EXCEEDED if limited else STATUS_FAILED, bus=bus,
+                            result_summary=run.summary, draft=run.final_text,
+                        )
+                        return
                 run.transition(STATUS_COMPLETED)
                 await self._commit(
                     run,
@@ -1401,24 +1469,24 @@ class AgentRuntimeService:
                 logger.warning("run %s 取消态提交被拒：%s", run.run_id, e)
                 committed = False
             if committed:
+                if is_team_run:
+                    await self._close_team_board(run, "cancelled")
                 try:
                     await self._write_back_session(run)  # FR-08.2：终态统一写回
                 except Exception:
                     logger.exception("run %s 取消态会话写回失败", run.run_id)
                 await bus.publish(RuntimeEvent(type=RUN_CANCELLED, run_id=run.run_id))
             raise
-        except _RunLimitExceeded as e:
-            await self._fail(run, str(e), status=STATUS_LIMIT_EXCEEDED, bus=bus)
-        except (ToolCallLimitExceededError, ModelCallLimitExceededError, GraphRecursionError) as e:
-            # 执行预算超限（工具/模型次数、步数）→ 明确 limit_exceeded 状态
-            await self._fail(run, f"执行预算超限: {e}", status=STATUS_LIMIT_EXCEEDED, bus=bus)
-        except BudgetExceededError as e:
-            # FR-10.7：预算耗尽 → limit_exceeded（不得误报 failed）
-            await self._fail(run, str(e), status=STATUS_LIMIT_EXCEEDED, bus=bus)
+        except (_RunLimitExceeded, BudgetExceededError, ToolCallLimitExceededError,
+                ModelCallLimitExceededError, GraphRecursionError) as e:
+            error = str(e) if isinstance(e, (_RunLimitExceeded, BudgetExceededError)) else f"执行预算超限: {e}"
+            draft, summary = await self._retain_interrupted_completion(run, ctx, "budget")
+            await self._fail(run, error, status=STATUS_LIMIT_EXCEEDED, bus=bus, team_mode=is_team_run,
+                             draft=draft, result_summary=summary)
         except ModelCapabilityError as e:
-            await self._fail(run, f"模型能力不满足: {e}", status=STATUS_FAILED, bus=bus)
+            await self._fail(run, f"模型能力不满足: {e}", status=STATUS_FAILED, bus=bus, team_mode=is_team_run)
         except ToolPolicyError as e:
-            await self._fail(run, f"安全策略拒绝: {e}", status=STATUS_FAILED, bus=bus)
+            await self._fail(run, f"安全策略拒绝: {e}", status=STATUS_FAILED, bus=bus, team_mode=is_team_run)
         except RunLeaseLost as e:
             # P0-02 E / LF-04：fencing 失败 —— 立即中止推进：
             # 不写 Session、不发布 RUN_COMPLETED / RUN_FAILED、不产生新副作用，
@@ -1437,7 +1505,12 @@ class AgentRuntimeService:
             raise
         except Exception as e:
             failure_code = None
-            if private_document_content:
+            if is_team_run and not private_document_content:
+                from .team_graph import TeamExecutionError
+
+                logger.warning("团队 run %s 执行失败，错误类型 %s", run.run_id, type(e).__name__)
+                error = str(e) if isinstance(e, TeamExecutionError) else "团队运行失败，请检查所选模型后重试"
+            elif private_document_content:
                 from app.services.documents.errors import DocumentError
 
                 logger.warning("文档 run %s 执行失败，错误类型 %s", run.run_id, type(e).__name__)
@@ -1447,7 +1520,12 @@ class AgentRuntimeService:
             else:
                 logger.exception("run %s 执行失败", run.run_id)
                 error = str(e)
-            await self._fail(run, error, status=STATUS_FAILED, bus=bus, document_failure_code=failure_code)
+            draft, summary = await self._retain_interrupted_completion(
+                run, None if private_document_content else ctx, "execution",
+            )
+            await self._fail(run, error, status=STATUS_FAILED, bus=bus,
+                             document_failure_code=failure_code, team_mode=is_team_run,
+                             draft=draft, result_summary=summary)
         finally:
             telemetry.record_run(
                 log_fields,
@@ -1584,9 +1662,8 @@ class AgentRuntimeService:
         # call_id -> 工具名：护栏拒绝的 ToolMessage（如并行 write_todos）name 为空，
         # 从发起调用时的 tool_calls 名称回填，避免事件里工具名丢失
         tool_names_by_call: Dict[str, str] = {}
-        async for mode, chunk in agent.astream(
-            payload, config=run_config, stream_mode=["updates", "messages"]
-        ):
+        stream_options = {"durability": "sync"} if ctx.task_contract and ctx.task_contract.is_complex else {}
+        async for mode, chunk in agent.astream(payload, config=run_config, stream_mode=["updates", "messages"], **stream_options):
             if mode == "messages":
                 msg, meta = chunk
                 if isinstance(msg, (AIMessage, AIMessageChunk)) and meta.get("langgraph_node") == "model":
@@ -1662,6 +1739,14 @@ class AgentRuntimeService:
                                             ),
                                         },
                                     ))
+                    review = node_update.get("completion_review") or {}
+                    if review.get("run_id") == run.run_id:
+                        ctx.completion_review = review
+                    if review.get("continuing"):
+                        await bus.publish(RuntimeEvent(type=RUN_RETRYING, run_id=run.run_id, data={
+                            "reason": "verification_fix", "round": review["fix_rounds"],
+                            "failed_checks": [check for check in review["report"]["checks"] if not check["passed"]],
+                        }))
                 # P1-05 §13：每个图步/工具边界 CAS 累计预算（崩溃恢复不丢累计）
                 await self._flush_budget(ctx, run)
         if interrupted:
@@ -1677,6 +1762,67 @@ class AgentRuntimeService:
         await self._flush_budget(ctx, run)
         # P1-06 §14.5：收尾刷一次 MODEL_DELTA 缓冲（确保尾部增量落库，最终文本重建完整）
         await bus.flush_deltas()
+
+    async def _read_completion_review(self, agent, run_config, ctx, run, bus) -> dict | None:
+        review = ctx.completion_review
+        if not review and (ctx.task_contract.is_complex or run.attempt > 1):
+            state = await agent.aget_state(run_config)
+            review = (state.values or {}).get("completion_review")
+        if not review:
+            return None
+        if review.get("run_id") != run.run_id:
+            return None
+        verification = {**review["report"], "version": 2, "stop_reason": review.get("stop_reason", "")}
+        run.final_text_parts = [review["answer"]]
+        await self._publish_completion_artifacts(ctx, run, verification)
+        if ctx.task_contract.is_complex or verification["status"] != "passed" or verification.get("fix_rounds"):
+            await bus.publish(RuntimeEvent(type=VERIFICATION_COMPLETED, run_id=run.run_id, data=verification))
+        return verification
+
+    async def _retain_interrupted_completion(self, run, ctx, reason: str) -> tuple[str | None, dict | None]:
+        if not (ctx and ctx.task_contract and ctx.task_contract.is_complex):
+            return None, None
+        from .completion import bounded_answer, interrupted_report
+
+        last = ctx.completion_review or {}
+        candidate = last.get("answer") if last.get("run_id") == run.run_id else None
+        draft, _ = bounded_answer(candidate or "".join(run.final_text_parts))
+        report = {
+            "version": 2, "status": "partial", "stop_reason": reason, "artifacts": [], "checks": [{
+                "id": "execution_interrupted", "passed": False, "detail": "任务中断，最终交付尚未完成",
+            }],
+        }
+        try:
+            async with asyncio.timeout(3):
+                evidence = await interrupted_report(ctx, draft, reason)
+                await self._publish_completion_artifacts(ctx, run, evidence)
+                report = evidence
+        except Exception:
+            logger.warning("run %s 中断后未能完成产物核对", run.run_id, exc_info=True)
+        return draft, {"verification": report}
+
+    async def _publish_completion_artifacts(self, ctx, run, verification: dict) -> None:
+        from app.api.v2.artifacts import make_artifact_id
+        from .completion import freeze_artifacts
+
+        artifacts = verification.get("artifacts") or []
+        if not artifacts:
+            return
+        if run.session_id:
+            frozen = await asyncio.to_thread(freeze_artifacts, ctx, artifacts)
+            # 旧版 checkpoint 里的产物仍可通过原有会话链接下载。
+            paths = {**{item["path"]: item["path"] for item in artifacts if not item.get("sha256")}, **frozen}
+            verification["artifacts"] = [
+                {**artifact, "download_url": "/api/v2/artifacts/" + make_artifact_id(run.session_id, paths[artifact["path"]])}
+                for artifact in artifacts if artifact["path"] in paths
+            ]
+            if missing := [item["path"] for item in artifacts if item["path"] not in paths]:
+                verification["status"] = "partial"
+                verification["stop_reason"] = verification.get("stop_reason") or "artifact_publish"
+                verification["checks"] = [*verification["checks"], {
+                    "id": "artifact_saved", "passed": False,
+                    "detail": "未能保存可下载版本 " + "、".join(missing[:6]),
+                }]
 
     async def _handle_interrupt(self, interrupts, run, bus) -> None:
         actions: List[Dict[str, Any]] = []
@@ -1695,8 +1841,18 @@ class AgentRuntimeService:
             type=APPROVAL_REQUIRED, run_id=run.run_id, data={"actions": actions}
         ))
 
+    @staticmethod
+    async def _close_team_board(run: RunHandle, phase: str) -> None:
+        from .team_runtime import close_team_board
+
+        try:
+            await close_team_board(run, phase)
+        except Exception:
+            logger.exception("run %s 团队任务板收尾失败", run.run_id)
+
     async def _fail(self, run: RunHandle, error: str, *, status: str, bus: EventBus,
-                    document_failure_code: str | None = None) -> None:
+                    document_failure_code: str | None = None, team_mode: bool = False,
+                    result_summary: dict | None = None, draft: str | None = None) -> None:
         """失败路径（P0-02 F）：不得覆盖已提交的终态。
 
         - Run 已是终态（如 completed 后 Session 写回异常）：直接返回，
@@ -1720,136 +1876,27 @@ class AgentRuntimeService:
             )
             return
         run.error = error
-        summary = {"document_failure_code": document_failure_code} if document_failure_code else None
+        summary = {"document_failure_code": document_failure_code} if document_failure_code else result_summary
         try:
-            await self._commit(run, status=status, error=error, finished=True, summary=summary)
+            await self._commit(run, status=status, error=error, finished=True, summary=summary, final_text=draft)
         except (RunLeaseLost, IllegalTransition):
             # 提交被拒：不写 Session、不发布 RUN_FAILED（不覆盖有效状态）
             return
+        if summary is not None:
+            run.summary = summary
+        if draft is not None:
+            run.final_text = draft
+        if team_mode:
+            await self._close_team_board(run, "failed")
         try:
             await self._write_back_session(run)  # FR-08.2：终态统一写回
         except Exception:
             logger.exception("run %s 失败态会话写回失败", run.run_id)
         await bus.publish(RuntimeEvent(
             type=RUN_FAILED, run_id=run.run_id,
-            data={"error": error, "status": status, "document_retryable": bool(document_failure_code)},
+            data={"error": error, "status": status, "document_retryable": bool(document_failure_code),
+                  **({"final_text": draft, "summary": summary} if draft is not None else {})},
         ))
-
-    async def _verify_and_fix(
-        self,
-        ctx: RuntimeContext,
-        run: RunHandle,
-        agent: Any,
-        run_config: Dict[str, Any],
-        bus: EventBus,
-        messages: Optional[List[Dict[str, Any]]],
-    ) -> Optional[Dict[str, Any]]:
-        """P4-01/02：任务契约 + 完成条件验证 + 有条件补充执行（§9）。
-
-        - 契约与验证全部确定性（零模型调用，简单问答不加验证负担）；
-        - 验证失败产生结构化事件（verification.started/completed），
-          不允许模型说"已完成"就通过；
-        - 复杂任务验证不通过 → 按 AGENT_VERIFICATION_MAX_ROUNDS 轮补充执行
-          （run.retrying 事件），仍不通过则把验证结论随 Run 交付（不伪造成功）；
-        - 验证自身异常绝不影响主结果交付（记录日志后返回 None）。
-        """
-        if not getattr(settings, "AGENT_VERIFICATION_ENABLED", True):
-            return None
-        if run.status != STATUS_RUNNING:
-            return None
-        try:
-            from sqlalchemy import select
-
-            from app.assistant.task_contract import build_task_contract
-            from app.assistant.verification import (
-                STATUS_PASSED,
-                ToolEvidence,
-                verify_task,
-            )
-            from app.models.agent import AgentToolExecution
-
-            # 证据收集：工具账本（副作用/查询/执行的客观事实）
-            async with AsyncSessionLocal() as db:
-                rows = (await db.execute(
-                    select(AgentToolExecution).where(
-                        AgentToolExecution.run_id == run.run_id
-                    ).order_by(AgentToolExecution.id)
-                )).scalars().all()
-            evidence = [
-                ToolEvidence(
-                    tool_name=r.tool_name,
-                    status=r.status,
-                    external_operation_id=r.external_operation_id,
-                    output=str(r.result_payload or ""),
-                )
-                for r in rows
-            ]
-            tool_names = [e.tool_name for e in evidence]
-            goal = _last_user_input(messages or [])
-            contract = build_task_contract(
-                goal,
-                capability_ids=ctx.agent_config.get("capability_ids"),
-                tool_names=tool_names,
-            )
-
-            await bus.publish(RuntimeEvent(
-                type=VERIFICATION_STARTED, run_id=run.run_id,
-                data=contract.to_dict(),
-            ))
-            result = verify_task(contract, "".join(run.final_text_parts), evidence)
-
-            # 部分通过/不通过 → 补充执行（有限轮次；简单问答不补执行）
-            max_rounds = max(0, int(getattr(settings, "AGENT_VERIFICATION_MAX_ROUNDS", 1)))
-            rounds = 0
-            while (
-                result.status != STATUS_PASSED
-                and contract.is_complex
-                and rounds < max_rounds
-                and run.status == STATUS_RUNNING
-            ):
-                rounds += 1
-                await bus.publish(RuntimeEvent(
-                    type=RUN_RETRYING, run_id=run.run_id,
-                    data={
-                        "reason": "verification_fix",
-                        "round": rounds,
-                        "failed_checks": [c.to_dict() for c in result.failed_checks],
-                    },
-                ))
-                feedback = result.feedback_text()
-                # 补充执行的 config 必须只含 thread_id（+recursion_limit/callbacks）：
-                # 实证（消融实验）发现 configurable 同时携带 run_id 与 user_id 时，
-                # LangGraph 对后续 astream 静默跳过执行（0 chunk、模型不调用、无异常），
-                # 只含其一或仅 thread_id 均正常。thread_id 是 checkpoint 恢复的唯一
-                # 必需键；callbacks 用新实例（Langfuse handler 单次使用语义）。
-                fix_config = {
-                    "configurable": {"thread_id": run.thread_id},
-                    "recursion_limit": run_config.get("recursion_limit", 1000),
-                    "callbacks": [ModelUsageCallback(ctx)],
-                }
-                await self._consume_stream(
-                    agent,
-                    {
-                        "messages": messages_to_langchain(
-                            [{"role": "user", "content": feedback}],
-                            namespace=run.thread_id,
-                            reset=False,
-                        ),
-                    },
-                    fix_config, ctx, run, bus,
-                )
-                result = verify_task(contract, "".join(run.final_text_parts), evidence)
-
-            data = result.to_event_data()
-            data["fix_rounds"] = rounds
-            await bus.publish(RuntimeEvent(
-                type=VERIFICATION_COMPLETED, run_id=run.run_id, data=data,
-            ))
-            return data
-        except Exception:  # noqa: BLE001
-            # 验证是质量增强，不得让验证自身故障毁掉主执行结果
-            logger.exception("run %s 验证执行异常（主结果照常交付）", run.run_id)
-            return None
 
     async def _load_prior_final_text(self, run_id: str) -> List[str]:
         """FR-09：从持久化事件日志重建本 Run 已产生的最终文本片段（MODEL_DELTA），
@@ -2290,6 +2337,7 @@ class AgentRuntimeService:
 
         route = (getattr(row, "input_payload", None) or {}).get("execution_context") or {}
         document_run = route.get("task_type") in DOCUMENT_GRAPH_TYPES
+        team_run = route.get("team_mode") is True
         has_document_inputs = False
         async with AsyncSessionLocal() as db:
             entries = await ToolExecutionRepository(db).list_unresolved(row.id)
@@ -2298,7 +2346,13 @@ class AgentRuntimeService:
 
                 has_document_inputs = await has_input_history(db, row.id)
 
-        state = await self.get_thread_state(row.thread_id)
+        state = await self.get_thread_state(row.thread_id) if document_run or not team_run else None
+        if team_run:
+            from .team_runtime import team_thread_id
+
+            team_state = await self.get_thread_state(team_thread_id(row.id))
+            if team_state and (team_state.get("error") or (state is None and not has_document_inputs)):
+                state = team_state
         checkpoint_error: Optional[str] = None
         if state is None:
             checkpoint_state = CHECKPOINT_MISSING

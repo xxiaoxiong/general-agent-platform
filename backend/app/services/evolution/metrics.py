@@ -20,9 +20,11 @@ logger = logging.getLogger(__name__)
 
 async def compute_deterministic(db: AsyncSession, run: AgentRun) -> Dict[str, Any]:
     """计算 Run 的确定性指标字典。"""
+    verification_status = ((run.summary or {}).get("verification") or {}).get("status")
     m: Dict[str, Any] = {
         "run_status": run.status or "",
-        "success": (run.status == "completed"),
+        "success": run.status == "completed" and verification_status not in {"failed", "partial"},
+        "verification_status": verification_status,
         "limit_exceeded": (run.status == "limit_exceeded"),
         "error_present": bool(run.error),
         "duration_s": None,

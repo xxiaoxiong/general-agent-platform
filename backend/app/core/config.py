@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings
 from pydantic import Field
+from pathlib import Path
 from typing import List, Optional
 from urllib.parse import urlsplit
 import json
@@ -137,7 +138,8 @@ class Settings(BaseSettings):
     AGENT_EVENT_CLEANUP_INTERVAL: float = 3600.0  # 事件保留清理执行间隔（秒，仅清理终态超期 Run）
     # ── P4-01/02：Task Contract + Verification ────────────────────────────
     AGENT_VERIFICATION_ENABLED: bool = True     # 复杂任务完成条件验证（确定性，不调模型）
-    AGENT_VERIFICATION_MAX_ROUNDS: int = 1      # 验证不通过的补充执行轮数（0=只验证不补充）
+    AGENT_VERIFICATION_MAX_ROUNDS: int = 2      # 原运行中的补充轮数（0=只验证不补充）
+    AGENT_PROJECT_VERIFIER_DIR: str = ""       # 离线工程验收共享队列（Compose 默认接入）
     # ── P4-03：工具瞬态失败重试（按风险策略；非幂等绝不盲目重放）──────────
     AGENT_TOOL_MAX_RETRIES: int = 2             # 运行内瞬态失败重试上限（0=不重试）
     AGENT_TOOL_RETRY_BACKOFF_SECONDS: float = 0.5  # 重试退避基数（线性退避 attempt*基数）
@@ -199,6 +201,9 @@ class Settings(BaseSettings):
         """
         if self.asr_enabled:
             self._validate_asr_settings()
+        verifier_directory = self.AGENT_PROJECT_VERIFIER_DIR.strip()
+        if verifier_directory and not Path(verifier_directory).is_absolute():
+            raise RuntimeError("配置非法：AGENT_PROJECT_VERIFIER_DIR 须为共享队列的绝对路径。")
         if self.is_production:
             dsn = (self.AGENT_CHECKPOINT_DSN or "").strip().lower()
             if dsn in ("", "memory"):

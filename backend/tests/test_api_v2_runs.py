@@ -5,6 +5,7 @@
 """
 import json
 import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -312,3 +313,268 @@ class TestRunsAPIv2:
         # 同 Key 不同摘要 → 409
         r3 = client.post("/api/v2/runs", json={"message": "不同输入", "use_memory": False}, headers=headers)
         assert r3.status_code == 409
+
+    def test_team_mode_requires_explicit_boolean_and_participates_in_idempotency(self, client, user_setup, monkeypatch):
+        _patch_model(monkeypatch, [AIMessage(content="单助手回答")])
+        user_id = user_setup["user1_id"]
+        headers = {**_auth(user_id), "Idempotency-Key": "v2-team-mode-opt-in"}
+        body = {"message": "请解释物料盘点规则", "use_memory": False}
+
+        invalid = client.post("/api/v2/runs", json={**body, "team_mode": "true"}, headers=headers)
+        assert invalid.status_code == 422
+        assert invalid.json()["detail"][0]["loc"] == ["body", "team_mode"]
+
+        omitted = client.post("/api/v2/runs", json=body, headers=headers)
+        assert omitted.status_code == 200
+        run_id = omitted.json()["run_id"]
+        disabled = client.post("/api/v2/runs", json={**body, "team_mode": False}, headers=headers)
+        assert disabled.status_code == 200
+        assert disabled.json()["run_id"] == run_id
+        assert disabled.json()["idempotent_reuse"] is True
+
+        enabled = client.post("/api/v2/runs", json={**body, "team_mode": True}, headers=headers)
+        assert enabled.status_code == 409
+        assert _wait_run(client, run_id, user_id)["status"] == "completed"
+        history = client.get(f"/api/v2/runs/{run_id}/events", headers=_auth(user_id))
+        assert history.status_code == 200
+        events = _iter_v2_sse(history)
+        assert all(event["event"] != "team.updated" for event in events)
+        assert events[-1]["data"]["final_text"] == "单助手回答"
+
+    def test_long_task_repairs_a_missing_artifact_and_preserves_the_real_final_answer(self, client, user_setup, monkeypatch, tmp_path):
+        from app.core.config import settings
+
+        def call(name, args, identifier):
+            return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": identifier}])
+
+        monkeypatch.setattr(settings, "AGENT_FILES_ROOT", str(tmp_path))
+        monkeypatch.setattr(settings, "AGENT_VERIFICATION_MAX_ROUNDS", 2)
+        _patch_model(monkeypatch, [
+            call("write_todos", {"todos": [{"content": "核对清单", "status": "in_progress"},
+                                          {"content": "保存事实明细", "status": "pending"}]}, "deliver-plan"),
+            call("write_file", {"file_path": "/workspace/audit/report.md", "content": "# 盘点报告\n\n三箱实物。"}, "deliver-report"),
+            AIMessage(content="初稿。报告写好了，全部完成。"),
+            call("write_file", {"file_path": "/workspace/audit/facts.json", "content": '{"boxes":3}'}, "deliver-facts"),
+            call("write_todos", {"todos": [{"content": "核对清单", "status": "completed"},
+                                          {"content": "保存事实明细", "status": "completed"}]}, "deliver-plan-done"),
+            AIMessage(content="盘点结束。报告与事实明细均可下载。"),
+        ])
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        started = client.post("/api/v2/runs", json={"message": "分阶段核对库存，实盘三箱。保存为 `audit/report.md` 与 `audit/facts.json` 两个文件。"}, headers=headers)
+        assert started.status_code == 200, started.text
+        run = started.json()
+        assert _wait_run(client, run["run_id"], owner)["status"] == "completed"
+        events = _iter_v2_sse(client.get(run["events_url"], headers=headers))
+        corrections = [event["data"] for event in events if event["event"] == "run.retrying"]
+        assert len(corrections) == 1
+        assert {check["id"] for check in corrections[0]["failed_checks"]} == {"artifact_produced", "plan_finished"}
+        assert events[-1]["data"]["final_text"] == "盘点结束。报告与事实明细均可下载。"
+        verification = events[-1]["data"]["summary"]["verification"]
+        assert verification["status"] == "passed" and verification["fix_rounds"] == 1
+        artifacts = {item["path"]: item["download_url"] for item in verification["artifacts"]}
+        assert set(artifacts) == {"audit/report.md", "audit/facts.json"}
+        assert client.get(artifacts["audit/facts.json"], headers=headers).json() == {"boxes": 3}
+        assert client.get(artifacts["audit/facts.json"], headers=_auth(user_setup["user2_id"])).status_code == 404
+
+        # 同名工作文件可继续修改，旧交付仍指向本轮已验收的内容。
+        _patch_model(monkeypatch, [
+            call("edit_file", {"file_path": "/workspace/audit/facts.json", "old_string": '{"boxes":3}',
+                               "new_string": '{"boxes":4}'}, "deliver-edit"),
+            AIMessage(content="已核对并保存为四箱。"),
+        ])
+        updated = client.post("/api/v2/runs", json={
+            "conversation_id": run["conversation_id"], "task_mode": "chat",
+            "message": "把箱数改成四箱并保存为 audit/facts.json。",
+        }, headers=headers)
+        assert updated.status_code == 200, updated.text
+        new_run = updated.json()
+        assert _wait_run(client, new_run["run_id"], owner)["status"] == "completed"
+        new_events = _iter_v2_sse(client.get(new_run["events_url"], headers=headers))
+        new_artifact = new_events[-1]["data"]["summary"]["verification"]["artifacts"][0]
+        assert client.get(new_artifact["download_url"], headers=headers).json() == {"boxes": 4}
+        assert client.get(artifacts["audit/facts.json"], headers=headers).json() == {"boxes": 3}
+
+    def test_exhausted_verification_keeps_partial_text_and_reports_failure(self, client, user_setup, monkeypatch):
+        model_output = "初步发现，建议继续核对。"
+        _patch_model(monkeypatch, [AIMessage(content=model_output), AIMessage(content=model_output)])
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        started = client.post("/api/v2/runs", json={"message": "深入调研行业现状，引用至少两个来源。"}, headers=headers).json()
+        assert _wait_run(client, started["run_id"], owner)["status"] == "failed"
+        events = _iter_v2_sse(client.get(started["events_url"], headers=headers))
+        assert events[-1]["event"] == "run.failed"
+        assert events[-1]["data"]["final_text"] == model_output
+        report = events[-1]["data"]["summary"]["verification"]
+        assert report["stop_reason"] == "no_progress"
+        assert any(check["id"] == "citations_present" and not check["passed"] for check in report["checks"])
+
+    @pytest.mark.parametrize("reason", ["budget", "execution"])
+    def test_interrupted_complex_task_preserves_confirmed_files(self, client, user_setup, monkeypatch, tmp_path, reason):
+        from app.core.config import settings
+
+        def failure():
+            raise RuntimeError("模型连接中断")
+
+        monkeypatch.setattr(settings, "AGENT_FILES_ROOT", str(tmp_path))
+        monkeypatch.setattr(settings, "AGENT_MAX_MODEL_CALLS", 1 if reason == "budget" else 10)
+        excerpt = "已生成报告草稿，事实表尚待保存。"
+        _patch_model(monkeypatch, [
+            AIMessage(content=excerpt, tool_calls=[{"name": "write_file", "id": "draft-before-interruption", "args": {
+                "file_path": "/workspace/report.md", "content": "# 报告\n\n第一部分已核对。"}}]),
+            failure,
+        ])
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        assistant = client.post("/api/v2/assistants", headers=headers, json={"name": f"长任务中断验收-{reason}"})
+        assert assistant.status_code == 200, assistant.text
+        response = client.post("/api/v2/runs", headers=headers, json={
+            "assistant_id": assistant.json()["id"], "task_mode": "chat",
+            "message": "分阶段核对并保存为 report.md 和 facts.json 两个文件。",
+        })
+        assert response.status_code == 200, response.text
+        run = response.json()
+        expected = "limit_exceeded" if reason == "budget" else "failed"
+        assert _wait_run(client, run["run_id"], owner)["status"] == expected
+        events = _iter_v2_sse(client.get(run["events_url"], headers=headers))
+        assert events[-1]["event"] == "run.failed"
+        terminal = events[-1]["data"]
+        assert terminal["status"] == expected and terminal["final_text"] == excerpt
+        verification = terminal["summary"]["verification"]
+        assert verification["stop_reason"] == reason and verification["status"] != "passed"
+        assert {item["id"] for item in verification["checks"] if not item["passed"]} == {
+            "artifact_produced", "execution_interrupted",
+        }
+        assert [item["path"] for item in verification["artifacts"]] == ["report.md"]
+        downloaded = client.get(verification["artifacts"][0]["download_url"], headers=headers)
+        assert downloaded.status_code == 200 and "第一部分已核对" in downloaded.text
+        if reason == "budget":
+            return
+
+        _patch_model(monkeypatch, [
+            AIMessage(content="", tool_calls=[{"name": "write_file", "id": "write-missing-facts", "args": {
+                "file_path": "/workspace/facts.json", "content": '{"total": 2}'}}]),
+            AIMessage(content="两份文件已齐备，事实表已补齐。"),
+        ])
+        continued = client.post("/api/v2/runs", headers=headers, json={
+            "conversation_id": run["conversation_id"], "message": "继续",
+        })
+        assert continued.status_code == 200, continued.text
+        next_run = continued.json()
+        assert _wait_run(client, next_run["run_id"], owner)["status"] == "completed"
+        history = _iter_v2_sse(client.get(next_run["events_url"], headers=headers))
+        started_tools = [event["data"] for event in history if event["event"] == "tool.started"]
+        assert len(started_tools) == 1 and started_tools[0]["tool_call_id"] == "write-missing-facts"
+        report = history[-1]["data"]["summary"]["verification"]
+        assert report["status"] == "passed"
+        files = {item["path"]: item["download_url"] for item in report["artifacts"]}
+        assert set(files) == {"report.md", "facts.json"}
+        assert client.get(files["report.md"], headers=headers).content == downloaded.content
+        assert client.get(files["facts.json"], headers=headers).json() == {"total": 2}
+
+    def test_model_length_stop_continues_the_same_answer(self, client, user_setup, monkeypatch):
+        _patch_model(monkeypatch, [AIMessage(content="第一部分。", response_metadata={"finish_reason": "length"}),
+                                  AIMessage(content="第二部分。")])
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        started = client.post("/api/v2/runs", json={"message": "用两段话解释拼图游戏。"}, headers=headers).json()
+        assert _wait_run(client, started["run_id"], owner)["status"] == "completed"
+        events = _iter_v2_sse(client.get(started["events_url"], headers=headers))
+        assert events[-1]["data"]["final_text"] == "第一部分。\n第二部分。"
+        assert any(event["event"] == "run.retrying" and event["data"]["failed_checks"][0]["id"] == "answer_complete" for event in events)
+
+    def test_files_exist_but_table_numbers_must_match_source_before_completion(self, client, user_setup, monkeypatch, tmp_path):
+        from app.core.config import settings
+
+        monkeypatch.setattr(settings, "AGENT_FILES_ROOT", str(tmp_path))
+        path = "/workspace/facts.json"
+        bad, good = '{"valid_rows":1}', '{"valid_rows":2}'
+        _patch_model(monkeypatch, [
+            AIMessage(content="", tool_calls=[{"name": "write_file", "id": "write-bad-count", "args": {
+                "file_path": path, "content": bad}}]),
+            AIMessage(content="有效记录 1 条，已完成。"),
+            AIMessage(content="", tool_calls=[{"name": "edit_file", "id": "correct-count", "args": {
+                "file_path": path, "old_string": bad, "new_string": good}}]),
+            AIMessage(content="有效记录 2 条，通过复算。"),
+        ])
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        message = ("核对有效记录数，按编号去重，忽略 VOID。保存为 facts.json，字段 valid_rows 为有效记录数。\n"
+                   "字段为 编号,数值,状态：\nS1,2,OK\nS1,2,OK\nS2,7,VOID\nS3,3,OK")
+        run = client.post("/api/v2/runs", json={"message": message}, headers=headers).json()
+        assert _wait_run(client, run["run_id"], owner)["status"] == "completed"
+        events = _iter_v2_sse(client.get(run["events_url"], headers=headers))
+        retry = next(event for event in events if event["event"] == "run.retrying")
+        assert [check["id"] for check in retry["data"]["failed_checks"]] == ["table_facts"]
+        report = events[-1]["data"]["summary"]["verification"]
+        assert report["fix_rounds"] == 1
+        assert client.get(report["artifacts"][0]["download_url"], headers=headers).json() == {"valid_rows": 2}
+
+    def test_project_repair_keeps_the_original_bundle_and_uses_a_new_run(self, client, user_setup, monkeypatch, tmp_path):
+        from app.core.config import settings
+        from app.services.agent_runtime import team_runtime
+
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        fixture = Path(__file__).parent / "e2e" / "fixtures" / "team-project"
+        tasks = [
+            {"id": "api", "role": "后端工程", "title": "交付 API", "brief": "实现工单接口", "depends_on": [],
+             "files": ["openapi.json", "backend/app.py"]},
+            {"id": "ui", "role": "前端工程", "title": "交付界面", "brief": "实现工单界面", "depends_on": ["api"],
+             "files": ["frontend/index.html", "frontend/style.css", "frontend/app.js"]},
+            {"id": "qa", "role": "测试工程", "title": "测试交付", "brief": "交付用例与文档", "depends_on": ["ui"],
+             "files": ["tests/test_api.py", "README.md"]},
+        ]
+        plan = {"name": "巡检工单台", "summary": "跟踪巡检工单", "features": ["录入和筛选工单"],
+                "api_contract": "GET /api/tickets 返回工单列表", "tasks": tasks}
+        should_repair = False
+        calls = []
+
+        class ProjectModel(FakeChatModel):
+            def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+                system = messages[0].content
+                data = json.loads(messages[-1].content)
+                if "项目立项" in system:
+                    text = json.dumps(plan, ensure_ascii=False)
+                else:
+                    path = data["path"]
+                    calls.append(path)
+                    filename = path + ".fixture" if path == "tests/test_api.py" else path
+                    text = (fixture / filename).read_text(encoding="utf-8")
+                    if path == "frontend/app.js" and not should_repair:
+                        text = "// 未实现点击事件和工单 API 请求\n"
+                return ChatResult(generations=[ChatGeneration(message=AIMessage(content=text))])
+
+        monkeypatch.setattr(settings, "AGENT_FILES_ROOT", str(tmp_path))
+        _patch_model(monkeypatch, [])
+        monkeypatch.setattr(team_runtime, "build_chat_model", lambda *args, **kwargs: ProjectModel())
+        started = client.post("/api/v2/runs", json={"message": "帮我构建前后端分离的工单管理项目", "team_mode": True}, headers=headers)
+        assert started.status_code == 200, started.text
+        initial = started.json()
+        assert _wait_run(client, initial["run_id"], owner)["status"] == "failed"
+        older = _iter_v2_sse(client.get(initial["events_url"], headers=headers))
+        draft = next(event["data"] for event in older if event["event"] == "project.delivery")
+        original_bytes = client.get(draft["download_url"], headers=headers).content
+        assert draft["state"] == "failed" and original_bytes[:2] == b"PK"
+        assert {issue["path"] for issue in draft["issues"]} == {"frontend/app.js"}
+        url = f"/api/v2/runs/{initial['run_id']}/project-repair"
+        assert client.post(url, json={}, headers=_auth(user_setup["user2_id"])).status_code == 404
+
+        should_repair = True
+        calls.clear()
+        repair_headers = {**headers, "Idempotency-Key": initial["run_id"] + "-repair"}
+        repaired = client.post(url, json={}, headers=repair_headers)
+        assert repaired.status_code == 200, repaired.text
+        new = repaired.json()
+        assert new["conversation_id"] == initial["conversation_id"]
+        assert new["run_id"] != initial["run_id"]
+        duplicate = client.post(url, json={}, headers=repair_headers)
+        assert duplicate.json()["run_id"] == new["run_id"]
+        assert client.post(url, json={"model_config_id": 101}, headers=repair_headers).status_code == 409
+        assert _wait_run(client, new["run_id"], owner)["status"] == "completed"
+        events = _iter_v2_sse(client.get(new["events_url"], headers=headers))
+        assert calls == ["frontend/app.js"]
+        assert any("已载入草稿" in event["data"].get("detail", "") for event in events if event["event"] == "project.progress")
+        delivery = next(event["data"] for event in events if event["event"] == "project.delivery")
+        assert delivery["state"] == "passed" and delivery["download_url"] != draft["download_url"]
+        assert client.get(draft["download_url"], headers=headers).content == original_bytes

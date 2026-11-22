@@ -9,6 +9,7 @@
   （工具执行账本 + 运行事件日志）采集为纯客观数据（不改事实表、无 LLM、无主观判断）；
 - 工具能力客观校验：用例声明 required_tools 时，未调用要求工具即判不通过
   （scoring_config.enforce_required_tools=false 可关闭），供「Agent 能力」评测；
+- 所有轮次必须实际完成，才进入交付和回答评分；同一用例的各轮共享执行时限。
 - 支持取消（pending→skipped）与恢复（重跑未完成用例）。
 """
 import asyncio
@@ -23,6 +24,7 @@ from app.core.database import AsyncSessionLocal
 from app.models.agent import Agent, AgentRun, AgentRunEvent, AgentToolExecution
 from app.models.evaluation import EvalDataset, EvalDatasetItem, EvalRun, EvalRunItem
 from app.services.agent_runtime.events import TOOL_COMPLETED, TOOL_FAILED, TOOL_STARTED
+from app.services.agent_runtime.lifecycle import STATUS_COMPLETED, TERMINAL_STATUSES
 
 from .scoring import ScoringError, resolve_method, score_output
 
@@ -315,6 +317,17 @@ async def _drain_stream(stream) -> None:
             break
 
 
+async def _cancel_unfinished_run(runtime, run_id: str, user_id: int) -> str:
+    """结束测评拥有的未完成 Run，避免离开事件流后 Worker 继续消耗预算。"""
+    try:
+        result = await runtime.cancel_run(run_id, user_id)
+        if result.get("ok"):
+            return str(result["status"])
+    except Exception:
+        logger.exception("测评取消运行失败 run_id=%s", run_id)
+    return "unknown"
+
+
 async def _collect_event_tool_calls(
     db: AsyncSession, run_ids: List[str],
 ) -> List[Dict[str, Any]]:
@@ -588,6 +601,11 @@ async def _execute_item(
     await db.commit()
 
     run_id: Optional[str] = None
+    active_run_id: Optional[str] = None
+    principal = user_id or 0
+    runtime = get_runtime_service()
+    clock = asyncio.get_running_loop().time
+    deadline = clock() + timeout_s
     try:
         turn_inputs = [snap_input] + [
             str(t) for t in (snap_meta.get("turns") or []) if str(t).strip()]
@@ -595,19 +613,23 @@ async def _execute_item(
         session_id: Optional[int] = None
         turn_stats: List[Dict[str, Any]] = []
         actual_output = ""
-        run_status = ""
+        execution_error = ""
+        cleanup_status = ""
 
         for idx, text in enumerate(turn_inputs):
+            if clock() >= deadline:
+                raise asyncio.TimeoutError
             user_message = {"role": "user", "content": text}
-            run_id, session_id, stream = await get_runtime_service().start_run_with_session(
+            run_id, session_id, stream = await runtime.start_run_with_session(
                 agent_config=agent_config,
                 messages=history + [user_message],
-                user_id=user_id or 0,
+                user_id=principal,
                 session_id=session_id,
                 endpoint="eval",
                 user_message=user_message,
             )
-            await asyncio.wait_for(_drain_stream(stream), timeout=timeout_s)
+            active_run_id = run_id
+            await asyncio.wait_for(_drain_stream(stream), timeout=deadline - clock())
 
             # 运行时在独立连接写入 Run 事实行：结束本会话旧事务，
             # 否则 MySQL REPEATABLE READ 快照读不到新提交的行（多轮第 2 轮起报「AgentRun 未找到」）
@@ -618,6 +640,7 @@ async def _execute_item(
                     select(AgentRun).where(AgentRun.id == run_id))).scalar_one_or_none()
                 if agent_run is not None:
                     break
+                await db.rollback()
                 await asyncio.sleep(0.5)
             if agent_run is None:
                 raise RuntimeError(f"AgentRun 未找到: {run_id}")
@@ -631,15 +654,37 @@ async def _execute_item(
             })
             history.append(user_message)
             history.append({"role": "assistant", "content": actual_output})
+            if run_status != STATUS_COMPLETED:
+                execution_error = f"第 {idx + 1} 轮 AgentRun 状态为 {run_status or 'unknown'}"
+                if agent_run.error:
+                    execution_error += f"。{agent_run.error[:1600]}"
+                if run_status not in TERMINAL_STATUSES:
+                    await db.rollback()
+                    cleanup_status = await _cancel_unfinished_run(runtime, run_id, principal)
+                break
+            active_run_id = None
 
         stats = _merge_turn_facts(turn_stats)
         stats["output_chars"] = len(actual_output or "")
-        stats["turns_count"] = len(turn_inputs)
+        stats["turns_count"] = len(turn_stats)
         stats["turns"] = [
             {k: t.get(k) for k in (
                 "turn", "run_id", "input", "output", "status", "steps",
                 "tool_calls", "tokens", "duration_s", "used_tools")}
             for t in turn_stats]
+
+        if execution_error:
+            await db.execute(update(EvalRunItem).where(EvalRunItem.id == item_id).values(
+                status="failed", passed=False, run_id=run_id, actual_output=actual_output,
+                stats=stats, score_detail={"execution": {
+                    "passed": False, "turns_expected": len(turn_inputs),
+                    "turns_attempted": len(turn_stats),
+                    "run_status": run_status, "cancellation_status": cleanup_status or None,
+                }},
+                error=execution_error, finished_at=_now(),
+            ))
+            await db.commit()
+            return
 
         # 评分输入：多轮时给裁判完整对话上下文
         if len(turn_inputs) > 1:
@@ -670,10 +715,12 @@ async def _execute_item(
             output_text=actual_output or "",
         )
 
-        # 工具能力客观校验：要求工具未被调用 / 禁用工具却被调用即判不通过（可用配置关闭）
+        # 必需工具需成功执行，禁用工具的任何调用仍计入违规。
         required_tools = [str(t) for t in (snap_meta.get("required_tools") or []) if t]
         used_tools = list(stats.get("used_tools") or [])
-        missing_tools = [t for t in required_tools if t not in used_tools]
+        succeeded_tools = sorted({entry["tool_name"] for entry in stats.get("tool_chain", [])
+                                  if entry["status"] == "succeeded"})
+        missing_tools = [t for t in required_tools if t not in succeeded_tools]
         enforce = bool(snap_config.get("enforce_required_tools", True))
         forbid_tools = bool(snap_config.get("forbid_tools"))
         expected_min_steps = snap_meta.get("expected_min_steps")
@@ -682,6 +729,7 @@ async def _execute_item(
         capability = {
             "required_tools": required_tools,
             "used_tools": used_tools,
+            "succeeded_tools": succeeded_tools,
             "missing_tools": missing_tools,
             "zero_tool": not used_tools,
             "forbid_tools": forbid_tools,
@@ -694,7 +742,7 @@ async def _execute_item(
         detail = dict(result.get("detail") or {})
         checks: List[str] = []
         if required_tools and enforce and missing_tools:
-            checks.append(f"必需工具未被调用：{','.join(missing_tools)}")
+            checks.append(f"必需工具未成功执行：{','.join(missing_tools)}")
         if forbid_tools and used_tools:
             checks.append(f"任务要求不使用工具，但调用了：{','.join(used_tools)}")
         if checks:
@@ -708,12 +756,8 @@ async def _execute_item(
             }
         detail["capability"] = capability
 
-        if run_status not in ("completed",) and result.get("passed") is None:
-            status = "error"
-        else:
-            status = "passed" if result.get("passed") else (
-                "failed" if result.get("passed") is False else "error")
-        # Run 执行失败但评分给出通过判定时，仍以评分为准（模型可能给出正确答案）
+        status = "passed" if result.get("passed") else (
+            "failed" if result.get("passed") is False else "error")
         await db.execute(
             update(EvalRunItem).where(EvalRunItem.id == item_id).values(
                 status=status,
@@ -723,17 +767,20 @@ async def _execute_item(
                 passed=result.get("passed"),
                 score_detail=detail,
                 stats=stats,
-                error=None if run_status == "completed"
-                else f"AgentRun 状态: {run_status}",
+                error=None,
                 finished_at=_now(),
             ))
         await db.commit()
     except asyncio.TimeoutError:
         await db.rollback()
+        cancellation_status = (
+            await _cancel_unfinished_run(runtime, active_run_id, principal) if active_run_id else None
+        )
         await db.execute(
             update(EvalRunItem).where(EvalRunItem.id == item_id).values(
                 status="error", run_id=run_id,
-                error=f"执行超时（>{int(timeout_s)}s）", finished_at=_now()))
+                score_detail={"execution": {"passed": False, "cancellation_status": cancellation_status}},
+                error=f"用例执行超时（>{timeout_s:g}s）", finished_at=_now()))
         await db.commit()
     except (ScoringError, Exception) as e:  # noqa: BLE001
         logger.exception("测评用例执行失败 eval_run=%s item=%s", eval_run_id, item_id)

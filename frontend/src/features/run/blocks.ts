@@ -5,6 +5,10 @@
  */
 import type { RunEventEnvelope } from '@/api/v2'
 import type { DocumentArtifact, DocumentEditReview, DocumentReviewDecision, InputRequest, ProfileDefinition } from '@/api/documents'
+import { finishTeamProgress, readTeamProgress, teamPhaseLabels, type TeamProgress } from './teamProgress.ts'
+import {
+  PROJECT_DOWNLOAD_PATH, projectPhaseLabels, readProjectDelivery, readProjectProgress, type ProjectDelivery, type ProjectProgress,
+} from './projectDelivery.ts'
 
 export interface TextBlock {
   kind: 'text'
@@ -14,6 +18,26 @@ export interface TextBlock {
 export interface PlanBlock {
   kind: 'plan'
   todos: any[]
+}
+
+export interface TeamBlock {
+  kind: 'team'
+  progress: TeamProgress
+}
+
+export interface ProjectBlock {
+  kind: 'project'
+  progress?: ProjectProgress
+  delivery?: ProjectDelivery
+}
+
+export interface VerificationBlock {
+  kind: 'verification'
+  state: 'reworking' | 'passed' | 'incomplete'
+  rounds: number
+  checks: { id: string; passed: boolean; detail: string }[]
+  artifacts: { name: string; size: number; url: string }[]
+  stopReason: string
 }
 
 export interface ToolBlock {
@@ -65,7 +89,7 @@ export interface DocumentStageBlock {
 }
 
 export type MsgBlock = TextBlock | ToolBlock | PlanBlock | DocumentArtifactBlock | ProfileDraftBlock
-  | InputRequestBlock | DocumentStageBlock | DocumentEditReviewBlock
+  | InputRequestBlock | DocumentStageBlock | DocumentEditReviewBlock | TeamBlock | ProjectBlock | VerificationBlock
 
 /** 携带块流的运行消息（工具步骤实时穿插展示的最小状态） */
 export interface RunStreamMessage {
@@ -148,6 +172,31 @@ function gapFillText(msg: RunStreamMessage, finalText: string) {
   } else if (ft.length > joined.length && ft.startsWith(joined)) {
     msg.blocks.push({ kind: 'text', text: ft.slice(joined.length) })
   }
+}
+
+function setVerifiedAnswer(msg: RunStreamMessage, value: string) {
+  msg.finalText = value
+  if (joinedText(msg) === value) return
+  // 纠正稿是整份交付。原先流式展示的过程文字不进入正文，工具、计划和验收记录继续保留。
+  msg.blocks = msg.blocks.filter(block => block.kind !== 'text')
+  if (hasVisibleText(value)) msg.blocks.push({ kind: 'text', text: value })
+}
+
+function setVerification(msg: RunStreamMessage, data: Record<string, any>, state: VerificationBlock['state']) {
+  const rawChecks = Array.isArray(data.checks) ? data.checks : []
+  const checks = rawChecks.slice(0, 24).filter(check => typeof check?.id === 'string' && typeof check.passed === 'boolean')
+    .map(check => ({ id: check.id, passed: check.passed, detail: String(check.detail || '') }))
+  const artifacts = Array.isArray(data.artifacts) ? data.artifacts.slice(0, 50)
+    .filter(file => typeof file?.name === 'string' && /^[^/\\\u0000-\u001f]{1,220}$/.test(file.name)
+      && Number.isSafeInteger(file.size) && file.size > 0 && typeof file.download_url === 'string'
+      && PROJECT_DOWNLOAD_PATH.test(file.download_url))
+    .map(file => ({ name: file.name, size: file.size, url: file.download_url })) : []
+  const next: VerificationBlock = { kind: 'verification', state, checks, artifacts,
+    rounds: Number.isSafeInteger(data.fix_rounds) && data.fix_rounds >= 0 ? data.fix_rounds : 0,
+    stopReason: typeof data.stop_reason === 'string' ? data.stop_reason : '' }
+  const previous = msg.blocks.find(block => block.kind === 'verification')
+  if (previous) Object.assign(previous, next)
+  else msg.blocks.push(next)
 }
 
 const DOCUMENT_TASK_LABELS: Record<string, string> = {
@@ -246,6 +295,40 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
       if (last && last.kind === 'plan') last.todos = todos
       else blocks.push({ kind: 'plan', todos })
       msg.liveStatus = '已更新任务计划…'
+      msg.lastActivity = 'other'
+      break
+    }
+
+    case 'team.updated': {
+      const progress = readTeamProgress(data)
+      if (!progress) break
+      const team = blocks.find((block): block is TeamBlock => block.kind === 'team')
+      if (team) team.progress = progress
+      else blocks.push({ kind: 'team', progress })
+      msg.liveStatus = teamPhaseLabels[progress.phase]
+      msg.lastActivity = 'other'
+      break
+    }
+
+    case 'project.progress': {
+      const progress = readProjectProgress(data)
+      if (!progress) break
+      const project = blocks.find((block): block is ProjectBlock => block.kind === 'project')
+      if (project?.delivery) break
+      if (project) project.progress = progress
+      else blocks.push({ kind: 'project', progress })
+      msg.liveStatus = projectPhaseLabels[progress.phase]
+      msg.lastActivity = 'other'
+      break
+    }
+
+    case 'project.delivery': {
+      const delivery = readProjectDelivery(data)
+      if (!delivery) break
+      const project = blocks.find((block): block is ProjectBlock => block.kind === 'project')
+      if (project) project.delivery = delivery
+      else blocks.push({ kind: 'project', delivery })
+      msg.liveStatus = delivery.state === 'passed' ? '项目已打包' : '已保存项目草稿'
       msg.lastActivity = 'other'
       break
     }
@@ -447,6 +530,12 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
       break
 
     case 'run.retrying': {
+      if (data.reason === 'verification_fix') {
+        setVerification(msg, { checks: data.failed_checks, fix_rounds: data.round }, 'reworking')
+        msg.liveStatus = '正在补齐待交付项…'
+        msg.lastActivity = 'other'
+        break
+      }
       if (data.manual) {
         msg.error = undefined
         msg.documentRetryable = false
@@ -473,16 +562,29 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
       break
     }
 
+    case 'verification.completed':
+      setVerification(msg, data, data.status === 'passed' ? 'passed' : 'incomplete')
+      break
+
     case 'run.completed':
       msg.finalText = String(data.final_text || '')
-      gapFillText(msg, msg.finalText)
+      if (data.summary?.verification?.version === 2) {
+        if (data.summary.verification.fix_rounds || data.summary.verification.artifacts?.length) {
+          setVerification(msg, data.summary.verification, 'passed')
+        }
+        setVerifiedAnswer(msg, msg.finalText)
+      } else gapFillText(msg, msg.finalText)
       msg.runStatus = 'completed'
       break
 
     case 'run.failed':
       if (data.historical) break
       msg.error = String(data.error || '运行失败')
-      msg.runStatus = 'failed'
+      msg.runStatus = data.status === 'limit_exceeded' ? 'limit_exceeded' : 'failed'
+      if (data.summary?.verification) {
+        setVerification(msg, data.summary.verification, 'incomplete')
+        if (typeof data.final_text === 'string') setVerifiedAnswer(msg, data.final_text)
+      }
       msg.documentRetryable = data.document_retryable === true
       if (blocks.some((block) => block.kind === 'document_stage') && !blocks.some(
         (block) => block.kind === 'document_stage' && block.label === '文档编写暂停',
@@ -515,7 +617,7 @@ export function finalizeRunMessage(
     msg.runDurationMs = msg.lastEventTs - msg.runStartedAt
   }
   const map: Record<string, string> = {
-    'run.completed': 'completed', 'run.failed': 'failed',
+    'run.completed': 'completed', 'run.failed': msg.runStatus === 'limit_exceeded' ? 'limit_exceeded' : 'failed',
     'run.cancelled': 'cancelled', 'run.suspended': 'suspended',
     'run.status_changed': msg.runStatus || 'completed',
   }
@@ -523,9 +625,9 @@ export function finalizeRunMessage(
     ? (msg.runStatus || 'failed')
     : (map[reason] || reason)
   if (fallbackText) gapFillText(msg, fallbackText)
-  const hasDocumentResult = msg.blocks.some((b) => b.kind === 'document_artifact'
+  const hasDelivery = msg.blocks.some((b) => b.kind === 'document_artifact' || (b.kind === 'project' && b.delivery)
     || (b.kind === 'document_profile_draft' && b.saved) || (b.kind === 'document_edit_review' && b.decision))
-  if (!hasDocumentResult && !joinedText(msg).trim()) {
+  if (!hasDelivery && !joinedText(msg).trim()) {
     // 占位文本只在真正收尾时出现；待审批/挂起还有后续执行，不能宣告"已完成"
     if (msg.runStatus === 'cancelled') msg.blocks.push({ kind: 'text', text: '（已停止生成）' })
     else if (msg.runStatus === 'completed') msg.blocks.push({ kind: 'text', text: '（任务已完成，本次未生成文本回答）' })
@@ -535,6 +637,7 @@ export function finalizeRunMessage(
     msg.pendingActions = []
     for (const b of msg.blocks) {
       if (b.kind === 'input_request' && b.state === 'pending') b.state = 'closed'
+      if (b.kind === 'team') b.progress = finishTeamProgress(b.progress, msg.runStatus)
       if (b.kind === 'tool' && b.state === 'running') {
         b.state = 'failed'
         if (!b.error) b.error = '（未收到执行结果，可能被中断）'

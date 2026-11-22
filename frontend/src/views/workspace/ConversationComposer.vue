@@ -60,6 +60,15 @@
             <Paperclip :size="18" />
           </button>
           <slot name="document-task" />
+          <button
+            type="button" class="selector team-switch" role="switch" aria-label="智能体团队"
+            :aria-checked="teamMode" :disabled="locked || sending || stoppable || Boolean(blockedReason) || uploading > 0"
+            :title="teamMode ? '关闭当前会话的团队协作' : '开启当前会话的团队协作，会增加模型调用'"
+            @click="teamMode = !teamMode"
+          >
+            <UsersRound :size="16" aria-hidden="true" /><span>团队</span>
+            <span class="team-indicator" aria-hidden="true"></span>
+          </button>
           <DropdownMenuRoot>
             <DropdownMenuTrigger as-child>
               <button type="button" class="selector" aria-label="审批模式">
@@ -122,6 +131,7 @@
     </form>
     <div class="composer-meta">
       <span v-if="blockedReason" class="blocked">{{ blockedReason }}</span>
+      <span v-else-if="teamMode" class="team-enabled">团队模式已开启 · 多角色协作会增加模型调用</span>
       <span v-else><kbd>Enter</kbd> 发送 <span class="shortcut-gap">·</span> <kbd>Shift</kbd> + <kbd>Enter</kbd> 换行</span>
     </div>
   </div>
@@ -129,7 +139,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { ArrowUp, Check, ChevronDown, CircleAlert, CircleCheck, Cpu, FileText, LoaderCircle, Mic, Paperclip, ShieldCheck, Square, X } from '@lucide/vue'
+import { ArrowUp, Check, ChevronDown, CircleAlert, CircleCheck, Cpu, FileText, LoaderCircle, Mic, Paperclip, ShieldCheck, Square, UsersRound, X } from '@lucide/vue'
 import {
   DropdownMenuContent, DropdownMenuItemIndicator, DropdownMenuPortal, DropdownMenuRadioGroup,
   DropdownMenuRadioItem, DropdownMenuRoot, DropdownMenuTrigger,
@@ -157,6 +167,7 @@ const emit = defineEmits<{
 }>()
 
 const text = defineModel<string>('text', { required: true })
+const teamMode = defineModel<boolean>('teamMode', { required: true })
 const approvalMode = defineModel<'manual' | 'auto'>('approvalMode', { required: true })
 const selectedModel = defineModel<number>('model', { required: true })
 const modelId = computed({
@@ -270,8 +281,8 @@ defineExpose({ focus: () => textarea.value?.focus(), cancelDictation })
 .composer textarea:focus-visible { outline: none; }
 .composer textarea::placeholder { color: var(--ui-muted); }
 .composer-bar, .composer-options { min-width: 0; display: flex; align-items: center; gap: 4px; }
-.composer-bar { justify-content: space-between; gap: 8px; }
-.model-options { justify-content: end; }
+.composer-bar { justify-content: space-between; flex-wrap: wrap; gap: 4px 8px; }
+.model-options { justify-content: end; margin-inline-start: auto; }
 .button-icon, .selector, .button-send {
   display: inline-flex; align-items: center; justify-content: center; height: 34px;
   border: 0; color: var(--ui-secondary); background: transparent; border-radius: var(--ui-radius-sm); cursor: pointer;
@@ -282,6 +293,16 @@ defineExpose({ focus: () => textarea.value?.focus(), cancelDictation })
 .selector { min-width: 0; padding: 0 7px; gap: 5px; font-size: 12px; }
 .selector svg { flex: none; }
 .selector span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.team-switch { flex: none; border: 1px solid transparent; }
+.team-switch[aria-checked="true"] { color: var(--ui-accent); background: var(--ui-accent-soft); }
+.team-switch:focus-visible { outline: var(--ui-focus); outline-offset: 2px; }
+.team-switch:disabled { opacity: .55; cursor: not-allowed; }
+.team-indicator { width: 16px; height: 9px; border-radius: 8px; border: 1px solid currentColor; position: relative; }
+.team-indicator::before {
+  content: ''; position: absolute; inset: 1px auto 1px 1px; width: 5px;
+  background: currentColor; border-radius: 50%; transition: transform var(--ui-duration) var(--ui-ease);
+}
+.team-switch[aria-checked="true"] .team-indicator::before { transform: translateX(7px); }
 .model-selector { max-width: 208px; }
 .button-send { background: var(--ui-accent); color: var(--ui-on-accent); }
 .button-send:hover { background: var(--ui-accent-hover); }
@@ -291,6 +312,7 @@ defineExpose({ focus: () => textarea.value?.focus(), cancelDictation })
 .composer-meta { color: var(--ui-muted); min-height: 18px; text-align: center; font-size: 12px; }
 .composer-meta kbd { font: inherit; }
 .composer-meta .blocked { color: var(--ui-secondary); }
+.composer-meta .team-enabled { color: var(--ui-accent); }
 .shortcut-gap { margin: 0 3px; }
 .composer-feedback { display: flex; align-items: center; gap: 6px; padding-inline: 8px; color: var(--ui-info); font-size: 12px; }
 .composer-feedback svg { flex: none; }
@@ -320,9 +342,10 @@ defineExpose({ focus: () => textarea.value?.focus(), cancelDictation })
 @keyframes rotate { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
 @media (max-width: 560px) {
+  .model-selector { max-width: 130px; }
   .selector .lucide-cpu, .selector .lucide-shield-check { display: none; }
   .composer-meta { font-size: 11px; }
-  .composer-meta > span:not(.blocked) { visibility: hidden; }
+  .composer-meta > span:not(.blocked, .team-enabled) { visibility: hidden; }
 }
 </style>
 
