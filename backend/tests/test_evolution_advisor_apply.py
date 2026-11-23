@@ -209,7 +209,7 @@ class TestApplyRollback:
 
 class TestCheckValidations:
     async def _setup_change(self, agent_id: int, baseline: dict) -> tuple:
-        from app.assistant.versions import publish_version
+        from app.services.assistant.versions import publish_version
 
         async with AsyncSessionLocal() as s:
             ver = await publish_version(s, agent_id)

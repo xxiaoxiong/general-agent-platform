@@ -64,7 +64,7 @@ class TestBuilder:
 
     def test_builder_capability_inference(self):
         """单元：关键词 → 能力包映射（不依赖 HTTP）。"""
-        from app.assistant.builder import infer_capability_ids
+        from app.services.assistant.builder import infer_capability_ids
 
         ids = infer_capability_ids("写 Python 脚本并重构代码")
         assert "coding" in ids
@@ -118,6 +118,16 @@ class TestAssistantsCRUD:
         pub = client.post(f"/api/v2/assistants/{created['id']}/publish", headers=headers)
         assert pub.status_code == 200
         assert pub.json()["version_no"] == 2
+
+    def test_delete_assistant(self, client, user_setup):
+        headers = _auth(user_setup["user_id"])
+        created = client.post(
+            "/api/v2/assistants", headers=headers,
+            json={"name": "待删助手", "capability_ids": ["general"]},
+        ).json()
+        resp = client.delete(f"/api/v2/assistants/{created['id']}", headers=headers)
+        assert resp.status_code == 200
+        assert client.get(f"/api/v2/assistants/{created['id']}", headers=headers).status_code == 404
 
     def test_owner_isolation(self, client, user_setup):
         """A22：他人助手 404。"""

@@ -13,7 +13,7 @@ class ModelService:
     def _get_client(provider: ModelProvider) -> AsyncOpenAI:
         # P2-03: ModelClientFactory 统一客户端生命周期（连接复用，
         # 修复每次调用新建 httpx.AsyncClient 的连接泄漏）
-        from app.assistant.model_clients import ModelClientFactory
+        from app.services.assistant.model_clients import ModelClientFactory
 
         verify = bool(settings.AGENT_CA_BUNDLE or settings.AGENT_TLS_VERIFY)
         return ModelClientFactory.get_openai_client(

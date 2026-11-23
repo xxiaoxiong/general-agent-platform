@@ -7,7 +7,7 @@ from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.deps import get_current_superuser
-from app.api.v1.users import router
+from app.api.identity.users import router
 from app.core.database import get_db
 from app.models.audit import AuditLog
 from app.models.base import BaseModel

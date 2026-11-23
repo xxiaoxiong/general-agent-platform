@@ -13,8 +13,8 @@ from langgraph.graph import END, START, StateGraph
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.api.deps import get_current_user
-from app.api.v2.runs import router as runs
-from app.api.v2.documents import documents, profiles
+from app.api.run import router as runs
+from app.api.document.documents import documents, profiles
 from app.core.config import settings
 from app.core.database import Base, get_db
 from app.models.agent import Agent, AgentRun

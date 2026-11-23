@@ -14,7 +14,7 @@ from pydantic import ValidationError
 import pytest
 
 from app.api.deps import get_current_user
-from app.api.v1 import asr
+from app.api.model import asr
 from app.core.config import Settings
 from app.services import asr_service
 

@@ -7,7 +7,7 @@ from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.deps import get_current_user
-from app.api.v1.prompts import router
+from app.api.model.prompts import router
 from app.core.database import get_db
 from app.models.base import BaseModel
 from app.models.prompt import PromptTemplate, PromptTemplateVersion

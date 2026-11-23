@@ -7,8 +7,8 @@ import asyncio
 
 import pytest
 
-from app.assistant.model_clients import ModelClientFactory
-from app.assistant.model_router import (
+from app.services.assistant.model_clients import ModelClientFactory
+from app.services.assistant.model_router import (
     ModelCandidate,
     candidate_from_row,
     check_model_requirements,

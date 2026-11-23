@@ -8,7 +8,7 @@ from zipfile import ZipFile
 
 import pytest
 
-from app.api.v2.artifacts import parse_artifact_id
+from app.api.workspace.artifacts import parse_artifact_id
 from app.core.config import settings
 from app.services.agent_runtime.team_project_files import (
     ProjectWorkspace,

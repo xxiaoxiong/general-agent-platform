@@ -350,7 +350,7 @@ def _write_agent_field(agent: Agent, target: str, value: Any,
 async def apply_suggestion(db: AsyncSession, report_id: int, index: int,
                            applied_by: Optional[str] = None) -> Dict[str, Any]:
     """一键应用建议：改 Agent 行 + 发布新版本 + 变更审计。"""
-    from app.assistant.versions import publish_version
+    from app.services.assistant.versions import publish_version
 
     report = (await db.execute(
         select(EvolutionReport).where(EvolutionReport.id == report_id)
@@ -425,7 +425,7 @@ async def apply_suggestion(db: AsyncSession, report_id: int, index: int,
 async def rollback_change(db: AsyncSession, change_id: int,
                           applied_by: Optional[str] = None) -> Dict[str, Any]:
     """回滚：还原 before 值 + 再发布版本（历史只增不减）。"""
-    from app.assistant.versions import publish_version
+    from app.services.assistant.versions import publish_version
 
     change = (await db.execute(
         select(EvolutionChangeLog).where(EvolutionChangeLog.id == change_id)

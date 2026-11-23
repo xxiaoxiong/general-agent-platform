@@ -169,7 +169,7 @@ import {
 } from '@lucide/vue'
 import DOMPurify from 'dompurify'
 import hljs from 'highlight.js/lib/common'
-import type { PreviewContent } from '@/api/v2'
+import type { PreviewContent } from '@/api/conversations'
 import MessageMarkdown from '@/features/run/MessageMarkdown.vue'
 
 const props = defineProps<{

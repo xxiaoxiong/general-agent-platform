@@ -14,7 +14,7 @@ from pypdf import PdfWriter
 import pytest
 
 from app.api.deps import get_current_user
-from app.api.v2 import files as file_api
+from app.api.chat import files as file_api
 from app.core.database import get_db
 from app.services.knowledge_service import KnowledgeService
 

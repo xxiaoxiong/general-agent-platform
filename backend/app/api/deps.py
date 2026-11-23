@@ -5,8 +5,8 @@ from sqlalchemy import select
 from app.core.database import get_db
 from app.core.security import decode_token
 from app.models.user import User
-from app.services.audit_context import bind_audit_actor
-from app.services.audit_http import bind_audit_route
+from app.services.audit.context import bind_audit_actor
+from app.services.audit.http import bind_audit_route
 
 security = HTTPBearer()
 

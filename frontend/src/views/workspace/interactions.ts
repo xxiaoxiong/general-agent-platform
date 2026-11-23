@@ -1,4 +1,4 @@
-import type { Conversation } from '@/api/v2'
+import type { Conversation } from '@/api/conversations'
 
 const LAST_MESSAGE_THRESHOLD = 40
 

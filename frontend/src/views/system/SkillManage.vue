@@ -139,7 +139,8 @@ import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { confirmDestructive } from '@/lib/confirmation'
 import { Plus } from '@lucide/vue'
-import { agentOptionApi, skillApi, type AgentOption, type SkillItem } from '@/api/extensions'
+import { agentOptionApi, type AgentOption } from '@/api/assistants'
+import { skillApi, type SkillItem } from '@/api/skills'
 
 const loading = ref(true)
 const loadError = ref(false)

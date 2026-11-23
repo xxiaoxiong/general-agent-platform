@@ -6,7 +6,7 @@
 import pytest
 import pytest_asyncio
 
-from app.assistant.task_contract import (
+from app.services.assistant.task_contract import (
     TASK_BUSINESS,
     TASK_CODE,
     TASK_DB,
@@ -17,7 +17,7 @@ from app.assistant.task_contract import (
     build_task_contract,
     infer_task_type,
 )
-from app.assistant.verification import (
+from app.services.assistant.verification import (
     STATUS_FAILED,
     STATUS_PARTIAL,
     STATUS_PASSED,
@@ -204,7 +204,7 @@ class TestVerification:
         """answer 通过但证据缺口：partial（可交付但标记复核）。"""
         c = build_task_contract("研究行业趋势并生成方案文档")  # research 或 doc
         # 只满足一半：构造 research 契约 + 有回答无来源
-        from app.assistant.task_contract import TaskContract
+        from app.services.assistant.task_contract import TaskContract
 
         contract = TaskContract(
             goal="x", task_type=TASK_RESEARCH,

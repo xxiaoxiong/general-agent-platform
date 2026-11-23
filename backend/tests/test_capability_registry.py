@@ -5,7 +5,7 @@
 """
 import pytest
 
-from app.assistant.capability import (
+from app.services.assistant.capability import (
     CAPABILITY_PACKS,
     CapabilityError,
     build_skill_sources,

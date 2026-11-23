@@ -20,8 +20,8 @@ from app.models.user import Role, User, UserRole
 from app.models.workflow import Workflow
 from app.services.agent_runtime.repositories.session_repository import SessionRepository
 from app.services.agent_runtime.worker import RunWorker
-from app.services.audit_capture import install_audit_capture, run_audit_origin, worker_audit_context
-from app.services.audit_context import AuditContext, current_audit
+from app.services.audit.capture import install_audit_capture, run_audit_origin, worker_audit_context
+from app.services.audit.context import AuditContext, current_audit
 
 
 @pytest_asyncio.fixture

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { DocumentArtifact } from '@/api/documents'
-import type { PreviewContent } from '@/api/v2'
+import type { PreviewContent } from '@/api/conversations'
 import FilePreviewPanel from '@/features/preview/FilePreviewPanel.vue'
 import DocumentPdfPreview from './DocumentPdfPreview.vue'
 

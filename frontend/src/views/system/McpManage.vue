@@ -177,13 +177,8 @@ import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { confirmDestructive } from '@/lib/confirmation'
 import { Plus } from '@lucide/vue'
-import {
-  agentOptionApi,
-  mcpApi,
-  type AgentOption,
-  type McpServerItem,
-  type McpToolSetting,
-} from '@/api/extensions'
+import { agentOptionApi, type AgentOption } from '@/api/assistants'
+import { mcpApi, type McpServerItem, type McpToolSetting } from '@/api/mcp'
 
 const loading = ref(true)
 const loadError = ref(false)

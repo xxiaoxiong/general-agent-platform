@@ -59,7 +59,7 @@ def _mk_session_with_file(user_id: int, agent_id: int, rel_path: str, content: s
     with open(target, "w", encoding="utf-8") as f:
         f.write(content)
 
-    from app.api.v2.artifacts import make_artifact_id
+    from app.api.workspace.artifacts import make_artifact_id
 
     return session_id, make_artifact_id(session_id, rel_path)
 
@@ -94,7 +94,7 @@ class TestArtifacts:
 
     def test_artifact_traversal_rejected(self, client, user_setup):
         """路径穿越令牌直接拒绝（400），不触达文件系统。"""
-        from app.api.v2.artifacts import make_artifact_id
+        from app.api.workspace.artifacts import make_artifact_id
 
         agent_id = _mk_agent(user_setup["user1_id"])
         session_id, _ = _mk_session_with_file(user_setup["user1_id"], agent_id, "ok.txt")
@@ -107,7 +107,7 @@ class TestArtifacts:
         assert r.status_code == 400
 
     def test_artifact_missing_file_404(self, client, user_setup):
-        from app.api.v2.artifacts import make_artifact_id
+        from app.api.workspace.artifacts import make_artifact_id
 
         agent_id = _mk_agent(user_setup["user1_id"])
         session_id, _ = _mk_session_with_file(user_setup["user1_id"], agent_id, "x.txt")

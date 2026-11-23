@@ -7,20 +7,20 @@ from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.api.v1 import audit, auth
-from app.api.v2 import conversations, files
+from app.api.identity import audit, auth
+from app.api.chat import conversations, files
 from app.core import database
 from app.core.config import settings
 from app.core.security import create_access_token, get_password_hash
 from app.models.agent import Agent, AgentSession
 from app.models.audit import AuditLog
 from app.models.user import User
-from app.services.audit_http import AuditHTTPMiddleware
+from app.services.audit.http import AuditHTTPMiddleware
 
 
 @pytest_asyncio.fixture
 async def audited_platform(tmp_path, monkeypatch):
-    from app.services.audit_capture import install_audit_capture
+    from app.services.audit.capture import install_audit_capture
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'audit.db'}")
     sessions = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)

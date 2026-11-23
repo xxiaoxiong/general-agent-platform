@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from 'vue'
 import { CircleAlert, CircleCheck, Download, ListChecks, LoaderCircle } from '@lucide/vue'
-import { downloadRunArtifact } from '@/api/v2'
+import { downloadRunArtifact } from '@/api/artifacts'
 import UiButton from '@/components/ui/UiButton.vue'
 import type { VerificationBlock } from './blocks'
 

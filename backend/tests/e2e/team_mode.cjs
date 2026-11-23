@@ -617,7 +617,7 @@ async function main() {
     for (const id of documents) await api(`/api/v2/documents/${id}`, { method: 'DELETE' }).catch(() => {});
     for (const id of conversationIds) await api(`/api/v2/conversations/${id}`, { method: 'DELETE' }).catch(() => {});
     // 已完成的 Run 仍可追踪。停用 QA 助手与模型，防止其它验收任务选中模拟供应商。
-    await api(`/api/v1/agents/${assistant.id}`, { method: 'DELETE' }).catch(() => {});
+    await api(`/api/v2/assistants/${assistant.id}`, { method: 'DELETE' }).catch(() => {});
     await api(`/api/v1/models/configs/${config.id}`, { method: 'PUT', json: { is_active: false } }).catch(() => {});
     await api(`/api/v1/models/providers/${provider.id}`, { method: 'PUT', json: { is_active: false } }).catch(() => {});
   }

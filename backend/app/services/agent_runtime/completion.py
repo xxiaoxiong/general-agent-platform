@@ -19,8 +19,8 @@ from langchain_core.tools import StructuredTool
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.assistant.task_contract import TaskContract, build_task_contract
-from app.assistant.verification import CheckResult, ToolEvidence, verify_task
+from app.services.assistant.task_contract import TaskContract, build_task_contract
+from app.services.assistant.verification import CheckResult, ToolEvidence, verify_task
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models.agent import AgentRun, AgentRunEvent, AgentToolExecution

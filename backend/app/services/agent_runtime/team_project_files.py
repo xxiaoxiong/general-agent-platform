@@ -1287,7 +1287,7 @@ class ProjectWorkspace:
         return _digest(files) == source_digest
 
     def publish(self, title: str, verification: dict) -> dict:
-        from app.api.v2.artifacts import make_artifact_id
+        from app.api.workspace.artifacts import make_artifact_id
 
         with self._lock:
             files = self.inspect()

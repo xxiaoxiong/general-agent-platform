@@ -13,22 +13,40 @@
 
 ```
 backend/
-  app/api/            # 路由：v1（传统模块）+ v2（agent runtime / workspace / evolution 等）
+  app/api/            # 路由按产品模块分包（URL 前缀保持 /api/v1、/api/v2 不变）
+    identity/         # auth / users / audit
+    model/            # models / prompts / asr
+    knowledge/        # knowledge / databases
+    workflow/         # workflows / app_market
+    assistant/        # assistants / capabilities
+    chat/             # conversations / files
+    run/              # Run 域（core 生命周期 / admin 核对与返工 / review 文档审阅）
+    document/         # documents / document-profiles
+    workspace/        # workspace / artifacts
+    ops/              # admin / evaluation / evolution / skills / mcp
+    common/           # schemas / serializers（无路由）
   app/core/           # config.py（全量配置，启动期校验）、database.py、security、redis
   app/models/         # SQLAlchemy 模型（agent.py / evolution.py 等）
-  app/schemas/        # Pydantic 模式
+  app/schemas/        # Pydantic 模式（v1 模块）
   app/services/       # 业务逻辑
-    agent/            # Agent 执行引擎包（engine / tool_executor / context_manager / ...）
+    agent_runtime/    # Agent 执行内核（service/ 包 = core + lifecycle/stream/approval/
+                      #   delivery/config 五个 Mixin + _common，导入路径兼容层见 service/__init__）
+    assistant/        # 助手域（capability / versions / task_contract / verification / model_router）
+    audit/            # 审计（core / capture / context / http）
+    documents/        # 文档智能
     evolution/        # 自进化闭环（metrics / judge / evolution_advisor / dev_briefing）
+    evaluation/       # Agent 测评
     inference/        # 模型连接池、请求队列
+    mcp/              # MCP 客户端
     tools/            # 工具注册表与执行器
   app/observability/  # langfuse_tracing.py、otel_tracing.py
   alembic/            # 数据库迁移
   tests/              # pytest 测试套件
 frontend/
-  src/api/            # API 封装（含 v2）
-  src/views/          # 页面组件
-  src/features/       # 业务功能组件（如 run/ApprovalPanel）
+  src/api/            # API 封装按模块一文件（auth/models/.../conversations/runs/artifacts 等，
+                      #   index.ts 仅作薄 barrel re-export）
+  src/views/          # 页面组件（workspace/、system/ 等按业务分子文件夹）
+  src/features/       # 业务功能组件（run/ documents/ preview/）
 docker/               # docker-compose.yml + Dockerfile + entrypoint + grafana
 docs/                 # 需求设计、任务书、阶段交付说明（历史文档，勿改写）
 ```
@@ -37,7 +55,7 @@ docs/                 # 需求设计、任务书、阶段交付说明（历史�
 
 ```bash
 # 后端测试（必须在 backend/ 目录下执行，否则 ModuleNotFoundError: app）
-cd backend && python -m pytest -q                 # 全量回归（当前 ~480 passed）
+cd backend && python -m pytest -q                 # 全量回归（~550 passed）
 cd backend && python -m pytest tests/test_xxx.py -q   # 单文件
 
 # 前端（vue-tsc 类型检查 + 构建）
@@ -56,6 +74,7 @@ cd backend && python -m alembic upgrade head
 ## 架构约定
 
 - **异步优先**：API 与 service 层使用 `AsyncSession`（`app/core/database.py`）；阻塞调用（Langfuse flush 等）用 `asyncio.to_thread` 包裹。
+- **API 模块化**：路由按产品模块分包（`app/api/<模块>`）；URL 前缀 `/api/v1`（传统平台模块）与 `/api/v2`（智能体工作台+运维）为历史契约保持不变。Run 生命周期唯一归属 `/api/v2/runs`（旧 `/api/v1/agents/*` 端点已删除，勿恢复）。
 - **配置集中**：所有配置项在 `app/core/config.py` 的 `Settings`，启动期 `validate_startup()` 直接拒绝非法配置（如生产环境 `AGENT_CHECKPOINT_DSN=memory`）。新增配置只加在这里 + `.env.example`。
 - **建表走 `init_db()`**（`Base.metadata.create_all`）：只自动补**新表**，不加新字段；改已有表结构必须写 Alembic 迁移。
 - **权限**：v2 evolution 等管理端点要求超管（`require_superuser`）；业务端点按 RBAC。
@@ -82,6 +101,7 @@ cd backend && python -m alembic upgrade head
 8. **开发简报只放客观数据**：`dev_briefing.py` 及「开发简报」Tab 是用户明确要求的纯客观数据收集/整理/呈现（零 LLM 调用）。**不要**往里加聚类、优化建议等 AI 主观判断；方向判断由用户/开发 AI 基于数据自行做出。
 9. **Langfuse 密钥经环境变量注入**：`LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_PROJECT_ID` 在 `docker/.env`（gitignored），代码里不要硬编码。
 10. **端口约定**：前端 80（容器）/ 5173（dev）、后端 8000（容器）/ 8002（dev）、MySQL 3308、Redis 6379、checkpoint_pg 5433、Langfuse 3100。
+11. **`agent_runtime/service/` 是导入兼容层**：该包由原 `service.py` 机械拆包而来（core + 五个 Mixin + `_common`），`__init__.py` re-export 全部旧符号，既有 `from app.services.agent_runtime.service import ...` 无需改动。测试 monkeypatch 目标 `service.build_agent` / `service._service` / `service.settings` 必须保持在**包级属性**；各子模块持有独立的 `AsyncSessionLocal` 绑定，替换会话工厂时需逐一补丁（见 `test_document_runtime.py` 的 platform fixture）。新增模块级共享符号放 `_common.py`。
 
 ## 修改范围原则
 

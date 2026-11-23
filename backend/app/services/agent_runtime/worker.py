@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
-from app.services.audit_capture import worker_audit_context
+from app.services.audit.capture import worker_audit_context
 
 from .events import (
     APPROVAL_REQUIRED,

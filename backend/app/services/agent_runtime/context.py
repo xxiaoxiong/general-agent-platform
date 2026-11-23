@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from langchain_core.callbacks import BaseCallbackHandler
 
 if TYPE_CHECKING:
-    from app.assistant.task_contract import TaskContract
+    from app.services.assistant.task_contract import TaskContract
 
 
 @dataclass(frozen=True)

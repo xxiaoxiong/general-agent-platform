@@ -1,24 +1,27 @@
 """API 级集成冒烟（FastAPI TestClient + SQLite 业务库 + FakeChatModel）。
 
-覆盖任务书 §8 验收场景的 HTTP 级证据：
-- AT-01：创建 Agent、/chat SSE、/invoke 非流式、会话历史查询、删除会话
-- AT-03：/chat 真流式事件（final_chunk/final/done + X-Run-Id 头）
-- P0-G：SSE 事件 seq 序号 + GET /agents/runs/{run_id} 断连查询（AT-03）
+覆盖任务书 §8 验收场景的 HTTP 级证据（v2 契约：/api/v2/runs + /api/v2/conversations）：
+- AT-01：创建 Run、事件流订阅、会话消息查询、删除会话
+- AT-03：v2 事件流信封（tool.started / run.completed + X-Run-Id 头）
+- P0-G：事件 sequence 序号 + GET /runs/{run_id} 断连查询
 - AT-08：任务生命周期（超限/超时/空结果/取消的明确状态）
-- AT-15：越权访问他人 Agent/会话被拒（所有权校验）
+- AT-15：越权访问他人助手/Run 被拒（所有权校验）
 - AT-16：工作流 Agent 节点（agent_invoke）端到端
 """
 import json
+import time
 from typing import Any, List
 
 import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.core.security import create_access_token
+
+TERMINAL_STATUSES = {"completed", "failed", "cancelled", "limit_exceeded"}
 
 
 class FakeChatModel(BaseChatModel):
@@ -101,7 +104,7 @@ def _patch_model(monkeypatch, script):
 
 
 def _iter_sse(resp):
-    """解析 data: {json} 行为 dict 列表。"""
+    """解析 SSE data: {json} 行为 dict 列表（v2 信封）。"""
     events = []
     for line in resp.iter_lines():
         if isinstance(line, bytes):
@@ -111,130 +114,117 @@ def _iter_sse(resp):
     return events
 
 
-# ── AT-01 / AT-03：/chat 流式对话 ─────────────────────────────────────────
+def _create_run(client, db_setup, message, *, idempotency_key=None, conversation_id=None):
+    headers = dict(_auth(db_setup["user1_id"]))
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+    payload = {"message": message, "use_memory": False, "assistant_id": db_setup["agent_id"]}
+    if conversation_id is not None:
+        payload["conversation_id"] = conversation_id
+    return client.post("/api/v2/runs", json=payload, headers=headers)
 
-class TestChatFlow:
-    def test_chat_sse_stream(self, client, db_setup, monkeypatch):
+
+def _wait_run(client, user_id, run_id, timeout=30.0):
+    """轮询 Run 状态直到终态（执行由 Worker 在后台推进）。"""
+    info = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = client.get(f"/api/v2/runs/{run_id}", headers=_auth(user_id))
+        assert r.status_code == 200, r.text
+        info = r.json()
+        if info["status"] in TERMINAL_STATUSES:
+            return info
+        time.sleep(0.05)
+    raise AssertionError(f"Run 未在 {timeout}s 内到达终态: {info}")
+
+
+# ── AT-01 / AT-03：创建 Run + 事件流 ─────────────────────────────────────────
+
+class TestRunFlow:
+    def test_run_events_stream(self, client, db_setup, monkeypatch):
         _patch_model(monkeypatch, [
             _tool_call_turn("calculator", {"expression": "21*2"}),
             AIMessage(content="SSE_DONE_42"),
         ])
-        with client.stream(
-            "POST",
-            f"/api/v1/agents/{db_setup['agent_id']}/chat",
-            json={"message": "计算 21*2", "stream": True, "use_memory": False},
-            headers=_auth(db_setup["user1_id"]),
-        ) as resp:
-            assert resp.status_code == 200
-            # X-Run-Id 与 X-Session-Id 响应头（P0-G 重连查询）
-            assert resp.headers.get("x-run-id"), "缺少 X-Run-Id 响应头"
-            assert resp.headers.get("x-session-id"), "缺少 X-Session-Id 响应头"
-            events = _iter_sse(resp)
+        r = _create_run(client, db_setup, "计算 21*2")
+        assert r.status_code == 200, r.text
+        assert r.headers.get("x-run-id"), "缺少 X-Run-Id 响应头"
+        run_id = r.json()["run_id"]
+        conversation_id = r.json()["conversation_id"]
+        assert conversation_id
 
-        types = [e["type"] for e in events]
-        assert "action" in types, f"缺少工具调用事件: {types}"
-        assert "observation" in types, f"缺少工具结果事件: {types}"
-        assert "final_chunk" in types and "final" in types and "done" in types
-        assert events[-1]["type"] == "done" and events[-1]["status"] == "completed"
-        final = [e for e in events if e["type"] == "final"][0]
-        assert "SSE_DONE_42" in final["content"], f"最终内容缺失: {final}"
-        action = [e for e in events if e["type"] == "action"][0]
-        assert action["tool"] == "calculator"
-        # seq 序号连续（P0-G）
-        seqs = [e["seq"] for e in events if "seq" in e]
-        assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), f"seq 异常: {seqs}"
+        info = _wait_run(client, db_setup["user1_id"], run_id)
+        assert info["status"] == "completed", info
 
-        # P0-G：run 状态可查询（断连后恢复/轮询，AT-03）
-        run_id = resp.headers["x-run-id"]
-        r = client.get(f"/api/v1/agents/runs/{run_id}", headers=_auth(db_setup["user1_id"]))
-        assert r.status_code == 200
-        body = r.json()
-        assert body["status"] == "completed", body
+        # v2 事件流（§7.1 信封）：tool.started / tool.completed / run.completed
+        er = client.get(f"/api/v2/runs/{run_id}/events", headers=_auth(db_setup["user1_id"]))
+        assert er.status_code == 200
+        assert er.headers["content-type"].startswith("text/event-stream")
+        assert "id: " in er.text, "标准 SSE id 行缺失"
+        events = _iter_sse(er)
+        names = [e["event"] for e in events]
+        assert "tool.started" in names, f"缺少工具调用事件: {names}"
+        assert "tool.completed" in names, f"缺少工具结果事件: {names}"
+        assert "run.completed" in names
+        assert events[-1]["event"] == "run.completed", events[-1]
+        tool = [e for e in events if e["event"] == "tool.started"][0]
+        assert tool["data"]["tool_name"] == "calculator"
+        # sequence 序号严格递增（P0-G）
+        seqs = [e["sequence"] for e in events]
+        assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), f"sequence 异常: {seqs}"
 
-    def test_chat_without_tools_non_stream_invoke(self, client, db_setup, monkeypatch):
+        # 最终内容回写会话（AT-01）
+        mr = client.get(f"/api/v2/conversations/{conversation_id}/messages",
+                        headers=_auth(db_setup["user1_id"]))
+        assert mr.status_code == 200
+        msgs = mr.json()["items"]
+        assert any(m.get("role") == "assistant" and "SSE_DONE_42" in (m.get("content") or "")
+                   for m in msgs), f"最终内容缺失: {msgs}"
+
+    def test_run_without_tools_completes(self, client, db_setup, monkeypatch):
         _patch_model(monkeypatch, [AIMessage(content="INVOKE_OK")])
-        r = client.post(
-            f"/api/v1/agents/{db_setup['agent_id']}/invoke",
-            json={"input": "你好"},
-            headers=_auth(db_setup["user1_id"]),
-        )
+        r = _create_run(client, db_setup, "你好")
         assert r.status_code == 200
-        body = r.json()
-        assert body["status"] == "ok" and body["content"] == "INVOKE_OK"
-        assert body.get("run_id"), "invoke 响应应带 run_id"
+        run_id = r.json()["run_id"]
+        info = _wait_run(client, db_setup["user1_id"], run_id)
+        assert info["status"] == "completed", info
 
-    def test_invoke_idempotency_key_hits_original_run(self, client, db_setup, monkeypatch):
-        """Idempotency-Key：幂等命中返回原 Run ID 与状态，不重复执行（FR-01 / §8.2）。"""
+    def test_run_idempotency_key_hits_original_run(self, client, db_setup, monkeypatch):
+        """Idempotency-Key：幂等命中返回原 Run ID，不重复执行（FR-01 / §8.2）。"""
         _patch_model(monkeypatch, [AIMessage(content="IDEM_OK")])
-        headers = {**_auth(db_setup["user1_id"]), "Idempotency-Key": "idem-1"}
-        r1 = client.post(
-            f"/api/v1/agents/{db_setup['agent_id']}/invoke",
-            json={"input": "幂等测试"},
-            headers=headers,
-        )
-        assert r1.status_code == 200 and r1.json()["content"] == "IDEM_OK"
+        r1 = _create_run(client, db_setup, "幂等测试", idempotency_key="idem-1")
+        assert r1.status_code == 200
         run_id = r1.json()["run_id"]
 
-        # 同键重试：命中缓存（模型脚本已耗尽，若重复执行必然失败）
-        r2 = client.post(
-            f"/api/v1/agents/{db_setup['agent_id']}/invoke",
-            json={"input": "幂等测试"},
-            headers=headers,
-        )
+        # 同键重试：命中缓存（模型脚本已耗尽，若重复执行必然产出不同内容）
+        r2 = _create_run(client, db_setup, "幂等测试", idempotency_key="idem-1")
         assert r2.status_code == 200
-        body2 = r2.json()
-        assert body2["idempotent_reuse"] is True
-        assert body2["run_id"] == run_id
-        assert body2["content"] == "IDEM_OK"
+        assert r2.json()["idempotent_reuse"] is True
+        assert r2.json()["run_id"] == run_id
 
         # 不同键 → 新 Run
-        _patch_model(monkeypatch, [AIMessage(content="IDEM_OK2")])
-        headers2 = {**_auth(db_setup["user1_id"]), "Idempotency-Key": "idem-2"}
-        r3 = client.post(
-            f"/api/v1/agents/{db_setup['agent_id']}/invoke",
-            json={"input": "幂等测试"},
-            headers=headers2,
-        )
+        r3 = _create_run(client, db_setup, "幂等测试", idempotency_key="idem-2")
         assert r3.status_code == 200 and r3.json()["run_id"] != run_id
 
-    def test_chat_idempotency_key_no_duplicate_execution(self, client, db_setup, monkeypatch):
-        """/chat 同键重试：不重复执行、返回原 Run（FR-01 / §8.2）。"""
-        _patch_model(monkeypatch, [AIMessage(content="CHAT_IDEM")])
-        headers = {**_auth(db_setup["user1_id"]), "Idempotency-Key": "idem-chat"}
-        payload = {"message": "幂等对话", "stream": False, "use_memory": False}
-        c1 = client.post(
-            f"/api/v1/agents/{db_setup['agent_id']}/chat", json=payload, headers=headers,
-        )
-        assert c1.status_code == 200 and c1.json()["content"] == "CHAT_IDEM"
-        c2 = client.post(
-            f"/api/v1/agents/{db_setup['agent_id']}/chat", json=payload, headers=headers,
-        )
-        assert c2.status_code == 200
-        assert c2.json()["idempotent_reuse"] is True
-
-    def test_session_history_and_delete(self, client, db_setup):
-        # 创建会话并对话
-        _id = db_setup["agent_id"]
-        with client.stream(
-            "POST", f"/api/v1/agents/{_id}/chat",
-            json={"message": "记录一下", "stream": True, "use_memory": False},
-            headers=_auth(db_setup["user1_id"]),
-        ) as resp:
-            events = _iter_sse(resp)
-        session_id = int(resp.headers["x-session-id"])
+    def test_session_history_and_delete(self, client, db_setup, monkeypatch):
+        _patch_model(monkeypatch, [AIMessage(content="记录一下")])
+        r = _create_run(client, db_setup, "记录一下")
+        assert r.status_code == 200
+        run_id, conversation_id = r.json()["run_id"], r.json()["conversation_id"]
+        _wait_run(client, db_setup["user1_id"], run_id)
 
         # 历史查询（AT-01）
-        r = client.get(f"/api/v1/agents/{_id}/sessions/{session_id}/messages",
-                       headers=_auth(db_setup["user1_id"]))
-        assert r.status_code == 200
-        msgs = r.json()
-        assert isinstance(msgs, (list, dict))
+        mr = client.get(f"/api/v2/conversations/{conversation_id}/messages",
+                        headers=_auth(db_setup["user1_id"]))
+        assert mr.status_code == 200
+        msgs = mr.json()["items"]
+        assert isinstance(msgs, list) and msgs
 
         # 删除会话后不可再查（AT-01）
-        r = client.delete(f"/api/v1/agents/{_id}/sessions/{session_id}",
+        r = client.delete(f"/api/v2/conversations/{conversation_id}",
                           headers=_auth(db_setup["user1_id"]))
         assert r.status_code in (200, 204)
-        r = client.get(f"/api/v1/agents/{_id}/sessions/{session_id}/messages",
+        r = client.get(f"/api/v2/conversations/{conversation_id}/messages",
                        headers=_auth(db_setup["user1_id"]))
         assert r.status_code == 404
 
@@ -245,21 +235,18 @@ class TestOwnership:
     def test_other_user_cannot_access_agent(self, client, db_setup):
         _id = db_setup["agent_id"]
         other = _auth(db_setup["user2_id"])
-        assert client.get(f"/api/v1/agents/{_id}", headers=other).status_code == 404
-        assert client.post(f"/api/v1/agents/{_id}/invoke",
-                           json={"input": "x"}, headers=other).status_code == 404
-        with client.stream(
-            "POST", f"/api/v1/agents/{_id}/chat",
-            json={"message": "x", "stream": True}, headers=other,
-        ) as resp:
-            assert resp.status_code == 404
+        assert client.get(f"/api/v2/assistants/{_id}", headers=other).status_code == 404
+        r = client.post("/api/v2/runs",
+                        json={"message": "x", "use_memory": False, "assistant_id": _id},
+                        headers=other)
+        assert r.status_code == 404
 
     def test_other_user_cannot_query_run(self, client, db_setup, monkeypatch):
         _patch_model(monkeypatch, [AIMessage(content="PRIVATE")])
-        r = client.post(f"/api/v1/agents/{db_setup['agent_id']}/invoke",
-                        json={"input": "hi"}, headers=_auth(db_setup["user1_id"]))
+        r = _create_run(client, db_setup, "hi")
         run_id = r.json()["run_id"]
-        assert client.get(f"/api/v1/agents/runs/{run_id}",
+        _wait_run(client, db_setup["user1_id"], run_id)
+        assert client.get(f"/api/v2/runs/{run_id}",
                           headers=_auth(db_setup["user2_id"])).status_code in (403, 404)
 
 
@@ -304,9 +291,19 @@ class TestWorkflowAgentNode:
 # ── AT-08 / P0-A：任务生命周期（预算超限/超时/空结果/取消）─────────────────
 
 class TestBudgetAndLifecycle:
-    def test_tool_budget_exceeded_status(self, client, db_setup, monkeypatch):
-        """工具调用次数超限 -> 明确 limit_exceeded 状态（与 failed/成功区分）"""
+    @pytest.mark.asyncio
+    async def test_tool_budget_exceeded_status(self, client, db_setup, monkeypatch):
+        """工具调用次数超限 -> 明确 limit_exceeded 状态（与 failed/成功区分）。
+
+        会话内 Run 的暂停错误文案是统一用户提示，预算/超时的区分细节在服务层
+        错误信息中验证（原 /invoke 同步契约的覆盖迁移至服务层）。
+        """
         import app.core.config as config_mod
+        import app.services.agent_runtime.factory as factory_mod
+        import app.services.agent_runtime.service as svc_mod
+
+        from app.services.agent_runtime import get_runtime_service
+
         monkeypatch.setattr(config_mod.settings, "AGENT_MAX_TOOL_CALLS", 2, raising=False)
 
         counter = {"n": 0}
@@ -315,55 +312,84 @@ class TestBudgetAndLifecycle:
             counter["n"] += 1
             return _tool_call_turn("calculator", {"expression": "1+1"}, f"tc{counter['n']}")
 
-        _patch_model(monkeypatch, [endless_tool_call] * 30)
-        r = client.post(f"/api/v1/agents/{db_setup['agent_id']}/invoke",
-                        json={"input": "一直计算"},
-                        headers=_auth(db_setup["user1_id"]))
-        assert r.status_code == 200
-        data = r.json()
-        assert data["status"] == "limit_exceeded", data
-        info = client.get(f"/api/v1/agents/runs/{data['run_id']}",
-                          headers=_auth(db_setup["user1_id"])).json()
+        monkeypatch.setattr(factory_mod, "build_chat_model",
+                            lambda *a, **k: FakeChatModel(script=[endless_tool_call] * 30))
+
+        async def fake_load_model(self, model_config_id):
+            return (
+                {"name": "p", "base_url": "http://x", "api_key": "k", "extra_config": {}},
+                {"name": "fake", "max_tokens": None, "supports_streaming": True,
+                 "supports_function_call": True, "extra_params": {}},
+            )
+
+        monkeypatch.setattr(svc_mod.AgentRuntimeService, "_load_model", fake_load_model)
+        svc = get_runtime_service()
+        run_id, stream = await svc.start_run(
+            agent_config={"id": 990002, "tools": ["calculator"],
+                          "system_prompt": "t", "temperature": "0.1"},
+            messages=[{"role": "user", "content": "一直计算"}],
+            user_id=db_setup["user1_id"],
+        )
+        events = [e async for e in stream]
+        assert events, "应有执行事件"
+        info = await svc.get_run(run_id, db_setup["user1_id"])
+        assert info["status"] == "limit_exceeded", info
         assert "预算" in (info.get("error") or ""), info
 
-    def test_run_timeout_status(self, client, db_setup, monkeypatch):
-        """运行超时 -> limit_exceeded，错误信息含超时"""
+    @pytest.mark.asyncio
+    async def test_run_timeout_status(self, client, db_setup, monkeypatch):
+        """运行超时 -> limit_exceeded，错误信息含超时（与预算超限可区分）"""
         import time as _time
 
         import app.core.config as config_mod
+        import app.services.agent_runtime.factory as factory_mod
+        import app.services.agent_runtime.service as svc_mod
+
+        from app.services.agent_runtime import get_runtime_service
+
         monkeypatch.setattr(config_mod.settings, "AGENT_RUN_TIMEOUT", 0.3, raising=False)
 
         def slow_answer(**kw):
             _time.sleep(0.8)
             return AIMessage(content="迟到的回答")
 
-        _patch_model(monkeypatch, [slow_answer])
-        r = client.post(f"/api/v1/agents/{db_setup['agent_id']}/invoke",
-                        json={"input": "慢一点"},
-                        headers=_auth(db_setup["user1_id"]))
-        assert r.status_code == 200
-        data = r.json()
-        assert data["status"] == "limit_exceeded", data
-        info = client.get(f"/api/v1/agents/runs/{data['run_id']}",
-                          headers=_auth(db_setup["user1_id"])).json()
+        monkeypatch.setattr(factory_mod, "build_chat_model",
+                            lambda *a, **k: FakeChatModel(script=[slow_answer]))
+
+        async def fake_load_model(self, model_config_id):
+            return (
+                {"name": "p", "base_url": "http://x", "api_key": "k", "extra_config": {}},
+                {"name": "fake", "max_tokens": None, "supports_streaming": True,
+                 "supports_function_call": True, "extra_params": {}},
+            )
+
+        monkeypatch.setattr(svc_mod.AgentRuntimeService, "_load_model", fake_load_model)
+        svc = get_runtime_service()
+        run_id, stream = await svc.start_run(
+            agent_config={"id": 990003, "tools": [],
+                          "system_prompt": "t", "temperature": "0.1"},
+            messages=[{"role": "user", "content": "慢一点"}],
+            user_id=db_setup["user1_id"],
+        )
+        events = [e async for e in stream]
+        assert events, "应有执行事件"
+        info = await svc.get_run(run_id, db_setup["user1_id"])
+        assert info["status"] == "limit_exceeded", info
         assert "超时" in (info.get("error") or ""), info
 
     def test_empty_result_is_success(self, client, db_setup, monkeypatch):
         """AT-08：空结果是正常完成，不当错误"""
         _patch_model(monkeypatch, [AIMessage(content="")])
-        r = client.post(f"/api/v1/agents/{db_setup['agent_id']}/invoke",
-                        json={"input": "什么都不说"},
-                        headers=_auth(db_setup["user1_id"]))
+        r = _create_run(client, db_setup, "什么都不说")
         assert r.status_code == 200
-        data = r.json()
-        assert data["status"] == "ok", data
-        assert data["content"] == ""
+        run_id = r.json()["run_id"]
+        info = _wait_run(client, db_setup["user1_id"], run_id)
+        assert info["status"] == "completed", info
 
     @pytest.mark.asyncio
     async def test_cancel_not_misreported_as_success(self, client, db_setup, monkeypatch):
         """AT-08：取消 -> cancelled（done.status=cancelled），不被误报成功"""
         import asyncio
-
         import app.services.agent_runtime.factory as factory_mod
         import app.services.agent_runtime.service as svc_mod
         from langchain_core.language_models.chat_models import BaseChatModel
@@ -423,15 +449,12 @@ class TestBudgetAndLifecycle:
 
 class TestRunEventsReplay:
     def test_events_replay_after_seq_and_last_event_id(self, client, db_setup, monkeypatch):
-        """GET /runs/{id}/events：旧契约字段保留 + seq 连续 + after_seq/Last-Event-ID 续传"""
+        """GET /runs/{id}/events：v2 信封 + sequence 连续 + after_seq/Last-Event-ID 续传"""
         _patch_model(monkeypatch, [AIMessage(content="HELLO_EVT")])
-        resp = client.post(
-            f"/api/v1/agents/{db_setup['agent_id']}/invoke",
-            json={"input": "hi"},
-            headers=_auth(db_setup["user1_id"]),
-        )
-        assert resp.status_code == 200
-        run_id = resp.json()["run_id"]
+        r = _create_run(client, db_setup, "hi")
+        assert r.status_code == 200
+        run_id = r.json()["run_id"]
+        _wait_run(client, db_setup["user1_id"], run_id)
 
         def fetch(after_seq=None, last_event_id=None):
             params = {"after_seq": after_seq} if after_seq is not None else {}
@@ -439,39 +462,37 @@ class TestRunEventsReplay:
             if last_event_id is not None:
                 headers["Last-Event-ID"] = str(last_event_id)
             r = client.get(
-                f"/api/v1/agents/runs/{run_id}/events", params=params, headers=headers,
+                f"/api/v2/runs/{run_id}/events", params=params, headers=headers,
             )
             assert r.status_code == 200
             assert r.headers["content-type"].startswith("text/event-stream")
             return r
 
-        # 全量回放：data 为旧契约 JSON（type 等字段保留）+ seq 连续 + 终态 done
+        # 全量回放：v2 信封（event/sequence/run_id/data）+ sequence 连续 + 终止事件
         r = fetch()
         assert "id: " in r.text  # 标准 SSE id 行
         events = _iter_sse(r)
-        assert events and events[-1]["type"] == "done"
-        assert [e["seq"] for e in events] == list(range(len(events)))
-        assert all("type" in e for e in events)
+        assert events and events[-1]["event"] == "run.completed"
+        seqs = [e["sequence"] for e in events]
+        assert seqs == list(range(seqs[0], seqs[0] + len(seqs))), f"sequence 不连续: {seqs}"
+        assert all("event" in e and "run_id" in e for e in events)
 
-        # after_seq 续传：只返回 seq 大于指定值的事件，直至终态
-        resumed = _iter_sse(fetch(after_seq=events[0]["seq"]))
-        assert [e["seq"] for e in resumed] == [e["seq"] for e in events][1:]
-        assert resumed[-1]["type"] == "done"
+        # after_seq 续传：只返回 sequence 大于指定值的事件，直至终止
+        resumed = _iter_sse(fetch(after_seq=events[0]["sequence"]))
+        assert [e["sequence"] for e in resumed] == [e["sequence"] for e in events][1:]
+        assert resumed[-1]["event"] == "run.completed"
 
         # Last-Event-ID（标准 SSE 重连头）与 after_seq 等价
-        by_header = _iter_sse(fetch(last_event_id=events[0]["seq"]))
-        assert [e["seq"] for e in by_header] == [e["seq"] for e in resumed]
+        by_header = _iter_sse(fetch(last_event_id=events[0]["sequence"]))
+        assert [e["sequence"] for e in by_header] == [e["sequence"] for e in resumed]
 
     def test_events_replay_forbidden_for_other_user(self, client, db_setup, monkeypatch):
         _patch_model(monkeypatch, [AIMessage(content="x")])
-        resp = client.post(
-            f"/api/v1/agents/{db_setup['agent_id']}/invoke",
-            json={"input": "hi"},
-            headers=_auth(db_setup["user1_id"]),
-        )
-        run_id = resp.json()["run_id"]
+        r = _create_run(client, db_setup, "hi")
+        run_id = r.json()["run_id"]
+        _wait_run(client, db_setup["user1_id"], run_id)
         r = client.get(
-            f"/api/v1/agents/runs/{run_id}/events",
+            f"/api/v2/runs/{run_id}/events",
             headers=_auth(db_setup["user2_id"]),
         )
         assert r.status_code in (403, 404)
@@ -489,7 +510,7 @@ class TestReconcileAuthz:
 
         # 非超管（db_setup 的 u2 默认 is_superuser=False）-> 403
         r = client.post(
-            "/api/v1/agents/runs/some-run/reconcile",
+            "/api/v2/runs/some-run/reconcile",
             json={"tool_call_id": "tc-x", "disposition": "unresolved"},
             headers=_auth(db_setup["user2_id"]),
         )
@@ -506,7 +527,7 @@ class TestReconcileAuthz:
             s.commit()
             admin_id = admin.id
         r = client.post(
-            "/api/v1/agents/runs/some-run/reconcile",
+            "/api/v2/runs/some-run/reconcile",
             json={"tool_call_id": "tc-x", "disposition": "unresolved"},
             headers=_auth(admin_id),
         )
@@ -514,11 +535,11 @@ class TestReconcileAuthz:
             f"超管应通过 Reconciliation 授权门禁: {r.status_code}"
 
 
-# ── A22：Agent 列表用户隔离（P0-03）────────────────────────────────────────
+# ── A22：助手列表用户隔离（P0-03）────────────────────────────────────────
 
 class TestAgentListIsolation:
-    def test_list_agents_isolated_by_owner(self, client, db_setup):
-        """列表不得泄露他人 Agent：普通用户只见自己的 + 公开（owner 为空）的"""
+    def test_list_assistants_isolated_by_owner(self, client, db_setup):
+        """列表不得泄露他人助手：普通用户只见自己的 + 公开（owner 为空）的"""
         import os
 
         from app.models.agent import Agent
@@ -541,21 +562,21 @@ class TestAgentListIsolation:
         own_id = db_setup["agent_id"]
         u2 = _auth(db_setup["user2_id"])
 
-        # 用户 2：看不到用户 1 的 Agent，能看到公开 Agent
-        r = client.get("/api/v1/agents", headers=u2)
+        # 用户 2：看不到用户 1 的助手，能看到公开助手
+        r = client.get("/api/v2/assistants", headers=u2)
         assert r.status_code == 200
         ids = {a["id"] for a in r.json()["items"]}
-        assert own_id not in ids, f"他人 Agent 泄露到列表: {ids}"
+        assert own_id not in ids, f"他人助手泄露到列表: {ids}"
         assert public_id in ids
         assert r.json()["total"] == len(ids), "total 与 items 必须同口径过滤"
 
         # 用户 1：能看到自己的 + 公开的
-        r = client.get("/api/v1/agents", headers=_auth(db_setup["user1_id"]))
+        r = client.get("/api/v2/assistants", headers=_auth(db_setup["user1_id"]))
         ids = {a["id"] for a in r.json()["items"]}
         assert own_id in ids and public_id in ids
 
         # 超管：可见全部
-        r = client.get("/api/v1/agents", headers=_auth(admin_id))
+        r = client.get("/api/v2/assistants", headers=_auth(admin_id))
         ids = {a["id"] for a in r.json()["items"]}
         assert own_id in ids and public_id in ids
 

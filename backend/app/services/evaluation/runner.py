@@ -287,7 +287,7 @@ async def create_eval_run(
 async def _build_agent_config(db: AsyncSession, agent: Agent, *,
                               use_memory: bool) -> Dict[str, Any]:
     """由 Agent 行构建运行配置（与 v2 runs._load_agent_config 同口径）。"""
-    from app.assistant.versions import config_from_version, ensure_version
+    from app.services.assistant.versions import config_from_version, ensure_version
 
     version = await ensure_version(db, agent.id)
     if version is not None:

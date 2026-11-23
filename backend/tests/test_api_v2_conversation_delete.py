@@ -9,7 +9,7 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.deps import get_current_user
-from app.api.v2.conversations import router
+from app.api.chat.conversations import router
 from app.core.database import Base, get_db
 from app.models.agent import Agent, AgentRun, AgentRunEvent, AgentSession
 from app.models.evolution import AgentEvaluation

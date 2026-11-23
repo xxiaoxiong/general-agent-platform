@@ -11,23 +11,18 @@ from app.core.config import settings
 from app.core.database import init_db
 from app.core.redis import init_redis, close_redis
 from app.core.logging import setup_logging, get_logger
-from app.api.v1 import asr
-from app.api.v1 import auth, users, models, knowledge, workflows, app_market, audit, prompts, agents, databases
-from app.api.v2 import admin as v2_admin
-from app.api.v2 import artifacts as v2_artifacts
-from app.api.v2 import assistants as v2_assistants
-from app.api.v2 import capabilities as v2_capabilities
-from app.api.v2 import conversations as v2_conversations
-from app.api.v2 import documents as v2_documents
-from app.api.v2 import evolution as v2_evolution
-from app.api.v2 import evaluation as v2_evaluation
-from app.api.v2 import files as v2_files
-from app.api.v2 import mcp as v2_mcp
-from app.api.v2 import runs as v2_runs
-from app.api.v2 import skills as v2_skills
-from app.api.v2 import workspace as v2_workspace
-from app.services.audit_capture import install_audit_capture
-from app.services.audit_http import AuditHTTPMiddleware
+from app.api.identity import audit, auth, users
+from app.api.model import asr, models, prompts
+from app.api.knowledge import databases, knowledge
+from app.api.workflow import app_market, workflows
+from app.api.assistant import assistants, capabilities
+from app.api.chat import conversations, files
+from app.api.run import router as run_router
+from app.api.document import documents as document_api
+from app.api.workspace import artifacts, workspace
+from app.api.ops import admin, evaluation, evolution, mcp, skills
+from app.services.audit.capture import install_audit_capture
+from app.services.audit.http import AuditHTTPMiddleware
 
 logger = get_logger("main")
 
@@ -242,26 +237,25 @@ app.include_router(workflows.router, prefix=API_PREFIX)
 app.include_router(app_market.router, prefix=API_PREFIX)
 app.include_router(audit.router, prefix=API_PREFIX)
 app.include_router(prompts.router, prefix=API_PREFIX)
-app.include_router(agents.router, prefix=API_PREFIX)
 app.include_router(databases.router, prefix=API_PREFIX)
 app.include_router(asr.router, prefix=API_PREFIX)
 
-# API v2（产品工作台契约，任务书 §7）：迁移期与 v1 并存
+# API v2（产品工作台契约，任务书 §7）
 API_V2_PREFIX = "/api/v2"
-app.include_router(v2_workspace.router, prefix=API_V2_PREFIX)
-app.include_router(v2_capabilities.router, prefix=API_V2_PREFIX)
-app.include_router(v2_assistants.router, prefix=API_V2_PREFIX)
-app.include_router(v2_conversations.router, prefix=API_V2_PREFIX)
-app.include_router(v2_documents.documents, prefix=API_V2_PREFIX)
-app.include_router(v2_documents.profiles, prefix=API_V2_PREFIX)
-app.include_router(v2_files.router, prefix=API_V2_PREFIX)
-app.include_router(v2_runs.router, prefix=API_V2_PREFIX)
-app.include_router(v2_artifacts.router, prefix=API_V2_PREFIX)
-app.include_router(v2_admin.router, prefix=API_V2_PREFIX)
-app.include_router(v2_evolution.router, prefix=API_V2_PREFIX)
-app.include_router(v2_evaluation.router, prefix=API_V2_PREFIX)
-app.include_router(v2_skills.router, prefix=API_V2_PREFIX)
-app.include_router(v2_mcp.router, prefix=API_V2_PREFIX)
+app.include_router(workspace.router, prefix=API_V2_PREFIX)
+app.include_router(capabilities.router, prefix=API_V2_PREFIX)
+app.include_router(assistants.router, prefix=API_V2_PREFIX)
+app.include_router(conversations.router, prefix=API_V2_PREFIX)
+app.include_router(document_api.documents, prefix=API_V2_PREFIX)
+app.include_router(document_api.profiles, prefix=API_V2_PREFIX)
+app.include_router(files.router, prefix=API_V2_PREFIX)
+app.include_router(run_router, prefix=API_V2_PREFIX)
+app.include_router(artifacts.router, prefix=API_V2_PREFIX)
+app.include_router(admin.router, prefix=API_V2_PREFIX)
+app.include_router(evolution.router, prefix=API_V2_PREFIX)
+app.include_router(evaluation.router, prefix=API_V2_PREFIX)
+app.include_router(skills.router, prefix=API_V2_PREFIX)
+app.include_router(mcp.router, prefix=API_V2_PREFIX)
 
 
 @app.get("/api/health")

@@ -18,7 +18,9 @@ from langgraph.types import interrupt
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.deps import get_current_user
-from app.api.v2 import assistants, conversations, runs
+from app.api import run as runs
+from app.api.assistant import assistants
+from app.api.chat import conversations
 from app.core.config import settings
 from app.core.database import Base, get_db
 from app.models.agent import Agent, AgentRun, AgentSession
@@ -79,7 +81,19 @@ async def platform(tmp_path, monkeypatch):
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
-    for module in (service, worker, run_input, document_graph, document_retry, adapter):
+    # service/ 拆包后各子模块持有独立的 AsyncSessionLocal 绑定，需逐一替换
+    from app.services.agent_runtime.service import (
+        _common as service_common,
+        approval as service_approval,
+        config as service_config,
+        delivery as service_delivery,
+        lifecycle as service_lifecycle,
+        stream as service_stream,
+    )
+
+    for module in (service, service_common, service_lifecycle, service_stream,
+                   service_approval, service_delivery, service_config,
+                   worker, run_input, document_graph, document_retry, adapter):
         monkeypatch.setattr(module, "AsyncSessionLocal", sessions)
     import app.core.database as database
 

@@ -4,7 +4,7 @@ import { ChevronRight, Cpu, LibraryBig, ListChecks, MessageSquare, SquarePen, St
 import dayjs from 'dayjs'
 import { useAuthStore } from '@/stores/auth'
 import { appApi, knowledgeApi, modelApi, workflowApi } from '@/api'
-import { conversationApi, type Conversation } from '@/api/v2'
+import { conversationApi, type Conversation } from '@/api/conversations'
 import UiButton from '@/components/ui/UiButton.vue'
 import EmptyState from '@/components/ui/EmptyState.vue'
 import ErrorState from '@/components/ui/ErrorState.vue'

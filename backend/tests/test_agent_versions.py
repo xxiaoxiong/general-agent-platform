@@ -7,7 +7,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import delete, select
 
-from app.assistant.versions import (
+from app.services.assistant.versions import (
     build_snapshot,
     config_from_version,
     ensure_version,

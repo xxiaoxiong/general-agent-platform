@@ -13,8 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
-from app.assistant.task_contract import TaskContract
-from app.assistant.verification import CheckResult
+from app.services.assistant.task_contract import TaskContract
+from app.services.assistant.verification import CheckResult
 from app.core.config import settings
 
 from .events import redact_secrets

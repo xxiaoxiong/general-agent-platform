@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from 'vue'
 import { ChevronRight, CircleAlert, CircleCheck, CircleMinus, Download, FolderArchive, LoaderCircle, Wrench } from '@lucide/vue'
-import { downloadProjectZip } from '@/api/v2'
+import { downloadProjectZip } from '@/api/artifacts'
 import UiButton from '@/components/ui/UiButton.vue'
 import {
   describeProjectScope, projectCheckLabels, projectPhaseLabels,

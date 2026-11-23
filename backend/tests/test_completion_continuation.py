@@ -8,7 +8,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from app.core.config import settings
-from app.assistant.verification import CheckResult
+from app.services.assistant.verification import CheckResult
 from app.services.agent_runtime import completion
 from app.services.agent_runtime.context import RunScope, RuntimeContext
 from app.services.agent_runtime.events import TOOL_COMPLETED, TOOL_FAILED, TOOL_STARTED

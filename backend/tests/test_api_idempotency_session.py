@@ -211,13 +211,13 @@ async def client():
         yield c
 
 
-def _chat_payload(message: str, session_id=None, stream=False) -> Dict[str, Any]:
-    return {
-        "message": message,
-        "stream": stream,
-        "use_memory": False,
-        **({"session_id": session_id} if session_id else {}),
-    }
+def _run_payload(message: str, *, conversation_id=None, agent_id=None) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"message": message, "use_memory": False}
+    if agent_id is not None:
+        payload["assistant_id"] = agent_id
+    if conversation_id is not None:
+        payload["conversation_id"] = conversation_id
+    return payload
 
 
 # ══════════════════════════ §9.3：P1-01 API 幂等验收 ══════════════════════════
@@ -232,12 +232,12 @@ class TestApiIdempotency:
         _patch_model(monkeypatch, [AIMessage(content="IDEM_OK")])
         key = f"idem-{uuid.uuid4().hex}"
         headers = {**_auth(db_setup["user1_id"]), "Idempotency-Key": key}
-        body = _chat_payload("幂等测试")
+        body = _run_payload("幂等测试", agent_id=db_setup["agent_id"])
 
         run_ids = set()
         for _ in range(10):
             r = await client.post(
-                f"/api/v1/agents/{db_setup['agent_id']}/chat", json=body, headers=headers
+                "/api/v2/runs", json=body, headers=headers
             )
             assert r.status_code == 200, r.text
             if r.json().get("run_id"):
@@ -258,13 +258,13 @@ class TestApiIdempotency:
         headers = {**_auth(db_setup["user1_id"]), "Idempotency-Key": key}
 
         r1 = await client.post(
-            f"/api/v1/agents/{db_setup['agent_id']}/chat",
-            json=_chat_payload("请求 A"), headers=headers,
+            "/api/v2/runs",
+            json=_run_payload("请求 A", agent_id=db_setup["agent_id"]), headers=headers,
         )
         assert r1.status_code == 200
         r2 = await client.post(
-            f"/api/v1/agents/{db_setup['agent_id']}/chat",
-            json=_chat_payload("请求 B"), headers=headers,
+            "/api/v2/runs",
+            json=_run_payload("请求 B", agent_id=db_setup["agent_id"]), headers=headers,
         )
         assert r2.status_code == 409, f"不同请求摘要必须 409，实际 {r2.status_code}"
 
@@ -273,7 +273,7 @@ class TestApiIdempotency:
         # §9.3-3：相同 Key、不同 agent_id → 冲突
         _patch_model(monkeypatch, [AIMessage(content="A_OK"), AIMessage(content="B_OK")])
         r = await client.post(
-            "/api/v1/agents",
+            "/api/v2/assistants",
             json={"name": "b5-agent-2", "system_prompt": "另一个 Agent", "tools": []},
             headers=_auth(db_setup["user1_id"]),
         )
@@ -283,74 +283,72 @@ class TestApiIdempotency:
         key = f"idem-{uuid.uuid4().hex}"
         headers = {**_auth(db_setup["user1_id"]), "Idempotency-Key": key}
         r1 = await client.post(
-            f"/api/v1/agents/{db_setup['agent_id']}/chat",
-            json=_chat_payload("同 Key 跨 Agent"), headers=headers,
+            "/api/v2/runs",
+            json=_run_payload("同 Key 跨 Agent", agent_id=db_setup["agent_id"]), headers=headers,
         )
         assert r1.status_code == 200
         r2 = await client.post(
-            f"/api/v1/agents/{agent2_id}/chat",
-            json=_chat_payload("同 Key 跨 Agent"), headers=headers,
+            "/api/v2/runs",
+            json=_run_payload("同 Key 跨 Agent", agent_id=agent2_id), headers=headers,
         )
         assert r2.status_code == 409, "跨 Agent 复用同 Key 必须冲突"
 
     @pytest.mark.asyncio(loop_scope="session")
     async def test_id04_same_key_different_session_409(self, client, db_setup, monkeypatch):
-        # §9.3-4：相同 Key、不同 session_id → 冲突
+        # §9.3-4：相同 Key、不同 conversation_id → 冲突
         _patch_model(monkeypatch, [AIMessage(content="S1_OK"), AIMessage(content="S2_OK")])
         key = f"idem-{uuid.uuid4().hex}"
         headers = {**_auth(db_setup["user1_id"]), "Idempotency-Key": key}
 
         r1 = await client.post(
-            f"/api/v1/agents/{db_setup['agent_id']}/chat",
-            json=_chat_payload("第一次"), headers=headers,
+            "/api/v2/runs",
+            json=_run_payload("第一次", agent_id=db_setup["agent_id"]), headers=headers,
         )
         assert r1.status_code == 200
-        session1_id = r1.json()["session_id"]
+        session1_id = r1.json()["conversation_id"]
         assert session1_id
 
         r2 = await client.post(
-            f"/api/v1/agents/{db_setup['agent_id']}/sessions",
-            json={}, headers=_auth(db_setup["user1_id"]),
+            "/api/v2/conversations",
+            json={"assistant_id": db_setup["agent_id"], "title": "幂等-会话2"},
+            headers=_auth(db_setup["user1_id"]),
         )
         assert r2.status_code == 200
         session2_id = r2.json()["id"]
 
         r3 = await client.post(
-            f"/api/v1/agents/{db_setup['agent_id']}/chat",
-            json=_chat_payload("第一次", session_id=session2_id), headers=headers,
+            "/api/v2/runs",
+            json=_run_payload("第一次", agent_id=db_setup["agent_id"], conversation_id=session2_id),
+            headers=headers,
         )
-        assert r3.status_code == 409, "跨 Session 复用同 Key 必须冲突"
+        assert r3.status_code == 409, "跨会话复用同 Key 必须冲突"
         assert session1_id != session2_id
 
     @pytest.mark.asyncio(loop_scope="session")
-    async def test_id05_stream_retry_still_returns_sse(self, client, db_setup, monkeypatch):
-        # §9.3-5：同一个流式请求重试后仍然返回 SSE（幂等命中不得改为普通 JSON）
+    async def test_id05_reuse_keeps_event_replay(self, client, db_setup, monkeypatch):
+        # §9.3-5（v2 契约）：幂等命中返回原 Run，事件流仍可完整回放
         _patch_model(monkeypatch, [AIMessage(content="SSE_OK")])
         key = f"idem-{uuid.uuid4().hex}"
         headers = {**_auth(db_setup["user1_id"]), "Idempotency-Key": key}
-        body = _chat_payload("流式幂等", stream=True)
+        body = _run_payload("流式幂等", agent_id=db_setup["agent_id"])
 
-        async with client.stream(
-            "POST", f"/api/v1/agents/{db_setup['agent_id']}/chat", json=body, headers=headers
-        ) as resp:
-            assert resp.status_code == 200
-            run_id = resp.headers.get("x-run-id")
-            assert run_id
-            events1 = await _iter_sse(resp)
-        assert events1[-1]["type"] == "done"
+        r1 = await client.post("/api/v2/runs", json=body, headers=headers)
+        assert r1.status_code == 200
+        run_id = r1.json()["run_id"]
+        assert run_id
 
-        async with client.stream(
-            "POST", f"/api/v1/agents/{db_setup['agent_id']}/chat", json=body, headers=headers
-        ) as resp:
-            assert resp.status_code == 200
-            assert resp.headers.get("content-type", "").startswith("text/event-stream"), \
-                "幂等命中必须保持 SSE 协议"
-            assert resp.headers.get("x-run-id") == run_id
-            events2 = await _iter_sse(resp)
+        r2 = await client.post("/api/v2/runs", json=body, headers=headers)
+        assert r2.status_code == 200
+        assert r2.json()["idempotent_reuse"] is True
+        assert r2.json()["run_id"] == run_id, "幂等命中必须复用原 Run"
 
-        assert events2, "幂等回放应包含持久化事件"
-        assert events2[-1]["type"] == "done", "回放流必须以 done 终止"
-        assert {e["type"] for e in events2} >= {"final"}
+        await _wait_status(run_id, {"completed", "failed", "cancelled", "limit_exceeded"})
+        er = await client.get(f"/api/v2/runs/{run_id}/events", headers=_auth(db_setup["user1_id"]))
+        assert er.status_code == 200
+        assert er.headers["content-type"].startswith("text/event-stream")
+        events = [json.loads(line[6:]) for line in er.text.splitlines() if line.startswith("data: ")]
+        assert events, "幂等回放应包含持久化事件"
+        assert events[-1]["event"] == "run.completed", "回放流必须以终止事件收尾"
 
     @pytest.mark.asyncio(loop_scope="session")
     async def test_id06_no_duplicate_user_message(self, client, db_setup, monkeypatch):
@@ -358,22 +356,20 @@ class TestApiIdempotency:
         _patch_model(monkeypatch, [AIMessage(content="MSG_OK")])
         key = f"idem-{uuid.uuid4().hex}"
         headers = {**_auth(db_setup["user1_id"]), "Idempotency-Key": key}
-        body = _chat_payload("只允许出现一次的用户消息")
+        body = _run_payload("只允许出现一次的用户消息", agent_id=db_setup["agent_id"])
 
         session_id = None
         for _ in range(3):
-            r = await client.post(
-                f"/api/v1/agents/{db_setup['agent_id']}/chat", json=body, headers=headers
-            )
+            r = await client.post("/api/v2/runs", json=body, headers=headers)
             assert r.status_code == 200
-            session_id = session_id or r.json().get("session_id")
+            session_id = session_id or r.json().get("conversation_id")
 
         r = await client.get(
-            f"/api/v1/agents/{db_setup['agent_id']}/sessions/{session_id}/messages",
+            f"/api/v2/conversations/{session_id}/messages",
             headers=_auth(db_setup["user1_id"]),
         )
         assert r.status_code == 200
-        msgs = r.json()["messages"]
+        msgs = r.json()["items"]
         user_msgs = [m for m in msgs if m.get("role") == "user"]
         assert len(user_msgs) == 1, f"幂等重试重复追加了用户消息: {user_msgs}"
         assert user_msgs[0]["content"] == "只允许出现一次的用户消息"

@@ -3,7 +3,7 @@
  * 助手消息由「文本段 / 工具步骤 / 计划」按事件到达顺序组成的块流，
  * 工具小步骤实时追加在对话流尾部（穿插在文本之间），而非聚堆在消息顶部。
  */
-import type { RunEventEnvelope } from '@/api/v2'
+import type { RunEventEnvelope } from '@/api/runs'
 import type { DocumentArtifact, DocumentEditReview, DocumentReviewDecision, InputRequest, ProfileDefinition } from '@/api/documents'
 import { finishTeamProgress, readTeamProgress, teamPhaseLabels, type TeamProgress } from './teamProgress.ts'
 import {

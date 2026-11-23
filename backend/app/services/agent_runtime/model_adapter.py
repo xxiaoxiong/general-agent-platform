@@ -68,7 +68,7 @@ def build_chat_model(
     # TLS：verify=False 仅在显式配置 AGENT_TLS_VERIFY=false 时允许
     # P2-03：非默认 TLS 配置经 ModelClientFactory 复用连接（不再每构一建）
     if not verify or ca_bundle:
-        from app.assistant.model_clients import ModelClientFactory
+        from app.services.assistant.model_clients import ModelClientFactory
 
         kwargs["http_client"] = ModelClientFactory.get_httpx_client(
             verify=verify,
