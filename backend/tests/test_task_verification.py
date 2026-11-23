@@ -69,6 +69,61 @@ class TestTaskContract:
         assert "citations_present" not in contract.completion_checks
         assert build_task_contract("怎么用数据库验证统计结果", capability_ids=["data_analysis"]).completion_checks == ["answer_present"]
 
+    def test_runnable_project_preserves_the_requirements_from_conversation_137(self):
+        request = (
+            "构建并交付可直接运行的前后端分离项目「设备保养与备件工作台」，文件必须可以从对话下载。\n"
+            "实际功能包括：\n"
+            "1. 登记设备保养工单，录入标题、设备编号、计划日期与优先级，支持搜索和筛选。\n"
+            "2. 启动工单、申请一条或多条备件并登记领取。备件数量必须为正整数。存在未领取备件时阻止完工，并在页面提示原因。\n"
+            "3. 完工后刷新页面仍能看到工单、备件和状态。工作台显示状态统计、校验错误和空状态。\n"
+            "技术约束是 Vue 3.5、TypeScript 5 和 Vite 7 的真实生产构建，使用 @vitejs/plugin-vue 6 和 vue-tsc 3。"
+            "后端用 FastAPI 0.125.0、Uvicorn 0.38.0 和 SQLite。可直接用浏览器 fetch 和 CSS。"
+            "后端启动端口 8000，Vite 预览端口 5173，使用项目自己的同源 API 代理。\n"
+            "交付源码 ZIP、启动与测试说明、OpenAPI 和可执行测试。请用浏览器验证至少一条从创建到完工的操作，"
+            "以及未领取备件时不能完工的业务规则，不要用写死的数据模拟结果。"
+        )
+        contract = build_task_contract(request)
+        assert contract.task_type == TASK_CODE
+        assert contract.project_scope == "fullstack"
+        assert contract.completion_checks == ["answer_present", "artifact_produced"]
+        expected = ("runtime_start", "runtime_build", "runtime_tests", "runtime_browser", "openapi", "archive")
+        assert contract.project_checks == expected
+        assert contract.to_dict()["project_checks"] == list(expected)
+
+    def test_project_requirements_preserve_named_platform_deliverables(self):
+        contract = build_task_contract(
+            "创建 FastAPI 后端 API 服务。执行测试。交付 `reports/pipeline.zip` 和 `docs/openapi.json`，提供浏览器测试说明。"
+        )
+        assert contract.project_scope == "backend"
+        assert contract.project_checks == ("runtime_start", "runtime_tests", "openapi", "archive")
+        assert contract.project_archive_path == "reports/pipeline.zip"
+        assert contract.project_openapi_path == "docs/openapi.json"
+        assert contract.artifact_paths == ()
+
+    @pytest.mark.parametrize("prompt", [
+        "如何创建前后端分离项目并验证浏览器流程？",
+        "生成前后端系统的用户手册。交付 PDF 和 ZIP 压缩包。",
+        "搭建一个前端项目，但只要方案。",
+        "重构现有的脚本，保存为 `tools/setup.py`。",
+    ])
+    def test_project_verification_does_not_apply_to_advice_documents_or_discrete_files(self, prompt):
+        result = build_task_contract(prompt)
+        assert result.project_scope is None
+        assert result.project_checks == ()
+
+    def test_optional_project_checks_do_not_turn_into_requirements(self):
+        contract = build_task_contract("实现前端网站。提供测试说明，不用浏览器验证，无需 OpenAPI，不用打包 ZIP。")
+        assert contract.project_scope == "frontend"
+        assert contract.project_checks == ("runtime_start",)
+
+    def test_project_checks_follow_explicit_implementation_and_stack_clauses(self):
+        contract = build_task_contract("开发一套工单管理系统。前端用Vue，后端使用FastAPI。交付源码ZIP和OpenAPI。")
+        assert contract.project_scope == "fullstack"
+        assert contract.project_checks == ("runtime_start", "openapi", "archive")
+        repair = build_task_contract("修复当前前端项目，确保 npm run build 成功。执行测试。")
+        assert repair.project_scope == "frontend"
+        assert repair.project_checks == ("runtime_start", "runtime_build", "runtime_tests")
+
     def test_table_counts_with_exactly_identical_duplicates_are_independently_recomputed(self):
         prompt = (
             "核对有效记录，按事件编号去重，忽略 VOID。保存为 facts.json，字段 valid_rows、duplicate_ids 和 void_ids。\n"

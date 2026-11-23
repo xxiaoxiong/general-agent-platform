@@ -25,7 +25,7 @@ from urllib.parse import urljoin, urlsplit
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 
-from .project_browser_contract import BROWSER_CHECKS_PATH, parse_browser_checks
+from .project_browser_contract import BROWSER_CHECKS_PATH, browser_form_scope, parse_browser_checks
 from .project_node_toolchain import NPM, dependency_ranges, provide_dependencies
 from .project_verifier_protocol import (
     JOB_NAME, JOB_TIMEOUT_SECONDS, MAX_JOB_BYTES, MAX_OPENAPI_BYTES, MAX_PROJECT_BYTES, MAX_PROJECT_FILES,
@@ -172,7 +172,7 @@ def _test_commands(files: dict[str, str]) -> tuple[list[Invocation], list[str]]:
                 script_names.append(path)
         elif path.endswith((".js", ".mjs", ".cjs")) and re.search(r"\b(?:node:test|node:assert)\b", content):
             individual.append(Invocation(path, parent, ("node", "--test", name)))
-    suites = [Invocation(paths[0], parent, (*_PYTHON, "-m", "pytest", "-q", "--tb=short", "--color=no", "-p", "no:cacheprovider",
+    suites = [Invocation(paths[0], parent, (*_PYTHON, "-m", "pytest", "-q", "-rfEp", "--tb=short", "--color=no", "-p", "no:cacheprovider",
                                             *(PurePosixPath(path).name for path in paths)))
               for parent, paths in groups.items()]
     return [*suites, *individual], script_names
@@ -276,9 +276,10 @@ def _cleanup_children() -> None:
 
 
 class Job:
-    def __init__(self, request: Path, deadline: float, area: Path):
+    def __init__(self, request: Path, deadline: float, area: Path, *, capture_browser_errors: bool = False):
         self.request = request
         self.deadline = deadline
+        self.capture_browser_errors = capture_browser_errors
         self.root = area / "source"
         self.area = area
         self.checks: list[dict] = []
@@ -305,10 +306,12 @@ class Job:
             self.heartbeat = time.monotonic()
 
     def add(self, identifier: str, label: str, status: str, detail: str, path: str = "",
-            *, files: list[str] | None = None) -> None:
+            *, files: list[str] | None = None, test_cases: list[str] | None = None) -> None:
         check = {"id": f"runtime.{identifier}", "label": label, "status": status, "detail": detail[:1200]}
         if files:
             check["files"] = files
+        if test_cases:
+            check["test_cases"] = test_cases
         self.checks.append(check)
         if status == "failed" and path:
             self.issues.append({"path": path, "message": detail[:500]})
@@ -619,6 +622,20 @@ def _suite_sources(suite: Invocation, files: dict[str, str]) -> list[str]:
     return list(dict.fromkeys(path for path in paths if path in files and _is_test(path)))
 
 
+def _pytest_passed_cases(output: str, suite: Invocation, test_files: list[str]) -> list[str]:
+    _, marker, summary = output.rpartition(" short test summary info ")
+    if not marker:
+        return []
+    observed: dict[str, None] = {}
+    for node_id in re.findall(r"(?m)^PASSED ([^\r\n]+)", summary):
+        filename, _, name = node_id.partition("::")
+        name = name.partition("[")[0]
+        path = filename if filename in test_files else (PurePosixPath(suite.cwd) / filename).as_posix()
+        if path in test_files and all(part.isidentifier() for part in name.split("::")):
+            observed[f"{path}::{name}"] = None
+    return list(observed)
+
+
 def _run_tests(job: Job, files: dict[str, str], readme_path: str, entry: Invocation | None, web: str | None) -> None:
     suites, scripts = _test_commands(files)
     if not suites:
@@ -629,6 +646,7 @@ def _run_tests(job: Job, files: dict[str, str], readme_path: str, entry: Invocat
         job.add("test_command", "测试启动说明", "failed",
                 f"{names} 是独立脚本，pytest 不会执行其主函数。请在 README 写清实际启动方式。", readme_path)
     ordered = sorted(((suite, _suite_owns_backend(suite, entry, files)) for suite in suites), key=lambda pair: pair[1])
+    case_budget = 8192
     for number, (suite, owns_backend) in enumerate(ordered[:12], start=1):
         identifier = f"tests.{number}"
         if unsupported := _unsupported_dependencies(suite, files, versions=job.python_versions):
@@ -660,9 +678,17 @@ def _run_tests(job: Job, files: dict[str, str], readme_path: str, entry: Invocat
         if issues:
             job.issues.extend(issues)
             detail = " · ".join([*(item["message"] for item in issues[:2]), detail])
+        test_files = _suite_sources(suite, files)
+        test_cases = []
+        if status == "passed" and "pytest" in suite.argv:
+            for case in _pytest_passed_cases(job.output(log, limit=32_768), suite, test_files):
+                size = len(case.encode()) + 3
+                if len(case) <= 360 and size <= case_budget:
+                    test_cases.append(case)
+                    case_budget -= size
         job.add(identifier, "随包功能测试", status,
                 f"{suite.path} {location}退出码 {process.returncode}" + (f" · {detail}" if detail else ""),
-                path, files=_suite_sources(suite, files))
+                path, files=test_files, test_cases=test_cases)
     if len(suites) > 12:
         job.add("tests.limit", "随包功能测试", "skipped", f"有 {len(suites) - 12} 组测试超出单轮验收范围")
 
@@ -754,7 +780,8 @@ def _start_vite(job: Job, project: ViteProject, index: str, files: dict[str, str
         return False
     if process.returncode:
         path, location = _build_failure(job.output(log), project, files)
-        detail = " · ".join(value for value in (location, job.details(log)) if value)
+        diagnostics = dict.fromkeys([location, *job.details(log).split(" · ")])
+        detail = " · ".join(value for value in diagnostics if value)
         job.add("web_build", "前端生产构建", "failed", f"{path} 构建退出码 {process.returncode} · {detail}", path)
         return False
 
@@ -864,6 +891,43 @@ def _browser_issue_file(site: Site, files: dict[str, str], problem: dict) -> str
     return web
 
 
+_BROWSER_CALL_TYPE_ERROR = re.compile(
+    r"(?:Uncaught(?: \(in promise\))? )?TypeError: "
+    r"([a-zA-Z_$][\w$]*(?:\.[a-zA-Z_$][\w$]*){2,8}) is not a function",
+    re.ASCII,
+)
+_BROWSER_SOURCE_NON_CODE = re.compile(
+    r"//[^\r\n]*|/\*[\s\S]*?\*/|<!--[\s\S]*?-->|"
+    r'"(?:\\.|[^"\\\r\n])*"|'
+    r"'(?:\\.|[^'\\\r\n])*'|`(?:\\.|[^`\\])*`",
+)
+
+
+def _browser_call_source(
+    site: Site, files: dict[str, str], diagnostic: str,
+) -> tuple[str, tuple[str, int] | None] | None:
+    error = _BROWSER_CALL_TYPE_ERROR.fullmatch(diagnostic)
+    if not error or not site.web:
+        return None
+    # 构建可能缩短根变量名，Vue 也可能展开 ref。其余成员必须精确匹配。
+    members = error[1].split(".")[1:]
+    if len(members) > 2 and members[0] == "value":
+        members = members[1:]
+    access = re.compile(r"(?<![\w$])" + r"\s*\.\s*".join(map(re.escape, members)) + r"\s*\(")
+    frontend = PurePosixPath(site.web).parent
+    location = None
+    for path, source in files.items():
+        if not path.endswith(_WEB_COMPONENTS) or not PurePosixPath(path).is_relative_to(frontend):
+            continue
+        code = _BROWSER_SOURCE_NON_CODE.sub(lambda match: "\n" * match[0].count("\n") + " ", source)
+        for line, text in enumerate(code.splitlines(), 1):
+            if access.search(text):
+                if location is not None:
+                    return ".".join(members), None
+                location = (path, line)
+    return ".".join(members), location
+
+
 def _read_browser_probe(stage: Job, site: Site, scenarios: list[dict], readme: str) -> dict:
     browser_home = stage.area / "probe"
     browser_home.mkdir(mode=0o700)
@@ -873,7 +937,12 @@ def _read_browser_probe(stage: Job, site: Site, scenarios: list[dict], readme: s
     ports = {site.web_port, site.backend_port} - {None}
     allowed = sorted(f"http://{host}:{port}" for port in ports for host in ("localhost", "127.0.0.1"))
     request = browser_home / "checks.json"
-    write_json(request, {"origin": origin, "allowed": allowed, "scenarios": scenarios})
+    form_scopes = {step["selector"]: scope for scenario in scenarios for step in scenario["steps"]
+                   if (scope := browser_form_scope(step))}
+    write_json(request, {
+        "origin": origin, "allowed": allowed, "scenarios": scenarios, "form_scopes": form_scopes,
+        **({"capture_browser_errors": True} if stage.capture_browser_errors else {}),
+    })
     os.chown(request, _BROWSER_USER, _BROWSER_USER)
     invocation = Invocation(site.web or "", ".", (sys.executable, "-I", "-B", str(_BROWSER_PROBE), str(request)))
     process, log = stage.start(invocation, browser_home=browser_home)
@@ -899,7 +968,7 @@ def _browser_fixture(job: Job, files: dict[str, str], scope: str, readme_path: s
     with tempfile.TemporaryDirectory(prefix="browser-site-", dir=job.area) as directory:
         area = Path(directory)
         area.chmod(0o711)
-        stage = Job(job.request, job.deadline, area)
+        stage = Job(job.request, job.deadline, area, capture_browser_errors=job.capture_browser_errors)
         try:
             _files_for(stage, {"files": files, "source_digest": source_digest(files)})
             site = _start_site(stage, files, scope, readme_path)
@@ -953,10 +1022,26 @@ def _browser_checks(job: Job, files: dict[str, str], scope: str, readme_path: st
                 skipped = outcome.get("kind") == "offline_dependency"
                 where = _browser_issue_file(site, files, outcome)
                 message = outcome.get("message", "")
+                positions = outcome.get("form_scope_steps")
+                if (isinstance(positions, list) and 1 <= len(positions) <= 5
+                        and all(type(position) is int and 1 < position <= len(scenario["steps"]) for position in positions)):
+                    message += "。真实表单字段已唯一定位，需更新步骤 " + ",".join(map(str, positions))
                 if (outcome.get("kind") == "document" and outcome.get("step") == 1 and site.web
                         and scenario["steps"][0]["path"] == "/" + site.web):
                     where, message = checks_path, f"使用了源文件路径作为页面 URL。页面已从 / 成功加载 · {message}"
                 detail = f"{checks_path} 「{scenario['name']}」第 {outcome.get('step', 1)} 步。{message}"
+                diagnostic = outcome.get("console_error")
+                if job.capture_browser_errors and not skipped and isinstance(diagnostic, str) and diagnostic:
+                    suffix = f" · 浏览器脚本异常 {diagnostic[:180]}"
+                    if source_hint := _browser_call_source(site, files, diagnostic[:180]):
+                        members, location = source_hint
+                        if location:
+                            where, line = location
+                            display_path = where if len(where) <= 120 else f"…/{PurePosixPath(where).name}"
+                            suffix += f" · 源码候选 {display_path}:{line}"
+                        else:
+                            suffix += f" · 源码位置未确认，请在前端查找 {members}"
+                    detail = detail[:500 - len(suffix)] + suffix
                 job.add(identifier, label, "skipped" if skipped else "failed", detail, where)
         else:
             job.add("browser.flows", "浏览器操作场景", "skipped", "工程未交付可执行的浏览器操作场景")
@@ -1019,7 +1104,10 @@ def _verify(request: Path, payload: dict, remaining: float) -> dict:
     with tempfile.TemporaryDirectory(prefix="project-") as directory:
         area = Path(directory)
         area.chmod(0o711)
-        job = Job(request, time.monotonic() + remaining, area)
+        job = Job(
+            request, time.monotonic() + remaining, area,
+            capture_browser_errors=payload.get("capture_browser_errors") is True,
+        )
         contract = None
         try:
             files = _files_for(job, payload)

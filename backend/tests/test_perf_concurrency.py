@@ -313,24 +313,30 @@ class TestTimeoutSemantics:
         monkeypatch.setattr(factory_mod, "build_chat_model", lambda *a, **k: Stall())
 
     @pytest.mark.asyncio
-    async def test_model_stream_timeout_resumes_from_checkpoint(self, monkeypatch):
+    @pytest.mark.parametrize("run_timeout", [0.0, 30.0])
+    async def test_model_stream_timeout_resumes_from_checkpoint(self, monkeypatch, run_timeout):
         """模型流停滞（内层超时）-> 断点重试成功，半截文本不重复、不误报运行超时。"""
         self._patch(monkeypatch, always_stall=False)
+        from app.core.config import settings
         from app.core.database import AsyncSessionLocal
         from app.models.agent import AgentRun, AgentRunEvent
         from app.services.agent_runtime import get_runtime_service
         from sqlalchemy import select
 
+        monkeypatch.setattr(settings, "AGENT_RUN_TIMEOUT", run_timeout)
         svc = get_runtime_service()
         r = await svc.run_to_completion(
             agent_config={"id": 991100, "tools": [], "capability_ids": ["general"],
-                          "system_prompt": "t", "temperature": "0.1"},
+                          "system_prompt": "t", "temperature": "0.1",
+                          "execution_budget": {"run_timeout_seconds": 30.0}},
             messages=[{"role": "user", "content": "会卡一次"}], user_id=1,
         )
         assert r["status"] == "completed", r
         assert "RECOVERED-完整回答" in (r.get("content") or "")
         assert "半截" not in (r.get("content") or ""), "断点重试后不得残留半截文本"
         async with AsyncSessionLocal() as db:
+            row = await db.get(AgentRun, r["run_id"])
+            assert (row.budget_deadline_at is None) == (run_timeout == 0)
             evs = (await db.execute(
                 select(AgentRunEvent).where(AgentRunEvent.run_id == r["run_id"])
             )).scalars().all()
@@ -342,11 +348,13 @@ class TestTimeoutSemantics:
     async def test_model_stream_timeout_exhausted_reports_real_error(self, monkeypatch):
         """重试耗尽：如实上报"模型请求超时"，不得谎报"运行超时（>Ns）"。"""
         self._patch(monkeypatch, always_stall=True)
+        from app.core.config import settings
         from app.core.database import AsyncSessionLocal
         from app.models.agent import AgentRun
         from app.services.agent_runtime import get_runtime_service
         from sqlalchemy import select
 
+        monkeypatch.setattr(settings, "AGENT_RUN_TIMEOUT", 0.0)
         svc = get_runtime_service()
         r = await svc.run_to_completion(
             agent_config={"id": 991200, "tools": [], "capability_ids": ["general"],
@@ -358,6 +366,7 @@ class TestTimeoutSemantics:
             row = (await db.execute(
                 select(AgentRun).where(AgentRun.id == r["run_id"])
             )).scalar_one()
+            assert row.budget_deadline_at is None
             err = row.error or ""
         assert "请求超时" in err, err
         assert "运行超时" not in err, f"内层请求超时不得误报运行超时: {err}"

@@ -74,6 +74,20 @@ class TestEventProtocol:
         assert ev["event"] == "run.cancelled"
         assert is_terminal(ev)
 
+    def test_terminal_verification_includes_generated_artifacts_after_source_files(self):
+        from app.services.agent_runtime.events import RUN_CANCELLED, RuntimeEvent, event_storage_payload
+
+        diagnostic = "浏览器没有保存工单。" * 50
+        artifacts = [{"path": f"src/file{index}.py"} for index in range(25)]
+        artifacts.append({"path": "project.zip", "download_url": "/api/v2/artifacts/verified"})
+        report = {"version": 2, "artifacts": artifacts, "checks": [
+            {"id": "runtime_browser", "passed": False, "detail": diagnostic},
+        ]}
+        stored = event_storage_payload(RuntimeEvent(type=RUN_CANCELLED, run_id="r", data={
+            "summary": {"verification": report},
+        }))
+        assert stored["summary"]["verification"] == report
+
 
 # ── Runs API v2 集成 ─────────────────────────────────────────────────────────
 
@@ -395,21 +409,263 @@ class TestRunsAPIv2:
         assert client.get(new_artifact["download_url"], headers=headers).json() == {"boxes": 4}
         assert client.get(artifacts["audit/facts.json"], headers=headers).json() == {"boxes": 3}
 
-    def test_exhausted_verification_keeps_partial_text_and_reports_failure(self, client, user_setup, monkeypatch):
+    def test_stalled_verification_pauses_with_partial_text(self, client, user_setup, monkeypatch):
         model_output = "初步发现，建议继续核对。"
         _patch_model(monkeypatch, [AIMessage(content=model_output), AIMessage(content=model_output)])
         owner = user_setup["user1_id"]
         headers = _auth(owner)
         started = client.post("/api/v2/runs", json={"message": "深入调研行业现状，引用至少两个来源。"}, headers=headers).json()
-        assert _wait_run(client, started["run_id"], owner)["status"] == "failed"
+        detail = _wait_run(client, started["run_id"], owner)
+        assert detail["status"] == "limit_exceeded"
+        assert detail["summary"]["stop"] == {"reason": "no_progress", "can_continue": False}
         events = _iter_v2_sse(client.get(started["events_url"], headers=headers))
         assert events[-1]["event"] == "run.failed"
         assert events[-1]["data"]["final_text"] == model_output
+        assert events[-1]["data"]["summary"]["stop"] == detail["summary"]["stop"]
         report = events[-1]["data"]["summary"]["verification"]
         assert report["stop_reason"] == "no_progress"
         assert any(check["id"] == "citations_present" and not check["passed"] for check in report["checks"])
 
-    @pytest.mark.parametrize("reason", ["budget", "execution"])
+    def test_main_project_requires_runtime_evidence_and_downloads_the_verified_snapshot(self, client, user_setup, monkeypatch, tmp_path):
+        import io
+        from zipfile import ZipFile
+
+        from app.core.config import settings
+        from app.services.agent_runtime import workspace_delivery
+        from app.services.agent_runtime.project_verifier_protocol import source_digest
+
+        def call(name, args, identifier):
+            return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": identifier}])
+
+        monkeypatch.setattr(settings, "AGENT_FILES_ROOT", str(tmp_path))
+        monkeypatch.setattr(settings, "AGENT_PROJECT_VERIFIER_DIR", str(tmp_path / "worker"))
+        observed = []
+        api = {"openapi": "3.1.0", "info": {"title": "工单", "version": "1.0"}, "paths": {"/api/items": {"get": {}}}}
+
+        async def verifier(files, scope, *, capture_openapi=False, capture_browser_errors=False):
+            assert scope == "fullstack"
+            if capture_openapi:
+                return {"openapi": api}
+            assert capture_browser_errors
+            assert json.loads(files["openapi.json"]) == api
+            has_browser = "tests/browser-checks.json" in files
+            observed.append((source_digest(files), has_browser))
+            checks = {"runtime.start": "passed", "runtime.web": "passed", "runtime.web_build": "passed",
+                      "runtime.tests.1": "passed", "runtime.browser": "passed"}
+            checks["runtime.browser.flow.1" if has_browser else "runtime.browser.flows"] = "passed" if has_browser else "skipped"
+            return {"source_digest": observed[-1][0], "checks": [{"id": key, "status": status} for key, status in checks.items()]}
+
+        monkeypatch.setattr(workspace_delivery, "verify_runtime", verifier)
+        contract = '{"version":1,"scenarios":[{"name":"登记工单","steps":[{"action":"open","path":"/"},{"action":"click","selector":"#create"},{"action":"expect_text","selector":"#list","value":"已登记"}]}]}'
+        _patch_model(monkeypatch, [
+            call("write_file", {"file_path": "/workspace/frontend/index.html", "content": '<button id="create">登记</button>'}, "project-page"),
+            call("write_file", {"file_path": "/workspace/backend/main.py", "content": "from fastapi import FastAPI\napp = FastAPI()"}, "project-api"),
+            AIMessage(content="已创建文件，交付完成。"),
+            call("write_file", {"file_path": "/workspace/tests/browser-checks.json", "content": contract}, "project-browser-checks"),
+            call("verify_workspace_project", {}, "project-verify"),
+            AIMessage(content="浏览器验证通过，可下载工程包。"),
+        ])
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        response = client.post("/api/v2/runs", headers=headers, json={
+            "team_mode": False, "task_mode": "chat", "message": (
+                "构建并交付可直接运行的前后端分离项目。执行真实生产构建，提供可执行测试、OpenAPI 和源码 ZIP。请用浏览器验证登记工单。"
+            ),
+        })
+        assert response.status_code == 200, response.text
+        run = response.json()
+        assert _wait_run(client, run["run_id"], owner)["status"] == "completed"
+        assert [value for _, value in observed] == [False, True]
+        events = _iter_v2_sse(client.get(run["events_url"], headers=headers))
+        assert any(event["event"] == "tool.completed" and event["data"]["tool_call_id"] == "project-verify" for event in events)
+        assert any(event["event"] == "run.retrying" and {"runtime_browser", "archive"} <= {
+            row["id"] for row in event["data"]["failed_checks"]} for event in events)
+        review = events[-1]["data"]["summary"]["verification"]
+        assert all(row["passed"] for row in review["checks"])
+        published = next(row for row in review["artifacts"] if row["path"].endswith(".zip"))
+        data = client.get(published["download_url"], headers=headers)
+        assert data.status_code == 200
+        with ZipFile(io.BytesIO(data.content)) as package:
+            archive_files = {name: package.read(name).decode() for name in package.namelist() if name != "verification.json"}
+            assert json.loads(package.read("verification.json"))["source_digest"] == observed[-1][0] == source_digest(archive_files)
+            assert archive_files["tests/browser-checks.json"] == contract
+
+    @pytest.mark.parametrize("ending", ["browser_failed", "budget_after_verified", "source_changed"])
+    def test_interrupted_main_project_uses_latest_exact_verifier_receipt(self, client, user_setup, monkeypatch, tmp_path, ending):
+        import asyncio
+        from threading import Event
+
+        from app.core.config import settings
+        from app.services.agent_runtime import workspace_delivery
+        from app.services.agent_runtime.events import WORKSPACE_PROJECT_REVIEWED
+        from app.services.agent_runtime.project_verifier_protocol import source_digest
+
+        def call(name, args, identifier):
+            return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": identifier}])
+
+        async def verifier(files, scope, *, capture_openapi=False, capture_browser_errors=False):
+            assert scope == "fullstack"
+            if capture_openapi:
+                return {"openapi": {"openapi": "3.1.0", "info": {"title": "工单", "version": "1.0"},
+                                    "paths": {"/api/items": {"post": {}}}}}
+            assert capture_browser_errors
+            checks = [{"id": key, "status": "passed"} for key in (
+                "runtime.start", "runtime.web", "runtime.web_build", "runtime.tests.1", "runtime.browser",
+            )]
+            if ending == "browser_failed":
+                detail = "登记工单后列表缺少新记录" if "新增" in files["frontend/index.html"] else "先前浏览器报错"
+                checks.append({"id": "runtime.browser.flow.1", "status": "failed", "detail": detail})
+            else:
+                checks.append({"id": "runtime.browser.flow.1", "status": "passed"})
+            return {"source_digest": source_digest(files), "checks": checks}
+
+        monkeypatch.setattr(settings, "AGENT_FILES_ROOT", str(tmp_path))
+        monkeypatch.setattr(settings, "AGENT_PROJECT_VERIFIER_DIR", str(tmp_path / "worker"))
+        monkeypatch.setattr(workspace_delivery, "verify_runtime", verifier)
+        script = [
+            call("write_file", {"file_path": "/workspace/frontend/index.html", "content": "<button>登记</button>"}, "write-page"),
+            call("write_file", {"file_path": "/workspace/backend/main.py", "content": "from fastapi import FastAPI\napp = FastAPI()"}, "write-api"),
+            call("verify_workspace_project", {}, "verify-project"),
+        ]
+        if ending in {"browser_failed", "source_changed"}:
+            script.append(call("edit_file", {"file_path": "/workspace/frontend/index.html", "old_string": "登记",
+                                             "new_string": "新增"}, "edit-page"))
+        if ending == "browser_failed":
+            script.append(call("verify_workspace_project", {}, "verify-updated-project"))
+        waiting = Event()
+        generate = FakeChatModel._agenerate
+
+        async def wait_after_tools(self, *args, **kwargs):
+            if not self.script:
+                waiting.set()
+                await asyncio.sleep(60)
+            return await generate(self, *args, **kwargs)
+
+        monkeypatch.setattr(FakeChatModel, "_agenerate", wait_after_tools)
+        if ending == "budget_after_verified":
+            monkeypatch.setattr(settings, "AGENT_MAX_MODEL_CALLS", len(script))
+        _patch_model(monkeypatch, script)
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        response = client.post("/api/v2/runs", headers=headers, json={
+            "team_mode": False, "task_mode": "chat",
+            "message": "构建并交付可直接运行的前后端分离项目。执行真实生产构建，提供可执行测试、OpenAPI 和源码 ZIP。请用浏览器验证登记工单。",
+        })
+        assert response.status_code == 200, response.text
+        run = response.json()
+        if ending == "budget_after_verified":
+            assert _wait_run(client, run["run_id"], owner)["status"] == "limit_exceeded"
+        else:
+            assert waiting.wait(10)
+            assert client.post(f"/api/v2/runs/{run['run_id']}/cancel", headers=headers).status_code == 200
+            assert _wait_run(client, run["run_id"], owner)["status"] == "cancelled"
+        events = _iter_v2_sse(client.get(run["events_url"], headers=headers))
+        assert all(event["event"] != WORKSPACE_PROJECT_REVIEWED for event in events)
+        report = events[-1]["data"]["summary"]["verification"]
+        checks = {row["id"]: row for row in report["checks"]}
+        assert not checks["execution_interrupted"]["passed"]
+        assert report["status"] != "passed"
+        paths = {artifact["path"]: artifact["download_url"] for artifact in report["artifacts"]}
+        assert {"frontend/index.html", "backend/main.py"} <= paths.keys()
+        archives = [url for path, url in paths.items() if path.endswith(".zip")]
+        if ending == "browser_failed":
+            assert report["stop_reason"] == "cancelled"
+            assert not checks["runtime_browser"]["passed"]
+            assert "登记工单后列表缺少新记录" in checks["runtime_browser"]["detail"]
+            assert "先前浏览器报错" not in checks["runtime_browser"]["detail"]
+            assert not archives
+        elif ending == "source_changed":
+            assert report["stop_reason"] == "cancelled"
+            assert not checks["project_sources"]["passed"]
+            assert "runtime_browser" not in checks
+            assert not archives and "openapi.json" not in paths
+        else:
+            assert report["stop_reason"] == "budget"
+            assert checks["runtime_browser"]["passed"]
+            assert len(archives) == 1 and client.get(archives[0], headers=headers).content.startswith(b"PK")
+            assert client.get(paths["openapi.json"], headers=headers).json()["info"]["title"] == "工单"
+
+    def test_stopping_main_file_task_retains_saved_evidence_for_continue(self, client, user_setup, monkeypatch, tmp_path):
+        import asyncio
+        from threading import Event
+
+        from app.core.config import settings
+
+        def write(path, content, identifier):
+            return AIMessage(content="", tool_calls=[{"name": "write_file", "id": identifier, "args": {
+                "file_path": f"/workspace/{path}", "content": content,
+            }}])
+
+        monkeypatch.setattr(settings, "AGENT_FILES_ROOT", str(tmp_path))
+        waiting = Event()
+        generate = FakeChatModel._agenerate
+
+        async def wait_after_first_write(self, *args, **kwargs):
+            if not self.script:
+                waiting.set()
+                await asyncio.sleep(60)
+            return await generate(self, *args, **kwargs)
+
+        monkeypatch.setattr(FakeChatModel, "_agenerate", wait_after_first_write)
+        _patch_model(monkeypatch, [write("report.md", "# 已确认的盘点报告", "saved-before-stop")])
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        run = client.post("/api/v2/runs", headers=headers, json={
+            "message": "分阶段盘点并保存为 report.md 和 facts.json 两份文件。",
+        }).json()
+        assert waiting.wait(5)
+        assert client.post(f"/api/v2/runs/{run['run_id']}/cancel", headers=headers).status_code == 200
+        assert _wait_run(client, run["run_id"], owner)["status"] == "cancelled"
+        terminal = _iter_v2_sse(client.get(run["events_url"], headers=headers))[-1]
+        assert terminal["event"] == "run.cancelled"
+        report = terminal["data"]["summary"]["verification"]
+        assert report["stop_reason"] == "cancelled"
+        assert [item["path"] for item in report["artifacts"]] == ["report.md"]
+
+        _patch_model(monkeypatch, [write("facts.json", '{"count":2}', "save-remaining"), AIMessage(content="两份文件已齐备。")])
+        next_run = client.post("/api/v2/runs", headers=headers, json={
+            "conversation_id": run["conversation_id"], "message": "继续",
+        }).json()
+        assert _wait_run(client, next_run["run_id"], owner)["status"] == "completed"
+        events = _iter_v2_sse(client.get(next_run["events_url"], headers=headers))
+        assert {item["path"] for item in events[-1]["data"]["summary"]["verification"]["artifacts"]} == {"report.md", "facts.json"}
+
+    def test_main_parallel_duplicate_plan_calls_keep_other_tasks_and_do_not_consume_the_budget(self, client, user_setup, monkeypatch):
+        from app.core.config import settings
+
+        def item(content, status):
+            return {"content": content, "status": status}
+
+        def call(todos, identifier):
+            return {"name": "write_todos", "id": identifier, "args": {"todos": todos}}
+
+        monkeypatch.setattr(settings, "AGENT_MAX_TOOL_CALLS", 4)
+        first = [item("核对库存", "in_progress"), item("核对出入库", "pending"), item("整理结论", "pending")]
+        bulk = [call(json.dumps([item("核对库存", "completed")], ensure_ascii=False), f"repeated-plan-{index}") for index in range(40)]
+        bulk.append(call(json.dumps([item("核对出入库", "completed")], ensure_ascii=False), "another-item"))
+        bulk.extend(call(json.dumps([item("整理结论", "completed")], ensure_ascii=False)[:-1], f"malformed-{index}") for index in range(40))
+        done = [{**entry, "status": "completed"} for entry in first]
+        _patch_model(monkeypatch, [
+            AIMessage(content="", tool_calls=[call(first, "initial-plan")]),
+            AIMessage(content="", tool_calls=bulk),
+            AIMessage(content="完成。"),
+            AIMessage(content="", tool_calls=[call(done, "confirmed-plan")]),
+            AIMessage(content="已完成盘点。"),
+        ])
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        response = client.post("/api/v2/runs", headers=headers, json={"message": "按多个阶段盘点并核对库存和出入库，最后整理结论。"})
+        assert response.status_code == 200
+        run = response.json()
+        assert _wait_run(client, run["run_id"], owner)["status"] == "completed"
+        events = _iter_v2_sse(client.get(run["events_url"], headers=headers))
+        actual = [event["data"]["tool_call_id"] for event in events if event["event"] == "tool.started"]
+        assert actual == ["initial-plan", "repeated-plan-0", "malformed-0", "confirmed-plan"]
+        assert any(event["event"] == "tool.failed" and event["data"]["tool_call_id"] == "malformed-0" for event in events)
+        assert any(event["event"] == "run.retrying" and any(check["id"] == "plan_finished" for check in event["data"]["failed_checks"])
+                   for event in events)
+
+    @pytest.mark.parametrize("reason", ["budget", "no_progress", "execution"])
     def test_interrupted_complex_task_preserves_confirmed_files(self, client, user_setup, monkeypatch, tmp_path, reason):
         from app.core.config import settings
 
@@ -417,11 +673,18 @@ class TestRunsAPIv2:
             raise RuntimeError("模型连接中断")
 
         monkeypatch.setattr(settings, "AGENT_FILES_ROOT", str(tmp_path))
-        monkeypatch.setattr(settings, "AGENT_MAX_MODEL_CALLS", 1 if reason == "budget" else 10)
+        monkeypatch.setattr(settings, "AGENT_MAX_MODEL_CALLS", 2 if reason == "budget" else 10)
         excerpt = "已生成报告草稿，事实表尚待保存。"
+        pending_todos = [{"content": "核对报告正文", "status": "completed"},
+                         {"content": "写入并核对事实清单", "status": "in_progress"}]
+        repeated = [AIMessage(content="", tool_calls=[{"name": "read_file", "id": f"repeated-{index}", "args": {
+            "file_path": "/workspace/report.md",
+        }}]) for index in range(3)] if reason == "no_progress" else []
         _patch_model(monkeypatch, [
+            AIMessage(content="", tool_calls=[{"name": "write_todos", "id": "initial-plan", "args": {"todos": pending_todos}}]),
             AIMessage(content=excerpt, tool_calls=[{"name": "write_file", "id": "draft-before-interruption", "args": {
                 "file_path": "/workspace/report.md", "content": "# 报告\n\n第一部分已核对。"}}]),
+            *repeated,
             failure,
         ])
         owner = user_setup["user1_id"]
@@ -434,12 +697,19 @@ class TestRunsAPIv2:
         })
         assert response.status_code == 200, response.text
         run = response.json()
-        expected = "limit_exceeded" if reason == "budget" else "failed"
-        assert _wait_run(client, run["run_id"], owner)["status"] == expected
+        expected = "failed" if reason == "execution" else "limit_exceeded"
+        detail = _wait_run(client, run["run_id"], owner)
+        assert detail["status"] == expected
         events = _iter_v2_sse(client.get(run["events_url"], headers=headers))
         assert events[-1]["event"] == "run.failed"
         terminal = events[-1]["data"]
         assert terminal["status"] == expected and terminal["final_text"] == excerpt
+        if expected == "limit_exceeded":
+            assert terminal["summary"]["stop"] == {"reason": reason, "can_continue": True}
+            assert detail["summary"]["stop"] == terminal["summary"]["stop"]
+            assert "暂停" in terminal["error"]
+        else:
+            assert "stop" not in terminal["summary"]
         verification = terminal["summary"]["verification"]
         assert verification["stop_reason"] == reason and verification["status"] != "passed"
         assert {item["id"] for item in verification["checks"] if not item["passed"]} == {
@@ -449,12 +719,23 @@ class TestRunsAPIv2:
         downloaded = client.get(verification["artifacts"][0]["download_url"], headers=headers)
         assert downloaded.status_code == 200 and "第一部分已核对" in downloaded.text
         if reason == "budget":
-            return
+            monkeypatch.setattr(settings, "AGENT_MAX_MODEL_CALLS", 10)
 
+        received = []
+        model_generate = FakeChatModel._generate
+
+        def observe_continuation(self, messages, *args, **kwargs):
+            received.append(messages)
+            return model_generate(self, messages, *args, **kwargs)
+
+        monkeypatch.setattr(FakeChatModel, "_generate", observe_continuation)
         _patch_model(monkeypatch, [
             AIMessage(content="", tool_calls=[{"name": "write_file", "id": "write-missing-facts", "args": {
                 "file_path": "/workspace/facts.json", "content": '{"total": 2}'}}]),
             AIMessage(content="两份文件已齐备，事实表已补齐。"),
+            AIMessage(content="", tool_calls=[{"name": "write_todos", "id": "close-carried-plan", "args": {
+                "todos": [{**item, "status": "completed"} for item in pending_todos]}}]),
+            AIMessage(content="已完成原计划，两份文件已齐备。"),
         ])
         continued = client.post("/api/v2/runs", headers=headers, json={
             "conversation_id": run["conversation_id"], "message": "继续",
@@ -464,13 +745,69 @@ class TestRunsAPIv2:
         assert _wait_run(client, next_run["run_id"], owner)["status"] == "completed"
         history = _iter_v2_sse(client.get(next_run["events_url"], headers=headers))
         started_tools = [event["data"] for event in history if event["event"] == "tool.started"]
-        assert len(started_tools) == 1 and started_tools[0]["tool_call_id"] == "write-missing-facts"
+        assert [item["tool_call_id"] for item in started_tools] == ["write-missing-facts", "close-carried-plan"]
+        header = "\n".join(str(item.content) for item in received[0] if item.type == "system")
+        assert '"verified_files": ["report.md"]' in header
+        assert '"content": "写入并核对事实清单", "status": "in_progress"' in header
+        assert any(event["event"] == "run.retrying" and any(check["id"] == "plan_finished"
+                   for check in event["data"].get("failed_checks", [])) for event in history)
         report = history[-1]["data"]["summary"]["verification"]
         assert report["status"] == "passed"
         files = {item["path"]: item["download_url"] for item in report["artifacts"]}
         assert set(files) == {"report.md", "facts.json"}
         assert client.get(files["report.md"], headers=headers).content == downloaded.content
         assert client.get(files["facts.json"], headers=headers).json() == {"total": 2}
+
+    def test_project_continue_rebuilds_plan_after_model_clears_todos(self, client, user_setup, monkeypatch, tmp_path):
+        from app.core.config import settings
+        from app.services.agent_runtime import workspace_delivery
+        from app.services.agent_runtime.project_verifier_protocol import source_digest
+
+        async def verifier(files, scope, *, capture_browser_errors=False):
+            assert scope == "fullstack" and capture_browser_errors
+            return {"source_digest": source_digest(files), "checks": [
+                *({"id": key, "status": "passed"} for key in ("runtime.start", "runtime.web", "runtime.browser")),
+                {"id": "runtime.browser.flow.1", "status": "failed", "detail": "提交工单后缺少列表结果 #new-row"},
+            ]}
+
+        def call(name, args, identifier):
+            return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": identifier}])
+
+        monkeypatch.setattr(settings, "AGENT_FILES_ROOT", str(tmp_path))
+        monkeypatch.setattr(settings, "AGENT_PROJECT_VERIFIER_DIR", str(tmp_path / "worker"))
+        monkeypatch.setattr(workspace_delivery, "verify_runtime", verifier)
+        script = [
+            call("write_file", {"file_path": "/workspace/frontend/index.html", "content": "<button>登记</button>"}, "saved-page"),
+            call("write_file", {"file_path": "/workspace/backend/main.py", "content": "from fastapi import FastAPI\napp = FastAPI()"}, "saved-api"),
+            call("write_file", {"file_path": "/workspace/backend", "content": "不可覆盖目录"}, "failed-write"),
+            call("verify_workspace_project", {}, "verified-browser-flow"),
+            call("write_todos", {"todos": []}, "cleared-todos"),
+        ]
+        monkeypatch.setattr(settings, "AGENT_MAX_MODEL_CALLS", len(script))
+        _patch_model(monkeypatch, script)
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        initial = client.post("/api/v2/runs", headers=headers, json={"task_mode": "chat", "message":
+            "构建一个前后端分离的可运行项目，请用浏览器验证登记工单并提供源码 ZIP。"})
+        assert initial.status_code == 200, initial.text
+        first = initial.json()
+        assert _wait_run(client, first["run_id"], owner)["status"] == "limit_exceeded"
+        initial_events = _iter_v2_sse(client.get(first["events_url"], headers=headers))
+        assert any(event["event"] == "tool.completed" and event["data"].get("tool_call_id") == "cleared-todos" for event in initial_events)
+
+        monkeypatch.setattr(settings, "AGENT_MAX_MODEL_CALLS", 1)
+        _patch_model(monkeypatch, [AIMessage(content="工单项目已完成。")])
+        resumed = client.post("/api/v2/runs", headers=headers, json={"conversation_id": first["conversation_id"], "message": "继续"})
+        assert resumed.status_code == 200, resumed.text
+        run = resumed.json()
+        assert _wait_run(client, run["run_id"], owner)["status"] != "completed"
+        events = _iter_v2_sse(client.get(run["events_url"], headers=headers))
+        planned = next(event["data"]["todos"] for event in events if event["event"] == "plan.updated")
+        assert all(row["status"] == "pending" for row in planned)
+        assert any("#new-row" in row["content"] for row in planned)
+        assert any("核对未确认的写入 backend" in row["content"] for row in planned)
+        report = events[-1]["data"]["summary"]["verification"]
+        assert {item["path"] for item in report["artifacts"]} == {"frontend/index.html", "backend/main.py"}
 
     def test_model_length_stop_continues_the_same_answer(self, client, user_setup, monkeypatch):
         _patch_model(monkeypatch, [AIMessage(content="第一部分。", response_metadata={"finish_reason": "length"}),

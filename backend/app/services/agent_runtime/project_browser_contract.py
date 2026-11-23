@@ -14,6 +14,16 @@ _INTERACTIONS = {"click", "check", "select", "press"}
 _METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
 _ANNOTATIONS = {"description", "label", "comment", "note"}
 _FINDING_STEP = re.compile(r"^tests/browser-checks\.json\s+「([^」]{1,72})」第 (\d+) 步", re.I)
+_FORM_SCOPE = re.compile(r"form(?P<form>#[A-Za-z][\w-]{0,63})\s+(?P<control>(?:input|textarea|select)?#[A-Za-z][\w-]{0,63})\Z", re.ASCII)
+_FORM_ACTIONS = {"fill", "select", "check"}
+
+
+def browser_form_scope(step: dict) -> tuple[str, str, str] | None:
+    """试探失效 ID 时保留表单约束和原来的精确字段。"""
+    if step["action"] in _FORM_ACTIONS and (match := _FORM_SCOPE.fullmatch(step["selector"])):
+        control = match["control"]
+        return match["form"], f"form {control}", "#" + control.split("#", 1)[1]
+    return None
 
 
 def _string(value, limit: int, *, empty: bool = False) -> bool:
@@ -78,6 +88,12 @@ def _step_problem(step) -> str:
         keys.add("confirm")
         if type(step["confirm"]) is not bool:
             return "confirm 需要是布尔值"
+    if action == "click" and "prompt" in step:
+        keys.add("prompt")
+        if "confirm" in step:
+            return "同一个点击步骤只能使用 confirm 或 prompt"
+        if not _string(step["prompt"], 300, empty=True):
+            return "prompt 需要是有效文本，最多 300 字符"
     if action == "expect_response":
         keys.update({"method", "status"})
         if not isinstance(step.get("method"), str) or step["method"] not in _METHODS:
@@ -168,6 +184,16 @@ def browser_observed_source(source: str, findings: list[str]) -> str:
         if not 0 < index < len(steps):
             continue
         step = steps[index]
+        scope_change = re.search(r"。真实表单字段已唯一定位，需更新步骤 ([0-9]{1,2}(?:,[0-9]{1,2}){0,4})$", message)
+        if scope_change and (origin := browser_form_scope(step)):
+            positions = [int(value) - 1 for value in scope_change[1].split(",")]
+            if positions == list(range(index, index + len(positions))) and positions[-1] < len(steps):
+                scopes = [browser_form_scope(steps[position]) for position in positions]
+                if all(scope and scope[0] == origin[0] for scope in scopes):
+                    for position, scope in zip(positions, scopes, strict=True):
+                        steps[position]["selector"] = scope[1]
+                    changed = True
+            continue
         field = re.search(r"场景输入未满足表单要求 (#[\w-]+)$", message)
         if (field and step["action"] == "expect_visible" and steps[index - 1]["action"] == "click"
                 and re.search(r"无效|校验|必填|invalid|required", location[1], re.I)

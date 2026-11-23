@@ -37,10 +37,10 @@ class RunScope:
 class ExecutionBudget:
     """执行预算：次数 / 时长限制（token 预算留接口，暂按次数/时长执行）"""
 
-    max_steps: int = 100                   # 图执行最大步数（模型调用轮数），0=不限制
-    max_tool_calls: int = 200              # 工具调用总次数，0=不限制
-    max_model_calls: int = 100             # 模型调用次数，0=不限制
-    run_timeout_seconds: float = 600.0     # 单次运行墙钟超时
+    max_steps: int = 1000                  # 图执行最大步数（模型调用轮数），0=不限制
+    max_tool_calls: int = 1000             # 工具调用总次数，0=不限制
+    max_model_calls: int = 1000            # 模型调用次数，0=不限制
+    run_timeout_seconds: float = 0.0       # 单次运行总时限（秒），0=不限制
     max_subagent_depth: int = 2            # 子代理派生深度上限
     max_tokens_budget: Optional[int] = None  # 预留：token 预算
 
@@ -74,6 +74,7 @@ class RuntimeContext:
     task_contract: Optional[TaskContract] = None
     completion_review: Optional[Dict[str, Any]] = None
     carried_artifacts: Dict[str, str] = field(default_factory=dict)
+    completion_continuation: Dict[str, Any] = field(default_factory=dict)
 
     # Worker 身份与 Fencing Token（工具账本执行权标记，Phase 2/3）
     worker_id: Optional[str] = None
@@ -95,7 +96,7 @@ class RuntimeContext:
 
     # ── Run 级预算（P1-05 §13）：跨崩溃/HITL 恢复不重置 ─────────────────
     # 上述计数在恢复时由 DB 累计值种子（不从零开始）；budget_* 为持久化镜像。
-    # budget_version：CAS 版本；budget_deadline_at：绝对截止（不随重启重置）。
+    # budget_version：CAS 版本；启用总时限时，budget_deadline_at 为持久化的绝对截止。
     budget_version: int = 0
     budget_deadline_at: Optional[Any] = None        # datetime，绝对截止
     budget_first_started_at: Optional[Any] = None   # datetime，Run 起点

@@ -64,10 +64,10 @@ def build_snapshot(
         "memory_policy": {"use_memory_context": True},
         # execution budget
         "execution_budget": {
-            "max_steps": getattr(settings, "AGENT_MAX_STEPS", 100),
-            "max_tool_calls": getattr(settings, "AGENT_MAX_TOOL_CALLS", 200),
-            "max_model_calls": getattr(settings, "AGENT_MAX_MODEL_CALLS", 100),
-            "run_timeout_seconds": getattr(settings, "AGENT_RUN_TIMEOUT", 600.0),
+            "max_steps": settings.AGENT_MAX_STEPS,
+            "max_tool_calls": settings.AGENT_MAX_TOOL_CALLS,
+            "max_model_calls": settings.AGENT_MAX_MODEL_CALLS,
+            "run_timeout_seconds": settings.AGENT_RUN_TIMEOUT,
         },
         # security policy
         "security_policy": {

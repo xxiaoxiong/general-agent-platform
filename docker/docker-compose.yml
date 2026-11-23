@@ -98,8 +98,11 @@ services:
       AGENT_CHECKPOINT_DSN: postgresql://${POSTGRES_USER:-ai_cp}:${POSTGRES_PASSWORD}@checkpoint_pg:5432/${POSTGRES_DB:-agent_checkpoints}
       # 跨线程长期记忆 Store（Phase 5 统一记忆事实来源，与 Checkpointer 同库）
       AGENT_STORE_DSN: postgresql://${POSTGRES_USER:-ai_cp}:${POSTGRES_PASSWORD}@checkpoint_pg:5432/${POSTGRES_DB:-agent_checkpoints}
-      # 运行超时/断点重试（可在 docker/.env 覆盖；大任务需要充足预算）
-      AGENT_RUN_TIMEOUT: ${AGENT_RUN_TIMEOUT:-1800.0}
+      # 运行预算与断点重试（可在 docker/.env 覆盖）
+      AGENT_MAX_STEPS: ${AGENT_MAX_STEPS:-1000}
+      AGENT_MAX_MODEL_CALLS: ${AGENT_MAX_MODEL_CALLS:-1000}
+      AGENT_MAX_TOOL_CALLS: ${AGENT_MAX_TOOL_CALLS:-1000}
+      AGENT_RUN_TIMEOUT: ${AGENT_RUN_TIMEOUT:-0}
       AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT: ${AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT:-false}
       AGENT_INNER_TIMEOUT_RETRIES: ${AGENT_INNER_TIMEOUT_RETRIES:-1}
       AGENT_PROJECT_VERIFIER_DIR: ${AGENT_PROJECT_VERIFIER_DIR-/var/lib/project-verifier}

@@ -102,6 +102,7 @@ export interface RunStreamMessage {
   liveStatus?: string
   error?: string
   runStatus?: string
+  executionStop?: { reason: 'budget' | 'no_progress'; canContinue: boolean }
   pendingActions?: any[]
   finalText?: string
   documentRetryable?: boolean
@@ -112,6 +113,22 @@ export interface RunStreamMessage {
   lastEventTs?: number
   /** 任务耗时（run.started -> 最近事件），终态后固化展示 */
   runDurationMs?: number
+}
+
+export function executionPause(message: RunStreamMessage) {
+  if (message.runStatus !== 'limit_exceeded') return undefined
+  const report = message.blocks.find(block => block.kind === 'verification')
+  const requiresReconciliation = report?.stopReason === 'external_operation'
+  const savedFileTask = !!report && (report.artifacts.length > 0 || report.checks.some(check => check.id === 'artifact_produced'))
+  const canContinue = !requiresReconciliation && (message.executionStop?.canContinue
+    ?? (savedFileTask && (report.stopReason === 'budget' || report.stopReason === 'no_progress')))
+  const noProgress = (message.executionStop?.reason ?? report?.stopReason) === 'no_progress'
+  const reason = noProgress ? '连续尝试后暂无新进展。' : '本轮已达到执行上限。'
+  return {
+    text: requiresReconciliation ? '本轮已暂停，请先核对外部操作记录。'
+      : reason + (canContinue ? '可从已记录的进度继续。' : ''),
+    canContinue,
+  }
 }
 
 /** 从工具入参提取目标摘要（文件路径/搜索模式/URL 等），让步骤行有意义 */
@@ -579,11 +596,18 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
 
     case 'run.failed':
       if (data.historical) break
-      msg.error = String(data.error || '运行失败')
       msg.runStatus = data.status === 'limit_exceeded' ? 'limit_exceeded' : 'failed'
+      msg.error = msg.runStatus === 'failed' ? String(data.error || '运行失败') : undefined
+      const stop = data.summary?.stop
+      if (msg.runStatus === 'limit_exceeded' && (stop?.reason === 'budget' || stop?.reason === 'no_progress')) {
+        msg.executionStop = { reason: stop.reason, canContinue: stop.can_continue === true }
+      }
       if (data.summary?.verification) {
         setVerification(msg, data.summary.verification, 'incomplete')
         if (typeof data.final_text === 'string') setVerifiedAnswer(msg, data.final_text)
+      } else if (msg.runStatus === 'limit_exceeded' && typeof data.final_text === 'string') {
+        msg.finalText = data.final_text
+        gapFillText(msg, data.final_text)
       }
       msg.documentRetryable = data.document_retryable === true
       if (blocks.some((block) => block.kind === 'document_stage') && !blocks.some(

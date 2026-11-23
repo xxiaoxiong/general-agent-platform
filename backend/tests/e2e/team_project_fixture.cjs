@@ -128,7 +128,8 @@ function reviewCoverage(marker, request) {
     assert(criteria.some(deletionRequired), '显式删除需求必须进入独立复核');
     assert(passed.has('runtime.browser.flow.1') && passed.has('runtime.browser.flow.2'),
       '覆盖回归须模拟原有浏览器验收正常通过');
-    operations.push({ marker, stage: 'coverage', flows: [...passed].filter(id => id.startsWith('runtime.browser.flow.')).length });
+    operations.push({ marker, stage: 'coverage', flows: [...passed].filter(id => id.startsWith('runtime.browser.flow.')).length,
+      criteria: criteria.map(item => `coverage.${item.id}`) });
   } else {
     operations.push({ marker, stage: 'coverage' });
   }
@@ -234,6 +235,7 @@ function projectReply(system, user) {
     }
     if (marker === MARKERS.vue && stage === 'write') {
       const fixture = JSON.parse(fileText(path));
+      fixture.scenarios[0].steps[1].selector = 'form#old-ticket-form input#ticket-title';
       const assertion = fixture.scenarios[0].steps.find(step => step.selector === '#tickets li span');
       assertion.action = 'expect_value';
       return JSON.stringify(fixture);
@@ -253,6 +255,11 @@ function projectReply(system, user) {
     assert(request.verification_findings.some(finding => finding.includes('构建退出码') && /error TS\d+/.test(finding)),
       '构建失败应包含类型检查结果并指向项目组件');
     assert(request.committed_files[browserChecks]?.includes('核对刷新后的完成状态'));
+    assert(request.current_file.includes('ref<string>(42)') && request.current_file.includes('<template>'),
+      '上一条无效回复不能覆盖真实页面');
+    if (!request.correction) return '抱歉，我无法直接修改当前源文件，请提供原始 Vue 组件。';
+    assert.match(request.correction, /Vue|组件/);
+    return "<<<<<<< SEARCH\nconst title = ref<string>(42)\n=======\nconst title = ref<string>('')\n>>>>>>> REPLACE";
   }
   if (marker === MARKERS.vue && path === 'tests/test_api.py' && stage === 'write') {
     return vueTest.replace('scope="function"', 'scope="module"');
@@ -331,7 +338,10 @@ async function verifyRunningBundle(marker, zip, browser, runtimeEnabled) {
       ...(marker === MARKERS.coverage ? ['runtime.browser.flow.3'] : []),
     ]);
     assert(runtimeChecks.every(check => check.status === 'passed'), JSON.stringify(runtimeChecks));
-    if (marker === MARKERS.vue) assert(runtimeChecks.find(check => check.id === 'runtime.web').detail.includes('生产构建'));
+    if (marker === MARKERS.vue) {
+      assert(runtimeChecks.find(check => check.id === 'runtime.web').detail.includes('生产构建'));
+      assert.equal(JSON.parse(sources[browserChecks]).scenarios[0].steps[1].selector, 'form input#ticket-title');
+    }
     if (marker === MARKERS.coverage) {
       assert(verification.checks.some(check => check.id.startsWith('coverage.') && check.status === 'passed'));
     }
@@ -474,12 +484,14 @@ function verifyProjectEvents(marker, events, runtimeEnabled) {
   }
   if (marker === MARKERS.vue) {
     assert.deepEqual(operations.filter(item => item.marker === marker && item.stage === 'repair').map(item => item.path),
-      ['frontend/App.vue'], '应修复实际构建错误并保留其他源码和验收场景');
+      ['frontend/App.vue', 'frontend/App.vue'], '无效回复后按原组件局部重试，保留其他源码和验收场景');
   }
   if (marker === MARKERS.coverage) {
     const reviewed = operations.filter(item => item.marker === marker && ['repair', 'coverage'].includes(item.stage));
     assert.equal(reviewed[0].flows, 2, '验收通过的两个基础场景无法证明删除需求');
     assert.equal(reviewed.at(-1).flows, 3, '须复核新增的真实浏览器操作');
+    assert.deepEqual(delivery.data.checks.filter(check => check.id.startsWith('coverage.')).map(check => check.id),
+      reviewed.at(-1).criteria, '交付事件回放需保留全部需求检查');
     assert.deepEqual(reviewed.filter(item => item.stage === 'repair').map(item => item.path), ['frontend/app.js', browserChecks]);
   }
   assert.equal(events.at(-1).event, passed ? 'run.completed' : 'run.failed');

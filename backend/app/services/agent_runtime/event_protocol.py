@@ -213,7 +213,7 @@ async def replay_events_v2(
     """
     from .repositories import EventRepository, RunRepository
     from .document_retry import latest_document_retry_seq
-    from .events import wait_wakeup
+    from .events import WORKSPACE_PROJECT_REVIEWED, wait_wakeup
     from .lifecycle import (
         TERMINAL_STATUSES, STATUS_WAITING_APPROVAL, STATUS_WAITING_INPUT,
         STATUS_NEEDS_RECONCILIATION,
@@ -243,6 +243,8 @@ async def replay_events_v2(
         if rows:
             for row in rows:
                 db_seq = row.sequence
+                if row.event_type == WORKSPACE_PROJECT_REVIEWED:
+                    continue
                 envelope = to_v2_event(
                     run_id=run_id,
                     sequence=row.sequence,

@@ -2279,11 +2279,11 @@ async def _budget_seed(worker_id: str, **advance):
     return run.id, version, state
 
 
-def _budget_ctx(run_id: str, **kw):
+def _budget_ctx(run_id: str, *, run_timeout_seconds: float = 300.0, **kw):
     from app.services.agent_runtime.context import ExecutionBudget
     return RuntimeContext(
         scope=RunScope(user_id=1), run_id=run_id, thread_id=f"t-{run_id[:6]}",
-        agent_id=1, budget=ExecutionBudget(run_timeout_seconds=300.0, **kw),
+        agent_id=1, budget=ExecutionBudget(run_timeout_seconds=run_timeout_seconds, **kw),
     )
 
 
@@ -2366,6 +2366,7 @@ async def test_p15_hitl_wait_timeout_is_explicitly_configurable(monkeypatch):
 
     from app.core.config import settings as app_settings
 
+    monkeypatch.setattr(app_settings, "AGENT_RUN_TIMEOUT", 300.0)
     run_id, _lease, state = await _budget_seed("w-p15-3")
     base_deadline = state["deadline_at"]
     assert base_deadline is not None
@@ -2435,6 +2436,49 @@ async def test_p15_deadline_absolute_not_reset_on_restart():
     # 剩余时间按绝对 deadline 计算（已过期 -> 0），不重新计满
     remaining = (ctx.budget_deadline_at - datetime.utcnow()).total_seconds()
     assert remaining <= 0, f"过期 deadline 恢复后不得重新获得完整时间，剩余 {remaining}s"
+
+
+@pytest.mark.asyncio
+async def test_p15_disabled_deadline_only_records_start_for_new_run():
+    """停用总时限时仍记录开始时间。"""
+    run_id, _lease = await _claimed_run("w-p15-no-deadline")
+    svc = _make_service(worker_id="w-p15-no-deadline")
+    ctx = _budget_ctx(run_id, run_timeout_seconds=0)
+    await svc._load_budget(ctx, _budget_handle(run_id))
+
+    assert ctx.budget_first_started_at is not None
+    assert ctx.budget_deadline_at is None
+    async with AsyncSessionLocal() as s:
+        row = await RunRepository(s).get_run(run_id)
+        assert _dt_eq(row.budget_first_started_at, ctx.budget_first_started_at)
+        assert row.budget_deadline_at is None
+
+
+@pytest.mark.asyncio
+async def test_p15_worker_reload_clears_old_deadline_without_resetting_counters():
+    """停用总时限后恢复旧任务，清掉已过期的截止，保留累计和版本。"""
+    from datetime import datetime, timedelta
+
+    run_id, _lease, state = await _budget_seed(
+        "w-p15-legacy-deadline", model_calls=10, tool_calls=20, steps=9, tokens=100,
+    )
+    past = datetime.utcnow() - timedelta(seconds=5)
+    async with AsyncSessionLocal() as s:
+        await s.execute(update(AgentRun).where(AgentRun.id == run_id).values(budget_deadline_at=past))
+        await s.commit()
+
+    svc = _make_service(worker_id="w-p15-no-deadline-resume")
+    ctx = _budget_ctx(run_id, run_timeout_seconds=0)
+    await svc._load_budget(ctx, _budget_handle(run_id))
+
+    assert ctx.budget_deadline_at is None
+    assert _dt_eq(ctx.budget_first_started_at, state["first_started_at"])
+    assert (ctx.model_calls, ctx.tool_calls, ctx.steps, ctx.tokens_generated) == (10, 20, 9, 100)
+    assert ctx.budget_version == state["version"]
+    async with AsyncSessionLocal() as s:
+        row = await RunRepository(s).get_run(run_id)
+        assert row.budget_deadline_at is None
+        assert row.budget_version == state["version"]
 
 
 @pytest.mark.asyncio

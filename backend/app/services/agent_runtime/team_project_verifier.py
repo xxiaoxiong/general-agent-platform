@@ -114,7 +114,9 @@ def _unavailable(digest: str, detail: str) -> dict:
     }
 
 
-async def verify_runtime(files: dict[str, str], scope: str, *, capture_openapi: bool = False) -> dict | None:
+async def verify_runtime(
+    files: dict[str, str], scope: str, *, capture_openapi: bool = False, capture_browser_errors: bool = False,
+) -> dict | None:
     directory = settings.AGENT_PROJECT_VERIFIER_DIR.strip()
     if not directory:
         return None
@@ -134,6 +136,7 @@ async def verify_runtime(files: dict[str, str], scope: str, *, capture_openapi: 
         await asyncio.to_thread(write_json, job / "request.json", {
             "source_digest": digest, "scope": scope, "files": files, "deadline": expires,
             **({"capture_openapi": True} if capture_openapi else {}),
+            **({"capture_browser_errors": True} if capture_browser_errors else {}),
         })
         while time.time() < expires:
             if (response := job / "result.json").is_file():
@@ -166,11 +169,22 @@ def merge_runtime_report(verification: dict, receipt: dict, files: dict[str, str
                 or status not in ("passed", "failed", "skipped")):
             continue
         identifiers.add(identifier)
+        is_suite = identifier.startswith("runtime.tests.")
+        test_files = [path for path in item["files"][:24] if isinstance(path, str) and path in files
+                      ] if is_suite and isinstance(item.get("files"), list) else []
+        test_cases = []
+        if status == "passed" and test_files and isinstance(item.get("test_cases"), list):
+            for case in item["test_cases"]:
+                if not isinstance(case, str) or len(case) > 360:
+                    continue
+                path, _, name = case.partition("::")
+                if path in test_files and path.endswith(".py") and all(part.isidentifier() for part in name.split("::")):
+                    test_cases.append(case)
         checks.append({
             "id": identifier, "status": status, "label": str(item.get("label") or "运行检查")[:100],
             "detail": str(redact_secrets(item.get("detail") or ""))[:1200],
-            **({"files": [path for path in item["files"][:24] if isinstance(path, str) and path in files]}
-               if identifier.startswith("runtime.tests.") and isinstance(item.get("files"), list) else {}),
+            **({"files": test_files} if test_files else {}),
+            **({"test_cases": list(dict.fromkeys(test_cases))} if test_cases else {}),
         })
     if not checks:
         checks = _unavailable(digest, "未取得有效的运行验收结果")["checks"]

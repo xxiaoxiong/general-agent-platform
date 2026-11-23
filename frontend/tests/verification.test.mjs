@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { applyRunEvent, finalizeRunMessage } from '../src/features/run/blocks.ts'
+import { applyRunEvent, executionPause, finalizeRunMessage } from '../src/features/run/blocks.ts'
 
 function replay(message, event, data) {
   applyRunEvent(message, { event, data, run_id: 'run', trace_id: 'run',
@@ -30,9 +30,37 @@ test('未通过验收保留草稿，预算停止状态在重连时不变', () =>
   replay(chat, 'assistant.delta', { text: '一份旧稿。' })
   replay(chat, 'run.failed', { status: 'limit_exceeded', error: '执行预算已用完', final_text: '已保存的报告草稿。',
     summary: { verification: { version: 2, status: 'failed', stop_reason: 'budget',
-      checks: [{ id: 'citations_present', passed: false, detail: '缺少来源' }] } } })
+      checks: [{ id: 'artifact_produced', passed: false, detail: '缺少交付文件' }] } } })
   finalizeRunMessage(chat, 'run.failed')
   assert.equal(chat.runStatus, 'limit_exceeded')
   assert.equal(chat.blocks[0].state, 'incomplete')
   assert.equal(chat.blocks[1].text, '已保存的报告草稿。')
+  assert.equal(chat.error, undefined)
+  assert.equal(executionPause(chat)?.canContinue, true)
+})
+
+test('自动止损给出续做说明，真实异常仍走错误提示', () => {
+  const chat = { blocks: [] }
+  replay(chat, 'assistant.delta', { text: '已写入项目入口。' })
+  replay(chat, 'run.failed', { status: 'limit_exceeded', summary: { stop: { reason: 'no_progress', can_continue: true } } })
+  finalizeRunMessage(chat, 'run.failed')
+  assert.deepEqual(executionPause(chat), { text: '连续尝试后暂无新进展。可从已记录的进度继续。', canContinue: true })
+  assert.equal(chat.blocks[0].text, '已写入项目入口。')
+
+  const failure = { blocks: [] }
+  replay(failure, 'run.failed', { status: 'failed', error: '模型连接失败' })
+  assert.equal(executionPause(failure), undefined)
+  assert.equal(failure.error, '模型连接失败')
+})
+
+test('历史超限消息展示暂停，待核对的外部动作不提供直接续做', () => {
+  const old = { blocks: [] }
+  replay(old, 'run.failed', { status: 'limit_exceeded', error: '模型调用次数超过预算(100)' })
+  assert.deepEqual(executionPause(old), { text: '本轮已达到执行上限。', canContinue: false })
+  const pending = { blocks: [] }
+  replay(pending, 'run.failed', { status: 'limit_exceeded', summary: {
+    stop: { reason: 'budget', can_continue: false },
+    verification: { version: 2, stop_reason: 'external_operation' },
+  } })
+  assert.deepEqual(executionPause(pending), { text: '本轮已暂停，请先核对外部操作记录。', canContinue: false })
 })

@@ -17,7 +17,8 @@ import sys
 import tempfile
 import threading
 import tomllib
-from collections.abc import Iterable
+from collections import Counter
+from collections.abc import Collection, Iterable
 from html import escape
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
@@ -28,6 +29,7 @@ from app.core.config import settings
 
 from .backends import workspace_root
 from .project_browser_contract import BROWSER_CHECKS_PATH, parse_browser_checks
+from .project_node_toolchain import dependency_ranges
 from .project_verifier_protocol import MAX_PROJECT_BYTES, MAX_PROJECT_FILE_BYTES, MAX_PROJECT_FILES, source_digest as _digest
 from .team_project_coverage import merge_coverage_report
 from .team_project_verifier import merge_runtime_report
@@ -59,6 +61,10 @@ _WEB_CODE = {".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".vue", ".svelte"}
 _JAVASCRIPT = {".js", ".mjs", ".cjs"}
 _SERVER_CODE = _WEB_CODE | {".py", ".go", ".rb", ".php", ".java", ".kt", ".cs", ".rs"}
 _HTML_DOCUMENT = re.compile(r"^\s*(?:<!doctype\s+html\b|<html[\s>])", re.I)
+_RAW_HTML_FRAGMENT = re.compile(
+    r"^(?>(?:\s|//[^\r\n]*|/\*[\s\S]*?\*/)*)"
+    r"<(?P<tag>template|script|style|main|section|div|form)(?:\s[^<>]*)?>[\s\S]*?</(?P=tag)\s*>", re.I,
+)
 _HTML_ELEMENT = re.compile(r"<[a-z][\w-]*(?:\s[^<>]*|/?)>", re.I)
 _MODEL_INTRO = re.compile(r"(?:你好[，,！!。\s]*)?(?:我(?:是|叫)|I(?: am|'m)\b|As an AI\b)", re.I)
 _CODE_ADVICE = re.compile(r"(?:你可以|请|可以|只需|下面是|以下是|(?:Here is|You can)\b)", re.I)
@@ -67,6 +73,9 @@ _INTERACTION = re.compile(
     r"addEventListener\s*\(|(?:onClick|onSubmit|onclick|onsubmit)\s*=|v-model\b|@(?:click|submit)\b"
     r"|v-on:(?:click|submit)\b|on:(?:click|submit)\b|\.(?:submit|on)\s*\("
 )
+_VUE_RENDER_EVENT = re.compile(r"\bon[A-Z][\w$]*\s*:\s*(?!null\b|undefined\b|false\b)\S|\$emit\s*\(")
+_VUE_REQUEST = re.compile(r"\b(?:fetch|axios(?:\.(?:request|get|post|put|patch|delete|head|options))?|XMLHttpRequest)\s*\(")
+_JS_STRING_OR_COMMENT = re.compile(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|//[^\r\n]*|/\*[\s\S]*?\*/''')
 _SERIALIZED_EVENT_ARGUMENT = re.compile(r"\bon[a-z]+\s*=\s*['\"][^'\"`\r\n<>]{0,200}\$\{\s*JSON\.stringify\s*\(", re.I)
 _SIMPLE_SERIALIZED_EVENT = re.compile(
     r"\b(?P<event>on[a-z]+)=(?P<quote>['\"])(?P<handler>[A-Za-z_$][\w$]*)"
@@ -118,6 +127,13 @@ _IMPLICIT_PYTHON_NAMES = frozenset(vars(builtins)) | {
 }
 _LOCAL_IMPORT = re.compile(r"(?:\bfrom\s+|\bimport\s+(?:\(\s*)?|\brequire\s*\(\s*)['\"](\.{1,2}/[^'\"\r\n]+)['\"]")
 _HTML_SOURCE = re.compile(r"<(?:script|link)\b[^>]*\b(?:src|href)\s*=\s*['\"]([^'\"]+)['\"]", re.I)
+_VITE_BUILD_COMMAND = re.compile(r"(?:^|&&|\|\||;)\s*vite\s+build(?:\s|$)")
+_VUE_3_RANGE = re.compile(r"\s*[~^]?\s*3(?:\.(?:\d+|[xX*])){0,2}\s*")
+_VUE_BROWSER_IMPORT = re.compile(
+    r"[ \t]*import[ \t]+(?:\{[\w$, \t]+\}|\*[ \t]+as[ \t]+[\w$]+)[ \t]+from[ \t]+"
+    r"(?P<literal>(?P<quote>['\"])(?P<url>https://unpkg\.com/vue@3/dist/vue\.esm-browser(?:\.prod)?\.js)(?P=quote))"
+    r"[ \t]*;?[ \t]*(?://.*)?",
+)
 _FLASK_VERSION = re.compile(r"\bflask\s*[\"']?\s*(?:===?|~=|>=)\s*(\d+)\.(\d+)", re.I)
 _LOCAL_HTML_START = re.compile(
     r"(?<!避免)(?<!不要)(?<!请勿)(?<!无需)(?<!禁止)直接(?:用|在)浏览器(?:中)?打开\s*[：:]?\s*"
@@ -377,6 +393,175 @@ def _python_dependencies(files: dict[str, str], trees: dict[str, ast.AST]) -> tu
     return checked, problems
 
 
+class _VueBlocks(HTMLParser):
+    """只识别顶层组件块与可确认的交互入口，具体语法仍由构建器验收。"""
+
+    def __init__(self, source: str):
+        super().__init__()
+        self.has_component = False
+        self.interaction = False
+        self.request = False
+        self.scripts: list[str] = []
+        self.external: set[str] = set()
+        self.unmatched_end_tags: list[tuple[str, int]] = []
+        self._root = ""
+        self._depth = 0
+        self._src = ""
+        self._body: list[str] = []
+        self._has_content = False
+        self._malformed = False
+        try:
+            self.feed(source.lstrip("\ufeff"))
+            self.close()
+        except (AssertionError, ValueError):
+            self._malformed = True
+
+    @property
+    def complete(self) -> bool:
+        return self.has_component and not self._root and not self._malformed
+
+    def _template_element(self, tag: str, attrs: dict[str, str | None]) -> None:
+        self.interaction |= any(bool(value and value.strip()) and (name in {"v-model", "v-on"}
+                                or name.startswith(("@", "v-model:", "v-model.", "v-on:")))
+                                for name, value in attrs.items())
+        self.request |= tag == "form" and bool(attrs.get("action") or attrs.get(":action"))
+
+    def handle_starttag(self, tag, attributes):
+        attrs = dict(attributes)
+        if self._root:
+            self._depth += tag == self._root
+            self._has_content = True
+            if self._root == "template":
+                self._template_element(tag, attrs)
+        else:
+            self._root, self._depth = tag, 1
+            self._src = (attrs.get("src") or "").strip()
+            self._body, self._has_content = [], False
+
+    def handle_startendtag(self, tag, attributes):
+        self.handle_starttag(tag, attributes)
+        self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        if not self._root:
+            self._malformed = True
+            self.unmatched_end_tags.append((tag, self.getpos()[0]))
+            return
+        if tag != self._root:
+            return
+        self._depth -= 1
+        if self._depth:
+            return
+        if tag in {"template", "script"} and (self._has_content or self._src):
+            self.has_component = True
+            if self._src:
+                self.external.add(self._src)
+            if tag == "script":
+                script = "".join(self._body)
+                script = _JS_STRING_OR_COMMENT.sub(lambda match: " " if match[0].startswith("/") else match[0], script)
+                self.scripts.append(script)
+                self.interaction |= bool(_INTERACTION.search(script) or _VUE_RENDER_EVENT.search(script))
+                self.request |= bool(_VUE_REQUEST.search(script))
+        self._root = ""
+
+    def handle_data(self, data):
+        if not self._root:
+            self._malformed |= bool(data.strip())
+        else:
+            self._has_content |= bool(data.strip())
+            if self._root == "script":
+                self._body.append(data)
+
+
+def _vue_wrapper_line_edit(source: str) -> dict[str, str]:
+    tags = _VueBlocks(source).unmatched_end_tags
+    if len(tags) != 1 or tags[0][0] != "vue":
+        return {}
+    lines = source.splitlines(keepends=True)
+    index = tags[0][1] - 1
+    previous = lines[index].rstrip("\r\n")
+    if previous.strip().casefold() != "</vue>" or source.splitlines().count(previous) != 1:
+        return {}
+    candidate = "".join(lines[:index] + lines[index + 1:])
+    return {previous: ""} if _VueBlocks(candidate).complete else {}
+
+
+class _HTMLScripts(HTMLParser):
+    """定位浏览器会忽略或误当作页面内容的脚本边界。"""
+
+    def __init__(self):
+        super().__init__()
+        self.open_line = 0
+        self.problem = ""
+        self.module_data: list[tuple[int, str]] = []
+        self._inline_module = False
+        self._inert_depth = 0
+
+    def handle_starttag(self, tag, attributes):
+        if tag == "script":
+            self.open_line = self.getpos()[0]
+            attrs = dict(attributes)
+            self._inline_module = (not self._inert_depth and "src" not in attrs
+                                   and (attrs.get("type") or "").strip().casefold() == "module")
+        elif tag in {"template", "noscript"}:
+            self._inert_depth += 1
+
+    def handle_startendtag(self, tag, attributes):
+        if tag == "script" and not self.problem:
+            self.problem = f"第 {self.getpos()[0]} 行 script 标签需要显式关闭"
+
+    def handle_endtag(self, tag):
+        if tag == "script":
+            if not self.open_line and not self.problem:
+                self.problem = f"第 {self.getpos()[0]} 行的 </script> 没有对应的开始标签，请检查前面的脚本是否落在标签外"
+            self.open_line = 0
+            self._inline_module = False
+        elif tag in {"template", "noscript"} and self._inert_depth:
+            self._inert_depth -= 1
+
+    def handle_data(self, data):
+        if self._inline_module:
+            self.module_data.append((self.getpos()[0], data))
+
+
+def vite_vue_entry_repairs(path: str, content: str, manifest: object, *, lock: object = None) -> dict[str, str]:
+    """本地已声明同主版本时，将已识别的 Vue 浏览器模块改由 Vite 打包。"""
+    if (PurePosixPath(path).name != "index.html" or "unpkg.com/vue@3/dist/vue.esm-browser" not in content
+            or not isinstance(manifest, dict) or (lock is not None and not isinstance(lock, dict))):
+        return {}
+    scripts = manifest.get("scripts")
+    if (not isinstance(scripts, dict) or not isinstance(build := scripts.get("build"), str)
+            or not _VITE_BUILD_COMMAND.search(build)):
+        return {}
+    parser = _HTMLScripts()
+    try:
+        dependencies = dependency_ranges(manifest, lock or {})
+        if ("vite" not in dependencies or not (vue := dependencies.get("vue"))
+                or not all(_VUE_3_RANGE.fullmatch(item) for item in vue)):
+            return {}
+        parser.feed(content)
+        parser.close()
+    except (AssertionError, ValueError):
+        return {}
+    if parser.problem or parser.open_line:
+        return {}
+    lines = content.split("\n")
+    anchors = Counter(content.splitlines())
+    edits = {}
+    for start_line, data in parser.module_data:
+        literals = {token.span() for token in _JS_STRING_OR_COMMENT.finditer(data) if token[0].startswith(("'", '"'))}
+        offset = 0
+        for line_number, raw in enumerate(data.split("\n"), start_line):
+            line = raw.removesuffix("\r")
+            match = _VUE_BROWSER_IMPORT.fullmatch(line)
+            if (match and (offset + match.start("literal"), offset + match.end("literal")) in literals
+                    and line == lines[line_number - 1].removesuffix("\r") and anchors[line] == 1):
+                # 内联模板依赖编译器，因此需要 Vue 的完整打包入口。
+                edits[line] = line[:match.start("url")] + "vue/dist/vue.esm-bundler.js" + line[match.end("url"):]
+            offset += len(raw) + 1
+    return edits
+
+
 def source_shape_problem(path: str, content: str) -> str:
     """可确认的文件类型错误。写入前和最终验收采用同一规则。"""
     suffix = PurePosixPath(path).suffix.casefold()
@@ -387,17 +572,48 @@ def source_shape_problem(path: str, content: str) -> str:
         return f"{path} 只包含模型自我介绍，需要完整文件内容"
     if suffix == ".html" and not _HTML_ELEMENT.search(text):
         return f"{path} 缺少 HTML 标记，无法提供页面入口"
+    if suffix == ".html" and re.search(r"</?script\b", text, re.I):
+        scripts = _HTMLScripts()
+        try:
+            scripts.feed(content.lstrip("\ufeff"))
+            scripts.close()
+        except (AssertionError, ValueError):
+            return f"{path} 的 HTML 标记无法解析"
+        if scripts.problem:
+            return f"{path} {scripts.problem}"
+        if scripts.open_line:
+            return f"{path} 第 {scripts.open_line} 行的 script 标签缺少 </script>"
     if suffix in _WEB_CODE | {".html"} and re.search(r"(?m)^(?:<<<<<<< SEARCH|>>>>>>> REPLACE)\b", text):
         return f"{path} 含有未应用的局部编辑块"
+    if suffix == ".vue" and not _VueBlocks(text).complete:
+        return f"{path} 缺少完整的 Vue 单文件组件，需提供有效的顶层 template 或 script 源码块"
     if suffix in (_WEB_CODE | {".css"}) - {".vue", ".svelte"} and _HTML_DOCUMENT.match(text):
         return f"{path} 误写成了完整 HTML 页面，需要与扩展名一致的源码"
+    if suffix in _JAVASCRIPT | {".ts"} and _RAW_HTML_FRAGMENT.match(text):
+        return f"{path} 误写成了 HTML 或 Vue 组件片段，需要保留脚本源码和实际入口"
     if (suffix in _SERVER_CODE | {".css", ".json", ".toml"} and len(text) < 400 and _CODE_ADVICE.match(text)
             and re.search(r"复制|粘贴|保存|代码|copy|paste|code", text, re.I) and not re.search(r"(?m)^\s*(?:import |const |def |export )", text)):
         return f"{path} 只收到操作说明，缺少可写入的实际源码"
     return ""
 
 
-def source_repair_problem(path: str, original: str, updated: str) -> str:
+def source_repair_problem(path: str, original: str, updated: str, *, known_paths: Collection[str] | None = None) -> str:
+    if known_paths is not None:
+        missing_before = set(_local_references(path, original, known_paths))
+        added_missing = [ref for ref in _local_references(path, updated, known_paths) if ref not in missing_before]
+        if added_missing:
+            return f"{path} 的返工新增了工程中不存在的引用 {added_missing[0]}，请使用实际文件或保留现有实现"
+    if path.casefold().endswith(".vue") and original:
+        before, after = _VueBlocks(original), _VueBlocks(updated)
+        if before.complete and not after.complete:
+            return "Vue 返工丢失了完整组件。请用原文锚点修改对应位置，保留可运行源码。"
+        if before.complete and ((before.interaction and not after.interaction) or (before.request and not after.request)):
+            # 允许把行为移交给新引用的组件或实现模块，构建和交互验收会检查移交后的实现。
+            old_imports = set(_LOCAL_IMPORT.findall("\n".join(before.scripts)))
+            new_imports = set(_LOCAL_IMPORT.findall("\n".join(after.scripts)))
+            replacements = (after.external - before.external) | (new_imports - old_imports)
+            if not any(not PurePosixPath(ref).suffix or PurePosixPath(ref).suffix in _WEB_CODE for ref in replacements):
+                return "Vue 返工移除了原有的用户交互或接口调用。请保留原有行为并只修改本轮涉及的位置。"
     if path.endswith(".html"):
         if _HTML_DOCUMENT.match(original) and not _HTML_DOCUMENT.match(updated):
             return "HTML 返工丢失了完整页面入口。请用原文锚点修改对应位置，保留其他页面结构。"
@@ -799,7 +1015,7 @@ def _entry_problems(readme: str, files: dict[str, str], parsed_json: dict[str, o
     return problems
 
 
-def _local_references(path: str, content: str, files: dict[str, str]) -> list[str]:
+def _local_references(path: str, content: str, files: Collection[str]) -> list[str]:
     directory = posixpath.dirname(path)
     web_root = path.partition("/")[0] if "/" in path and _layer(path, _FRONTEND) else ""
     references = _LOCAL_IMPORT.findall(content) if PurePosixPath(path).suffix in _WEB_CODE else []
@@ -901,6 +1117,12 @@ def _verify_sources(files: dict[str, str], expected: list[str], scope: ProjectSc
                 problems.extend(page_issues)
                 if edits:
                     page_repairs[path] = edits
+                directory = PurePosixPath(path).parent
+                manifest_path = (directory / "package.json").as_posix()
+                lock_path = (directory / "package-lock.json").as_posix()
+                if vue_edits := vite_vue_entry_repairs(path, content, parsed_json.get(manifest_path), lock=parsed_json.get(lock_path)):
+                    problems.append((path, f"{path} 从外部加载 Vue，隔离浏览器无法访问。请用 {manifest_path} 声明的本地 Vue 3 打包"))
+                    page_repairs.setdefault(path, {}).update(vue_edits)
         if not any(_ENTRY_TAG.search(content) for content in frontend_source.values()):
             anchor = next((path for path in [*frontend, *expected] if path.lower().endswith("index.html")),
                           _frontend_target(frontend, expected, scope))
@@ -970,6 +1192,8 @@ def _verify_sources(files: dict[str, str], expected: list[str], scope: ProjectSc
     distinct_issues = list({(issue["path"], issue["message"]): issue for issue in issues}.values())
     line_repairs = _flask_database_line_repairs(tests, backend_source, trees,
                                               [(issue["path"], issue["message"]) for issue in distinct_issues])
+    line_repairs.update({path: edits for path in shape_problems if path.casefold().endswith(".vue")
+                         and (edits := _vue_wrapper_line_edit(files[path]))})
     line_repairs.update({path: edits for path, content in frontend_source.items()
                          if PurePosixPath(path).suffix in _WEB_CODE and (edits := _serialized_event_repairs(content))})
     for repairs in (launch_repairs, page_repairs):

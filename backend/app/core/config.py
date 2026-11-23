@@ -111,10 +111,10 @@ class Settings(BaseSettings):
     CHECKPOINT_DIR: str = "./data/checkpoints"  # 断点存储目录
 
     # ── DeepAgents Runtime（阶段一新内核）────────────────────────────────────
-    AGENT_MAX_STEPS: int = 100                  # 图执行最大步数（0=不限制）
-    AGENT_MAX_TOOL_CALLS: int = 200             # 工具调用总次数预算（0=不限制）
-    AGENT_MAX_MODEL_CALLS: int = 100            # 模型调用次数预算（0=不限制）
-    AGENT_RUN_TIMEOUT: float = 1800.0           # 单次运行墙钟超时（秒）；大任务（多步工具/代码生成）需要充足预算
+    AGENT_MAX_STEPS: int = 1000                 # 主图模型轮数上限（0=不限制）
+    AGENT_MAX_TOOL_CALLS: int = 1000            # 工具调用总次数预算（0=不限制）
+    AGENT_MAX_MODEL_CALLS: int = 1000           # 模型调用次数预算（0=不限制）
+    AGENT_RUN_TIMEOUT: float = 0.0              # 单次运行总时限（秒），0=不限制
     # P1-05 §13：HITL 等待时间是否计入 Run Timeout。True=计入（deadline 绝对、含等待）；
     # False=不计入（HITL 恢复时按等待时长顺延 deadline，只耗执行时间不耗人工等待）。
     AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT: bool = False

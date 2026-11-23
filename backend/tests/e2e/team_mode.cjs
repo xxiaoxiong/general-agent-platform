@@ -540,7 +540,7 @@ async function main() {
           assert.equal(created.status(), 200, await created.text());
           repaired = await created.json();
         } else {
-          repaired = await api(path, { method: 'POST', body: {} });
+          repaired = await api(path, { method: 'POST', json: {} });
         }
         runs.push(repaired);
         assert.equal(repaired.conversation_id, projectRun.conversation_id);

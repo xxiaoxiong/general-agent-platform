@@ -9,15 +9,20 @@ from collections import deque
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from playwright.sync_api import Error, expect, sync_playwright
+from playwright.sync_api import Error, TimeoutError, expect, sync_playwright
 
 _WAIT_MS = 2500
 _CRITICAL_RESOURCES = {"document", "script", "stylesheet"}
 _UI_OUTCOMES = {"expect_visible", "expect_hidden", "expect_text", "expect_value", "expect_invalid"}
+_FORM_CONTROL_TAGS = {"fill": "input, textarea", "select": "select", "check": "input[type=checkbox], input[type=radio]"}
+
+
+class ScenarioInputError(AssertionError):
+    """场景需要为触发的浏览器交互指定正确输入。"""
 
 
 class PageCheck:
-    def __init__(self, context, origin: str, allowed: set[str]):
+    def __init__(self, context, origin: str, allowed: set[str], *, capture_browser_errors: bool = False):
         self.page = context.new_page()
         self.page.set_default_timeout(_WAIT_MS)
         self.origin = origin
@@ -25,6 +30,7 @@ class PageCheck:
         self.errors: list[dict] = []
         self.responses: deque[tuple[str, str, int]] = deque(maxlen=40)
         self.server_failure: str = ""
+        self.last_console_error: str = ""
         self.form_errors: list[dict] = []
         self.confirm_dismissed = False
         self.page.add_init_script(
@@ -41,6 +47,8 @@ class PageCheck:
         )
         context.route("**/*", self.route)
         self.page.on("pageerror", self.page_error)
+        if capture_browser_errors:
+            self.page.on("console", self.console_error)
         self.page.on("response", self.response)
         self.page.on("requestfailed", self.request_failed)
 
@@ -59,6 +67,17 @@ class PageCheck:
         stack = getattr(error, "stack", "") or ""
         location = re.search(r"https?://(?:127\.0\.0\.1|localhost):\d+([^\s()]+?):\d+:\d+", stack)
         self.fault(str(error).split("\n", 1)[0], location[1] if location else "", "script")
+
+    def console_error(self, message) -> None:
+        if message.type != "error":
+            return
+        url = urlsplit(message.location.get("url") or "")
+        if f"{url.scheme}://{url.netloc}" not in self.allowed:
+            return
+        # 框架捕获的异常会进入控制台，但不会触发 pageerror。普通 HTTP 错误由响应检查处理。
+        first_line = message.text[:180].split("\n", 1)[0]
+        if re.match(r"^(?:Uncaught(?: \(in promise\))? )?(?:TypeError|ReferenceError|SyntaxError|RangeError|URIError|EvalError|DOMException|Error):", first_line):
+            self.last_console_error = first_line
 
     def response(self, response) -> None:
         path = urlsplit(response.url).path
@@ -126,8 +145,53 @@ class PageCheck:
         except Error:
             return False
 
+    def click(self, control, step: dict) -> None:
+        self.server_failure = ""
+        self.confirm_dismissed = False
+        self.page.evaluate("() => { window.__projectCheckInvalid = []; }")
+        prompt = step.get("prompt")
+        prompt_accepted = False
+        dialog_problem = ""
+
+        def handle_dialog(dialog):
+            nonlocal prompt_accepted, dialog_problem
+            if dialog.type == "prompt":
+                if prompt is not None and not prompt_accepted:
+                    prompt_accepted = True
+                    dialog.accept(prompt)
+                    return
+                dialog_problem = ("一次点击触发了多个原生输入弹窗，场景仅能为该步骤输入一次"
+                                  if prompt_accepted else "点击打开了原生输入弹窗，请在该点击步骤填写 prompt 文本")
+            elif prompt is not None and not prompt_accepted:
+                dialog_problem = "点击触发了其他浏览器弹窗，请核对 prompt 字段对应的原生输入控件"
+            elif dialog.type == "confirm":
+                if step.get("confirm"):
+                    dialog.accept()
+                    return
+                self.confirm_dismissed = True
+            dialog.dismiss()
+
+        self.page.on("dialog", handle_dialog)
+        try:
+            control.click()
+            if prompt is not None and not (prompt_accepted or dialog_problem):
+                try:
+                    self.page.wait_for_event("dialog", timeout=_WAIT_MS)
+                except TimeoutError:
+                    dialog_problem = "点击后未出现原生输入弹窗，请核对 prompt 字段与实际控件"
+        finally:
+            self.page.remove_listener("dialog", handle_dialog)
+        if dialog_problem:
+            raise ScenarioInputError(dialog_problem)
+        validation = self.page.evaluate("() => window.__projectCheckInvalid || []")
+        self.form_errors = [field for field in validation[:5] if isinstance(field, dict)
+                            and isinstance(field.get("name"), str) and type(field.get("visible")) is bool
+                            ] if isinstance(validation, list) else []
+
     def act(self, step: dict) -> None:
         action = step["action"]
+        if not action.startswith("expect_"):
+            self.last_console_error = ""
         if action == "open":
             self.open(step["path"])
         elif action == "reload":
@@ -142,26 +206,7 @@ class PageCheck:
         else:
             control = self.locator(step)
             if action == "click":
-                self.server_failure = ""
-                self.confirm_dismissed = False
-                self.page.evaluate("() => { window.__projectCheckInvalid = []; }")
-
-                def handle_dialog(dialog):
-                    if step.get("confirm"):
-                        dialog.accept()
-                    else:
-                        self.confirm_dismissed = dialog.type == "confirm"
-                        dialog.dismiss()
-
-                self.page.on("dialog", handle_dialog)
-                try:
-                    control.click()
-                finally:
-                    self.page.remove_listener("dialog", handle_dialog)
-                validation = self.page.evaluate("() => window.__projectCheckInvalid || []")
-                self.form_errors = [field for field in validation[:5] if isinstance(field, dict)
-                                    and isinstance(field.get("name"), str) and type(field.get("visible")) is bool
-                                    ] if isinstance(validation, list) else []
+                self.click(control, step)
             elif action == "fill":
                 control.fill(step["value"])
             elif action == "select":
@@ -217,7 +262,28 @@ class PageCheck:
             pass
         return "", "action"
 
-    def scenario(self, steps: list[dict]) -> dict:
+    def observed_form_steps(self, steps: list[dict], index: int, scopes: dict) -> list[int]:
+        initial_scope = scopes.get(steps[index - 1].get("selector"))
+        if not initial_scope or self.page.locator(f"css={initial_scope[0]}").count():
+            return []
+        matches = []
+        for position, step in enumerate(steps[index - 1:index + 4], index):
+            scope = scopes.get(step.get("selector"))
+            if step["action"] not in _FORM_CONTROL_TAGS or not scope or scope[0] != initial_scope[0]:
+                break
+            control = self.page.locator(f"css={scope[1]}")
+            try:
+                if (self.page.locator(f"css={scope[2]}").count() != 1 or control.count() != 1 or not control.is_visible()
+                        or not control.evaluate(
+                            "(node, [first, tag]) => node.matches(tag) && node.closest('form') === document.querySelector(first)?.closest('form')",
+                            [initial_scope[2], _FORM_CONTROL_TAGS[step["action"]]], timeout=400)):
+                    break
+            except Error:
+                break
+            matches.append(position)
+        return matches
+
+    def scenario(self, steps: list[dict], form_scopes: dict) -> dict:
         before = {}
         for index, step in enumerate(steps, 1):
             try:
@@ -227,9 +293,9 @@ class PageCheck:
                 if index == 1:
                     before = {number: self.visible_outcome(candidate) for number, candidate in enumerate(steps, 1)
                               if candidate["action"] in _UI_OUTCOMES}
-            except (Error, AssertionError):
+            except (Error, AssertionError) as error:
                 target = step.get("selector") or step.get("path") or ""
-                description, kind = self.describe_control(step)
+                description, kind = (f"。{error}", "scenario_input") if isinstance(error, ScenarioInputError) else self.describe_control(step)
                 detail = {"message": f"操作或断言未满足 {step['action']} {target}".strip() + description,
                           "kind": kind, "selector": step.get("selector"), "path": urlsplit(self.page.url).path, "step": index}
                 fields = self.form_errors
@@ -240,8 +306,12 @@ class PageCheck:
                     detail.update(kind="action" if hidden else "scenario_input", message=f"{detail['message']}。{reason} {failed}")
                 elif self.confirm_dismissed and step["action"] == "expect_hidden":
                     detail.update(kind="scenario_input", message=f"{detail['message']}。上一次点击的确认弹窗已取消")
+                elif kind == "missing_control" and (positions := self.observed_form_steps(steps, index, form_scopes)):
+                    detail.update(kind="scenario_input", form_scope_steps=positions)
                 elif self.server_failure:
                     detail.update(kind="api", message=f"{detail['message']} · {self.server_failure}")
+                if self.last_console_error:
+                    detail["console_error"] = self.last_console_error
                 return {**detail, **(self.errors[0] if self.errors else {})}
         if all(before.values()):
             return {"kind": "coverage", "step": len(steps), "path": "",
@@ -257,7 +327,9 @@ def run(configuration: dict) -> dict:
 
         def new_check():
             context = browser.new_context(viewport={"width": 1280, "height": 800}, service_workers="block", accept_downloads=False)
-            return context, PageCheck(context, origin, allowed)
+            return context, PageCheck(
+                context, origin, allowed, capture_browser_errors=configuration.get("capture_browser_errors") is True,
+            )
 
         try:
             context, page = new_check()
@@ -269,7 +341,7 @@ def run(configuration: dict) -> dict:
             for scenario in configuration["scenarios"] if not smoke else []:
                 context, page = new_check()
                 try:
-                    results.append(page.scenario(scenario["steps"]))
+                    results.append(page.scenario(scenario["steps"], configuration.get("form_scopes", {})))
                 finally:
                     context.close()
             return {"smoke": smoke, "scenarios": results}

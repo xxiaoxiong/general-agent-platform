@@ -15,6 +15,8 @@ from app.services.agent_runtime.team_project_graph import (
     ProjectPlanTruncated,
     TeamProjectContext,
     _repair_file_text,
+    _repair_jobs,
+    browser_plan,
     build_project_graph,
     drive_project_graph,
 )
@@ -54,6 +56,31 @@ def test_project_patch_rejects_changed_or_overlapping_anchors():
         content = "\n".join(f"<<<<<<< SEARCH\n{old}\n=======\nfixed\n>>>>>>> REPLACE" for old in anchors)
         with pytest.raises(ProjectWorkspaceError, match="锚点"):
             _repair_file_text("script.py", content, original)
+
+
+def test_large_source_patch_requires_unique_ordered_whole_line_boundaries():
+    path = "frontend/index.html"
+    original = '<main id="app"></main>\r\nconst oldApp = {\r\n' + '  legacy: true,\r\n' * 400 + '}; // 旧入口\r\n</body>\r\n'
+    patch = '<<<<<<< SEARCH\nconst oldApp = {\n<<<<<<< THROUGH\n}; // 旧入口\n=======\n>>>>>>> REPLACE'
+    assert _repair_file_text(path, patch, original) == '<main id="app"></main>\r\n\r\n</body>\r\n'
+    with pytest.raises(ProjectWorkspaceError, match="锚点"):
+        _repair_file_text(path, patch, original.replace('</body>', '}; // 旧入口'))
+    with pytest.raises(ProjectWorkspaceError, match="锚点"):
+        _repair_file_text(path, patch.replace('const oldApp', 'oldApp'), original)
+    with pytest.raises(ProjectWorkspaceError, match="锚点"):
+        _repair_file_text(path, patch.replace('const oldApp = {', '</body>'), original)
+
+
+def test_requirement_repair_attempts_only_charge_findings_sent_to_the_model():
+    path = "frontend/app.js"
+    issues = [{"path": path, "criterion": f"u{index}", "message": f"缺少功能 {index}"} for index in range(1, 7)]
+    state = {"plan": _PLAN, "written": {path: ""}, "repair_attempts": {path: 2}}
+    first, = _repair_jobs(state, issues, {}, {}, {})
+    assert first["requirement_keys"] == [f"u{index}" for index in range(1, 6)]
+    state["requirement_repair_attempts"] = {path: dict.fromkeys(first["requirement_keys"], 1)}
+    second, = _repair_jobs(state, issues, {}, {}, {})
+    assert second["findings"][0] == "缺少功能 6"
+    assert "u6" in second["requirement_keys"]
 
 
 def test_localized_html_patch_with_a_model_preamble_preserves_the_full_page():
@@ -148,6 +175,54 @@ async def test_browser_scenario_uses_committed_ui_and_is_preserved_during_repair
     assert (await result.run(browser_checks=True))["project"]["state"] == "passed"
     assert result.calls["project_file", BROWSER_CHECKS_PATH] == 1
     assert result.calls["project_repair", BROWSER_CHECKS_PATH] == 0
+
+
+@pytest.mark.asyncio
+async def test_browser_repair_reads_mounted_component_with_large_entry_and_contract():
+    page = "frontend/index.html"
+    entry = "frontend/src/main.ts"
+    component = "frontend/src/App.vue"
+    tasks = [{**task, "files": [page, entry, component]} if task["id"] == "web" else task for task in _TASKS]
+    previous = json.dumps({"version": 1, "scenarios": [{"name": "加载任务", "steps": [
+        {"action": "open", "path": "/"}, {"action": "click", "selector": "#stale-load"},
+        {"action": "expect_text", "selector": "#result", "value": "已加载"},
+    ]}]}, ensure_ascii=False)
+    problem = f"{BROWSER_CHECKS_PATH} 「加载任务」第 2 步。操作或断言未满足 click #stale-load"
+
+    async def invoke(stage, system, data):
+        assert stage == "project_repair" and data["path"] == BROWSER_CHECKS_PATH
+        assert "实际挂载组件的控件" in system
+        files = data["committed_files"]
+        assert 'id="load-tasks"' in files[component] and "@click=" in files[component]
+        assert "createApp(App).mount('#app')" in files[entry]
+        assert 'id="stale-load"' in files[page] and "样式摘略" in files[component]
+        assert sum(len(source.removesuffix("\n[源文件摘录]")) for source in files.values()) <= 10_000
+        return data["current_file"].replace("#stale-load", "#load-tasks")
+
+    class BrowserHarness(_Harness):
+        async def review(self, plan):
+            report = await super().review(plan)
+            if "#stale-load" in self.files[BROWSER_CHECKS_PATH]:
+                report.update(passed=False, issues=[{"path": BROWSER_CHECKS_PATH, "message": problem}])
+            return report
+
+    harness = BrowserHarness(invoke)
+    harness.files = {path: _example_file(path) for task in tasks for path in task["files"]}
+    harness.files.update({
+        page: '<div id="app"><button id="stale-load">占位按钮</button>' + '<p>静态占位</p>' * 650 + '</div>'
+              '<script type="module" src="/src/main.ts"></script>',
+        entry: "import {createApp} from 'vue'; import App from './App.vue'; createApp(App).mount('#app');",
+        component: '<style>' + '.placeholder { color: blue; }\n' * 240 + '</style>\n'
+                   '<template><button id="load-tasks" @click="load">加载</button><p id="result">{{ result }}</p></template>\n'
+                   '<script setup>import {ref} from "vue"; const result = ref(""); '
+                   'const load = () => { result.value = "已加载"; };</script>',
+        "openapi.json": json.dumps({"paths": {f"/api/tasks/{index}/items": {"get": {}} for index in range(180)}}),
+        BROWSER_CHECKS_PATH: previous,
+    })
+    plan = browser_plan({**_PLAN, "scope": "fullstack", "tasks": tasks}, True)
+    report = await harness.run({**_INPUT, "plan": plan, "restored_paths": list(harness.files)}, browser_checks=True)
+    assert report["project"]["state"] == "passed"
+    assert harness.calls == {("project_repair", BROWSER_CHECKS_PATH): 1}
 
 
 @pytest.mark.asyncio

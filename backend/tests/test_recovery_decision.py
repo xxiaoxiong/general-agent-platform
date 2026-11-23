@@ -532,6 +532,74 @@ async def _write_real_checkpoint(dsn: str, thread_id: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_recovery_does_not_resume_another_run_from_the_session_checkpoint(monkeypatch):
+    service = _make_service(worker_id="shared-thread-worker")
+
+    async def previous_run_checkpoint(thread_id):
+        return {"thread_id": thread_id, "checkpoint_id": "last", "run_id": "older-run", "has_interrupt": True}
+
+    monkeypatch.setattr(service, "get_thread_state", previous_run_checkpoint)
+    async with AsyncSessionLocal() as db:
+        repo = RunRepository(db)
+        row, _ = await _create_run(repo)
+        run_id = row.id
+        await repo.claim(run_id, "first-worker", 30)
+        await db.commit()
+        row = await repo.get_run(run_id)
+        row.lease_expires_at = row.lease_expires_at.replace(year=2000)
+        await db.commit()
+    claimed = await service.worker.claim_run(run_id)
+    assert claimed is not None
+    mode, _, actions, metadata = await service._recovery_check(claimed)
+    assert mode == RECOVERY_FRESH and actions == []
+    assert metadata["checkpoint_state"] == CHECKPOINT_MISSING and metadata["checkpoint_run_id"] == "older-run"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_state_reports_real_pending_interrupt_without_sensitive_values(monkeypatch):
+    from typing import TypedDict
+
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import Command, interrupt
+
+    class State(TypedDict):
+        result: str
+
+    async def await_approval(state: State):
+        decision = interrupt({"action_requests": [{
+            "name": "send_notification", "tool_call_id": "call-stable",
+            "args": {"token": "private-test-value", "body": "审核通知"},
+        }]})
+        return {"result": decision}
+
+    saver = InMemorySaver()
+
+    async def checkpointer():
+        return saver
+
+    monkeypatch.setattr(CheckpointerFactory, "get", lambda: SimpleNamespace(get_checkpointer=checkpointer))
+    config = {"configurable": {"thread_id": "main-checkpoint-state", "run_id": "previous-run"}}
+    graph = StateGraph(State).add_node("await_approval", await_approval).add_edge(START, "await_approval").add_edge(
+        "await_approval", END,
+    ).compile(checkpointer=saver)
+    await graph.ainvoke({"result": ""}, config)
+
+    service = AgentRuntimeService()
+    paused = await service.get_thread_state("main-checkpoint-state")
+    record = await saver.aget_tuple(config)
+    assert paused["checkpoint_id"] == record.checkpoint["id"] and paused["run_id"] == "previous-run"
+    assert paused["next"] == ["await_approval"] and paused["has_pending_writes"] and paused["has_interrupt"]
+    assert paused["pending_actions"][0]["action_id"] == "call-stable"
+    assert "private-test-value" not in str(paused)
+
+    await graph.ainvoke(Command(resume="approved"), config)
+    completed = await service.get_thread_state("main-checkpoint-state")
+    assert completed["checkpoint_id"] != paused["checkpoint_id"]
+    assert completed["next"] == [] and not completed["has_interrupt"] and completed["pending_actions"] == []
+
+
+@pytest.mark.asyncio
 async def test_rc05_corrupted_checkpoint_blob_blocks_fresh_restart(monkeypatch, tmp_path):
     """RC-05：Checkpoint 内容损坏（真实 BLOB 篡改）-> 不得自动回退 fresh。"""
     db_path = tmp_path / "cp.db"

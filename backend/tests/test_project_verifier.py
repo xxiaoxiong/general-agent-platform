@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import subprocess
 import time
 
 import pytest
@@ -35,14 +36,16 @@ def queue(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("correct_digest", [True, False])
-async def test_runtime_queue_binds_the_receipt_to_the_exact_sources(queue, correct_digest):
+@pytest.mark.parametrize("capture_browser_errors", [True, False])
+async def test_runtime_queue_binds_the_receipt_to_the_exact_sources(queue, correct_digest, capture_browser_errors):
     sources = {"backend/app.py": "print('运行验收')\n", "README.md": "python backend/app.py\n"}
     digest = source_digest(sources)
-    result = asyncio.create_task(verify_runtime(sources, "backend"))
+    result = asyncio.create_task(verify_runtime(sources, "backend", capture_browser_errors=capture_browser_errors))
     request = await _next_request(queue)
     payload = read_json(request, MAX_JOB_BYTES)
     assert payload["files"] == sources and payload["scope"] == "backend"
     assert payload["source_digest"] == digest and payload["deadline"] > time.time()
+    assert payload.get("capture_browser_errors") is (True if capture_browser_errors else None)
     response = {"source_digest": digest if correct_digest else "old", "checks": [
         {"id": "runtime.start", "status": "passed"},
     ], "issues": []}
@@ -165,6 +168,25 @@ def test_observed_text_control_repairs_value_assertion_without_weakening_it():
     assert steps[3] == contract["scenarios"][0]["steps"][3]
 
 
+def test_observed_form_scope_repairs_only_contiguous_verified_fields():
+    contract = {"version": 1, "scenarios": [{"name": "登记工单", "steps": [
+        {"action": "open", "path": "/"},
+        {"action": "fill", "selector": "form#old input#title", "value": "机组检修"},
+        {"action": "select", "selector": "form#old #priority", "value": "3"},
+        {"action": "click", "selector": "form#old button"},
+        {"action": "expect_text", "selector": "#result", "value": "机组检修"},
+    ]}]}
+    source = json.dumps(contract)
+    prefix = "tests/browser-checks.json 「登记工单」第 2 步。真实表单字段已唯一定位，需更新步骤 "
+    steps = parse_browser_checks(browser_observed_source(source, [prefix + "2,3"]))[0]["steps"]
+    assert steps[1] == {"action": "fill", "selector": "form input#title", "value": "机组检修"}
+    assert steps[2] == {"action": "select", "selector": "form #priority", "value": "3"}
+    assert steps[3:] == contract["scenarios"][0]["steps"][3:]
+    assert browser_observed_source(source, [prefix + "2,3,4"]) == source
+    assert browser_observed_source(source, [prefix + "2,4"]) == source
+    assert browser_observed_source(source.replace("form#old #priority", "form#other #priority"), [prefix + "2,3"]) == source.replace("form#old #priority", "form#other #priority")
+
+
 def test_only_the_vite_reference_proven_missing_by_typescript_can_be_removed():
     path = "frontend/tsconfig.json"
     source = '{\n  "compilerOptions": {"strict": true},\n  "references": [{"path":"./tsconfig.node.json"}, {"path":"./tsconfig.shared.json"}]\n}'
@@ -248,6 +270,47 @@ def test_standalone_and_collected_tests_are_distinguished_and_failures_point_to_
     assert worker._test_failure_path("ImportError: test support missing", standalone, backend, "frontend/index.html") == standalone.path
 
 
+def test_pytest_runtime_evidence_contains_only_reported_passing_cases(tmp_path, monkeypatch):
+    path = "tests/test_rules.py"
+    source = """
+import pytest
+import unittest
+
+class Helpers:
+    def test_uncollected(self):
+        assert False
+
+class RulesTest(unittest.TestCase):
+    def test_http(self):
+        self.assertEqual(200, 200)
+
+@pytest.mark.parametrize("value", ["备件", "设备"])
+def test_params(value):
+    assert value
+
+@pytest.mark.skip
+def test_skipped():
+    assert False
+"""
+    target = tmp_path / path
+    target.parent.mkdir()
+    target.write_text(source, encoding="utf-8")
+    files = {path: source}
+    suite = worker._test_commands(files)[0][0]
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    run = subprocess.run(suite.argv, cwd=target.parent, capture_output=True, check=True, encoding="utf-8", timeout=15)
+    cases = worker._pytest_passed_cases(run.stdout, suite, [path])
+    assert cases == [f"{path}::RulesTest::test_http", f"{path}::test_params"]
+    assert not worker._pytest_passed_cases(f"PASSED {path}::test_uncollected", suite, [path])
+
+    digest = source_digest(files)
+    verification = {"source_digest": digest, "checks": [], "issues": [], "passed": True}
+    result = {"id": "runtime.tests.1", "files": [path], "status": "passed",
+              "test_cases": [*cases, *cases, "tests/unrelated.py::test_missing"]}
+    merged = merge_runtime_report(verification, {"source_digest": digest, "checks": [result]}, files)
+    assert merged["checks"][0]["test_cases"] == cases
+
+
 def test_known_test_command_updates_only_the_line_and_retains_pytest_for_collected_cases():
     files = {"backend/test_app.py": "def test_http():\n    assert True\n",
              "e2e/test_flow.py": 'if __name__ == "__main__":\n    main()\n'}
@@ -282,6 +345,10 @@ def test_http_suites_that_start_the_same_backend_are_detected_separately():
     ({"action": "click", "selector": "#save >> text=next"}, "CSS"),
     ({"action": "execute", "source": "document.body"}, "不支持"),
     ({"action": "click", "selector": "#save", "confirm": 1}, "布尔值"),
+    ({"action": "click", "selector": "#save", "prompt": 2}, "prompt 需要是有效文本"),
+    ({"action": "click", "selector": "#save", "prompt": "a" * 301}, "最多 300 字符"),
+    ({"action": "click", "selector": "#save", "confirm": False, "prompt": "2"}, "只能使用 confirm 或 prompt"),
+    ({"action": "check", "selector": "#save", "prompt": "2"}, "未知字段 prompt"),
 ])
 def test_browser_scenarios_only_accept_typed_actions_in_the_application(step, problem):
     checks = {"version": 1, "scenarios": [{"name": "保存后可查", "steps": [
@@ -289,6 +356,16 @@ def test_browser_scenarios_only_accept_typed_actions_in_the_application(step, pr
     ]}]}
     with pytest.raises(ValueError, match=problem):
         parse_browser_checks(json.dumps(checks))
+
+
+@pytest.mark.parametrize("value", ["2", "", "轮轴备件"])
+def test_native_prompt_input_is_preserved_as_click_text(value):
+    step = {"action": "click", "selector": "#parts-request", "prompt": value}
+    checks = {"version": 1, "scenarios": [{"name": "登记备件", "steps": [
+        {"action": "open", "path": "/"}, step,
+        {"action": "expect_text", "selector": "#result", "value": "已登记"},
+    ]}]}
+    assert parse_browser_checks(json.dumps(checks))[0]["steps"][1] == step
 
 
 def test_browser_scenario_requires_a_visible_state_assertion_and_a_user_action():
@@ -317,6 +394,71 @@ def test_browser_failure_routes_to_real_assets_api_or_the_scenario_itself():
     assert worker._browser_issue_file(site, files, {"kind": "coverage"}) == BROWSER_CHECKS_PATH
     assert worker._browser_issue_file(site, files, {"kind": "scenario_input"}) == BROWSER_CHECKS_PATH
     assert worker._browser_issue_file(site, files, {"kind": "missing_control", "selector": "#wrong-id"}) == BROWSER_CHECKS_PATH
+
+
+@pytest.mark.parametrize(("capture", "status"), [(False, "failed"), (True, "failed"), (True, "passed"), (True, "skipped")])
+def test_browser_console_error_only_enriches_opted_in_failed_steps(tmp_path, monkeypatch, capture, status):
+    files = {"frontend/index.html": "", BROWSER_CHECKS_PATH: json.dumps({"version": 1, "scenarios": [{
+        "name": "提交表单", "steps": [{"action": "open", "path": "/"}, {"action": "click", "selector": "#save"},
+                                     {"action": "expect_visible", "selector": "#result"}],
+    }]})}
+    site = worker.Site(None, None, "frontend/index.html", 3000, False)
+    job = worker.Job(tmp_path / "request.json", 0, tmp_path, capture_browser_errors=capture)
+    fault = "TypeError: quantity.trim is not a function"
+    outcome = {"console_error": fault + "x" * 200, "step": 3, "message": "描述" * 500}
+    if status == "passed":
+        outcome["steps"] = 3
+    if status == "skipped":
+        outcome["kind"] = "offline_dependency"
+    monkeypatch.setattr(job, "stop", lambda: None)
+    monkeypatch.setattr(worker, "_browser_fixture", lambda *_: (site, {"smoke": {}, "scenarios": [outcome]}))
+
+    worker._browser_checks(job, files, "frontend", "README.md", site)
+
+    assert job.checks[-1]["status"] == status
+    assert len(job.issues) == int(status == "failed")
+    detail = job.checks[-1]["detail"]
+    if capture and status == "failed":
+        assert detail.startswith(f"{BROWSER_CHECKS_PATH} 「提交表单」第 3 步。")
+        assert detail.endswith(" · 浏览器脚本异常 " + outcome["console_error"][:180])
+        assert len(detail) == 500 and job.issues[0]["message"] == detail
+    else:
+        assert fault not in detail
+
+
+def test_main_browser_report_attributes_only_a_unique_source_call(tmp_path, monkeypatch):
+    site = worker.Site(None, None, "frontend/index.html", 3000, False)
+    modal = "frontend/src/components/OrderDetailModal.vue"
+    fault = "TypeError: u.value.quantity.trim is not a function"
+    files = {"frontend/index.html": '<script src="./src/main.ts"></script>', "frontend/src/main.ts": "",
+             modal: "<script>\n/* 统计行位置\nrow.quantity.trim()\n*/\nconst result = part.quantity . trim()\n</script>",
+             "frontend/log.js": "// thing.quantity.trim()\nconsole.log('thing.quantity.trim()')",
+             "backend/util.ts": "row.quantity.trim();"}
+    assert worker._browser_call_source(site, files, fault) == ("quantity.trim", (modal, 5))
+    files[BROWSER_CHECKS_PATH] = json.dumps({"version": 1, "scenarios": [{
+        "name": "申请备件", "steps": [{"action": "open", "path": "/"}, {"action": "click", "selector": ".submit"},
+                                     {"action": "expect_visible", "selector": ".warning"}],
+    }]})
+    outcome = {"kind": "missing_control", "selector": ".warning", "console_error": fault, "step": 3}
+    monkeypatch.setattr(worker.Job, "stop", lambda _: None)
+    monkeypatch.setattr(worker, "_browser_fixture", lambda *_: (site, {"smoke": {}, "scenarios": [outcome]}))
+
+    def issue(capture):
+        job = worker.Job(tmp_path / "request.json", 0, tmp_path, capture_browser_errors=capture)
+        worker._browser_checks(job, files, "frontend", "README.md", site)
+        assert job.checks[-1]["status"] == "failed"
+        return job.issues[0]
+
+    assert issue(False)["path"] == "frontend/src/main.ts"
+    located = issue(True)
+    assert located["path"] == modal and f"源码候选 {modal}:5" in located["message"]
+
+    files["frontend/another.ts"] = "other.quantity.trim()"
+    ambiguous = issue(True)
+    assert ambiguous["path"] == "frontend/src/main.ts"
+    assert "源码位置未确认，请在前端查找 quantity.trim" in ambiguous["message"]
+    assert worker._browser_call_source(site, files, "TypeError: u.otherquantity.trim is not a function") == ("otherquantity.trim", None)
+    assert worker._browser_call_source(site, files, "ReferenceError: x is not defined") is None
 
 
 def test_browser_scenario_recovers_annotations_and_equivalent_step_fields():

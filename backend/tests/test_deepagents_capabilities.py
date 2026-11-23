@@ -113,6 +113,61 @@ async def test_a1_file_tools_roundtrip_on_workspace(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_workspace_parent_file_conflict_preserves_content_and_names_the_virtual_blocker(tmp_path, monkeypatch):
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "AGENT_FILES_ROOT", str(tmp_path))
+    blocker = "/workspace/frontend/src"
+    target = blocker + "/main.ts"
+    agent = _build([
+        _turn("write_file", {"file_path": blocker, "content": "现有配置"}, "blocker"),
+        _turn("write_file", {"file_path": target, "content": "export {}"}, "blocked-write"),
+        _turn("edit_file", {"file_path": target, "old_string": "x", "new_string": "y"}, "blocked-edit"),
+        _turn("write_file", {"file_path": "/workspace/backend/src/main.py", "content": "pass"}, "write-tree"),
+        _turn("write_file", {"file_path": "/workspace/backend/src", "content": "父目录"}, "write-directory"),
+        AIMessage(content="完成核对"),
+    ])
+    result = await agent.ainvoke({"messages": [HumanMessage(content="核对源码路径")]})
+    by_id = {message.tool_call_id: message for message in _tool_msgs(result)}
+    for call_id in ("blocked-write", "blocked-edit"):
+        message = by_id[call_id]
+        assert message.status == "error"
+        assert f"父路径 `{blocker}` 已是文件" in message.content and target in message.content
+        assert "原样重试仍会失败" in message.content and "read_file" in message.content
+        assert str(tmp_path) not in message.content
+    assert "阻塞路径未变化" not in by_id["blocked-write"].content
+    assert "继续不依赖它的工作" in by_id["blocked-edit"].content
+    assert by_id["write-tree"].status == "success"
+    assert by_id["write-directory"].status == "error" and "已是目录" in by_id["write-directory"].content
+    workspace = tmp_path / "999" / "999" / "999"
+    assert (workspace / "frontend" / "src").read_text(encoding="utf-8") == "现有配置"
+    assert (workspace / "backend" / "src" / "main.py").read_text(encoding="utf-8") == "pass"
+
+
+@pytest.mark.asyncio
+async def test_empty_extensionless_files_are_preserved_until_explicit_cleanup(tmp_path, monkeypatch):
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "AGENT_FILES_ROOT", str(tmp_path))
+    blocker = "/workspace/frontend/src"
+    target = blocker + "/main.ts"
+    agent = _build([
+        _turn("write_file", {"file_path": blocker, "content": ""}, "empty"),
+        _turn("write_file", {"file_path": target, "content": "export {}"}, "blocked"),
+        _turn("read_file", {"file_path": blocker}, "read-empty"),
+        _turn("delete", {"file_path": blocker}, "remove-fixture"),
+        _turn("write_file", {"file_path": target, "content": "export {}"}, "write-file"),
+        AIMessage(content="完成核对"),
+    ])
+    result = await agent.ainvoke({"messages": [HumanMessage(content="核对并清理测试占位")]})
+    by_id = {message.tool_call_id: message for message in _tool_msgs(result)}
+    assert by_id["empty"].status == "success" and by_id["read-empty"].status == "success"
+    assert by_id["blocked"].status == "error" and "为 0 字节" in by_id["blocked"].content
+    assert by_id["remove-fixture"].status == "success" and by_id["write-file"].status == "success"
+    assert (tmp_path / "999" / "999" / "999" / "frontend" / "src" / "main.ts").read_text(encoding="utf-8") == "export {}"
+
+
+@pytest.mark.asyncio
 async def test_a2_state_backend_virtual_files(tmp_path, monkeypatch):
     """默认路由 StateBackend：虚拟文件可写读回，但不落磁盘。"""
     from app.core.config import settings
@@ -380,7 +435,7 @@ async def _run_turns(agent):
 
 
 def test_c1_execute_hidden_without_sandbox(monkeypatch, tmp_path):
-    """A05/A09：无外部 Sandbox 时工具面不含 execute；external 模式才暴露。"""
+    """未接入实际 Sandbox 时，配置里的 external 不会暴露空壳命令。"""
     agent = _build_sec([AIMessage(content="完成")], _policy(), monkeypatch, tmp_path)
     names = _tool_names(agent)
     assert "execute" not in names, f"无 Sandbox 不得暴露 execute: {sorted(names)}"
@@ -391,7 +446,7 @@ def test_c1_execute_hidden_without_sandbox(monkeypatch, tmp_path):
         [AIMessage(content="完成")], _policy(sandbox_mode="external"),
         monkeypatch, tmp_path,
     )
-    assert "execute" in _tool_names(agent_ext), "external 沙箱模式应暴露 execute"
+    assert "execute" not in _tool_names(agent_ext)
 
 
 @pytest.mark.asyncio
@@ -407,6 +462,19 @@ async def test_c2_execute_unavailable_even_if_model_calls_it(monkeypatch, tmp_pa
     assert msgs["t1"].status == "error", f"execute 调用必须报错: {msgs['t1'].content}"
     assert not marker.exists(), "execute 不得真实执行命令"
 
+
+@pytest.mark.asyncio
+async def test_continued_agent_cannot_read_frozen_artifact_as_current_source(monkeypatch, tmp_path):
+    agent = _build_sec([
+        _turn("read_file", {"file_path": "/workspace/.run-artifacts/old/source.py"}, "artifact"),
+        AIMessage(content="完成"),
+    ], _policy(), monkeypatch, tmp_path)
+    frozen = tmp_path / "11" / "22" / "33" / ".run-artifacts" / "old"
+    frozen.mkdir(parents=True)
+    (frozen / "source.py").write_text("OLD_SOURCE_MARKER", encoding="utf-8")
+    results = {message.tool_call_id: message for message in _tool_msgs(await _run_turns(agent))}
+    assert results["artifact"].status == "error"
+    assert "OLD_SOURCE_MARKER" not in results["artifact"].content
 
 @pytest.mark.asyncio
 async def test_c3_fs_permission_denies_sensitive_files(monkeypatch, tmp_path):

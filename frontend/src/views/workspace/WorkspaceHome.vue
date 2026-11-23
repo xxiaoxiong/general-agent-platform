@@ -174,7 +174,14 @@
                 </div>
                 <p v-if="staleSeconds(m) >= 8" class="stale-hint">已 {{ staleSeconds(m) }} 秒无新进展，任务仍在执行。</p>
 
-                <div v-if="m.error" class="msg-error" role="alert"><CircleAlert :size="16" />{{ m.error }}</div>
+                <div v-if="executionPause(m)" class="msg-pause" role="status">
+                  <CirclePause :size="17" aria-hidden="true" />
+                  <span>{{ executionPause(m)?.text }}</span>
+                  <button v-if="m.runId && idx === messages.length - 1 && !m.streaming && executionPause(m)?.canContinue"
+                    type="button" class="continue-button" :disabled="!!blockedReason || sending || !!uploading || loadingMessages || messagesFailed"
+                    @click="sendMessage(true)">继续任务</button>
+                </div>
+                <div v-else-if="m.error" class="msg-error" role="alert"><CircleAlert :size="16" />{{ m.error }}</div>
                 <ApprovalPanel
                   v-if="m.runId && m.pendingActions?.length && currentConversation"
                   :key="m.runId"
@@ -273,7 +280,7 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
-  ArrowDown, Bot, ChartNoAxesCombined, Circle, CircleAlert, CircleCheck, CircleDot,
+  ArrowDown, Bot, ChartNoAxesCombined, Circle, CircleAlert, CircleCheck, CircleDot, CirclePause,
   Copy, ExternalLink, FilePenLine, FileText, Layers, ListTodo, LoaderCircle, PanelLeft, RotateCcw, Search, X,
 } from '@lucide/vue'
 import { ElMessage } from 'element-plus'
@@ -284,7 +291,7 @@ import {
   type Assistant, type Conversation, type ConversationMetadata, type PreviewContent,
 } from '@/api/v2'
 import {
-  acceptDocInput, addDocInput, applyRunEvent, documentReviewInput, finalizeRunMessage, hasVisibleText,
+  acceptDocInput, addDocInput, applyRunEvent, documentReviewInput, executionPause, finalizeRunMessage, hasVisibleText,
   isDocumentReviewInput, pendingDocInput, recordDocumentReview,
   type DocumentEditReviewBlock, type MsgBlock, type RunStreamMessage, type ToolBlock,
 } from '@/features/run/blocks'
@@ -601,7 +608,7 @@ const statuses: Record<string, { label: string; tone: string }> = {
   failed: { label: '失败', tone: 'danger' },
   cancelled: { label: '已停止', tone: 'neutral' },
   suspended: { label: '已挂起', tone: 'warning' },
-  limit_exceeded: { label: '达到执行上限', tone: 'warning' },
+  limit_exceeded: { label: '已暂停', tone: 'warning' },
 }
 
 function runState(message: ChatMessage) {
@@ -1351,8 +1358,10 @@ async function repairProjectDraft(message: ChatMessage) {
   }
 }
 
-async function sendMessage() {
-  const text = inputText.value.trim()
+async function sendMessage(continueTask = false) {
+  const latest = messages.value[messages.value.length - 1]
+  if (continueTask && (!latest?.runId || latest.streaming || !executionPause(latest)?.canContinue)) return
+  const text = continueTask ? '继续' : inputText.value.trim()
   if (!text || blockedReason.value || sending.value || uploading.value || loadingMessages.value || messagesFailed.value) return
 
   sending.value = true
@@ -1366,15 +1375,17 @@ async function sendMessage() {
   }
   const convId = conv.id
   if (inactive || currentConversation.value?.id !== convId) return
-  const sentFiles = attachments.value.map((a) => ({ ...a }))
+  const sentFiles = continueTask ? [] : attachments.value.map((a) => ({ ...a }))
   const sentModelId = selectedModelId.value
   const sentMode = approvalMode.value
-  const sentTeamMode = teamMode.value
-  const sentTask = { ...documentTask.value }
+  const sentTeamMode = !continueTask && teamMode.value
+  const sentTask: DocumentTaskSelection = continueTask ? { mode: 'chat' } : { ...documentTask.value }
 
-  inputText.value = ''
-  attachments.value = []
-  resetDocumentTask()
+  if (!continueTask) {
+    inputText.value = ''
+    attachments.value = []
+    resetDocumentTask()
+  }
   pushMsg(convId, {
     role: 'user', content: text, blocks: [], task: sentTask,
     files: sentFiles.map(({ name, path, previewUrl }) => ({ name, path, previewUrl })),
@@ -1414,7 +1425,7 @@ async function sendMessage() {
     aMsg.runStatus = 'failed'
     aMsg.error = '创建任务失败，可编辑原消息后重新发送。'
     clearActiveRun(convId, entry)
-    if (currentConversation.value?.id === convId && !inputText.value) {
+    if (!continueTask && currentConversation.value?.id === convId && !inputText.value) {
       inputText.value = text
       documentTask.value = sentTask
     }
@@ -1737,6 +1748,19 @@ function observeResumedRun(convId: number, aMsg: ChatMessage, liveStatus: string
   color: var(--ui-danger); background: var(--ui-danger-soft); white-space: pre-wrap; overflow-wrap: anywhere;
 }
 .msg-error svg { flex: none; margin-top: 2px; }
+.msg-pause {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  padding: 8px 10px; border-radius: var(--ui-radius-md); background: var(--ui-subtle);
+  color: var(--ui-secondary); font-size: 13px;
+}
+.msg-pause > svg { flex: none; color: var(--ui-warning); }
+.msg-pause > span { flex: 1 1 12rem; }
+.continue-button {
+  padding: 4px 10px; border: var(--ui-line); border-radius: var(--ui-radius-sm);
+  color: var(--ui-accent); background: var(--ui-bg); cursor: pointer;
+}
+.continue-button:hover:not(:disabled) { background: var(--ui-accent-soft); }
+.continue-button:disabled { cursor: default; opacity: .55; }
 .message-actions { display: flex; align-items: center; gap: 4px; }
 .trace-link {
   display: inline-flex; align-items: center; min-height: 30px; gap: 6px; padding: 0 8px;

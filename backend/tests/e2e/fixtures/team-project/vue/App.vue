@@ -72,7 +72,7 @@ onMounted(load)
   <main>
     <header><span>运维工作台</span><h1>巡检工单台</h1><p>记录巡检问题，跟踪处理和闭环。</p></header>
     <form aria-label="新建工单" @submit.prevent="create">
-      <label>工单标题<input v-model="title" name="title" maxlength="120" required></label>
+      <label>工单标题<input id="ticket-title" v-model="title" name="title" maxlength="120" required></label>
       <button type="submit">创建工单</button>
     </form>
     <section aria-label="工单筛选">

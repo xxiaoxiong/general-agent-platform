@@ -17,7 +17,7 @@ from app.observability.langfuse_tracing import platform_span
 from app.services.documents.workflow_support import read_attachments
 
 from .context import RuntimeContext
-from .events import TEAM_UPDATED, EventBus, RuntimeEvent, redact_secrets
+from .events import TEAM_UPDATED, EventBus, RuntimeEvent, event_storage_payload, redact_secrets
 from .lifecycle import RunHandle
 from .model_adapter import build_chat_model
 from .persistence import make_run_config
@@ -166,7 +166,7 @@ class TeamRun:
         event = RuntimeEvent(type=event_type, run_id=self.run.run_id, thread_id=self.run.thread_id, data=payload)
         async with AsyncSessionLocal() as db:
             await self._check_fence(db)
-            if await _latest_event(db, self.run.run_id, event_type) == redact_secrets(payload):
+            if await _latest_event(db, self.run.run_id, event_type) == event_storage_payload(event):
                 return
             event.sequence = await EventBus.persist_in_transaction(event, db)
             await db.commit()

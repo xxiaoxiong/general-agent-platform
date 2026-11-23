@@ -105,6 +105,7 @@ from .repositories import (
 )
 from .repositories.errors import IllegalTransition, RunLeaseLost, SessionBusy
 from .telemetry import telemetry
+from .tool_batches import ToolLoopStopped
 from .tools.classification import (
     CHECKPOINT_MISSING,
     CHECKPOINT_OK,
@@ -123,6 +124,11 @@ from .worker import (
 )
 
 logger = logging.getLogger("agent_runtime")
+
+_STOP_MESSAGES = {
+    "budget": "已达到本次执行上限，任务已暂停。",
+    "no_progress": "连续尝试后进度未变化，任务已自动暂停。",
+}
 
 # Langfuse Trace 富化等后台 best-effort 任务的强引用（防 GC 提前回收）
 _BG_TASKS: set = set()
@@ -219,7 +225,9 @@ def _synthetic_terminal_event(run_row: Any) -> RuntimeEvent:
             data={"final_text": run_row.final_text or "", "summary": run_row.summary},
         )
     if run_row.status == STATUS_CANCELLED:
-        return RuntimeEvent(type=RUN_CANCELLED, run_id=run_row.id, data={})
+        return RuntimeEvent(type=RUN_CANCELLED, run_id=run_row.id, data={
+            "final_text": run_row.final_text, "summary": run_row.summary,
+        } if run_row.summary else {})
     return RuntimeEvent(
         type=RUN_FAILED,
         run_id=run_row.id,
@@ -609,6 +617,8 @@ class AgentRuntimeService:
                 "last_event_seq": row.last_event_seq or 0,
                 "pending_input": None,
             }
+            if row.status == STATUS_LIMIT_EXCEEDED and (stop := (row.summary or {}).get("stop")):
+                result["summary"] = {"stop": stop}
             execution_context = (row.input_payload or {}).get("execution_context")
             if execution_context is not None:
                 from .document_retry import document_retryable
@@ -636,42 +646,55 @@ class AgentRuntimeService:
         return result
 
     async def get_thread_state(self, thread_id: str) -> Optional[Dict[str, Any]]:
-        """查询 LangGraph 线程状态（恢复语义：checkpoint 保存全量执行状态）。"""
-        cp = await CheckpointerFactory.get().get_checkpointer()
+        """从 checkpoint 读取恢复所需的元数据及未完成中断。"""
+        from langgraph.pregel._task_status import read_task_statuses
+
         config = {"configurable": {"thread_id": thread_id}}
         try:
-            snapshot = await cp.aget(config)
+            cp = await CheckpointerFactory.get().get_checkpointer()
+            record = await cp.aget_tuple(config)
         except Exception as e:
-            return {"error": str(e)}
-        if snapshot is None:
+            return {"error": str(redact_secrets(str(e)))[:500]}
+        if record is None:
             return None
-        actions, has_interrupt = self._extract_snapshot_actions(snapshot)
+        checkpoint = record.checkpoint
+        writes = record.pending_writes or []
+        # 已完成节点的历史 interrupt 可能与输出同时出现在写入日志中。
+        interrupts = [interrupt for status in read_task_statuses(writes).values() for interrupt in status.pending_interrupts]
+        values = checkpoint.get("channel_values") or {}
+        versions = checkpoint.get("channel_versions") or {}
+        seen = checkpoint.get("versions_seen") or {}
+        # 这里只报告持久化的候选分支和 Send 节点；编译执行图负责计算最终调度顺序。
+        next_nodes = [name for channel in values if channel.startswith("branch:to:")
+                      and (name := channel.removeprefix("branch:to:"))
+                      and versions.get(channel) != seen.get(name, {}).get(channel)]
+        next_nodes.extend(name for send in values.get("__pregel_tasks", ()) or ()
+                          if isinstance(name := _field(send, "node"), str))
         return {
             "thread_id": thread_id,
-            "checkpoint_id": getattr(snapshot, "id", None),
-            "next": list(getattr(snapshot, "next", ()) or ()),
-            "has_pending_writes": bool(getattr(snapshot, "pending_writes", None)),
-            "has_interrupt": has_interrupt,
-            "pending_actions": actions,
+            "checkpoint_id": checkpoint.get("id"),
+            "run_id": record.metadata.get("run_id"),
+            "next": list(dict.fromkeys(next_nodes)),
+            "has_pending_writes": bool(writes),
+            "has_interrupt": bool(interrupts),
+            "pending_actions": self._extract_snapshot_actions(interrupts),
         }
 
     @staticmethod
-    def _extract_snapshot_actions(snapshot: Any) -> Tuple[List[Dict[str, Any]], bool]:
+    def _extract_snapshot_actions(interrupts: list[Any]) -> List[Dict[str, Any]]:
         """从 Checkpoint 快照提取未决 HITL 动作（恢复审批所需）。
 
         动作带稳定 action_id（FR-06）：重启后重提取与中断时记录同一 ID。
         """
         actions: List[Dict[str, Any]] = []
-        has_interrupt = False
-        for task in (getattr(snapshot, "tasks", None) or ()):
-            for it in (getattr(task, "interrupts", None) or ()):
-                has_interrupt = True
-                value = _field(it, "value", it)
-                interrupt_id = str(_field(it, "id", "") or "")
-                if isinstance(value, dict) and "action_requests" in value:
-                    for ridx, req in enumerate(value["action_requests"]):
-                        actions.append(_action_from_req(req, interrupt_id, ridx))
-        return actions, has_interrupt
+        for item in interrupts:
+            value = _field(item, "value", item)
+            interrupt_id = str(_field(item, "id", "") or "")
+            if isinstance(value, dict) and isinstance(requests := value.get("action_requests"), list):
+                for index, request in enumerate(requests):
+                    if isinstance(request, dict):
+                        actions.append(redact_secrets(_action_from_req(request, interrupt_id, index)))
+        return actions
 
     async def _current_batch_action_ids(self, run_id: str) -> List[str]:
         """当前 Interrupt 批次的动作 ID（按 action_requests 顺序 = 登记 id 顺序）。
@@ -1114,6 +1137,9 @@ class AgentRuntimeService:
             # P4-05/06：Run 级预算优先取 AgentVersion 快照的 execution_budget
             # （P2-01 版本绑定语义），缺省回落全局 settings
             _budget_cfg = agent_config.get("execution_budget") or {}
+            run_timeout = settings.AGENT_RUN_TIMEOUT
+            if run_timeout > 0:
+                run_timeout = max(run_timeout, float(_budget_cfg.get("run_timeout_seconds", 0) or 0))
             ctx = RuntimeContext(
                 scope=scope,
                 run_id=run.run_id,
@@ -1126,17 +1152,12 @@ class AgentRuntimeService:
                 memory_context=mem_ctx,
                 budget=ExecutionBudget(
                     max_steps=_budget_cfg.get(
-                        "max_steps", getattr(settings, "AGENT_MAX_STEPS", 100)),
+                        "max_steps", settings.AGENT_MAX_STEPS),
                     max_tool_calls=_budget_cfg.get(
-                        "max_tool_calls", getattr(settings, "AGENT_MAX_TOOL_CALLS", 200)),
+                        "max_tool_calls", settings.AGENT_MAX_TOOL_CALLS),
                     max_model_calls=_budget_cfg.get(
-                        "max_model_calls", getattr(settings, "AGENT_MAX_MODEL_CALLS", 100)),
-                    run_timeout_seconds=float(max(
-                        # 运行超时取快照与全局配置的较大者：旧版本快照钉死的旧默认值
-                        # 不得掐死大任务，全局 AGENT_RUN_TIMEOUT 是运维口径的下限
-                        float(_budget_cfg.get("run_timeout_seconds", 0) or 0),
-                        float(getattr(settings, "AGENT_RUN_TIMEOUT", 600.0)),
-                    )),
+                        "max_model_calls", settings.AGENT_MAX_MODEL_CALLS),
+                    run_timeout_seconds=run_timeout,
                 ),
                 enable_hitl=enable_hitl,
                 sandbox_mode=getattr(settings, "AGENT_SANDBOX_MODE", "restricted"),
@@ -1160,7 +1181,10 @@ class AgentRuntimeService:
                     continued.get("request") or _last_user_input(original_messages),
                     capability_ids=agent_config.get("capability_ids"),
                 )
-                ctx.carried_artifacts = dict(continued.get("artifacts") or {})
+                if continued:
+                    from .completion import prepare_completion_continuation
+
+                    await prepare_completion_continuation(ctx, continued)
 
             tool_specs = self._resolve_tool_specs(agent_config)
             if execution_context is not None:
@@ -1258,7 +1282,7 @@ class AgentRuntimeService:
                 # 过小的系数会让长任务误触发 GraphRecursionError。预算上限本身由
                 # ModelCallLimit/ToolCallLimit 与 ctx.budget 独立执行，这里只是兜底。
                 config["recursion_limit"] = (
-                    ctx.budget.max_steps * 12 + 40 if ctx.budget.max_steps > 0 else 10000
+                    max(ctx.budget.max_steps, ctx.budget.max_model_calls, 1000) * 16 + 40
                 )
                 run_config = config
 
@@ -1301,7 +1325,7 @@ class AgentRuntimeService:
                         }):
                             pass
 
-                    # P1-05 §13：按绝对 deadline 计算剩余超时（重启不重新获得完整时间）。
+                    # 启用总时限时，按持久化的绝对截止算剩余时间。
                     # 超时两层语义必须区分（Python 3.11 下 asyncio.TimeoutError 与内层
                     # 请求超时同型，混捕会把"模型流卡死"误报成"运行超时"）：
                     # - timeout 上下文到期 = 运行墙钟预算耗尽 -> limit_exceeded；
@@ -1312,10 +1336,7 @@ class AgentRuntimeService:
                         _snap_parts = len(run.final_text_parts)
                         try:
                             _deadline = ctx.budget_deadline_at
-                            if _deadline is not None:
-                                _remaining = max(0.0, (_deadline - datetime.utcnow()).total_seconds())
-                            else:
-                                _remaining = ctx.budget.run_timeout_seconds
+                            _remaining = max(0.0, (_deadline - datetime.utcnow()).total_seconds()) if _deadline else None
                             async with asyncio.timeout(_remaining) as _to:
                                 if team is not None:
                                     outcome = await team.drive(
@@ -1402,9 +1423,18 @@ class AgentRuntimeService:
                 if verification is not None:
                     run.summary["verification"] = verification
                     if verification["status"] != "passed":
-                        limited = verification.get("stop_reason") == "budget"
+                        stop_reason = verification.get("stop_reason")
+                        limited = stop_reason in _STOP_MESSAGES and not (is_team_run or private_document_content)
+                        if limited:
+                            from .completion import supports_completion_resume
+
+                            run.summary["stop"] = {
+                                "reason": stop_reason,
+                                "can_continue": bool(run.session_id and task_type in (None, "general_chat")
+                                                     and supports_completion_resume(ctx.task_contract)),
+                            }
                         await self._fail(
-                            run, "执行预算已用完，仍有交付项需要处理。" if limited else "任务仍有交付项未通过验收，已保存当前结果。",
+                            run, _STOP_MESSAGES[stop_reason] if limited else "任务仍有交付项未通过验收，已保存当前结果。",
                             status=STATUS_LIMIT_EXCEEDED if limited else STATUS_FAILED, bus=bus,
                             result_summary=run.summary, draft=run.final_text,
                         )
@@ -1454,6 +1484,9 @@ class AgentRuntimeService:
                 except Exception:
                     logger.exception("run %s 挂起事件发布失败", run.run_id)
                 raise
+            draft, partial = await self._retain_interrupted_completion(
+                run, None if private_document_content or is_team_run else ctx, "cancelled",
+            )
             if not run.is_terminal:
                 try:
                     run.transition(STATUS_CANCELLED)
@@ -1461,26 +1494,46 @@ class AgentRuntimeService:
                     pass
             committed = True
             try:
-                await self._commit(run, status=STATUS_CANCELLED, finished=True)
+                await self._commit(run, status=STATUS_CANCELLED, final_text=draft, summary=partial, finished=True)
             except PersistenceError:
                 logger.critical("run %s 取消状态持久化失败", run.run_id, exc_info=True)
+                committed = False
             except (RunLeaseLost, IllegalTransition) as e:
                 # 提交被拒：不得谎报 cancelled —— 不写回、不发布取消事件
                 logger.warning("run %s 取消态提交被拒：%s", run.run_id, e)
                 committed = False
             if committed:
+                if partial:
+                    run.final_text, run.summary = draft, partial
+                    await bus.publish(RuntimeEvent(type=VERIFICATION_COMPLETED, run_id=run.run_id, data=partial["verification"]))
                 if is_team_run:
                     await self._close_team_board(run, "cancelled")
                 try:
                     await self._write_back_session(run)  # FR-08.2：终态统一写回
                 except Exception:
                     logger.exception("run %s 取消态会话写回失败", run.run_id)
-                await bus.publish(RuntimeEvent(type=RUN_CANCELLED, run_id=run.run_id))
+                await bus.publish(RuntimeEvent(type=RUN_CANCELLED, run_id=run.run_id, data={
+                    "final_text": draft, "summary": partial,
+                } if partial else {}))
             raise
         except (_RunLimitExceeded, BudgetExceededError, ToolCallLimitExceededError,
-                ModelCallLimitExceededError, GraphRecursionError) as e:
-            error = str(e) if isinstance(e, (_RunLimitExceeded, BudgetExceededError)) else f"执行预算超限: {e}"
-            draft, summary = await self._retain_interrupted_completion(run, ctx, "budget")
+                ModelCallLimitExceededError, GraphRecursionError, ToolLoopStopped) as e:
+            reason = "no_progress" if isinstance(e, ToolLoopStopped) else "budget"
+            # 独立 API 调用仍返回原有的超限错误详情，供程序化调用方判断。
+            main_stop = not (is_team_run or private_document_content) and bool(run.session_id or reason == "no_progress")
+            if main_stop:
+                logger.info("run %s 暂停执行 %s", run.run_id, e)
+                error = _STOP_MESSAGES[reason]
+                if ctx:
+                    try:
+                        await self._flush_budget(ctx, run)
+                    except Exception:
+                        logger.warning("run %s 暂停时预算计数未能持久化", run.run_id, exc_info=True)
+            else:
+                error = str(e) if isinstance(e, (_RunLimitExceeded, BudgetExceededError)) else f"执行预算超限: {e}"
+            draft, summary = await self._retain_interrupted_completion(
+                run, ctx, reason, graceful=main_stop, resumable_route=task_type in (None, "general_chat"),
+            )
             await self._fail(run, error, status=STATUS_LIMIT_EXCEEDED, bus=bus, team_mode=is_team_run,
                              draft=draft, result_summary=summary)
         except ModelCapabilityError as e:
@@ -1573,7 +1626,7 @@ class AgentRuntimeService:
     async def _load_budget(self, ctx: RuntimeContext, run: RunHandle) -> None:
         """加载 Run 预算历史累计并种子 ctx：恢复后计数继续，不从零开始。
 
-        deadline_at 为绝对时间：重启不重新获得完整超时。子 Agent 共享父 Run
+        启用总时限时，deadline_at 为绝对时间。子 Agent 共享父 Run
         ctx/预算（口径一致，见 P1-05 §13.5）。
         """
         timeout = float(ctx.budget.run_timeout_seconds)
@@ -1613,8 +1666,9 @@ class AgentRuntimeService:
             row = await repo.get_run(run_id)
             wait_since = getattr(row, "hitl_wait_started_at", None) if row else None
             if wait_since is not None:
-                waited = (datetime.utcnow() - wait_since).total_seconds()
-                await repo.shift_deadline(run_id, extra_seconds=waited)
+                if settings.AGENT_RUN_TIMEOUT > 0:
+                    waited = (datetime.utcnow() - wait_since).total_seconds()
+                    await repo.shift_deadline(run_id, extra_seconds=waited)
                 await repo.clear_hitl_wait(run_id)
             await session.commit()
 
@@ -1779,10 +1833,17 @@ class AgentRuntimeService:
             await bus.publish(RuntimeEvent(type=VERIFICATION_COMPLETED, run_id=run.run_id, data=verification))
         return verification
 
-    async def _retain_interrupted_completion(self, run, ctx, reason: str) -> tuple[str | None, dict | None]:
+    async def _retain_interrupted_completion(
+        self, run, ctx, reason: str, *, graceful: bool = False, resumable_route: bool = False,
+    ) -> tuple[str | None, dict | None]:
+        from .completion import bounded_answer, interrupted_report, supports_completion_resume
+
+        summary = {"stop": {"reason": reason, "can_continue": False}} if graceful else {}
         if not (ctx and ctx.task_contract and ctx.task_contract.is_complex):
+            if graceful:
+                draft, _ = bounded_answer("".join(run.final_text_parts))
+                return draft, summary
             return None, None
-        from .completion import bounded_answer, interrupted_report
 
         last = ctx.completion_review or {}
         candidate = last.get("answer") if last.get("run_id") == run.run_id else None
@@ -1797,9 +1858,14 @@ class AgentRuntimeService:
                 evidence = await interrupted_report(ctx, draft, reason)
                 await self._publish_completion_artifacts(ctx, run, evidence)
                 report = evidence
+                if graceful:
+                    summary["stop"]["can_continue"] = bool(
+                        run.session_id and resumable_route and evidence.get("stop_reason") != "external_operation"
+                        and supports_completion_resume(ctx.task_contract)
+                    )
         except Exception:
             logger.warning("run %s 中断后未能完成产物核对", run.run_id, exc_info=True)
-        return draft, {"verification": report}
+        return draft, {**summary, "verification": report}
 
     async def _publish_completion_artifacts(self, ctx, run, verification: dict) -> None:
         from app.api.v2.artifacts import make_artifact_id
@@ -2354,7 +2420,10 @@ class AgentRuntimeService:
             if team_state and (team_state.get("error") or (state is None and not has_document_inputs)):
                 state = team_state
         checkpoint_error: Optional[str] = None
-        if state is None:
+        checkpoint_owner = state.get("run_id") if state else None
+        other_run = bool(checkpoint_owner and checkpoint_owner != row.id and not (document_run or team_run))
+        if state is None or other_run:
+            # 同一会话共用执行线程，新 Run 在写入第一个快照前崩溃时不能续跑上一轮的工具。
             checkpoint_state = CHECKPOINT_MISSING
         elif state.get("error"):
             checkpoint_state = CHECKPOINT_UNREADABLE
@@ -2381,6 +2450,8 @@ class AgentRuntimeService:
             "pending": decision.pending,
             "decided_at": datetime.utcnow().isoformat() + "Z",
         }
+        if other_run:
+            metadata["checkpoint_run_id"] = checkpoint_owner
         logger.info(
             "run %s 恢复决策: mode=%s checkpoint=%s pending=%d reason=%s",
             row.id, mode, checkpoint_state, len(decision.pending), reason or "-",

@@ -117,17 +117,25 @@ async def drive_project(team: TeamRun, checkpointer, messages: list[dict], route
         criteria, prompt = coverage_input(objective, plan, files, verification["checks"])
         await team.emit("project.progress", {"phase": "checking", "title": plan["name"],
                                              "detail": "对照原始要求复核工程实现与实际验收证据"})
-        raw = ""
-        if team.remaining_model_calls():
+        review = coverage_report("", criteria, files, verification["checks"], digest)
+        for attempt in range(2):
+            if not team.remaining_model_calls():
+                break
+            instruction = _REVIEW_SYSTEM
+            if attempt:
+                instruction += "上一次未收到完整 JSON。直接输出 JSON，逐项保留 criteria 的编号，用短句引用最关键的证据。"
             try:
-                raw = _model_text(await invoke("project_coverage", _REVIEW_SYSTEM, prompt))
+                raw = _model_text(await invoke("project_coverage", instruction, prompt))
             except (GraphBubbleUp, PersistenceError):
                 raise
             except BudgetExceededError:
-                pass
+                break
             except Exception as exc:
                 logger.info("工程需求复核未返回可用证据 error=%s", type(exc).__name__)
-        review = coverage_report(raw, criteria, files, verification["checks"], digest)
+                continue
+            review = coverage_report(raw, criteria, files, verification["checks"], digest, previous=review)
+            if review["received"]:
+                break
         return merge_coverage_report(verification, review, files)
 
     context = TeamProjectContext(

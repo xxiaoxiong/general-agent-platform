@@ -12,6 +12,7 @@ from referencing import Registry
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models.agent import AgentRun
 from app.models.document import RunInputRequest
@@ -194,10 +195,11 @@ async def submit_run_input(
         request.response = values
         request.status = "submitted"
         request.submitted_at = datetime.utcnow()
-        # 用户补充属于业务等待，绝对截止仅顺延一次，仍计入重启和执行耗时。
-        await repo.shift_deadline(
-            run_id, extra_seconds=(request.submitted_at - request.created_at).total_seconds()
-        )
+        # 启用总时限时，为用户补充所耗的等待时间顺延一次。
+        if settings.AGENT_RUN_TIMEOUT > 0:
+            await repo.shift_deadline(
+                run_id, extra_seconds=(request.submitted_at - request.created_at).total_seconds()
+            )
         for event in (
             RuntimeEvent(type="input.received", run_id=run_id, thread_id=run.thread_id,
                          data={"request_id": request_id}),

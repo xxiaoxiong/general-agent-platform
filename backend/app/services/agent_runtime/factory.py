@@ -32,6 +32,7 @@ from .events import EventBus
 from .model_adapter import build_chat_model
 from .skills import SkillRegistry
 from .subagents import build_subagents
+from .tool_batches import NativeToolBatchMiddleware
 from .tools.adapter import ToolAdapterFactory
 from .tools.policy import ToolPolicy
 
@@ -44,14 +45,15 @@ from langchain.agents.middleware.human_in_the_loop import InterruptOnConfig
 FS_NATIVE_TOOLS: tuple = ("ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep")
 
 
-def build_fs_tools(policy: ToolPolicy) -> List[str]:
+def build_fs_tools(policy: ToolPolicy, backend: Any) -> List[str]:
     """原生工具面白名单：无外部 Sandbox 时不含 execute。
 
-    restricted（进程内限制）不是安全沙箱；仅 external 或开发逃生开关
-    （allow_unsafe_python）时才暴露 execute，与 ToolPolicy.check_exec_allowed 同口径。
+    配置允许执行且实际后端实现了 Sandbox 接口时，才向模型公开 execute。
     """
+    from deepagents.backends.protocol import SandboxBackendProtocol
+
     tools = list(FS_NATIVE_TOOLS)
-    if policy.sandbox_mode == "external" or policy.allow_unsafe_python:
+    if isinstance(backend, SandboxBackendProtocol) and (policy.sandbox_mode == "external" or policy.allow_unsafe_python):
         tools.append("execute")
     return tools
 
@@ -80,7 +82,7 @@ def build_fs_permissions(policy: ToolPolicy) -> List[Any]:
     ]
     return [
         # 读保护：任意路径深度（read 按路径精确匹配，不影响 delete）
-        FilesystemPermission(operations=["read"], paths=sensitive, mode="deny"),
+        FilesystemPermission(operations=["read"], paths=[*sensitive, "/workspace/.run-artifacts", "/workspace/.run-artifacts/**"], mode="deny"),
         # 写保护：仅锚定真实落盘工作区（带字面前缀，delete 检查可精确推理）
         FilesystemPermission(
             operations=["write"],
@@ -133,10 +135,11 @@ def build_agent(
     from deepagents.middleware.filesystem import FilesystemMiddleware
 
     backend = build_backend(ctx.scope.user_id, ctx.agent_id, ctx.session_id, store=store)
-    fs_middleware = FilesystemMiddleware(tools=build_fs_tools(policy), backend=backend)
+    file_tools = build_fs_tools(policy, backend)
+    fs_middleware = FilesystemMiddleware(tools=file_tools, backend=backend)
     subagents = [
         {**sa, "tools": _subagent_tools(sa, adapter),
-         "middleware": [FilesystemMiddleware(tools=build_fs_tools(policy), backend=backend)]}
+         "middleware": [FilesystemMiddleware(tools=file_tools, backend=backend)]}
         for sa in build_subagents(policy)
     ]
 
@@ -155,12 +158,12 @@ def build_agent(
     # limit_exceeded 状态（任务书 P0-A：超限返回明确 failed/limit_exceeded）
     # 预算 <=0 = 不限制：不挂对应 Limit 中间件（防真死循环仍由重复调用防护兜底）
     # FilesystemMiddleware 替换基栈同名中间件（按名替换、保留顺序），继承 permissions
-    middleware = [fs_middleware, TodoListMiddleware()]
+    middleware = [fs_middleware, TodoListMiddleware(), NativeToolBatchMiddleware()]
     if ctx.task_contract is not None:
         from .completion import CompletionMiddleware
 
         # after_model 按逆序执行，验收回到模型前已更新模型调用计数。
-        middleware.insert(0, CompletionMiddleware(ctx, ctx.task_contract))
+        middleware.insert(0, CompletionMiddleware(ctx, ctx.task_contract, bus))
     if ctx.budget.max_tool_calls > 0:
         middleware.append(
             ToolCallLimitMiddleware(run_limit=ctx.budget.max_tool_calls, exit_behavior="error")
@@ -212,9 +215,10 @@ def _compose_system_prompt(ctx: RuntimeContext) -> str:
         from .completion import completion_prompt
 
         parts.append("## 本次交付要求\n" + completion_prompt(ctx.task_contract))
-        if ctx.carried_artifacts:
-            parts.append("继续上次未完成的交付。先用 read_file 核对已有文件，沿用可用内容，只补上仍然缺失或需要修正的交付项。"
-                         "\n前一轮登记的工作文件 " + "、".join(ctx.carried_artifacts))
+    if ctx.completion_continuation:
+        from .completion import continuation_prompt
+
+        parts.append(continuation_prompt(ctx))
     parts.append(
         "## 执行约束\n"
         "- 始终使用用户提问所用的语言回答（用户用中文则用中文）。\n"
@@ -223,6 +227,7 @@ def _compose_system_prompt(ctx: RuntimeContext) -> str:
         "- 工具调用前先确认参数完整；工具失败时给出明确状态，不要假装成功。\n"
         "- write_todos 每轮调用一次即可，不要与其他工具并行发起多个 write_todos。\n"
         "- 同一文件的写入/编辑/读取请串行进行，不要在同一步并行操作同一路径。\n"
+        "- write_file 会自动创建工作区中的父目录。请直接填写最终文件路径，目录本身无需写成空文件。\n"
         "- 涉及外部副作用（HTTP POST/邮件/Webhook）的操作会在执行前要求人工审批。\n"
         "- 不要输出与任务无关的内容；最终回答直接给出结论。"
     )

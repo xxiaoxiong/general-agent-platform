@@ -50,6 +50,7 @@ PLAN_UPDATED = "plan_updated"
 # P4-02：Verification（§7.1 verification.started / verification.completed）
 VERIFICATION_STARTED = "verification_started"
 VERIFICATION_COMPLETED = "verification_completed"
+WORKSPACE_PROJECT_REVIEWED = "workspace_project_reviewed"
 # P4-03：Retry / Recovery（§7.1 run.retrying / run.recovering）
 RUN_RETRYING = "run_retrying"
 RUN_RECOVERING = "run_recovering"
@@ -176,6 +177,32 @@ def _persist_max_len(ev_type: str) -> int:
     if ev_type == TEAM_UPDATED:
         return 4200
     return _FULL_PAYLOAD_MAX_LEN if ev_type in _FULL_PAYLOAD_EVENTS else 400
+
+
+def event_storage_payload(ev: RuntimeEvent) -> dict:
+    # 输入 schema 的属性和枚举属于协议。提交值只保存在输入请求记录中。
+    if ev.type == "input.required":
+        return {**ev.data, "prompt": redact_sensitive(ev.data.get("prompt", ""), 4000)}
+    if ev.type == "document.profile_draft.created":
+        return _redact(ev.data, max_len=None, max_items=None)
+    if ev.type in {"document.edit.review_required", "document.edit.reviewed"}:
+        return _redact(ev.data, max_len=400, max_items=None)
+    if ev.type == "project.delivery":
+        # 静态、运行和逐项需求检查之和会超过普通事件的 20 项上限。
+        return _redact(ev.data, max_len=1200, max_items=64)
+    if ev.type == WORKSPACE_PROJECT_REVIEWED:
+        return redact_sensitive(ev.data, max_len=1200)
+    data = ev.data or {}
+    if ev.type == VERIFICATION_COMPLETED and data.get("version") == 2:
+        return _redact(data, max_len=1200, max_items=128)
+    payload = redact_sensitive(data, max_len=_persist_max_len(ev.type))
+    if ev.type in (RUN_COMPLETED, RUN_FAILED, RUN_CANCELLED):
+        summary = data.get("summary")
+        report = summary.get("verification") if isinstance(summary, dict) else None
+        if isinstance(report, dict) and report.get("version") == 2:
+            # 工程源码和自动生成的交付文件可能超过普通事件的 20 项上限。
+            payload["summary"]["verification"] = _redact(report, max_len=1200, max_items=128)
+    return payload
 
 
 # ── 旧 SSE 契约适配 ──────────────────────────────────────────────────────────
@@ -415,20 +442,8 @@ class EventBus:
         """持久化与暂停或恢复状态必须原子提交的事件。"""
         from .repositories import EventRepository
 
-        # 输入 schema 属于前端协议字段，递归脱敏会改变属性名和枚举。
-        # 提交值仅持久化至请求记录，不进入任何事件。
-        if ev.type == "input.required":
-            payload = {**ev.data, "prompt": redact_sensitive(ev.data.get("prompt", ""), 4000)}
-        elif ev.type == "document.profile_draft.created":
-            # 规范草稿须可完整编辑与确认，保留 Schema 允许的章节与说明。
-            payload = _redact(ev.data, max_len=None, max_items=None)
-        elif ev.type in {"document.edit.review_required", "document.edit.reviewed"}:
-            # 全部操作锚点需与等待输入的枚举一致，正文由鉴权后的审阅接口读取。
-            payload = _redact(ev.data, max_len=400, max_items=None)
-        else:
-            payload = redact_sensitive(ev.data or {}, max_len=_persist_max_len(ev.type))
         return await EventRepository(db).append(
-            ev.run_id, ev.type, payload, thread_id=ev.thread_id or ""
+            ev.run_id, ev.type, event_storage_payload(ev), thread_id=ev.thread_id or ""
         )
 
     @staticmethod
@@ -538,11 +553,8 @@ class EventBus:
                 repo = EventRepository(db)
                 seqs: List[int] = []
                 for ev in events:
-                    # 与 _persist 相同的脱敏规则：文本/工具证据不截断，保证最终文本重建与执行证据完整
-                    max_len = _persist_max_len(ev.type)
-                    payload = redact_sensitive(ev.data or {}, max_len=max_len)
                     seq = await repo.append(
-                        ev.run_id, ev.type, payload, thread_id=ev.thread_id or "",
+                        ev.run_id, ev.type, event_storage_payload(ev), thread_id=ev.thread_id or "",
                     )
                     seqs.append(seq)
                 await db.commit()

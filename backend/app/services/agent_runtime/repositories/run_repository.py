@@ -631,9 +631,9 @@ class RunRepository:
     # ── Run 级执行预算（P1-05 §13）：跨恢复持久化 + CAS 并发一致性 ────────
 
     async def ensure_budget(self, run_id: str, *, timeout_seconds: float) -> dict:
-        """读取 Run 预算累计值；新 Run 初始化（first_started_at/deadline_at 仅首次设置）。
+        """加载累计值，首次记录开始时间。总时限停用时清除旧截止。
 
-        deadline_at 为绝对时间：重启不重新获得完整超时时间。
+        启用总时限时保留已记录的绝对截止，恢复执行继续使用同一截止。
         返回 {model_calls, tool_calls, steps, tokens, first_started_at, deadline_at, version}。
         """
         row = await self.session.execute(
@@ -642,24 +642,20 @@ class RunRepository:
                 AgentRun.budget_steps, AgentRun.budget_tokens,
                 AgentRun.budget_first_started_at, AgentRun.budget_deadline_at,
                 AgentRun.budget_version,
-            ).where(AgentRun.id == run_id)
+            ).where(AgentRun.id == run_id).with_for_update()
         )
         rec = row.one_or_none()
         if rec is None:
             raise LookupError(f"run {run_id} 不存在，无法读取预算")
         (mc, tc, st, tk, first_at, deadline_at, ver) = rec
         now = datetime.utcnow()
-        if first_at is None or deadline_at is None:
-            # 首次初始化预算：绝对截止 = now + timeout，仅首次写入
+        effective_deadline = (deadline_at or now + timedelta(seconds=timeout_seconds)) if timeout_seconds > 0 else None
+        if first_at is None or effective_deadline != deadline_at:
             first_at = first_at or now
-            deadline_at = deadline_at or (now + timedelta(seconds=timeout_seconds))
             await self.session.execute(
-                update(AgentRun).where(
-                    AgentRun.id == run_id,
-                    AgentRun.budget_first_started_at.is_(None),
-                ).values(
+                update(AgentRun).where(AgentRun.id == run_id).values(
                     budget_first_started_at=first_at,
-                    budget_deadline_at=deadline_at,
+                    budget_deadline_at=effective_deadline,
                     updated_at=now,
                 ),
                 execution_options={"synchronize_session": False},
@@ -667,7 +663,7 @@ class RunRepository:
         return {
             "model_calls": mc or 0, "tool_calls": tc or 0,
             "steps": st or 0, "tokens": tk or 0,
-            "first_started_at": first_at, "deadline_at": deadline_at,
+            "first_started_at": first_at, "deadline_at": effective_deadline,
             "version": ver or 0,
         }
 
@@ -712,10 +708,9 @@ class RunRepository:
         cur = row.scalar_one_or_none()
         if cur is None:
             return
-        from datetime import timedelta
         await self.session.execute(
             update(AgentRun)
-            .where(AgentRun.id == run_id)
+            .where(AgentRun.id == run_id, AgentRun.budget_deadline_at == cur)
             .values(
                 budget_deadline_at=cur + timedelta(seconds=extra_seconds),
                 updated_at=datetime.utcnow(),

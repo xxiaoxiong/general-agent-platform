@@ -230,7 +230,11 @@ async def test_input_pause_reload_restart_and_resume_same_run(platform):
 
 
 @pytest.mark.asyncio
-async def test_failed_document_continues_from_saved_chapter_in_same_run(platform, monkeypatch):
+@pytest.mark.parametrize("retry_timeout", [0.0, 300.0])
+async def test_failed_document_continues_from_saved_chapter_in_same_run(platform, monkeypatch, retry_timeout):
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "AGENT_RUN_TIMEOUT", 300.0)
     client, new_service, user, sessions = platform
     calls = {"saved": 0, "failed": 0}
 
@@ -273,8 +277,10 @@ async def test_failed_document_continues_from_saved_chapter_in_same_run(platform
     old_reply = next(item for item in old_history if item["role"] == "assistant")
     async with sessions() as db:
         old_deadline = (await db.get(AgentRun, run_id)).budget_deadline_at
+        assert old_deadline is not None
 
     await first.worker.stop()
+    monkeypatch.setattr(settings, "AGENT_RUN_TIMEOUT", retry_timeout)
     await CheckpointerFactory.get().aclose()
     CheckpointerFactory._instance = CheckpointerFactory()
     second = new_service()
@@ -287,6 +293,12 @@ async def test_failed_document_continues_from_saved_chapter_in_same_run(platform
     assert resumed.status_code == 200, resumed.text
     assert resumed.json()["run_id"] == run_id and resumed.json()["after_seq"] == failed["sequence"]
     assert (await client.post(url + "/retry", headers=header)).json()["after_seq"] == failed["sequence"]
+    async with sessions() as db:
+        retry_deadline = (await db.get(AgentRun, run_id)).budget_deadline_at
+        if retry_timeout == 0:
+            assert retry_deadline is None
+        else:
+            assert retry_deadline > old_deadline
     await second.worker.start()
     events = await _events(client, url, failed["sequence"])
     assert events[0]["event"] == "run.retrying" and events[0]["data"]["manual"]
@@ -298,7 +310,7 @@ async def test_failed_document_continues_from_saved_chapter_in_same_run(platform
     assert next(event for event in history if event["event"] == "run.failed")["data"]["historical"]
     async with sessions() as db:
         row = await db.get(AgentRun, run_id)
-        assert row.thread_id == status["thread_id"] and row.budget_deadline_at > old_deadline
+        assert row.thread_id == status["thread_id"] and row.budget_deadline_at == retry_deadline
     saved_history = (await client.get("/api/v2/conversations/31/messages")).json()["items"]
     replies = [item for item in saved_history if item["role"] == "assistant"]
     assert len(replies) == 1 and replies[0]["message_id"] == old_reply["message_id"]

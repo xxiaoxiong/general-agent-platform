@@ -52,10 +52,13 @@ _SOURCE_PATCH_BLOCK = re.compile(
     re.M | re.S,
 )
 _SOURCE_PATCH_MARKER = re.compile(r"^(?:<<<<<<< SEARCH|>>>>>>> REPLACE)\b", re.M)
+_SOURCE_RANGE_MARKER = re.compile(r"^<<<<<<< THROUGH[ \t]*\r?$", re.M)
 _PATCH_INSTRUCTIONS = (
     "按以下格式输出 1 至 12 个编辑块，换行、引号和缩进使用源码原文。\n"
     "<<<<<<< SEARCH\n要替换的原文\n=======\n替换后的源码\n>>>>>>> REPLACE\n"
     "SEARCH 必须从 current_file 逐字复制并唯一匹配，各块的原文不得重叠。"
+    "删除或替换较长的连续区间时，SEARCH 内只写原样首行、单独一行 <<<<<<< THROUGH、原样末行。"
+    "首尾都必须是独立且唯一的整行，含首尾整段会被替换。只删除时让 ======= 与 >>>>>>> REPLACE 相邻。"
 )
 _BROWSER_STEP_FAILURE = re.compile(r"^tests/browser-checks\.json\s+「([^」]{1,72})」第 (\d+) 步", re.I)
 _SOURCE_LANGUAGES = {
@@ -65,6 +68,9 @@ _SOURCE_LANGUAGES = {
     ".json": {"json"}, ".toml": {"toml"}, ".yml": {"yaml", "yml"}, ".yaml": {"yaml", "yml"},
 }
 _PAGE_STYLES = re.compile(r"<style\b[^>]*>.*?</style\s*>", re.I | re.S)
+_BROWSER_COMPONENTS = {".vue", ".svelte", ".tsx", ".jsx"}
+_BROWSER_ENTRY_NAMES = {"app", "main", "index", "page"}
+_BROWSER_SCRIPTS = {".js", ".mjs", ".ts"}
 
 
 class _ProjectTask(BaseModel):
@@ -148,6 +154,7 @@ class _Job(TypedDict):
     verified_imports: NotRequired[list[str]]
     verified_lines: NotRequired[dict[str, str]]
     browser_failure_key: NotRequired[str]
+    requirement_keys: NotRequired[list[str]]
 
 
 class _Draft(TypedDict, total=False):
@@ -170,6 +177,7 @@ class _ProjectState(TypedDict, total=False):
     verification: dict[str, Any]
     repair_attempts: dict[str, int]
     browser_repair_attempts: dict[str, dict[str, int]]
+    requirement_repair_attempts: dict[str, dict[str, int]]
     repairing: bool
     budget_limited: bool
     planning_notice: str
@@ -204,6 +212,8 @@ def _repair_file_text(path: str, reply: str, current: str) -> str:
     text = _model_text(reply).strip()
     markers = list(_SOURCE_PATCH_MARKER.finditer(text))
     if not markers:
+        if _SOURCE_RANGE_MARKER.search(text):
+            raise ProjectWorkspaceError(f"{path} 的修改区间需要完整的局部编辑块")
         return _file_text(path, reply)
     edits = list(_SOURCE_PATCH_BLOCK.finditer(text))
     if not current or not 1 <= len(edits) <= 12 or len(markers) != 2 * len(edits):
@@ -219,12 +229,15 @@ def _repair_file_text(path: str, reply: str, current: str) -> str:
         end = edit.end()
         old, new = edit.groups()
         new = new.removesuffix("\n").removesuffix("\r")
-        if not old.strip() or old == new:
+        if not old.strip() or _SOURCE_RANGE_MARKER.search(new):
             raise ProjectWorkspaceError(f"{path} 的局部修改需要原文锚点和实际改动")
-        start = current.find(old)
-        if start < 0 or current.find(old, start + 1) >= 0:
+        span = _repair_span(current, old)
+        if span is None:
             raise ProjectWorkspaceError(f"{path} 的修改锚点未在原文中唯一匹配，请使用更完整的原文片段")
-        spans.append((start, start + len(old), new))
+        start, finish = span
+        if current[start:finish] == new:
+            raise ProjectWorkspaceError(f"{path} 的局部修改需要原文锚点和实际改动")
+        spans.append((start, finish, new))
     if text[end:].strip():
         raise ProjectWorkspaceError(f"{path} 的局部修改存在未闭合的编辑块")
     chunks = []
@@ -236,6 +249,19 @@ def _repair_file_text(path: str, reply: str, current: str) -> str:
         offset = end
     chunks.append(current[offset:])
     return "".join(chunks)
+
+
+def _repair_span(current: str, anchor: str) -> tuple[int, int] | None:
+    if not _SOURCE_RANGE_MARKER.search(anchor):
+        start = current.find(anchor)
+        return (start, start + len(anchor)) if start >= 0 and current.find(anchor, start + 1) < 0 else None
+    lines = anchor.splitlines()
+    if len(lines) != 3 or lines[1].rstrip() != "<<<<<<< THROUGH" or not (lines[0].strip() and lines[2].strip()):
+        return None
+    first, last = [list(re.finditer(r"^" + re.escape(line) + r"(?=\r?$)", current, re.M)) for line in (lines[0], lines[2])]
+    if len(first) != 1 or len(last) != 1 or first[0].end() >= last[0].start():
+        return None
+    return first[0].start(), last[0].end()
 
 
 def _parse_plan(reply: str, scope: ProjectScope) -> dict[str, Any]:
@@ -343,37 +369,48 @@ def _repair_jobs(state: _ProjectState, issues: list[dict[str, str]],
     remaining = _MAX_REPAIR_ATTEMPTS - sum(attempts.values())
     if remaining <= 0:
         return []
-    findings: dict[str, list[str]] = {}
+    findings: dict[str, list[tuple[str, str]]] = {}
     for issue in issues:
         path = issue.get("path", "").casefold()
-        findings.setdefault(path, []).append(issue["message"][:500])
-    browser_failures = {path: "\n".join(sorted({f"{name}:{step}" for message in messages
-                                                  for name, step in _BROWSER_STEP_FAILURE.findall(message)}))
-                        for path, messages in findings.items()}
+        findings.setdefault(path, []).append((issue["message"][:500], issue.get("criterion", "")))
     browser_attempts = state.get("browser_repair_attempts", {})
-    pending = set()
+    requirement_attempts = state.get("requirement_repair_attempts", {})
+    pending: dict[str, list[tuple[str, str]]] = {}
     for task in tasks.values():
         for path in task["files"]:
-            if path.casefold() not in findings:
+            if not (entries := findings.get(path.casefold())):
                 continue
-            key = browser_failures[path.casefold()]
+            technical = [(message, criterion) for message, criterion in entries if not criterion]
+            key = _browser_failure_key(technical)
             used = browser_attempts.get(path, {}).get(key, 0) if key else attempts.get(path, 0)
-            if used < _MAX_ATTEMPTS_PER_PATH:
-                pending.add(path)
+            used_by_requirement = requirement_attempts.get(path, {})
+            requirements = [(message, criterion) for message, criterion in entries
+                            if criterion and used_by_requirement.get(criterion, 0) < _MAX_ATTEMPTS_PER_PATH]
+            requirements.sort(key=lambda entry: used_by_requirement.get(entry[1], 0))
+            selected = (technical if used < _MAX_ATTEMPTS_PER_PATH else []) + requirements
+            if selected:
+                pending[path] = selected[:5]
     jobs = []
+    affected_tasks = set()
     for tid in order:
         task = tasks[tid]
-        if any(pending.intersection(tasks[dep]["files"]) for dep in task["depends_on"]):
-            continue  # 下游读取已经修复的接口和页面，再更新自己的文件。
         path = next((item for item in task["files"] if item in pending), None)
+        waits_for_input = any(dep in affected_tasks for dep in task["depends_on"])
+        if path or waits_for_input:
+            affected_tasks.add(tid)
+        if waits_for_input:
+            continue  # 下游读取已经修复的接口和页面，再更新自己的文件。
         if path:
             related = [p for p, reason in written.items() if not reason and p != path]
             previous = state.get("rejected", {}).get(path)
-            job: _Job = {"path": path, "task": task, "related": related, "findings": findings[path.casefold()][:5]}
+            selected = pending[path]
+            job: _Job = {"path": path, "task": task, "related": related, "findings": [message for message, _ in selected]}
             if previous:
                 job["previous_rejection"] = previous[:500]
-            if key := browser_failures[path.casefold()]:
+            if key := _browser_failure_key(selected):
                 job["browser_failure_key"] = key
+            if keys := sorted({criterion for _, criterion in selected if criterion}):
+                job["requirement_keys"] = keys
             if path in line_repairs:
                 job["verified_lines"] = line_repairs[path]
             elif len(findings[path.casefold()]) == 1:
@@ -383,6 +420,11 @@ def _repair_jobs(state: _ProjectState, issues: list[dict[str, str]],
                     job["verified_lines"] = readme_edits
             jobs.append(job)
     return jobs[:remaining]
+
+
+def _browser_failure_key(findings: list[tuple[str, str]]) -> str:
+    return "\n".join(sorted({f"{name}:{step}" for message, criterion in findings if not criterion
+                             for name, step in _BROWSER_STEP_FAILURE.findall(message)}))
 
 
 def build_project_graph(checkpointer, context: TeamProjectContext):
@@ -500,6 +542,9 @@ def build_project_graph(checkpointer, context: TeamProjectContext):
     async def draft(state: dict[str, Any], *, repairing: bool) -> dict[str, Any]:
         job = state["job"]
         path = job["path"]
+        plan = state["plan"]
+        planned_files = [entry for task in plan["tasks"] for entry in task["files"]]
+        known_paths = {*planned_files, *job["related"]}
         previous = ""
         if repairing:
             try:
@@ -520,7 +565,8 @@ def build_project_graph(checkpointer, context: TeamProjectContext):
                     text = line.rstrip("\r\n")
                     updated_lines.append(replacements.get(text, text) + line[len(text):])
                 updated = "".join(updated_lines)
-                if not source_repair_problem(path, previous, updated):
+                if (not source_shape_problem(path, updated)
+                        and not source_repair_problem(path, previous, updated, known_paths=known_paths)):
                     try:
                         await asyncio.to_thread(parse_project_source, path, updated)
                         return {"drafts": [{"path": path, "content": updated}]}
@@ -541,11 +587,20 @@ def build_project_graph(checkpointer, context: TeamProjectContext):
         evidence_sources = {name for name in job["related"]
                             if re.search(rf"(?<![\w./-]){re.escape(name)}(?![\w./-])", evidence)}
         if browser_scenarios:
-            matching = sorted(job["related"], key=lambda item: (
-                not item.endswith("index.html"), item != "openapi.json", not item.startswith(("frontend/", "client/", "web/")),
-                PurePosixPath(item).suffix not in {".html", ".js", ".mjs", ".vue", ".ts", ".tsx", ".jsx"},
-                "vite.config." in item,
-            ))
+            framework = any(PurePosixPath(name).suffix in _BROWSER_COMPONENTS for name in job["related"])
+
+            def browser_priority(item: str) -> tuple[bool, ...]:
+                file = PurePosixPath(item)
+                component = file.suffix in _BROWSER_COMPONENTS
+                entry_name = file.stem.casefold() in _BROWSER_ENTRY_NAMES
+                frontend = file.parts[0] in {"frontend", "client", "web", "ui", "src"}
+                entry_script = framework and entry_name and file.suffix in _BROWSER_SCRIPTS and (frontend or len(file.parts) == 1)
+                # 框架组件和挂载脚本给出实际控件与事件，入口 HTML 可能是加载前的占位内容。
+                return (not (component or entry_script), not (component and entry_name), not entry_script,
+                        file.name != "index.html", item != "openapi.json", not frontend,
+                        file.suffix not in _BROWSER_SCRIPTS | _BROWSER_COMPONENTS | {".html"}, "vite.config." in item)
+
+            matching = sorted(job["related"], key=browser_priority)
         else:
             preserve_scenarios = repairing and (state["plan"]["scope"] == "frontend"
                                                or path.startswith(("frontend/", "client/", "web/")))
@@ -561,7 +616,8 @@ def build_project_graph(checkpointer, context: TeamProjectContext):
                 source = await context.read_file(related)
             except (OSError, ValueError):
                 continue
-            if (browser_scenarios or path.endswith((".js", ".mjs", ".ts"))) and related.endswith(".html"):
+            if ((browser_scenarios and related.endswith((".html", ".vue", ".svelte")))
+                    or (path.endswith((".js", ".mjs", ".ts")) and related.endswith(".html"))):
                 source = _PAGE_STYLES.sub("<style>/* 样式摘略，保留页面结构 */</style>", source)
             limit = 14_000 if PurePosixPath(related).parent == directory else 6500
             if related == "openapi.json" and len(source) > limit:
@@ -577,13 +633,12 @@ def build_project_graph(checkpointer, context: TeamProjectContext):
             remaining -= min(len(source), limit)
             if remaining <= 0:
                 break
-        plan = state["plan"]
         data = {
             "path": path, "task": job["task"], "objective": state["objective"],
             **({"verification_findings": job["findings"]} if repairing or job["findings"] else {}),
             **({"current_file": previous[:_MAX_FILE_BYTES]} if repairing else {}),
             "project": {key: plan[key] for key in ("name", "summary", "features", "scope", "api_contract")},
-            "planned_files": [entry for task in plan["tasks"] for entry in task["files"]],
+            "planned_files": planned_files,
             "reference_context": state["reference_context"][:8000], "committed_files": examples,
             "assistant_context": state["assistant_prompt"],
         }
@@ -604,19 +659,25 @@ def build_project_graph(checkpointer, context: TeamProjectContext):
         if path.endswith((".js", ".mjs", ".ts")):
             instructions += "脚本要包含实际事件绑定和请求。使用已交付 HTML 中的控件标识，并覆盖项目要求的用户流程。"
             instructions += "按接口契约调用已实现的路由。动态数据用 DOM 属性或 textContent 绑定，避免在 HTML 事件属性内拼接 JSON。"
+        if context.browser_checks and path.endswith((".html", ".vue", ".svelte", ".js", ".mjs", ".ts", ".tsx", ".jsx")):
+            instructions += "复用项目已声明的本地框架依赖和实际挂载入口。浏览器验收只访问本地工程，框架、脚本和样式需随构建可用。"
+        if _is_test_path(path) and not browser_scenarios:
+            instructions += "用实际的用户入口验证业务操作。数据库可用于准备隔离数据或读取结果，领取、完工等业务动作须经页面或公开接口执行。"
         if browser_scenarios:
             instructions = marker + (
                 "担任独立页面验收工程师。根据 objective、项目功能与已提交的页面组件及脚本，编写 1 至 3 个实际可执行的浏览器场景。"
+                "入口 HTML 含框架挂载点或占位内容时，跟随入口脚本，使用实际挂载组件的控件、事件及接口。"
                 "使用已存在的稳定 CSS 选择器和全新的测试数据。优先覆盖关键操作从输入到结果的全过程，包括登录后的主工作区，"
                 "记录保存后刷新，或无效输入后的可见反馈，按产品实际功能取舍。断言要能观察操作造成的变化。"
                 "每个场景独立启动，没有其它场景创建的数据。先准备本场景所需记录。"
                 "从 open 路径 / 开始，使用浏览器 URL。最后一步验证页面状态或响应。仅返回一个 JSON 对象。示例结构如下。\n"
                 '{"version":1,"scenarios":[{"name":"实际操作验证","steps":[{"action":"open","path":"/"},'
                 '{"action":"click","selector":"#open"},{"action":"expect_visible","selector":"#panel"}]}]}\n'
-                "可用动作 open（path），reload，click（selector，可选 confirm 布尔值），check（selector），"
+                "可用动作 open（path），reload，click（selector，可选 confirm 布尔值或 prompt 文本），check（selector），"
                 "fill、select、press（selector、value）。断言 expect_visible、expect_hidden、expect_invalid（selector），"
                 "expect_text、expect_value（selector、value），expect_response（method、path、status）。"
                 "使用 expect_text 检查状态、统计和其他可见文本，expect_value 仅用于输入框、下拉和多行文本框。"
+                "页面点击调用 window.prompt 时，在该 click 步骤的 prompt 字段提供输入文本，随后核对实际界面或响应。"
                 "逐条核对 objective 中明确要求验收的操作。从实际的按钮和接口设计完整场景，刷新后核对关键业务数据。"
                 "每步只写该动作需要的字段。reload 保持当前页面，只有 action 字段。"
                 "从可见的表单切换到注册后再填写必填字段，包括确认密码。需要不同账户时每个场景使用不同测试账号。"
@@ -645,7 +706,7 @@ def build_project_graph(checkpointer, context: TeamProjectContext):
                     problem = shape
                 elif focused_retry and not _SOURCE_PATCH_MARKER.search(_model_text(reply)):
                     problem = f"{path} 的局部重试需要带原文锚点的编辑块"
-                elif repairing and (retention := source_repair_problem(path, previous, content)):
+                elif repairing and (retention := source_repair_problem(path, previous, content, known_paths=known_paths)):
                     problem = retention
                 elif browser_scenarios and repairing and (retention := browser_repair_problem(previous, content, job["findings"])):
                     problem = retention
@@ -734,6 +795,7 @@ def build_project_graph(checkpointer, context: TeamProjectContext):
         result = {**result, "issues": findings, "passed": bool(result.get("passed")) and not missing}
         attempts = dict(state.get("repair_attempts", {}))
         browser_attempts = {path: dict(values) for path, values in state.get("browser_repair_attempts", {}).items()}
+        requirement_attempts = {path: dict(values) for path, values in state.get("requirement_repair_attempts", {}).items()}
         may_repair = not state.get("budget_limited") and not result["passed"]
         # 缺失的组件会让有效引用看起来有误。优先重试已失败的写入，完成源码后再处理引用问题。
         rejected_paths = {path.casefold() for path in missing if path in state["written"]}
@@ -753,8 +815,12 @@ def build_project_graph(checkpointer, context: TeamProjectContext):
             if key := job.get("browser_failure_key"):
                 by_step = browser_attempts.setdefault(path, {})
                 by_step[key] = by_step.get(key, 0) + 1
+            for key in job.get("requirement_keys", []):
+                by_requirement = requirement_attempts.setdefault(path, {})
+                by_requirement[key] = by_requirement.get(key, 0) + 1
         update = {"verification": result, "work": jobs,
-                  "repair_attempts": attempts, "browser_repair_attempts": browser_attempts, "repairing": bool(jobs)}
+                  "repair_attempts": attempts, "browser_repair_attempts": browser_attempts,
+                  "requirement_repair_attempts": requirement_attempts, "repairing": bool(jobs)}
         checked = {**state, "verification": result}
         if jobs:
             await progress(state, "repairing")

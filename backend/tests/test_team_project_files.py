@@ -18,6 +18,7 @@ from app.services.agent_runtime.team_project_files import (
     source_shape_problem,
     validate_project_path,
     validate_project_paths,
+    vite_vue_entry_repairs,
 )
 from app.services.agent_runtime.team_project_verifier import merge_runtime_report
 
@@ -172,6 +173,134 @@ def test_html_repair_requires_applied_edits_and_preserves_the_page_entry():
     assert "未应用" in source_shape_problem("frontend/index.html", partial)
     assert "完整页面入口" in source_repair_problem("frontend/index.html", original, "<h1>项目</h1>")
     assert "交互脚本" in source_repair_problem("frontend/index.html", original, "<!doctype html><html><main>项目</main></html>")
+
+
+def test_html_preflight_routes_unwrapped_script_to_the_page_entry(project):
+    workspace, _ = project
+    path = "frontend/index.html"
+    page = '<!doctype html>\n<div id="app"></div>\n<script type="module" src="/src/main.ts"></script>\n'
+    invalid = page + 'const view = `<input id="duplicate">`\n</script>\n'
+    workspace.write_files({path: invalid}, allowed=[path])
+    result = workspace.verify(expected=[path], scope="frontend")
+    assert not result["passed"]
+    assert {"path": path, "message": f"{path} 第 5 行的 </script> 没有对应的开始标签，请检查前面的脚本是否落在标签外"} in result["issues"]
+    assert "第 4 行的 script 标签缺少 </script>" in source_shape_problem(path, page + "<script>const value = 1")
+    assert not source_shape_problem(path, page + '<!-- </script> --><script type="application/json">{"x":1}</script>')
+
+
+def test_typescript_entry_rejects_misrouted_raw_html_and_preserves_legitimate_template_strings():
+    path = "frontend/src/main.ts"
+    assert "误写成了 HTML" in source_shape_problem(path, '// 页面入口\n<div id="app"></div>')
+    assert "组件片段" in source_shape_problem(path, '<template><div id="app"></div></template>')
+    assert not source_shape_problem(path, 'const layout = `<div id="app"></div>`')
+    assert not source_shape_problem("frontend/src/App.tsx", '<div id="app"></div>')
+
+
+def test_repair_rejects_new_imports_to_files_outside_the_project_plan():
+    path = "frontend/src/main.ts"
+    entry = "import App from './App.vue'\n"
+    paths = [path, "frontend/src/App.vue"]
+    updated = entry + "import './style.css'\n"
+    kwargs = {"known_paths": paths}
+    assert "新增了工程中不存在的引用 ./style.css" in source_repair_problem(path, entry, updated, **kwargs)
+    assert not source_repair_problem(path, updated, entry, **kwargs)
+    assert not source_repair_problem(path, entry, updated, known_paths=[*paths, "frontend/src/style.css"])
+
+
+_VITE_MANIFEST = {"scripts": {"build": "vue-tsc --noEmit && vite build"},
+                  "dependencies": {"vue": "^3.5.0"}, "devDependencies": {"vite": "^7.0.0"}}
+_VUE_CDN = "https://unpkg.com/vue@3/dist/vue.esm-browser.prod.js"
+_VUE_CDN_IMPORT = f"  import {{ createApp }} from '{_VUE_CDN}';"
+
+
+def test_vite_html_repair_bundles_declared_vue_and_preserves_template_compiler(project):
+    workspace, _ = project
+    path = "frontend/index.html"
+    source = (f'<main id="app"></main>\r\n<script type="module">\r\n{_VUE_CDN_IMPORT}\r\n'
+              "  createApp({template: '<button @click=\"count++\">{{ count }}</button>', data: () => ({count: 0})}).mount('#app');\r\n"
+              "</script>\r\n")
+    files = {**_FILES, path: source, "frontend/package.json": json.dumps(_VITE_MANIFEST)}
+    workspace.write_files(files, allowed=files)
+    report = workspace.verify(expected=files)
+    assert not report["passed"]
+    assert any(row["path"] == path and "隔离浏览器无法访问" in row["message"] for row in report["issues"])
+    edits = report["line_repairs"][path]
+    assert edits == {_VUE_CDN_IMPORT: "  import { createApp } from 'vue/dist/vue.esm-bundler.js';"}
+    corrected = source.replace(_VUE_CDN_IMPORT, edits[_VUE_CDN_IMPORT])
+    workspace.write_files({path: corrected}, allowed=files)
+    assert workspace.verify(expected=files)["passed"]
+
+
+@pytest.mark.parametrize("source", [
+    f'<!-- <script type="module">\n{_VUE_CDN_IMPORT}\n</script> -->',
+    f'<template><script type="module">\n{_VUE_CDN_IMPORT}\n</script></template>',
+    f'<script type="text/plain">\n{_VUE_CDN_IMPORT}\n</script>',
+    f'<script type="module" src="app.js">\n{_VUE_CDN_IMPORT}\n</script>',
+    f'<script type="module">\n/*\n{_VUE_CDN_IMPORT}\n*/\n</script>',
+    f'<script type="module">\nconst sample = `\n{_VUE_CDN_IMPORT}\n`;\n</script>',
+    f'<script type="module">\n{_VUE_CDN_IMPORT}\n</script>\n<!--\n{_VUE_CDN_IMPORT}\n-->',
+    f'<script type="module">\n{_VUE_CDN_IMPORT.replace("vue@3/", "vue@3.2.0/")}\n</script>',
+])
+def test_vite_vue_repair_only_edits_unambiguous_executed_imports(source):
+    assert vite_vue_entry_repairs("frontend/index.html", source, _VITE_MANIFEST) == {}
+
+
+def test_vue_repair_requires_a_compatible_vite_build_and_lockfile():
+    source = f'<script type="module">\n{_VUE_CDN_IMPORT}\n</script>'
+    path = "frontend/index.html"
+    for manifest in (None, {**_VITE_MANIFEST, "scripts": {"build": "echo vite build"}},
+                     {**_VITE_MANIFEST, "dependencies": {"vue": "^2.7.0"}},
+                     {**_VITE_MANIFEST, "devDependencies": {}}):
+        assert vite_vue_entry_repairs(path, source, manifest) == {}
+    incompatible = {"packages": {"node_modules/vue": {"version": "2.7.16"}}}
+    assert vite_vue_entry_repairs(path, source, _VITE_MANIFEST, lock=incompatible) == {}
+
+
+@pytest.mark.parametrize("source", [
+    "抱歉，按当前文件和验收结果暂时无法完成这次组件修复。我只能提供说明，建议先修复类型错误。" * 4,
+    '<!-- <template><p>注释内的组件</p></template> --><style>p { color: red }</style>',
+    '<docs><template><p>文档内的片段</p></template></docs>',
+    '<template></template><script setup>\n\n</script>',
+    '<template><div>尚未闭合</div>',
+])
+def test_vue_shape_rejects_prose_and_non_component_blocks(source):
+    assert "完整的 Vue 单文件组件" in source_shape_problem("frontend/src/App.vue", source)
+
+
+@pytest.mark.parametrize("source", [
+    "<!-- 计数器 -->\n<script>\nimport { h } from 'vue'\nexport default { render() { return h('p', '计数器') } }\n</script>",
+    '<script lang="ts" src="./render.ts" />',
+    '<template><main><template v-if="isOpen"><input v-model="draft" /></template></main></template>',
+    '<template lang="pug">p 组件标题</template>',
+])
+def test_vue_shape_accepts_script_only_and_other_component_blocks(source):
+    assert not source_shape_problem("frontend/src/App.vue", source)
+
+
+def test_vue_repair_preserves_interaction_and_requests_and_accepts_delegation():
+    path = "frontend/src/App.vue"
+    controls = '<template><button @click="load">获取备件</button></template>'
+    integration = '<script setup>const load = () => fetch("/api/parts")</script>'
+    original = controls + integration
+    assert "完整组件" in source_repair_problem(path, original, "抱歉，当前无法修复这份源码。")
+    assert "用户交互" in source_repair_problem(path, original, '<template><p>备件</p></template>' + integration)
+    assert "接口调用" in source_repair_problem(path, original, controls + '<script setup>\n// fetch("/api/parts")\nconst load = () => []\n</script>')
+    assert not source_repair_problem(path, original, original.replace("获取备件", "刷新备件"))
+    assert not source_repair_problem(path, original, controls + '<script setup>import { load } from "./parts.ts"</script>')
+    delegated = '<template><PartsPanel /></template><script setup>import PartsPanel from "./PartsPanel.vue"</script>'
+    assert not source_repair_problem(path, original, delegated)
+
+
+def test_vue_preflight_finds_only_the_unmatched_top_level_wrapper_in_a_saved_draft(project):
+    workspace, _ = project
+    path = "frontend/src/App.vue"
+    complete = '<template><button @click="count++">增加</button></template>\n<script setup>const count = 0</script>\n'
+    source = complete + '</vue>\n'
+    workspace.write_files({path: source}, allowed=[path])
+    report = workspace.verify(expected=[path], scope="frontend")
+    assert not report["passed"] and report["line_repairs"][path] == {"</vue>": ""}
+    assert not source_shape_problem(path, complete + '<vue>自定义块</vue>\n')
+    assert "缺少完整" in source_shape_problem(path, source)
 
 
 def test_project_repairs_explicit_port_conflict_and_unassociated_submit_control(project):

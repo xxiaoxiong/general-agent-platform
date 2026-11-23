@@ -660,6 +660,12 @@ class TestTelemetry:
 # ── 执行预算（P0-A）：次数/步数超限 -> 明确异常与 limit_exceeded 状态 ──────
 
 class TestBudget:
+    def test_default_budget_allows_1000_tool_calls_without_total_timeout(self):
+        budget = ExecutionBudget()
+        assert budget.run_timeout_seconds == 0
+        assert budget.exhausted_reason(0, 1000, 0) is None
+        assert "工具调用" in (budget.exhausted_reason(0, 1001, 0) or "")
+
     def test_budget_exhausted_reason(self):
         b = ExecutionBudget(max_steps=5, max_tool_calls=3, max_model_calls=4)
         assert b.exhausted_reason(1, 1, 1) is None
