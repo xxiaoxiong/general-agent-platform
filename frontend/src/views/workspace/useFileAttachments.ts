@@ -116,7 +116,7 @@ export function useFileAttachments(
   let fileListTimer: number | undefined
   const workspaceZipBusy = ref(false)
 
-  /** 刷新工作区文件清单：immediate=立即拉取；否则 800ms 防抖（面板未打开不请求） */
+  /** 刷新工作区文件清单：immediate=立即拉取；否则 800ms 防抖（面板与预览均未打开时不请求） */
   async function refreshFileList(immediate = false) {
     const conv = st.currentConversation.value
     if (!conv) {
@@ -124,18 +124,26 @@ export function useFileAttachments(
       return
     }
     if (!immediate) {
-      if (!st.filesPanelOpen.value) return
+      if (!st.filesPanelOpen.value && !st.preview.value) return
       if (fileListTimer) clearTimeout(fileListTimer)
       fileListTimer = window.setTimeout(() => { void refreshFileList(true) }, 800)
       return
     }
+    const previewed = st.preview.value
+    const previous = previewed && st.fileList.value.find((item) => item.path === previewed.path)
     st.filesLoading.value = true
     st.filesError.value = ''
     try {
       const res = await conversationApi.fileList(conv.id)
       if (st.inactive.value || st.currentConversation.value?.id !== conv.id) return
-      st.fileList.value = res.files || []
+      const files = res.files || []
+      const next = previewed && files.find((item) => item.path === previewed.path)
+      st.fileList.value = files
       st.filesTruncated.value = res.truncated === true
+      // 当前预览文件被 Agent 改写时自动重载内容（大小 / 修改时间变化即视为变动）
+      if (previewed && next && (!previous || previous.size !== next.size || previous.mtime !== next.mtime)) {
+        void openPreview(previewed.path, previewed.name)
+      }
     } catch {
       if (st.inactive.value || st.currentConversation.value?.id !== conv.id) return
       st.filesError.value = '无法加载文件列表'
@@ -144,7 +152,7 @@ export function useFileAttachments(
     }
   }
 
-  // 工具写入 / 会话切换等文件变动信号 → 防抖刷新（面板未打开不发请求）
+  // 工具写入 / 会话切换等文件变动信号 → 防抖刷新（面板与预览均未打开时不请求）
   watch(() => st.workspaceVersion.value, () => { void refreshFileList() })
 
   function openFilesPanel() {

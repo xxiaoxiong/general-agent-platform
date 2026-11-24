@@ -260,6 +260,15 @@
 
     <DocumentPreviewPanel v-if="documentPreview" :artifact="documentPreview"
       @close="closePreview" @download="downloadArtifact(documentPreview)" />
+    <!-- 文件面板打开时由面板承载预览（左侧文件树保持可见）；关闭后点文件名走独立预览 -->
+    <WorkspaceFilesPanel
+      v-else-if="filesPanelOpen"
+      :files="fileList" :loading="filesLoading" :error="filesError" :truncated="filesTruncated"
+      :downloading="workspaceZipBusy" :preview="preview"
+      @open="openPreview" @refresh="refreshFileList(true)" @close="closeFilesPanel"
+      @download-zip="downloadWorkspaceZip" @download="downloadPreview"
+      @open-original="openPreview" @close-preview="closePreview"
+    />
     <FilePreviewPanel
       v-else-if="preview"
       :data="preview.data"
@@ -269,12 +278,6 @@
       @close="closePreview"
       @download="downloadPreview"
       @open-original="openPreview"
-    />
-    <WorkspaceFilesPanel
-      v-else-if="filesPanelOpen"
-      :files="fileList" :loading="filesLoading" :error="filesError" :truncated="filesTruncated"
-      :downloading="workspaceZipBusy"
-      @open="openPreview" @refresh="refreshFileList(true)" @close="closeFilesPanel" @download-zip="downloadWorkspaceZip"
     />
   </section>
 </template>
