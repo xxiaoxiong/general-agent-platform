@@ -162,15 +162,16 @@
  * 按类型深度优化展示：表格(数据网格) / 代码(行号+高亮) / 文本 / Markdown /
  * 图片 / PDF / Office(段落) / 二进制兜底。
  */
-import { computed, onMounted, onUnmounted, ref, type Component } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
-  CircleAlert, CodeXml, Download, File, FileText, Folder, Image as ImageIcon, Info, LoaderCircle,
-  Maximize, Minimize, Notebook, Table, X,
+  CircleAlert, Download, File, Info, LoaderCircle,
+  Maximize, Minimize, X,
 } from '@lucide/vue'
 import DOMPurify from 'dompurify'
 import hljs from 'highlight.js/lib/common'
 import type { PreviewContent } from '@/api/conversations'
 import MessageMarkdown from '@/features/run/MessageMarkdown.vue'
+import { KIND_META, type FileKindMeta } from './fileKinds'
 
 const props = defineProps<{
   /** 已解析的预览内容（null 时仅显示文件名占位） */
@@ -263,18 +264,8 @@ onUnmounted(() => {
   stopResize()
 })
 
-/** 类型 -> 图标 / 标签 / 配色（头部视觉锚点） */
-const KIND_META: Record<PreviewContent['kind'], { label: string; icon: Component; color: string; bg: string }> = {
-  image: { label: '图片', icon: ImageIcon, color: 'var(--ui-success)', bg: 'var(--ui-success-soft)' },
-  pdf: { label: 'PDF', icon: FileText, color: 'var(--ui-danger)', bg: 'var(--ui-danger-soft)' },
-  markdown: { label: 'Markdown', icon: Notebook, color: 'var(--ui-info)', bg: 'var(--ui-info-soft)' },
-  code: { label: '代码', icon: CodeXml, color: 'var(--ui-accent)', bg: 'var(--ui-accent-soft)' },
-  text: { label: '文本', icon: FileText, color: 'var(--ui-secondary)', bg: 'var(--ui-subtle)' },
-  table: { label: '表格', icon: Table, color: 'var(--ui-info)', bg: 'var(--ui-info-soft)' },
-  office: { label: '文档', icon: FileText, color: 'var(--ui-warning)', bg: 'var(--ui-warning-soft)' },
-  binary: { label: '文件', icon: Folder, color: 'var(--ui-secondary)', bg: 'var(--ui-subtle)' },
-}
-const meta = computed(() => {
+/** 类型 -> 图标 / 标签 / 配色（头部视觉锚点，映射表与文件面板共用） */
+const meta = computed<FileKindMeta>(() => {
   const data = props.data
   if (data?.kind === 'pdf' && /\.docx$/i.test(data.name)) return { ...KIND_META.office, label: 'Word 版式' }
   return (data && KIND_META[data.kind]) || KIND_META.binary

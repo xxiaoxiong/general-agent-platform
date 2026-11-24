@@ -40,6 +40,18 @@ export interface PreviewContent extends FilePreview {
   objectUrl?: string
 }
 
+/** 工作区文件清单条目（右侧文件面板） */
+export interface WorkspaceFile {
+  /** 工作区内相对路径 */
+  path: string
+  name: string
+  size: number
+  /** 最后修改时间（秒级时间戳） */
+  mtime: number
+  /** 渲染分支（同 FilePreview.kind） */
+  kind: string
+}
+
 export const conversationApi = {
   list: (params?: any) =>
     request.get<any, { items: Conversation[]; total: number }>('/conversations', { params }),
@@ -78,4 +90,10 @@ export const conversationApi = {
     request.get<any, Blob>(`/conversations/${id}/file-bytes`, {
       params: { path }, responseType: 'blob',
     }),
+  /** 列出会话工作区文件（右侧文件面板；排除平台内部目录） */
+  fileList: (id: number) =>
+    request.get<any, { files: WorkspaceFile[]; truncated: boolean }>(`/conversations/${id}/file-list`),
+  /** 打包下载会话工作区文件（与 fileList 同一范围） */
+  downloadWorkspaceZip: (id: number) =>
+    request.get<any, Blob>(`/conversations/${id}/files.zip`, { responseType: 'blob' }),
 }

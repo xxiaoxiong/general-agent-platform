@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.common.zipstream import zip_stream_response
 from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.database import get_db
@@ -70,6 +71,12 @@ _TEXT_EXTS = {"txt", "log", "text"}
 
 _MAX_PREVIEW_TEXT = 200_000  # 预览文本截断阈值（字符）
 _MAX_PREVIEW_ROWS = 500  # 表格预览最大行数
+
+# 工作区文件清单（右侧文件面板）：排除平台内部目录与模型用文本副本
+_INTERNAL_DIRS = {"tool-outputs", "tool_results"}
+_EXTRACT_SUFFIX = ".extracted.txt"
+_MAX_LIST_FILES = 500  # 清单条目上限（超出置 truncated）
+_MAX_LIST_DEPTH = 8  # 清单递归深度上限
 
 
 def _classify(ext: str) -> tuple[str, str]:
@@ -317,6 +324,84 @@ async def delete_conversation_file(
             if fname == name:
                 record_attachment_change(session.id, before={"name": name, "size": size})
     return {"message": "已删除"}
+
+
+# ── 工作区文件清单与打包（右侧文件面板）────────────────────────────────────
+def _iter_workspace_files(root: str) -> tuple[list[tuple[str, str]], bool]:
+    """递归列出工作区用户可见文件 -> [(工作区内相对路径, 绝对路径)], 是否截断。
+
+    排除点前缀隐藏条目（.run-artifacts 等平台内部目录）、工具输出转储目录、
+    模型用文本副本 ``*.extracted.txt`` 与符号链接；限制深度和条目数防超大目录。
+    """
+    real_root = os.path.realpath(root)
+    found: list[tuple[str, str]] = []
+    truncated = False
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        rel_dir = os.path.relpath(dirpath, root)
+        depth = 0 if rel_dir == "." else rel_dir.count(os.sep) + 1
+        dirnames[:] = [
+            name for name in sorted(dirnames)
+            if depth < _MAX_LIST_DEPTH and not name.startswith(".")
+            and name.casefold() not in _INTERNAL_DIRS
+            and not os.path.islink(os.path.join(dirpath, name))
+        ]
+        for name in sorted(filenames):
+            path = os.path.join(dirpath, name)
+            if name.startswith(".") or name.endswith(_EXTRACT_SUFFIX) or os.path.islink(path):
+                continue
+            real = os.path.realpath(path)
+            if not (real == real_root or real.startswith(real_root + os.sep)) or not os.path.isfile(real):
+                continue
+            found.append((os.path.relpath(path, root).replace(os.sep, "/"), path))
+            if len(found) > _MAX_LIST_FILES:
+                truncated = True
+                break
+        if truncated:
+            break
+    found.sort(key=lambda item: item[0])
+    if len(found) > _MAX_LIST_FILES:
+        truncated = True
+        found = found[:_MAX_LIST_FILES]
+    return found, truncated
+
+
+@router.get("/{session_id}/file-list")
+async def list_conversation_files(
+    session_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """列出会话工作区文件（右侧文件面板：过程中产生的文件可点击预览）。"""
+    session = await _get_owned_session(db, session_id, current_user)
+    root = workspace_root(current_user.id, session.agent_id, session.id)
+    files, truncated = await asyncio.to_thread(_iter_workspace_files, root)
+    entries = []
+    for rel, path in files:
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        entries.append({
+            "path": rel,
+            "name": os.path.basename(rel),
+            "size": stat.st_size,
+            "mtime": stat.st_mtime,
+            "kind": _classify(os.path.splitext(rel)[1])[0],
+        })
+    return {"files": entries, "truncated": truncated}
+
+
+@router.get("/{session_id}/files.zip")
+async def download_conversation_files_zip(
+    session_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """打包下载会话工作区文件（与 file-list 同一范围，条目名为工作区相对路径）。"""
+    session = await _get_owned_session(db, session_id, current_user)
+    root = workspace_root(current_user.id, session.agent_id, session.id)
+    files, _ = await asyncio.to_thread(_iter_workspace_files, root)
+    return zip_stream_response(files, f"workspace-{session.id}.zip")
 
 
 @router.get("/{session_id}/file-preview")

@@ -5,7 +5,7 @@
  */
 import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import type { Conversation } from '@/api/conversations'
+import type { Conversation, WorkspaceFile } from '@/api/conversations'
 import { conversationApi, type PreviewContent } from '@/api/conversations'
 import type { Assistant } from '@/api/workspace'
 import { pendingDocInput, isDocumentReviewInput } from '@/features/run/blocks'
@@ -185,6 +185,19 @@ export function useWorkspaceState() {
     controller: undefined as AbortController | undefined,
   }
 
+  // ── 右侧文件面板状态（当前会话工作目录文件清单）────────────────────────────
+  const filesPanelOpen = ref(false)
+  const fileList = ref<WorkspaceFile[]>([])
+  const filesLoading = ref(false)
+  const filesError = ref('')
+  const filesTruncated = ref(false)
+  /** 工作区文件变动信号（工具写入 / 会话切换等），文件面板据此防抖刷新 */
+  const workspaceVersion = ref(0)
+
+  function noteWorkspaceChange() {
+    workspaceVersion.value += 1
+  }
+
   /** 图片扩展名（生成缩略图预览用） */
   function isImageName(name: string): boolean {
     return /\.(png|jpe?g|gif|bmp|webp|svg)$/i.test(name)
@@ -282,6 +295,8 @@ export function useWorkspaceState() {
     documentTask, documentContext, documentPreview, downloadingDocuments,
     documentInputsBusy, documentInputErrors,
     attachments, attachmentUrls, preview, previewState,
+    filesPanelOpen, fileList, filesLoading, filesError, filesTruncated,
+    workspaceVersion, noteWorkspaceChange,
     isImageName, attachmentUrl, releaseAttachmentUrl, loadFilePreview, clearAttachments,
     closePreview, resetDocumentTask,
     numericQuery, syncConversationUrl, openHistory, closeHistory, syncHistoryVisibility,

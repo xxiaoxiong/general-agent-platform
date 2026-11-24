@@ -116,6 +116,128 @@ class TestArtifacts:
         assert r.status_code == 404
 
 
+def _mk_run_with_frozen(user_id: int, agent_id: int, run_id: str, frozen: list, summary: dict | None = None) -> int:
+    """创建 Run 并写入冻结交付副本 [(digest, rel_path, content)]，返回 session_id。"""
+    from app.models.agent import AgentRun, AgentSession
+    from app.services.agent_runtime.backends import workspace_root
+
+    engine = create_engine(os.environ["DATABASE_SYNC_URL"])
+    with Session(engine) as s:
+        sess = AgentSession(agent_id=agent_id, user_id=user_id, messages=[])
+        s.add(sess)
+        s.commit()
+        session_id = sess.id
+        s.add(AgentRun(id=run_id, agent_id=agent_id, session_id=session_id, user_id=user_id,
+                       thread_id=f"t-{run_id}", status="completed", summary=summary))
+        s.commit()
+
+    root = workspace_root(user_id, agent_id, session_id)
+    for digest, rel, content in frozen:
+        target = os.path.join(root, ".run-artifacts", run_id, digest, rel)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(content)
+    return session_id
+
+
+class TestRunArtifactsZip:
+    def test_run_zip_packs_frozen_artifacts(self, client, user_setup):
+        """Run 交付包：冻结副本打包，条目名为工作区相对路径。"""
+        import hashlib
+        from io import BytesIO
+        from uuid import uuid4
+        from zipfile import ZipFile
+
+        agent_id = _mk_agent(user_setup["user1_id"])
+        run_id = uuid4().hex
+        _mk_run_with_frozen(user_setup["user1_id"], agent_id, run_id, [
+            (hashlib.sha256(b"a").hexdigest(), "report/结果.md", "内容A"),
+            (hashlib.sha256(b"b").hexdigest(), "data.csv", "内容B"),
+        ])
+        r = client.get(f"/api/v2/artifacts/runs/{run_id}/zip", headers=_auth(user_setup["user1_id"]))
+        assert r.status_code == 200
+        assert r.headers["content-type"] == "application/zip"
+        assert f"filename*=UTF-8''run-{run_id}.zip" in r.headers["content-disposition"]
+        with ZipFile(BytesIO(r.content)) as archive:
+            assert sorted(archive.namelist()) == ["data.csv", "report/结果.md"]
+            assert archive.read("report/结果.md") == "内容A".encode("utf-8")
+
+    def test_run_zip_dedupes_digest_variants(self, client, user_setup):
+        """同名多 digest 副本取 mtime 最新一份。"""
+        import hashlib
+        import time
+        from io import BytesIO
+        from uuid import uuid4
+        from zipfile import ZipFile
+
+        from app.services.agent_runtime.backends import workspace_root
+
+        agent_id = _mk_agent(user_setup["user1_id"])
+        run_id = uuid4().hex
+        digest_old = hashlib.sha256(b"old").hexdigest()
+        digest_new = hashlib.sha256(b"new").hexdigest()
+        session_id = _mk_run_with_frozen(user_setup["user1_id"], agent_id, run_id, [
+            (digest_old, "report.md", "旧版"),
+            (digest_new, "report.md", "新版"),
+        ])
+        root = workspace_root(user_setup["user1_id"], agent_id, session_id)
+        now = time.time()
+        os.utime(os.path.join(root, ".run-artifacts", run_id, digest_old, "report.md"), (now - 60, now - 60))
+        os.utime(os.path.join(root, ".run-artifacts", run_id, digest_new, "report.md"), (now, now))
+        r = client.get(f"/api/v2/artifacts/runs/{run_id}/zip", headers=_auth(user_setup["user1_id"]))
+        with ZipFile(BytesIO(r.content)) as archive:
+            assert archive.namelist() == ["report.md"]
+            assert archive.read("report.md") == "新版".encode("utf-8")
+
+    def test_run_zip_owner_isolation_and_missing(self, client, user_setup):
+        from uuid import uuid4
+
+        agent_id = _mk_agent(user_setup["user1_id"])
+        run_id = uuid4().hex
+        import hashlib
+        _mk_run_with_frozen(user_setup["user1_id"], agent_id, run_id, [
+            (hashlib.sha256(b"a").hexdigest(), "a.txt", "x"),
+        ])
+        assert client.get(
+            f"/api/v2/artifacts/runs/{run_id}/zip", headers=_auth(user_setup["user2_id"]),
+        ).status_code == 404
+        assert client.get(
+            "/api/v2/artifacts/runs/no-such-run/zip", headers=_auth(user_setup["user1_id"]),
+        ).status_code == 404
+
+    def test_run_zip_falls_back_to_summary_paths(self, client, user_setup):
+        """旧版 Run 无冻结副本：按 summary 记录的工作区原路径打包（穿越路径拒绝）。"""
+        from io import BytesIO
+        from uuid import uuid4
+        from zipfile import ZipFile
+
+        from app.services.agent_runtime.backends import workspace_root
+
+        agent_id = _mk_agent(user_setup["user1_id"])
+        run_id = uuid4().hex
+        summary = {"verification": {"artifacts": [{"path": "draft.md"}, {"path": "../evil.txt"}]}}
+        session_id = _mk_run_with_frozen(user_setup["user1_id"], agent_id, run_id, [], summary=summary)
+        root = workspace_root(user_setup["user1_id"], agent_id, session_id)
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, "draft.md"), "w", encoding="utf-8") as f:
+            f.write("草稿")
+        r = client.get(f"/api/v2/artifacts/runs/{run_id}/zip", headers=_auth(user_setup["user1_id"]))
+        assert r.status_code == 200
+        with ZipFile(BytesIO(r.content)) as archive:
+            assert archive.namelist() == ["draft.md"]
+            assert archive.read("draft.md") == "草稿".encode("utf-8")
+
+    def test_run_zip_without_deliverables_404(self, client, user_setup):
+        from uuid import uuid4
+
+        agent_id = _mk_agent(user_setup["user1_id"])
+        run_id = uuid4().hex
+        _mk_run_with_frozen(user_setup["user1_id"], agent_id, run_id, [])
+        assert client.get(
+            f"/api/v2/artifacts/runs/{run_id}/zip", headers=_auth(user_setup["user1_id"]),
+        ).status_code == 404
+
+
 class TestAdminObservability:
     def test_observability_superuser_only(self, client, user_setup):
         """P0-03：管理端点仅超管可访问。"""

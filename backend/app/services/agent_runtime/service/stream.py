@@ -986,6 +986,8 @@ class StreamMixin:
                     if review.get("continuing"):
                         await bus.publish(RuntimeEvent(type=RUN_RETRYING, run_id=run.run_id, data={
                             "reason": "verification_fix", "round": review["fix_rounds"],
+                            # 截断续写（prefix 存在）只补余下内容；否则为整稿替换（前端据此撤回旧稿）
+                            "continuation": bool(review.get("prefix")),
                             "failed_checks": [check for check in review["report"]["checks"] if not check["passed"]],
                         }))
                 # P1-05 §13：每个图步/工具边界 CAS 累计预算（崩溃恢复不丢累计）

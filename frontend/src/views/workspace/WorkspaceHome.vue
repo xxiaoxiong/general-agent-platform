@@ -1,5 +1,5 @@
 <template>
-  <section class="workspace-home" :class="{ 'has-preview': preview || documentPreview }" aria-label="智能体工作空间">
+  <section class="workspace-home" :class="{ 'has-preview': preview || documentPreview || filesPanelOpen }" aria-label="智能体工作空间">
     <button v-if="historyOpen" type="button" class="history-overlay" aria-label="关闭会话历史" @click="closeHistory()"></button>
     <ConversationHistory
       v-show="historyOpen"
@@ -40,6 +40,12 @@
           <span>{{ currentConversation?.title || '新对话' }}</span>
         </div>
         <span class="assistant-name"><Bot :size="15" />{{ currentAssistant?.name || '通用助手' }}</span>
+        <button
+          type="button" class="icon-button" :aria-pressed="filesPanelOpen"
+          aria-label="工作目录文件" title="工作目录文件" @click="toggleFilesPanel"
+        >
+          <FolderOpen :size="17" />
+        </button>
       </header>
 
       <div
@@ -107,7 +113,7 @@
                   <MessageMarkdown v-if="block.kind === 'text'" :text="block.text" />
                   <ToolStep v-else-if="block.kind === 'tool'" :tool="block" @preview="openPreview" />
                   <TeamRunCard v-else-if="block.kind === 'team'" :progress="block.progress" :active="Boolean(m.streaming)" />
-                  <VerificationCard v-else-if="block.kind === 'verification'" :report="block" />
+                  <VerificationCard v-else-if="block.kind === 'verification'" :report="block" :run-id="m.runId" />
                   <ProjectDeliveryCard v-else-if="block.kind === 'project'"
                     :delivery="block.delivery" :progress="block.progress" :active="Boolean(m.streaming)"
                     :repairable="!!m.runId && m.runStatus === 'failed' && block.delivery?.state === 'failed'"
@@ -264,6 +270,12 @@
       @download="downloadPreview"
       @open-original="openPreview"
     />
+    <WorkspaceFilesPanel
+      v-else-if="filesPanelOpen"
+      :files="fileList" :loading="filesLoading" :error="filesError" :truncated="filesTruncated"
+      :downloading="workspaceZipBusy"
+      @open="openPreview" @refresh="refreshFileList(true)" @close="closeFilesPanel" @download-zip="downloadWorkspaceZip"
+    />
   </section>
 </template>
 
@@ -284,7 +296,7 @@
 import { computed, onMounted, onUnmounted } from 'vue'
 import {
   ArrowDown, Bot, ChartNoAxesCombined, CircleAlert, CirclePause,
-  Copy, ExternalLink, FilePenLine, FileText, Layers, ListTodo, LoaderCircle, PanelLeft, RotateCcw, Search, X,
+  Copy, ExternalLink, FilePenLine, FileText, FolderOpen, Layers, ListTodo, LoaderCircle, PanelLeft, RotateCcw, Search, X,
 } from '@lucide/vue'
 import { ElMessage } from 'element-plus'
 import { modelApi } from '@/api'
@@ -302,6 +314,7 @@ import ProjectDeliveryCard from '@/features/run/ProjectDeliveryCard.vue'
 import VerificationCard from '@/features/run/VerificationCard.vue'
 import { projectPhaseLabels } from '@/features/run/projectDelivery'
 import FilePreviewPanel from '@/features/preview/FilePreviewPanel.vue'
+import WorkspaceFilesPanel from '@/features/preview/WorkspaceFilesPanel.vue'
 import DocumentArtifactCard from '@/features/documents/DocumentArtifactCard.vue'
 import DocumentEditReviewCard from '@/features/documents/DocumentEditReviewCard.vue'
 import DocumentPreviewPanel from '@/features/documents/DocumentPreviewPanel.vue'
@@ -338,6 +351,7 @@ const {
   attachments, uploading, sending, streaming, historyRun, blockedReason,
   pendingDecisions, documentContext, documentTask, documentInputsBusy,
   documentInputErrors, repairingProject, projectRepairErrors, downloadingDocuments,
+  filesPanelOpen, fileList, filesLoading, filesError, filesTruncated,
   composer,
   openHistory, closeHistory, resetDocumentTask, closePreview,
 } = st
@@ -356,7 +370,10 @@ const {
   continueDocument, isInlineProfileConfirmation,
 } = doc
 
-const { uploadAttachments, removeAttachment, openPreview, downloadPreview } = files
+const {
+  uploadAttachments, removeAttachment, openPreview, downloadPreview,
+  refreshFileList, closeFilesPanel, toggleFilesPanel, downloadWorkspaceZip, workspaceZipBusy,
+} = files
 
 // ── 展示辅助 ────────────────────────────────────────────────────────────────
 const messageBlocks = computed(() => messages.value.map(displayBlocks))
@@ -394,10 +411,11 @@ async function copyAnswer(message: ChatMessage) {
   }
 }
 
-/** Esc 关闭预览（仅预览打开时拦截） */
+/** Esc 关闭预览 / 文件面板（仅打开时拦截） */
 function onGlobalKeydown(e: KeyboardEvent) {
   if (e.key !== 'Escape' || e.defaultPrevented) return
   if (preview.value || documentPreview.value) closePreview()
+  else if (filesPanelOpen.value) closeFilesPanel()
   else if (historyOpen.value && !st.historyMedia.matches) closeHistory()
 }
 
@@ -474,6 +492,7 @@ onUnmounted(() => {
   border: 0; background: transparent; color: var(--ui-muted); border-radius: var(--ui-radius-sm); cursor: pointer;
 }
 .icon-button:hover, .trace-link:hover { color: var(--ui-accent); background: var(--ui-hover); }
+.icon-button[aria-pressed='true'] { color: var(--ui-accent); background: var(--ui-hover); }
 
 .ws-messages { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; overflow-anchor: none; }
 .ws-messages:focus-visible { outline-offset: -2px; }

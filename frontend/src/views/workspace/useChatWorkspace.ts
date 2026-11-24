@@ -118,6 +118,7 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
     st.composer.value?.cancelDictation()
     st.clearAttachments()
     st.closePreview()
+    st.noteWorkspaceChange()
     if (st.currentConversation.value && st.currentConversation.value.id !== c?.id) {
       st.resetDocumentTask()
     }
@@ -151,6 +152,7 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
       replayPastPauses: true,
       onEvent: (envelope) => {
         applyRunEvent(msg, envelope)
+        if (envelope.event === 'tool.completed') st.noteWorkspaceChange()
         if (st.currentConversation.value?.id === convId) void scroll.scrollToBottom()
       },
       onDone: (reason) => {
@@ -382,6 +384,7 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
       onEvent: (envelope) => {
         if (entry.stopped) return
         applyRunEvent(entry.msg, envelope)
+        if (envelope.event === 'tool.completed') st.noteWorkspaceChange()
         if (st.currentConversation.value?.id === convId) void scroll.scrollToBottom()
       },
       onReconnecting: (attempt) => {
@@ -398,6 +401,7 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
     if (st.activeRuns.get(convId) !== entry) return
     finalizeRunMessage(entry.msg, reason, entry.msg.content)
     st.clearActiveRun(convId, entry)
+    st.noteWorkspaceChange()
     if (entry.msg.runStatus === 'failed') void refreshDocumentRetryability(entry.msg)
     void loadConversations(true) // 标题已规范化生成，刷新会话列表
     if (st.currentConversation.value?.id === convId) void scroll.scrollToBottom()
@@ -524,6 +528,7 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
       onEvent: (envelope) => {
         if (entry.stopped) return
         applyRunEvent(aMsg, envelope)
+        if (envelope.event === 'tool.completed') st.noteWorkspaceChange()
         if (st.currentConversation.value?.id === convId) void scroll.scrollToBottom()
       },
       onDone: (reason) => {

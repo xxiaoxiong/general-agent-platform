@@ -176,3 +176,69 @@ async def test_word_layout_preview_validates_conversation_and_returns_pdf(applic
         assert result.headers["cache-control"] == "private, no-store"
         assert result.content == b"%PDF-preview"
         assert render.await_args.args[0].name == "draft.docx"
+
+
+@pytest.mark.asyncio
+async def test_workspace_file_list_excludes_internal_and_copies(application, tmp_path):
+    """右侧文件面板清单：含嵌套文件，排除内部转储 / 文本副本 / 隐藏条目。"""
+    for name in ("src", "uploads", "tool-outputs", "tool_results", ".run-artifacts"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "report.md").write_text("# 报告", encoding="utf-8")
+    (tmp_path / "src" / "app.py").write_text("print(1)", encoding="utf-8")
+    (tmp_path / "uploads" / "参考.docx").write_bytes(_word())
+    (tmp_path / "uploads" / "参考.docx.extracted.txt").write_text("抽取", encoding="utf-8")
+    (tmp_path / "tool-outputs" / "dump.txt").write_text("内部", encoding="utf-8")
+    (tmp_path / "tool_results" / "r.json").write_text("{}", encoding="utf-8")
+    (tmp_path / ".run-artifacts" / "frozen.md").write_text("冻结", encoding="utf-8")
+    (tmp_path / ".hidden.txt").write_text("隐藏", encoding="utf-8")
+    async with AsyncClient(transport=ASGITransport(app=application), base_url="http://test") as client:
+        result = await client.get("/api/v2/conversations/1/file-list")
+        assert result.status_code == 200
+        payload = result.json()
+        assert payload["truncated"] is False
+        files = {item["path"]: item for item in payload["files"]}
+        assert set(files) == {"report.md", "src/app.py", "uploads/参考.docx"}
+        assert files["report.md"]["kind"] == "markdown"
+        assert files["src/app.py"]["kind"] == "code"
+        assert files["uploads/参考.docx"]["kind"] == "office"
+        assert files["report.md"]["size"] == len("# 报告".encode("utf-8"))
+        assert (await client.get("/api/v2/conversations/999/file-list")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_workspace_file_list_truncates_over_limit(application, tmp_path, monkeypatch):
+    for i in range(3):
+        (tmp_path / f"f{i}.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(file_api, "_MAX_LIST_FILES", 2)
+    async with AsyncClient(transport=ASGITransport(app=application), base_url="http://test") as client:
+        payload = (await client.get("/api/v2/conversations/1/file-list")).json()
+        assert payload["truncated"] is True
+        assert len(payload["files"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_workspace_files_zip_entries_and_exclusions(application, tmp_path):
+    """打包下载：与清单同范围（排除内部转储 / 文本副本），条目名为工作区相对路径。"""
+    (tmp_path / "uploads").mkdir()
+    (tmp_path / "tool-outputs").mkdir()
+    (tmp_path / "report.md").write_text("# 报告", encoding="utf-8")
+    (tmp_path / "uploads" / "a.bin").write_bytes(b"\x00\x01")
+    (tmp_path / "uploads" / "a.bin.extracted.txt").write_text("副本", encoding="utf-8")
+    (tmp_path / "tool-outputs" / "dump.txt").write_text("内部", encoding="utf-8")
+    async with AsyncClient(transport=ASGITransport(app=application), base_url="http://test") as client:
+        result = await client.get("/api/v2/conversations/1/files.zip")
+        assert result.status_code == 200
+        assert result.headers["content-type"] == "application/zip"
+        assert "filename*=UTF-8''workspace-1.zip" in result.headers["content-disposition"]
+        with ZipFile(BytesIO(result.content)) as archive:
+            assert sorted(archive.namelist()) == ["report.md", "uploads/a.bin"]
+            assert archive.read("report.md") == "# 报告".encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_workspace_files_zip_empty_workspace(application):
+    async with AsyncClient(transport=ASGITransport(app=application), base_url="http://test") as client:
+        result = await client.get("/api/v2/conversations/1/files.zip")
+        assert result.status_code == 200
+        with ZipFile(BytesIO(result.content)) as archive:
+            assert archive.namelist() == []

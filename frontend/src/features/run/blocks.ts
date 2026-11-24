@@ -104,7 +104,6 @@ export interface RunStreamMessage {
   runStatus?: string
   executionStop?: { reason: 'budget' | 'no_progress'; canContinue: boolean }
   pendingActions?: any[]
-  finalText?: string
   documentRetryable?: boolean
   documentCompleted?: number
   documentTotal?: number
@@ -179,24 +178,51 @@ function joinedText(msg: RunStreamMessage): string {
     .join('')
 }
 
-/** 权威最终文本补齐：delta 缺尾/缺失时用 final_text 兜底（不重复已有文本） */
+/** 块尾草稿区：从尾部向前的连续文本块（答案草稿所在位置，验证返工替换/补齐的目标） */
+function tailTextBlocks(msg: RunStreamMessage): TextBlock[] {
+  const blocks = msg.blocks
+  const out: TextBlock[] = []
+  for (let i = blocks.length - 1; i >= 0 && blocks[i].kind === 'text'; i--) {
+    out.unshift(blocks[i] as TextBlock)
+  }
+  return out
+}
+
+/** 权威最终文本补齐：delta 缺尾/缺失时用 final_text 兜底（不重复已有文本，不动既有块顺序） */
 function gapFillText(msg: RunStreamMessage, finalText: string) {
   const ft = String(finalText || '')
   if (!ft) return
   const joined = joinedText(msg)
   if (!joined.trim()) {
     msg.blocks.push({ kind: 'text', text: ft })
-  } else if (ft.length > joined.length && ft.startsWith(joined)) {
+    return
+  }
+  if (ft.length > joined.length && ft.startsWith(joined)) {
     msg.blocks.push({ kind: 'text', text: ft.slice(joined.length) })
+    return
+  }
+  // 交付稿只覆盖块尾草稿区（更早的过程文字不属于交付稿）：仅补草稿区缺尾
+  const tail = tailTextBlocks(msg)
+  const tailJoined = tail.map((b) => b.text).join('')
+  if (tailJoined && ft.length > tailJoined.length && ft.startsWith(tailJoined)) {
+    tail[tail.length - 1].text += ft.slice(tailJoined.length)
   }
 }
 
-function setVerifiedAnswer(msg: RunStreamMessage, value: string) {
-  msg.finalText = value
-  if (joinedText(msg) === value) return
-  // 纠正稿是整份交付。原先流式展示的过程文字不进入正文，工具、计划和验收记录继续保留。
-  msg.blocks = msg.blocks.filter(block => block.kind !== 'text')
-  if (hasVisibleText(value)) msg.blocks.push({ kind: 'text', text: value })
+/** 撤回块尾被替换的答案草稿（整稿重写返工时，重写稿在原位流式重建，保持执行顺序） */
+function retractAnswerDraft(msg: RunStreamMessage) {
+  const tail = tailTextBlocks(msg)
+  if (tail.length) msg.blocks.splice(msg.blocks.length - tail.length, tail.length)
+}
+
+/** 可续写的文本块：尾部验收卡不打断文本续写（截断续写稿并入草稿），其他块隔断 */
+function appendableTextBlock(blocks: MsgBlock[]): TextBlock | undefined {
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i]
+    if (b.kind === 'verification') continue
+    return b.kind === 'text' ? (b as TextBlock) : undefined
+  }
+  return undefined
 }
 
 function setVerification(msg: RunStreamMessage, data: Record<string, any>, state: VerificationBlock['state']) {
@@ -408,8 +434,8 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
     case 'assistant.delta': {
       const text = String(data.text || '')
       if (!text) break
-      const last = blocks[blocks.length - 1]
-      if (last && last.kind === 'text') last.text += text
+      const last = appendableTextBlock(blocks)
+      if (last) last.text += text
       // 无可见内容的增量（纯空白/零宽字符）不新开文本块（避免空气泡白板）
       else if (hasVisibleText(text)) blocks.push({ kind: 'text', text })
       msg.lastActivity = 'text'
@@ -548,6 +574,12 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
 
     case 'run.retrying': {
       if (data.reason === 'verification_fix') {
+        // 整稿替换返工：撤回被替换的旧草稿，重写稿在原位流式重建；
+        // 截断续写（continuation）只补余下内容，不撤回。旧事件缺字段按 failed_checks 兜底。
+        const continuation = data.continuation === true
+          || (data.continuation == null && Array.isArray(data.failed_checks)
+            && data.failed_checks.length === 1 && data.failed_checks[0]?.id === 'answer_complete')
+        if (!continuation) retractAnswerDraft(msg)
         setVerification(msg, { checks: data.failed_checks, fix_rounds: data.round }, 'reworking')
         msg.liveStatus = '正在补齐待交付项…'
         msg.lastActivity = 'other'
@@ -584,13 +616,12 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
       break
 
     case 'run.completed':
-      msg.finalText = String(data.final_text || '')
-      if (data.summary?.verification?.version === 2) {
-        if (data.summary.verification.fix_rounds || data.summary.verification.artifacts?.length) {
-          setVerification(msg, data.summary.verification, 'passed')
-        }
-        setVerifiedAnswer(msg, msg.finalText)
-      } else gapFillText(msg, msg.finalText)
+      // 块序保持执行顺序原样展示：只补缺尾，不删除过程文字、不把文稿挪到末尾
+      gapFillText(msg, String(data.final_text || ''))
+      if (data.summary?.verification?.version === 2
+        && (data.summary.verification.fix_rounds || data.summary.verification.artifacts?.length)) {
+        setVerification(msg, data.summary.verification, 'passed')
+      }
       msg.runStatus = 'completed'
       break
 
@@ -603,10 +634,9 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
         msg.executionStop = { reason: stop.reason, canContinue: stop.can_continue === true }
       }
       if (data.summary?.verification) {
+        if (typeof data.final_text === 'string') gapFillText(msg, data.final_text)
         setVerification(msg, data.summary.verification, 'incomplete')
-        if (typeof data.final_text === 'string') setVerifiedAnswer(msg, data.final_text)
       } else if (msg.runStatus === 'limit_exceeded' && typeof data.final_text === 'string') {
-        msg.finalText = data.final_text
         gapFillText(msg, data.final_text)
       }
       msg.documentRetryable = data.document_retryable === true
