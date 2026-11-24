@@ -122,10 +122,16 @@ def _check_citations_present(final_text: str, evidence: Sequence[ToolEvidence], 
     for entry in evidence:
         if entry.status == "succeeded" and entry.tool_name in _WEB_TOOLS:
             observed.update(_urls(entry.output))
-    verified = len(_urls(final_text) & observed)
+    cited = _urls(final_text)
+    verified = len(cited & observed)
     required = max(1, contract.source_count)
     if verified >= required:
-        return CheckResult("citations_present", True, "")
+        # 客观数据：附带未经工具账本/用户输入核对的引用数量，供复核
+        unverified = len(cited - observed)
+        detail = f"已核对来源 {verified} 个"
+        if unverified:
+            detail += f"；另有 {unverified} 个引用链接未在工具账本中出现"
+        return CheckResult("citations_present", True, detail)
     return CheckResult("citations_present", False, f"需要引用 {required} 个已读取或由用户提供的来源，当前验收 {verified} 个")
 
 

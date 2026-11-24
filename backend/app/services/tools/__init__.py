@@ -33,6 +33,9 @@ from . import (
 
 # ── 汇总所有工具注册表 ────────────────────────────────────────────────────────
 
+# 网络检索工具集（联网检索开关 web_enabled=false 时整体收窄禁用）
+WEB_RETRIEVAL_TOOLS = {"web_search", "fetch_webpage", "http_get", "http_request"}
+
 BUILTIN_TOOLS: List[Dict[str, Any]] = (
     datetime_tools.TOOLS
     + math_tools.TOOLS

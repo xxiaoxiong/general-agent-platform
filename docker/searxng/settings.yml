@@ -1,0 +1,59 @@
+# SearXNG 配置（Docker 方案 A：独立容器，供 backend 的 web_search 工具内网调用）
+#
+# use_default_settings 表示以镜像内置的官方默认 settings.yml 为基线做深合并，
+# 本文件只覆盖必要字段，运行时配置始终是「官方全量默认 + 以下覆盖」，
+# 不会出现只写几个字段导致的缺项配置；升级镜像时也无需同步维护完整引擎列表。
+# 配置说明：https://docs.searxng.org/admin/settings/
+use_default_settings:
+  # 裁剪与本部署无关的暗网引擎（依赖 Tor），避免启动期引擎注册报错；
+  # 其余引擎完整保留官方默认
+  engines:
+    remove:
+      - ahmia
+      - torch
+
+# 额外启用官方自带的搜索引擎（默认 disabled；私有实例无滥用风险），
+# 提升中英文搜索在本网络下的可达性
+engines:
+  - name: bing
+    disabled: false
+  - name: baidu
+    disabled: false
+  - name: sogou
+    disabled: false
+  - name: "360search"
+    disabled: false
+  - name: quark
+    disabled: false
+
+general:
+  # 生产部署禁止调试模式（debug 仅限开发环境使用）
+  debug: false
+  # wikipedia/wikidata/openstreetmap 引擎注册要求填写联系方式（内部实例填占位地址即可）
+  contact_url: "mailto:admin@example.com"
+
+search:
+  # 启用 JSON 输出格式：web_search 依赖 format=json，缺少 json 时请求会返回 HTTP 403
+  # remove format to deny access, use lower case
+  formats:
+    - html
+    - json
+
+outgoing:
+  # 上游引擎请求超时：默认 3.0s 对跨境链路过短，适当放宽（总耗时仍远低于
+  # Backend 侧 SEARCH_TIMEOUT=25s 的兜底）
+  request_timeout: 8.0
+
+server:
+  # 占位符：运行时由环境变量 SEARXNG_SECRET 覆盖（docker/.env 注入），此处不放真实密钥
+  secret_key: "ultrasecretkey"
+  # 容器内监听 8080，Backend 通过 http://searxng:8080 访问；不映射宿主机/公网端口
+  port: 8080
+  bind_address: "0.0.0.0"
+  # 启用官方限流 / 反爬（配置见 limiter.toml），限流状态需要 valkey/redis 存储
+  limiter: true
+
+valkey:
+  # limiter 的限流状态存储：复用 Compose 内现有 redis 服务的独立 DB(1)，
+  # 与平台缓存 (DB 0) 隔离；协议兼容（valkey 客户端 <-> Redis 7 服务端）
+  url: "valkey://redis:6379/1"

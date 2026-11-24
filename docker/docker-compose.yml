@@ -61,6 +61,30 @@ services:
       timeout: 5s
       retries: 5
 
+  # SearXNG 内网元搜索（web_search 工具的搜索引擎，方案 A：独立容器，不合并进 Backend 镜像）
+  searxng:
+    image: searxng/searxng:2026.11.23-a7163d091
+    container_name: ai_plat_searxng
+    restart: unless-stopped
+    environment:
+      # 运行时覆盖 settings.yml 中的占位 secret_key；密钥经 docker/.env 注入，不硬编码
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?SEARXNG_SECRET is required (openssl rand -hex 32)}
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - ./searxng/limiter.toml:/etc/searxng/limiter.toml:ro
+      - searxng_data:/var/cache/searxng
+    # limiter 限流状态存储依赖 redis（valkey://redis:6379/1）
+    depends_on:
+      redis:
+        condition: service_healthy
+    # 仅容器网络内访问（Backend 经 http://searxng:8080），不映射宿主机/公网端口
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz | grep -q OK"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+
   backend:
     build:
       # 构建上下文为仓库根目录，docker/ 目录集中存放部署文件
@@ -91,6 +115,9 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required (>=12 chars, change on first login)}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      # 网页搜索：内网 SearXNG 元搜索（独立容器，经服务名访问）；留空则仅用外网引擎
+      SEARXNG_URL: ${SEARXNG_URL:-http://searxng:8080}
+      SEARCH_TIMEOUT: ${SEARCH_TIMEOUT:-25}
       # 注意：默认值内的单引号属于 YAML 引用，不能放进 ${} 插值内部，
       # 否则会作为字面量混入 JSON 导致 json.loads 失败（启动崩溃）
       CORS_ORIGINS: '${CORS_ORIGINS:-["http://localhost:5173","http://localhost:3000","http://localhost:80"]}'
@@ -129,6 +156,8 @@ services:
       redis:
         condition: service_healthy
       checkpoint_pg:
+        condition: service_healthy
+      searxng:
         condition: service_healthy
 
   project_verifier:
@@ -206,6 +235,7 @@ volumes:
   asr_model_cache:
     name: general-agent-platform-asr_model_cache
   project_verifier_queue:
+  searxng_data:
 
 networks:
   # 已部署的 Langfuse 栈（langfuse-deploy 项目）所在网络，用于 Trace 上报与评分回写

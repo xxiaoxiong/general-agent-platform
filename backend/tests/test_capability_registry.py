@@ -118,3 +118,19 @@ class TestRuntimeIntegration:
 
         specs = AgentRuntimeService._resolve_tool_specs(None, {"tools": ["calculator"]})
         assert [s["name"] for s in specs] == ["calculator"]
+
+    def test_web_enabled_false_narrows_web_retrieval_tools(self):
+        """联网检索开关（web_enabled=false）：网络检索工具整体收窄禁用。"""
+        from app.services.agent_runtime.service import AgentRuntimeService
+
+        specs = AgentRuntimeService._resolve_tool_specs(None, {
+            "tools": ["web_search", "fetch_webpage", "http_get", "calculator"],
+            "web_enabled": False,
+        })
+        assert [s["name"] for s in specs] == ["calculator"]
+
+        # 未关闭（None/True）时保持原有工具面，只做收窄不做扩张
+        specs = AgentRuntimeService._resolve_tool_specs(None, {
+            "tools": ["web_search", "calculator"], "web_enabled": True,
+        })
+        assert [s["name"] for s in specs] == ["web_search", "calculator"]

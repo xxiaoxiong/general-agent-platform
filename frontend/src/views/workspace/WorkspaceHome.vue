@@ -195,6 +195,14 @@
                   :deciding="pendingDecisions.get(m.runId)"
                   @decide="decideApproval(currentConversation.id, m, $event)"
                 />
+                <div v-if="messageSources(m).length" class="msg-sources" aria-label="来源">
+                  <div class="msg-sources-label"><BookOpen :size="13" /> 来源</div>
+                  <ol class="msg-sources-list">
+                    <li v-for="s in messageSources(m)" :key="s.url">
+                      <a :href="s.url" target="_blank" rel="noopener noreferrer" :title="s.url">{{ s.title || s.url }}</a>
+                    </li>
+                  </ol>
+                </div>
                 <div v-if="!m.streaming && (m.runId || m.error || answerText(m))" class="message-actions">
                   <button v-if="answerText(m)" type="button" class="icon-button" aria-label="复制回复" title="复制回复" @click="copyAnswer(m)">
                     <Copy :size="15" />
@@ -231,6 +239,7 @@
           v-model:text="inputText"
           v-model:team-mode="teamMode"
           v-model:approval-mode="approvalMode"
+          v-model:web-enabled="webSearchOn"
           v-model:model="selectedModelId"
           :options="modelOptions"
           :attachments="attachments"
@@ -298,7 +307,7 @@
  */
 import { computed, onMounted, onUnmounted } from 'vue'
 import {
-  ArrowDown, Bot, ChartNoAxesCombined, CircleAlert, CirclePause,
+  ArrowDown, Bot, BookOpen, ChartNoAxesCombined, CircleAlert, CirclePause,
   Copy, ExternalLink, FilePenLine, FileText, FolderOpen, Layers, ListTodo, LoaderCircle, PanelLeft, RotateCcw, Search, X,
 } from '@lucide/vue'
 import { ElMessage } from 'element-plus'
@@ -327,7 +336,7 @@ import ProfileDraftCard from '@/features/documents/ProfileDraftCard.vue'
 import ConversationComposer from './ConversationComposer.vue'
 import ConversationHistory from './ConversationHistory.vue'
 import {
-  answerText, conversationStatus as conversationStatusOf, displayBlocks, groupFailCount, groupSummary,
+  answerText, conversationStatus as conversationStatusOf, displayBlocks, groupFailCount, groupSummary, messageSources,
   planIcon, planItems, runState, staleSeconds as staleSecondsOf,
   taskTimeText as taskTimeTextOf, type ChatMessage,
 } from './chatDisplay'
@@ -350,7 +359,7 @@ const {
   historyLoading, historyFailed, creatingConversation, deletingId,
   hasMoreConversations, historyLoadingMore, showWelcome, historyToggle,
   currentAssistant, loadingMessages, messagesFailed, messages,
-  inputText, teamMode, approvalMode, selectedModelId, modelOptions,
+  inputText, teamMode, approvalMode, webSearchOn, selectedModelId, modelOptions,
   attachments, uploading, sending, streaming, historyRun, blockedReason,
   pendingDecisions, documentContext, documentTask, documentInputsBusy,
   documentInputErrors, repairingProject, projectRepairErrors, downloadingDocuments,
@@ -574,6 +583,19 @@ onUnmounted(() => {
 .continue-button:hover:not(:disabled) { background: var(--ui-accent-soft); }
 .continue-button:disabled { cursor: default; opacity: .55; }
 .message-actions { display: flex; align-items: center; gap: 4px; }
+/* 消息尾部来源引用区（正文 [标题](URL) 引用的去重清单） */
+.msg-sources {
+  margin-top: 10px; padding: 8px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-md); background: var(--ui-surface);
+}
+.msg-sources-label {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 12px; color: var(--ui-muted); margin-bottom: 4px;
+}
+.msg-sources-list { margin: 0; padding-inline-start: 18px; display: flex; flex-direction: column; gap: 2px; }
+.msg-sources-list li { font-size: 12px; line-height: 1.6; }
+.msg-sources-list a { color: var(--ui-secondary); text-decoration: none; overflow-wrap: anywhere; }
+.msg-sources-list a:hover { color: var(--ui-accent); text-decoration: underline; }
 .trace-link {
   display: inline-flex; align-items: center; min-height: 30px; gap: 6px; padding: 0 8px;
   border: 0; border-radius: var(--ui-radius-sm); color: var(--ui-secondary); background: transparent; font-size: 12px; cursor: pointer;

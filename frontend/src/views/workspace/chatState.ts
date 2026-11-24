@@ -91,6 +91,9 @@ export function useWorkspaceState() {
     localStorage.getItem('approval_mode') === 'auto' ? 'auto' : 'manual',
   )
   watch(approvalMode, (v) => localStorage.setItem('approval_mode', v))
+  /** 联网检索开关：关闭后本次 Run 禁用网络检索工具（web_enabled=false） */
+  const webSearchOn = ref(localStorage.getItem('web_search') !== 'off')
+  watch(webSearchOn, (v) => localStorage.setItem('web_search', v ? 'on' : 'off'))
   const modelOptions = ref<Array<{ id: number; name: string; display_name?: string | null }>>([])
   const selectedModelId = ref<number>(0)
   /** 当前对话使用的助手：固定为 bootstrap 下发的默认助手（不再提供助手管理入口） */
@@ -285,7 +288,7 @@ export function useWorkspaceState() {
     activeRuns, historyStreams, pendingDecisions, runningConvIds, inactive,
     setActiveRun, clearActiveRun, streaming, historyRun, blockedReason,
     inputText, sending, repairingProject, projectRepairErrors, projectRepairKeys, uploading,
-    approvalMode, modelOptions, selectedModelId, currentAssistant, clock,
+    approvalMode, webSearchOn, modelOptions, selectedModelId, currentAssistant, clock,
     authStore, draftTeamMode, rememberedTeamModes, teamPreferenceKey, rememberTeamMode, teamMode,
     composer, historyToggle, historyMedia, historyOpen, historyLoading, historyFailed,
     historyLoadingMore, historyTotal, historyLoadedPages, historyPageSize, hasMoreConversations,

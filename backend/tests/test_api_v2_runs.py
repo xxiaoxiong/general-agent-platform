@@ -34,6 +34,21 @@ class TestEventProtocol:
         assert ev["data"]["summary"]
         assert ev["timestamp"].endswith("Z")
 
+    def test_tool_completed_carries_sources(self):
+        from app.services.agent_runtime.event_protocol import to_v2_event
+
+        ev = to_v2_event(
+            run_id="r1", sequence=8, event_type="tool_completed",
+            payload={"tool": "web_search", "tool_call_id": "c1", "output": "…",
+                     "sources": [{"id": 1, "title": "T", "url": "https://example.com/a", "desc": ""}]},
+        )
+        assert ev["event"] == "tool.completed"
+        assert ev["data"]["sources"][0]["url"] == "https://example.com/a"
+
+        plain = to_v2_event(run_id="r1", sequence=9, event_type="tool_completed",
+                            payload={"tool": "calculator", "tool_call_id": "c2", "output": "42"})
+        assert "sources" not in plain["data"]
+
     def test_terminal_events(self):
         from app.services.agent_runtime.event_protocol import is_terminal, to_v2_event
 
@@ -915,3 +930,92 @@ class TestRunsAPIv2:
         delivery = next(event["data"] for event in events if event["event"] == "project.delivery")
         assert delivery["state"] == "passed" and delivery["download_url"] != draft["download_url"]
         assert client.get(draft["download_url"], headers=headers).content == original_bytes
+
+
+# ── 联网检索集成（SearXNG 集成 + web_enabled 开关）────────────────────────────
+
+
+class TestWebRetrievalToggle:
+    def _assistant(self, client, headers, name):
+        resp = client.post("/api/v2/assistants", headers=headers, json={
+            "name": name, "capability_ids": ["general", "web_research"],
+        })
+        assert resp.status_code in (200, 201), resp.text
+        return resp.json()
+
+    def test_web_search_sources_flow_through_events(self, client, user_setup, monkeypatch):
+        """web_search 结构化来源随 tool.completed 事件透传到 v2 事件流。"""
+        import app.services.tools as tools_pkg
+        from app.services.tools.result import ToolResult
+
+        async def fake_web_search(params):
+            return ToolResult.succeeded(
+                "搜索结果:\n1. **来源A**\n   🔗 [来源A](https://example.com/a)\n",
+                metadata={"sources": [{"id": 1, "title": "来源A", "url": "https://example.com/a", "desc": "摘要"}],
+                          "engine": "SearXNG"},
+            )
+
+        monkeypatch.setitem(tools_pkg._ASYNC_HANDLERS, "web_search", fake_web_search)
+
+        def call(name, args, identifier):
+            return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": identifier}])
+
+        _patch_model(monkeypatch, [
+            call("web_search", {"query": "测试检索"}, "s1"),
+            AIMessage(content="根据 [来源A](https://example.com/a) 的报道，结论成立。"),
+        ])
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        assistant = self._assistant(client, headers, "联网检索冒烟")
+        started = client.post("/api/v2/runs", headers=headers, json={
+            "message": "联网调研一下测试检索的情况，引用来源。", "assistant_id": assistant["id"],
+            "web_enabled": True, "use_memory": False,
+        }).json()
+        assert _wait_run(client, started["run_id"], owner)["status"] == "completed"
+        events = _iter_v2_sse(client.get(started["events_url"], headers=headers))
+        completed = [e["data"] for e in events
+                     if e["event"] == "tool.completed" and e["data"]["tool_name"] == "web_search"]
+        assert completed, "web_search 应执行并产生 tool.completed"
+        assert completed[0]["sources"][0]["url"] == "https://example.com/a"
+
+    def test_web_disabled_blocks_web_search_and_snapshots_toggle(self, client, user_setup, monkeypatch):
+        """web_enabled=false：网络检索工具 fail-closed 收窄，且开关落入 Run 配置快照。"""
+        import os
+
+        import app.services.tools as tools_pkg
+        from sqlalchemy import text
+
+        called = []
+
+        async def fake_web_search(params):
+            called.append(params)
+            return "不应执行"
+
+        monkeypatch.setitem(tools_pkg._ASYNC_HANDLERS, "web_search", fake_web_search)
+
+        def call(name, args, identifier):
+            return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": identifier}])
+
+        _patch_model(monkeypatch, [
+            call("web_search", {"query": "不该执行"}, "s2"),
+            AIMessage(content="未联网，直接作答。"),
+        ])
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        assistant = self._assistant(client, headers, "联网关闭冒烟")
+        started = client.post("/api/v2/runs", headers=headers, json={
+            "message": "随便问个问题。", "assistant_id": assistant["id"],
+            "web_enabled": False, "use_memory": False,
+        }).json()
+        # 状态不作断言：越权工具调用被内核拒绝后自行收尾（failed 亦可）
+        _wait_run(client, started["run_id"], owner)
+        assert called == [], "web_enabled=false 时 web_search 不得执行（fail-closed）"
+        engine = create_engine(os.environ["DATABASE_SYNC_URL"])
+        with Session(engine) as s:
+            snapshot = s.execute(
+                text("SELECT agent_config_snapshot FROM agent_runs WHERE id = :id"),
+                {"id": started["run_id"]},
+            ).scalar_one()
+        if isinstance(snapshot, str):
+            snapshot = json.loads(snapshot)
+        assert snapshot.get("web_enabled") is False

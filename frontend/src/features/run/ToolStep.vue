@@ -39,6 +39,18 @@
         <div class="detail-label">入参</div>
         <pre class="detail-pre">{{ inputText }}</pre>
       </div>
+      <div v-if="tool.sources?.length" class="detail-block">
+        <div class="detail-label">来源（{{ tool.sources.length }}）</div>
+        <ul class="source-list">
+          <li v-for="s in tool.sources" :key="s.id" class="source-item">
+            <a class="source-link" :href="s.url" target="_blank" rel="noopener noreferrer" :title="s.url">
+              <span class="source-id">{{ s.id }}</span>
+              <span class="source-title">{{ s.title || s.url }}</span>
+              <span class="source-host">{{ hostOf(s.url) }}</span>
+            </a>
+          </li>
+        </ul>
+      </div>
       <div v-if="tool.error" class="detail-block">
         <div class="detail-label detail-label-err">错误</div>
         <pre class="detail-pre detail-pre-err">{{ tool.error }}</pre>
@@ -108,6 +120,11 @@ function toDetailText(value: any, limit = 600): string {
 
 const inputText = computed(() => toDetailText(props.tool.input))
 const outputText = computed(() => toDetailText(props.tool.output))
+
+/** 来源链接的主机名（来源卡片行内展示） */
+function hostOf(url: string): string {
+  try { return new URL(url).hostname } catch { return '' }
+}
 const durationText = computed(() => {
   const ms = props.tool.durationMs || 0
   return ms > 0 ? `${(ms / 1000).toFixed(1)}s` : ''
@@ -184,4 +201,18 @@ const diffStat = computed(() => {
 .detail-pre { margin: 0; line-height: 1.5; max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 .detail-label-err, .detail-pre-err { color: var(--ui-danger); }
 .detail-pre-err { background: var(--ui-danger-soft); }
+.source-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.source-link {
+  display: flex; align-items: baseline; gap: 6px; min-width: 0;
+  padding: 3px 7px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-bg); color: var(--ui-secondary); text-decoration: none; font-size: 12px;
+}
+.source-link:hover { color: var(--ui-accent); border-color: var(--ui-accent); }
+.source-id {
+  flex: none; min-width: 16px; text-align: center;
+  background: var(--ui-accent-soft); color: var(--ui-accent); border-radius: var(--ui-radius-sm);
+  font-family: var(--ui-font-mono); font-size: 11px;
+}
+.source-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.source-host { margin-inline-start: auto; flex: none; color: var(--ui-muted); font-family: var(--ui-font-mono); font-size: 11px; }
 </style>

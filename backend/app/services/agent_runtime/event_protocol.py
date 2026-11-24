@@ -87,6 +87,9 @@ def _reshape_data(name: str, event_type: str, payload: Dict[str, Any]) -> Dict[s
         }
         if name == "tool.completed":
             data["output"] = payload.get("output")
+            if payload.get("sources"):
+                # 结构化来源（如 web_search 的搜索结果清单）
+                data["sources"] = payload.get("sources")
         else:
             data["error"] = payload.get("error")
         if payload.get("replay"):

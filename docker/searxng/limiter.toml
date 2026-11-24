@@ -1,0 +1,46 @@
+# SearXNG 限流 / 反爬配置（[botdetection]），取自官方镜像内置默认 limiter.toml。
+# 私有内网部署：容器不映射宿主机端口，仅 Backend 可达；如后续挂在反向代理后，
+# 请把代理网段加入 trusted_proxies 以便正确提取客户端 IP。
+# 参考：https://docs.searxng.org/admin/searx.botdetection.html
+
+[botdetection]
+
+# 判定客户端是否属于同一网段时比较的地址前缀位数
+ipv4_prefix = 32
+ipv6_prefix = 48
+
+# 若请求 IP 在 trusted_proxies 内，则从 X-Forwarded-For / X-Real-IP 提取真实客户端 IP。
+# 当前部署无反向代理，留空即直接使用对端 IP（挂反向代理后再填代理网段）。
+trusted_proxies = [
+  # '127.0.0.0/8',
+  # '::1',
+  # '172.16.0.0/12',   # Docker 网桥网段（挂在反向代理后时再启用）
+]
+
+[botdetection.ip_limit]
+
+# 本地网络默认不限流 link-local 地址
+filter_link_local = false
+
+# 是否启用 ip_limit 的 link_token 校验
+link_token = false
+
+[botdetection.ip_lists]
+
+# ip_lists 优先级最高：pass_ip 内的 IP 不限流，也不做 bot 特征检查。
+# 注意：ip_limit 对 JSON API 请求有 4 次/小时/IP 的硬上限（API_MAX，公开实例防滥用），
+# 会直接打断 Backend 的 web_search 调用；故放行全部内网网段（容器网络 + 本机回环），
+# 限流仅对将来可能接入的公网来源生效。
+block_ip = [
+]
+
+pass_ip = [
+  '127.0.0.0/8',     # 本机回环（健康检查等）
+  '::1',
+  '10.0.0.0/8',      # RFC1918 内网（Docker 网桥/自定义网络）
+  '172.16.0.0/12',
+  '192.168.0.0/16',
+]
+
+# 放行 SearXNG 官方组织的固定 IP（如 check.searx.space）
+pass_searxng_org = true

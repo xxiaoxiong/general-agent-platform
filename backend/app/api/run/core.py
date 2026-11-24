@@ -100,6 +100,10 @@ async def create_run(
     agent_config["approval_mode"] = (
         body.approval_mode if body.approval_mode in ("manual", "auto") else "manual"
     )
+    # 联网检索开关：随 Run 创建写入快照（false=收窄禁用网络检索工具；None=跟随能力包），
+    # 崩溃恢复/断点续跑后仍保持原开关状态
+    if body.web_enabled is not None:
+        agent_config["web_enabled"] = bool(body.web_enabled)
     # ensure_version 可能写入 agent_versions（flush 持写锁）：先提交释放，
     # 避免与 start_run_with_session 的独立会话写入互相阻塞（SQLite 必需）
     await db.commit()

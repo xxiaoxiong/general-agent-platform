@@ -323,6 +323,7 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
     const sentFiles = continueTask ? [] : st.attachments.value.map((a) => ({ ...a }))
     const sentModelId = st.selectedModelId.value
     const sentMode = st.approvalMode.value
+    const sentWebEnabled = st.webSearchOn.value
     const sentTeamMode = !continueTask && st.teamMode.value
     const sentTask = continueTask ? { mode: 'chat' as const } : { ...st.documentTask.value }
 
@@ -350,6 +351,7 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
         conversation_id: convId,
         assistant_id: st.currentAssistant.value?.id,
         approval_mode: sentMode,
+        web_enabled: sentWebEnabled,
         model_config_id: sentModelId || undefined,
         ...(sentTeamMode ? { team_mode: true } : {}),
         attachments: sentFiles,

@@ -11,14 +11,19 @@
   链接: [链接文字](https://URL)
 """
 import json
+import logging
 import re
 from typing import Dict, Any, List
+from urllib.parse import urlsplit, urlunsplit
 
 from app.core.config import settings
 
 from .result import ToolResult
 
 import httpx
+
+
+logger = logging.getLogger(__name__)
 
 
 _HEADERS = {
@@ -138,6 +143,44 @@ def _format_search_results(query: str, results: List[Dict], engine: str) -> str:
     return "\n".join(lines)
 
 
+def _normalize_url(url: str) -> str:
+    """URL 规范化用于去重：主机小写、去 fragment、去尾部斜杠"""
+    try:
+        parts = urlsplit((url or "").strip())
+    except ValueError:
+        return url or ""
+    path = parts.path.rstrip("/") or "/"
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, parts.query, ""))
+
+
+def _dedup_results(results: List[Dict], max_results: int) -> List[Dict]:
+    """按规范化 URL 去重并截断到 max_results"""
+    seen = set()
+    out: List[Dict] = []
+    for r in results:
+        key = _normalize_url(r.get("url", ""))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+        if len(out) >= max_results:
+            break
+    return out
+
+
+def _query_language(query: str) -> str:
+    """按查询字符集路由搜索语言：含 CJK 用 zh-CN，否则 en（英文结果质量更好）"""
+    return "zh-CN" if re.search(r"[\u4e00-\u9fff]", query or "") else "en"
+
+
+def _build_sources(results: List[Dict]) -> List[Dict[str, Any]]:
+    """结构化来源清单（metadata 旁路通道，供 SSE 事件/前端引用卡片使用）"""
+    return [
+        {"id": i, "title": r.get("title", ""), "url": r.get("url", ""), "desc": r.get("desc", "")}
+        for i, r in enumerate(results, 1)
+    ]
+
+
 def _parse_duckduckgo_html(html: str, max_results: int) -> List[Dict[str, str]]:
     """从 DuckDuckGo HTML Lite 解析搜索结果"""
     results = []
@@ -218,7 +261,7 @@ async def _enhance_results_with_content(
     return results
 
 
-async def execute_web_search(params: dict) -> str:
+async def execute_web_search(params: dict) -> Any:
     from app.core.config import settings
 
     query       = params.get("query", "")
@@ -235,33 +278,50 @@ async def execute_web_search(params: dict) -> str:
         searxng_url = settings.SEARXNG_URL
         if not found_results and searxng_url and engine in ("auto", "searxng"):
             try:
-                resp = await client.get(
-                    f"{searxng_url.rstrip('/')}/search",
-                    params={"q": query, "format": "json", "language": "zh-CN"},
-                    headers=_HEADERS,
-                )
+                # 内网 SearXNG 直连，不走统一出口代理（AGENT_EGRESS_PROXY），避免代理无法直达容器网络
+                async with httpx.AsyncClient(
+                    timeout=timeout,
+                    verify=(settings.AGENT_CA_BUNDLE or settings.AGENT_TLS_VERIFY),
+                    follow_redirects=True,
+                ) as searxng_client:
+                    resp = await searxng_client.get(
+                        f"{searxng_url.rstrip('/')}/search",
+                        params={"q": query, "format": "json", "language": _query_language(query)},
+                        headers=_HEADERS,
+                    )
                 if resp.status_code == 200:
-                    data = resp.json()
-                    results = []
-                    for item in (data.get("results") or [])[:max_results]:
-                        results.append({
-                            "title": item.get("title", ""),
-                            "url": item.get("url", ""),
-                            "desc": (item.get("content") or "")[:200],
-                        })
-                    if results:
-                        found_results = results
-                        found_engine = "SearXNG"
+                    try:
+                        data = resp.json()
+                    except ValueError:
+                        errors.append("SearXNG: 响应不是有效 JSON（可能 JSON 格式未启用）")
+                        logger.warning("SearXNG 搜索 '%s' 响应不是有效 JSON（可能 JSON 格式未启用）", query)
                     else:
-                        errors.append("SearXNG: 返回 0 条结果")
+                        results = []
+                        for item in (data.get("results") or [])[:max_results]:
+                            results.append({
+                                "title": item.get("title", ""),
+                                "url": item.get("url", ""),
+                                "desc": (item.get("content") or "")[:200],
+                            })
+                        if results:
+                            found_results = results
+                            found_engine = "SearXNG"
+                        else:
+                            errors.append("SearXNG: 返回 0 条结果")
+                            logger.warning("SearXNG 搜索 '%s' 返回 0 条结果", query)
                 else:
-                    errors.append(f"SearXNG: HTTP {resp.status_code}")
+                    hint = "（HTTP 403 常见于 JSON 格式未启用，检查 search.formats 是否包含 json）" if resp.status_code == 403 else ""
+                    errors.append(f"SearXNG: HTTP {resp.status_code}{hint}")
+                    logger.warning("SearXNG 搜索 '%s' 返回 HTTP %s%s", query, resp.status_code, hint)
             except httpx.ConnectError:
                 errors.append(f"SearXNG: 连接失败（{searxng_url}）")
+                logger.warning("SearXNG 连接失败（%s）", searxng_url)
             except httpx.TimeoutException:
                 errors.append("SearXNG: 请求超时")
+                logger.warning("SearXNG 请求超时（%s，timeout=%ss）", searxng_url, timeout)
             except Exception as e:
                 errors.append(f"SearXNG: {type(e).__name__}: {e}")
+                logger.warning("SearXNG 调用异常: %s", e)
 
         # 引擎 1：DuckDuckGo HTML Lite（POST 方式，最低反爬虫）
         if not found_results and engine in ("auto", "duckduckgo"):
@@ -335,11 +395,16 @@ async def execute_web_search(params: dict) -> str:
 
         # ★ 搜索成功后自动拓展：拨取前 N 条结果的页面正文
         if found_results:
+            found_results = _dedup_results(found_results, max_results)
             try:
                 found_results = await _enhance_results_with_content(client, found_results)
             except Exception:
                 pass  # 内容拓展失败不影响主流程
-            return _format_search_results(query, found_results, found_engine)
+            # 文本契约保持不变；结构化来源走 metadata 旁路（SSE 事件/前端引用卡片）
+            return ToolResult.succeeded(
+                _format_search_results(query, found_results, found_engine),
+                metadata={"sources": _build_sources(found_results), "engine": found_engine},
+            )
 
     # 所有引擎均失败，返回详细错误信息
     error_detail = "; ".join(errors) if errors else "网络不可达"

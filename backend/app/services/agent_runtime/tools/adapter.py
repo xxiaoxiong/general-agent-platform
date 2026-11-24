@@ -484,10 +484,14 @@ class ToolAdapterFactory:
                     result_payload=text[:_RESULT_PAYLOAD_LIMIT],
                     external_operation_id=tr.external_operation_id,
                 )
+                event_data = {"tool": name, "tool_call_id": tool_call_id, "output": text[:2000]}
+                if tr.metadata.get("sources"):
+                    # 结构化来源（如 web_search）：随事件透传，供前端引用卡片/来源区使用
+                    event_data["sources"] = tr.metadata["sources"]
                 await self.bus.publish(RuntimeEvent(
                     type=TOOL_COMPLETED,
                     run_id=self.ctx.run_id,
-                    data={"tool": name, "tool_call_id": tool_call_id, "output": text[:2000]},
+                    data=event_data,
                 ))
                 telemetry.record_tool(
                     self.ctx.to_log_fields(), tool=name, status="completed",

@@ -69,6 +69,15 @@
             <UsersRound :size="16" aria-hidden="true" /><span>团队</span>
             <span class="team-indicator" aria-hidden="true"></span>
           </button>
+          <button
+            type="button" class="selector team-switch" role="switch" aria-label="联网检索"
+            :aria-checked="webEnabled" :disabled="locked || sending"
+            :title="webEnabled ? '关闭后本次对话不再联网检索' : '开启后允许智能体联网搜索与抓取网页'"
+            @click="webEnabled = !webEnabled"
+          >
+            <Globe :size="16" aria-hidden="true" /><span>联网</span>
+            <span class="team-indicator" aria-hidden="true"></span>
+          </button>
           <DropdownMenuRoot>
             <DropdownMenuTrigger as-child>
               <button type="button" class="selector" aria-label="审批模式">
@@ -139,7 +148,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { ArrowUp, Check, ChevronDown, CircleAlert, CircleCheck, Cpu, FileText, LoaderCircle, Mic, Paperclip, ShieldCheck, Square, UsersRound, X } from '@lucide/vue'
+import { ArrowUp, Check, ChevronDown, CircleAlert, CircleCheck, Cpu, FileText, Globe, LoaderCircle, Mic, Paperclip, ShieldCheck, Square, UsersRound, X } from '@lucide/vue'
 import {
   DropdownMenuContent, DropdownMenuItemIndicator, DropdownMenuPortal, DropdownMenuRadioGroup,
   DropdownMenuRadioItem, DropdownMenuRoot, DropdownMenuTrigger,
@@ -169,6 +178,7 @@ const emit = defineEmits<{
 const text = defineModel<string>('text', { required: true })
 const teamMode = defineModel<boolean>('teamMode', { required: true })
 const approvalMode = defineModel<'manual' | 'auto'>('approvalMode', { required: true })
+const webEnabled = defineModel<boolean>('webEnabled', { required: true })
 const selectedModel = defineModel<number>('model', { required: true })
 const modelId = computed({
   get: () => String(selectedModel.value),

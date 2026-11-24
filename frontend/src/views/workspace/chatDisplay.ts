@@ -73,6 +73,24 @@ export function answerText(message: ChatMessage) {
   return message.blocks.flatMap((block) => block.kind === 'text' ? [block.text] : []).join('\n\n')
 }
 
+/** 消息来源引用区：从正文 markdown 链接提取去重后的外链来源（客观展示，不改写正文） */
+export function messageSources(message: ChatMessage): Array<{ title: string; url: string }> {
+  const out: Array<{ title: string; url: string }> = []
+  const seen = new Set<string>()
+  const linkRe = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g
+  for (const block of message.blocks) {
+    if (block.kind !== 'text') continue
+    let match: RegExpExecArray | null
+    while ((match = linkRe.exec(block.text))) {
+      const url = match[2]
+      if (seen.has(url)) continue
+      seen.add(url)
+      out.push({ title: match[1].trim() || url, url })
+    }
+  }
+  return out
+}
+
 /** 任务耗时（对齐 Trae「任务耗时 7m 4s」） */
 export function formatDuration(ms: number): string {
   const s = Math.round(ms / 1000)

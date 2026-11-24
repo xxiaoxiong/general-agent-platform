@@ -40,6 +40,14 @@ export interface VerificationBlock {
   stopReason: string
 }
 
+/** 搜索结果结构化来源（web_search 工具随 tool.completed 事件透传） */
+export interface ToolSource {
+  id: number
+  title: string
+  url: string
+  desc?: string
+}
+
 export interface ToolBlock {
   kind: 'tool'
   key: string
@@ -53,6 +61,8 @@ export interface ToolBlock {
   durationMs?: number
   /** 文件类工具的完整工作区路径（read/write/edit），点击行内文件名打开右侧预览 */
   filePath?: string
+  /** 结构化来源清单（如 web_search 搜索结果），供来源卡片展示 */
+  sources?: ToolSource[]
 }
 
 export interface DocumentArtifactBlock {
@@ -419,7 +429,13 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
         blk.state = failed ? 'failed' : 'done'
       }
       if (failed) blk.error = String(data.error || '')
-      else blk.output = data.output
+      else {
+        blk.output = data.output
+        if (Array.isArray(data.sources)) {
+          // 结构化来源（如 web_search）：供来源卡片展示
+          blk.sources = data.sources.filter((s: any) => s && typeof s.url === 'string')
+        }
+      }
       if (blk.startedAt) {
         const end = Date.parse(ev.timestamp) || Date.now()
         if (end >= blk.startedAt) blk.durationMs = end - blk.startedAt

@@ -124,6 +124,12 @@ class ConfigMixin:
             spec = get_tool_by_name(name)
             if spec:
                 specs.append(spec)
+        if agent_config.get("web_enabled") is False:
+            # 联网检索开关（收窄语义）：本次 Run 禁用网络检索工具，
+            # 子代理工具集与 policy 同步收窄（子代理工具 ∩ 允许集）
+            from app.services.tools import WEB_RETRIEVAL_TOOLS
+
+            specs = [s for s in specs if s["name"] not in WEB_RETRIEVAL_TOOLS]
         # MCP 工具面（装配期写入，见 _load_mcp_runtime）：与内置工具同口径进入
         # 工具面/事件桥接/授权集合
         specs.extend(agent_config.get("mcp_tool_specs") or [])
