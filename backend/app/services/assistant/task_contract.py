@@ -57,6 +57,7 @@ _FILE_NAME = re.compile(r"(?<![\w.@/-])(?:/workspace/)?((?:[\w-][\w.-]*/)*[\w-][
 _FORMATS = {"markdown": "md", "excel": "xlsx", "word": "docx", "powerpoint": "pptx"}
 _FORMAT = re.compile(r"\b(markdown|excel|word|powerpoint|md|txt|json|csv|tsv|xlsx|docx|pdf|pptx|zip)\b", re.I)
 _RESEARCH = re.compile(r"调研|研究.{0,25}(?:趋势|市场|行业|竞品|进展|现状|证据)|(?:交叉)?(?:核实|核验|核对|查证).{0,20}(?:资料|来源|事实)|\b(?:research|fact[- ]check)\b", re.I)
+_NO_WEB = re.compile(r"不要联网|无需联网|不用联网|禁止联网|不能联网|不要搜索|无需搜索|不用搜索|离线", re.I)
 _DATABASE = re.compile(r"(?:查询|核对|统计|分析).{0,24}(?:数据库|数据表)|从.{0,12}(?:数据库|数据表).{0,18}(?:查|取|读)|\bquery (?:the |a )?database\b", re.I)
 _EXTERNAL_ACTION = re.compile(r"(?:发送|发出|代发).{0,20}(?:邮件|通知|webhook)|\b(?:send (?:an? |the )?e-?mail|invoke (?:a |the )?webhook)\b", re.I)
 _DEPTH = re.compile(r"深入|深度|全面|端到端|交叉验证|逐项|分阶段|多阶段|\b(?:in.depth|end.to.end|comprehensive|cross.check)\b", re.I)
@@ -207,6 +208,7 @@ def build_task_contract(
     capability_ids: Optional[Sequence[str]] = None,
     tool_names: Optional[Sequence[str]] = None,
     goal_limit: int = 200,
+    web_searchable: bool = True,
 ) -> TaskContract:
     """用户目标 → 结构化任务契约（确定性，不调用模型）。"""
     request = (user_input or "").split("\n\n[附件]", 1)[0].split("\n\n[参考文档]", 1)[0].strip()
@@ -261,6 +263,10 @@ def build_task_contract(
             chinese = {key: index for index, key in enumerate("零一二三四五六七八九十")}
             source_count = int(value) if value.isdigit() else chinese.get(value, 2)
         checks.append("citations_present")
+        # 网络调研任务必须有真实检索证据（工具账本），防止凭模型记忆编造调研结论。
+        # 用户明确禁网（"不要联网"等）或本次 Run 禁用网络检索时不强加该义务。
+        if web_searchable and not _NO_WEB.search(request):
+            checks.append("web_evidence")
     if not (advisory or text_only) and _DATABASE.search(request):
         checks.append("db_evidence")
     if not (advisory or text_only) and _EXTERNAL_ACTION.search(request):

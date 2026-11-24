@@ -8,6 +8,7 @@
 验证依据是执行证据（工具账本 + 最终文本），全部确定性可测试：
 - answer_present       最终回答非空（模型自评不算证据）
 - citations_present    研究任务：回答/工具输出含来源 URL
+- web_evidence         研究任务：工具账本有成功网络检索记录（硬门槛，防凭记忆编造）
 - artifact_produced    文档任务：写文件工具成功执行
 - computation_evidence 数据任务：计算/统计工具被执行或回答含数值结论
 - db_evidence          数据库任务：db 工具成功执行
@@ -209,6 +210,23 @@ def _check_db_evidence(_final_text: str, evidence: Sequence[ToolEvidence]) -> Ch
     return CheckResult("db_evidence", False, "数据库任务未成功执行任何数据库查询")
 
 
+def _check_web_evidence(_final_text: str, evidence: Sequence[ToolEvidence], contract: TaskContract) -> CheckResult:
+    """研究任务必须有真实检索证据（工具账本），杜绝凭模型记忆编造调研结论。
+
+    用户已提供来源资料（supplied_urls）时豁免：其来源义务由 citations_present
+    按"已读取或由用户提供"口径核对。
+    """
+    succeeded = [e for e in evidence if e.tool_name in _WEB_TOOLS and e.status == "succeeded"]
+    if succeeded:
+        return CheckResult("web_evidence", True, f"已执行 {len(succeeded)} 次网络检索/抓取")
+    if contract.supplied_urls:
+        return CheckResult("web_evidence", True, "来源由用户提供，未另行执行网络检索")
+    attempted = [e for e in evidence if e.tool_name in _WEB_TOOLS]
+    if attempted:
+        return CheckResult("web_evidence", False, "网络检索/抓取均未成功，调研结论缺少可核验来源，请重试检索或如实说明无法联网核实")
+    return CheckResult("web_evidence", False, "调研任务未执行任何网络检索，不能仅凭模型记忆输出调研结论，请先用 web_search 检索再作答")
+
+
 def _check_exec_evidence(_final_text: str, evidence: Sequence[ToolEvidence]) -> CheckResult:
     if _has_success(evidence, _EXEC_TOOLS | _WRITE_TOOLS):
         return CheckResult("exec_evidence", True, "")
@@ -255,6 +273,8 @@ def verify_task(
     for cid in contract.completion_checks:
         if cid == "citations_present":
             checks.append(_check_citations_present(final_text, evidence, contract))
+        elif cid == "web_evidence":
+            checks.append(_check_web_evidence(final_text, evidence, contract))
         elif cid == "artifact_produced":
             checks.append(_check_artifact_produced(evidence, contract))
         elif cid == "table_facts" and contract.table_facts:
@@ -275,15 +295,22 @@ def verify_task(
     checks.extend(execution_checks)
 
     answer = next((c for c in checks if c.id == "answer_present"), None)
+    web = next((c for c in checks if c.id == "web_evidence"), None)
     failed = [c for c in checks if not c.passed]
 
     if answer is not None and not answer.passed:
         status = STATUS_FAILED
+    elif web is not None and not web.passed:
+        # 硬门槛：研究任务没有真实检索证据不得交付（防止凭记忆编造调研结论）
+        status = STATUS_FAILED
     elif not failed:
         status = STATUS_PASSED
-    elif len(failed) * 2 >= len(checks):
-        status = STATUS_FAILED
     else:
-        status = STATUS_PARTIAL
+        # web_evidence 是门槛项：通过后不计入通过率分母，避免稀释其余检查缺口的严重度
+        ratio = [c for c in checks if c.id != "web_evidence" or not c.passed]
+        if len(failed) * 2 >= len(ratio):
+            status = STATUS_FAILED
+        else:
+            status = STATUS_PARTIAL
 
     return VerificationResult(status=status, task_type=contract.task_type, checks=checks)

@@ -135,6 +135,8 @@ def _format_search_results(query: str, results: List[Dict], engine: str) -> str:
     lines = [f"搜索结果（{query}，来源: {engine}）:\n"]
     for i, r in enumerate(results, 1):
         lines.append(f"{i}. **{r['title']}**")
+        if r.get("published"):
+            lines.append(f"   📅 发布时间: {r['published']}")
         if r.get("desc"):
             lines.append(f"   {r['desc']}")
         if r.get("page_content"):
@@ -176,7 +178,8 @@ def _query_language(query: str) -> str:
 def _build_sources(results: List[Dict]) -> List[Dict[str, Any]]:
     """结构化来源清单（metadata 旁路通道，供 SSE 事件/前端引用卡片使用）"""
     return [
-        {"id": i, "title": r.get("title", ""), "url": r.get("url", ""), "desc": r.get("desc", "")}
+        {"id": i, "title": r.get("title", ""), "url": r.get("url", ""), "desc": r.get("desc", ""),
+         "published": r.get("published", "")}
         for i, r in enumerate(results, 1)
     ]
 
@@ -302,6 +305,8 @@ async def execute_web_search(params: dict) -> Any:
                                 "title": item.get("title", ""),
                                 "url": item.get("url", ""),
                                 "desc": (item.get("content") or "")[:200],
+                                # 发布时间：时效性判断的关键信号（防止拿旧资料当现状）
+                                "published": str(item.get("publishedDate") or "")[:32],
                             })
                         if results:
                             found_results = results

@@ -21,6 +21,7 @@ from app.models.agent import AgentToolExecution
 from app.observability.langfuse_tracing import platform_span
 from app.observability.metrics import observe_document_stage, record_document_validation
 from app.services.mcp.registry import parse_mcp_tool_name
+from app.services.agent_runtime.task_router import references_prior_content
 
 from . import repository, storage
 from .editor import DocumentPatchError, apply_patch, diff_drafts
@@ -302,7 +303,8 @@ class DocumentWorkflow:
                                      content=request))
         if task == "document_generate":
             excerpt = context.get("draft") or ""
-            if not excerpt and re.search(r"上[面文一条]|刚才|前[文面]|上述|这[些段]内容", request):
+            # 兼容未经过 document_turn 的调用方：指代前文（调研结果/讨论过的内容等）时补注入正文
+            if not excerpt and references_prior_content(request):
                 excerpt = next((str(item.get("content") or "") for item in reversed(state["messages"])
                                 if item.get("role") == "assistant" and item.get("content")), "")[:24_000]
             if excerpt:
@@ -366,7 +368,9 @@ class DocumentWorkflow:
             "为本次生成建立一次性的文档结构。仅提取实质上必要的输入字段与章节目次。"
             "usage=structure_template 的资料是版式与结构模板，不是目标产品的事实资料。"
             "根据最初业务主题和后续修订组织章节。标题应体现业务主题，交付方式或'下载文档'不得用作文档标题。"
-            "文章结构须满足用户要求，不创建永久规范，不从样例推断当前项目事实。",
+            "文章结构须满足用户要求，不创建永久规范，不从样例推断当前项目事实。"
+            "materials 已含对话前文或完整正文时，按既有正文结构组织章节，"
+            "不得把正文已覆盖的信息设为需用户补充的必填字段。",
             {"request": _generation_request(state), "materials": state["sources"]}, ProfileDefinition)
         return {"profile": result.model_dump(mode="json")}
 
@@ -444,6 +448,7 @@ class DocumentWorkflow:
         result = await model_json(self.context, config, "identify_missing",
             "整理可核实的字段值和业务标题，标题不得仅表示下载或文件格式。field_values 的键只使用规范中的字段 ID，日期必须是 YYYY-MM-DD。"
             "模板资料只用作结构。优先使用用户本轮明确更正和之前提交的有效字段。"
+            "对话前文已覆盖的内容必须填入 field_values，不得重复向用户索要。"
             "真实任务中无法证实的字段省略。明确授权的测试样例可按示例填充，并在成稿中注明。"
             "additional_required_inputs 只声明用户明确需要但资料与规范字段均未覆盖的业务事实。",
             {"request": _generation_request(state), "profile": profile.model_dump(mode="json"), "sources": state["sources"],

@@ -327,6 +327,48 @@ class TestToolAdapter:
         ev3 = await bus._queue.get()
         assert ev3.type == TOOL_FAILED
 
+    @pytest.mark.asyncio
+    async def test_consecutive_failure_circuit_breaker(self, monkeypatch):
+        """同工具连续失败（参数各不相同）触发熔断，防止误用死循环（143 实录：
+        拿 calculator 跑 shell 代码失败 40+ 次烧 12 分钟）。任一次成功即清零。"""
+        from app.core.config import settings
+        from app.services.agent_runtime.events import EventBus
+        from app.services.agent_runtime.tools.adapter import ToolAdapterFactory
+
+        monkeypatch.setattr(settings, "AGENT_TOOL_MAX_CONSECUTIVE_FAILURES", 3, raising=False)
+        monkeypatch.setattr(settings, "AGENT_TOOL_MAX_RETRIES", 0, raising=False)
+
+        bus = EventBus()
+        ctx = await make_db_ctx()
+        factory = ToolAdapterFactory(ctx, ToolPolicy(allowed_tools={"calculator"}), bus)
+        spec = {
+            "name": "calculator", "description": "计算",
+            "parameters": {"expression": {"type": "string", "description": ""}}, "required": ["expression"],
+        }
+        tools = factory.build([spec])
+        calc = tools[0]
+
+        # 参数各不相同的连续失败（模拟误用 calculator 执行 shell 代码）
+        for i in range(3):
+            ret = await calc.ainvoke({"type": "tool_call", "name": "calculator",
+                                      "args": {"expression": f"import subprocess; subprocess.run(['ls', '{i}'])"},
+                                      "id": f"call-f{i}"})
+            content = ret.content if isinstance(ret, ToolMessage) else ret
+            assert "错误" in content or "计算" in content
+        # 熔断：不再执行，直接返回明确的熔断提示
+        ret = await calc.ainvoke({"type": "tool_call", "name": "calculator",
+                                  "args": {"expression": "import os"}, "id": "call-f3"})
+        content = ret.content if isinstance(ret, ToolMessage) else ret
+        assert "熔断" in content
+
+        # 成功清零：换一个新工具实例路径——先手动清零验证成功后重新计数
+        factory._consecutive_failures.pop("calculator", None)
+        ret = await calc.ainvoke({"type": "tool_call", "name": "calculator",
+                                  "args": {"expression": "1+1"}, "id": "call-ok"})
+        content = ret.content if isinstance(ret, ToolMessage) else ret
+        assert "2" in content
+        assert factory._consecutive_failures.get("calculator", 0) == 0
+
 
 # ── 模型能力（AT-14）───────────────────────────────────────────────────────
 
@@ -516,6 +558,33 @@ class TestHarness:
         by_name = {s["name"]: s for s in subs}
         assert set(by_name["researcher"]["tools"]) <= {"web_search", "calculator"}
         assert set(by_name["data-analyst"]["tools"]) <= {"calculator"}
+
+    def test_general_purpose_registered_and_never_absent(self):
+        """general-purpose 必须收编在注册表内，且即使工具面为空也不缺席。
+
+        缺席时 deepagents 会自动注入默认全工具 general-purpose，绕过白名单。
+        """
+        from app.services.agent_runtime.subagents import build_subagents
+
+        policy = ToolPolicy(allowed_tools={"web_search"})
+        by_name = {s["name"]: s for s in build_subagents(policy)}
+        assert "general-purpose" in by_name, "general-purpose 缺席会触发 deepagents 全工具自动注入"
+        assert set(by_name["general-purpose"]["tools"]) <= {"web_search"}
+
+        # 完全无共同工具时仍保留占位（空工具面）
+        empty = {s["name"]: s for s in build_subagents(ToolPolicy(allowed_tools=set()))}
+        assert "general-purpose" in empty
+        assert empty["general-purpose"]["tools"] == []
+
+    def test_researcher_prompt_requires_search_and_numbered_citations(self):
+        """研究协议：先检索后作答 + [N] 编号引用 + 来源清单（防止凭记忆编造调研）。"""
+        from app.services.agent_runtime.subagents import SUBAGENT_PROFILES
+
+        prompt = SUBAGENT_PROFILES["researcher"].system_prompt
+        assert "先检索后作答" in prompt
+        assert "提纲先行" in prompt
+        assert "[N]" in prompt and "来源清单" in prompt
+        assert "发布时间" in prompt
 
     @pytest.mark.asyncio
     async def test_subagent_delegation_and_result_collection(self, monkeypatch):

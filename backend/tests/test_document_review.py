@@ -24,6 +24,26 @@ def test_screenshot_request_edits_prior_word_and_plain_delivery_uses_document_gr
     assert route_task("如何修改 Word 文档", has_word_attachment=True)["task_type"] == "general_chat"
 
 
+def test_research_delivery_to_word_routes_to_document_generate():
+    """「将调研结果放到 word 文档中给到我」类语序必须识别为文档交付（143 实录教训）。"""
+    assert route_task("将调研结果放到word文档中给到我")["task_type"] == "document_generate"
+    assert route_task("把调研报告存到word给我")["task_type"] == "document_generate"
+
+
+def test_host_style_path_write_is_rejected_with_workspace_guidance(tmp_path, monkeypatch):
+    """宿主机风格路径（/Users/... 等）写入必须拒绝并引导到工作区（143 实录教训）。"""
+    monkeypatch.setattr(settings, "AGENT_FILES_ROOT", str(tmp_path))
+    backend = build_backend(1, 1, 1)
+    for bad in ("/Users/user/Documents/调研报告.md", "C:\\Users\\user\\report.md"):
+        result = backend.write(bad, "内容")
+        assert result.error, bad
+        assert "/workspace/" in result.error
+        edit = backend.edit(bad, "a", "b")
+        assert edit.error and "/workspace/" in edit.error
+    # 工作区正常路径不受影响
+    assert not backend.write("/workspace/报告.md", "内容").error
+
+
 def test_agent_can_read_but_cannot_overwrite_original_or_extraction(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "AGENT_FILES_ROOT", str(tmp_path))
     folder = tmp_path / "1" / "1" / "1" / "uploads"

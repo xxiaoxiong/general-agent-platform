@@ -367,6 +367,59 @@ def test_document_turn_uses_phm_objective_and_exports_the_existing_draft():
     assert document_turn("继续", history, route_task("继续", task_mode="chat"))[0]["task_type"] == "general_chat"
 
 
+def test_document_turn_exports_stitched_conversation_report():
+    """143 实录：报告分两段生成（中间只说「继续」），随后要求「将调研结果放到 word 文档中给我」。
+
+    必须把两段正文拼成完整草稿并直接导出，不得向用户索要资料表单。
+    """
+    part1 = "# Agent Swarm 深度调研报告\n\n## 一、概述\n\n" + "多智能体编排正在成为主流。" * 20
+    part1 += "\n\n## 二、框架对比\n\n|框架|特点|\n|---|---|\n|LangGraph|图编排|"
+    part2 = "## 四、安全架构\n\n" + "沙箱隔离与最小权限是生产落地前提。" * 20
+    part2 += "\n\n## 五、结论\n\n结构化编排替代自由对话。"
+    history = [
+        {"role": "user", "content": "帮我深度研究 agent swarm 的进展"},
+        {"role": "assistant", "content": part1},
+        {"role": "user", "content": "继续"},
+        {"role": "assistant", "content": part2},
+    ]
+    message = "将调研结果放到word文档中给我"
+    route, refs, run = document_turn(message, history, route_task(message))
+    assert route["task_type"] == "document_generate"
+    context = route["document_context"]
+    assert context["export_existing"] is True
+    assert context["draft"].startswith("# Agent Swarm 深度调研报告")
+    assert "## 一、概述" in context["draft"] and "## 四、安全架构" in context["draft"]
+    assert "## 五、结论" in context["draft"]
+    assert refs == [] and run is None
+
+
+def test_document_turn_exports_referenced_content_phrasings():
+    """指代前文 + 轻度交付动词也必须走直接导出，不得退化成资料表单。"""
+    part = "# 调研报告\n\n## 一、背景\n\n" + "背景说明。" * 80
+    part += "\n\n## 二、结论\n\n结论内容。"
+    history = [
+        {"role": "user", "content": "帮我调研一下 agent 框架"},
+        {"role": "assistant", "content": part},
+    ]
+    for message in ("把上面的内容生成一个文档", "把这段话变成 word 文档",
+                    "把这些内容整理成一份完整的调研报告"):
+        route = document_turn(message, history, route_task(message))[0]
+        assert route["task_type"] == "document_generate", message
+        context = route["document_context"]
+        assert context["export_existing"] is True, message
+        assert context["draft"].startswith("# 调研报告"), message
+
+
+def test_references_prior_content_detection():
+    from app.services.agent_runtime.task_router import references_prior_content
+
+    for text in ("将调研结果放到word文档中给我", "把讨论过的内容整理成文档",
+                 "依据上面的结论写报告", "把刚才的内容导出"):
+        assert references_prior_content(text), text
+    for text in ("生成一份新的考勤报告", "帮我写一份周报", "查询今天的天气"):
+        assert not references_prior_content(text), text
+
+
 @pytest.mark.asyncio
 async def test_cancel_waiting_input_after_worker_exit(platform):
     client, new_service, _user, sessions = platform

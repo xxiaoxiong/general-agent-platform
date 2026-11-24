@@ -436,7 +436,11 @@ def completion_prompt(contract: TaskContract) -> str:
                 "验证用户要求的完整操作、无效输入的反馈和刷新结果。不要用写数据库代替用户操作。"
             )
     if contract.source_count:
-        lines.append(f"在最终正文引用实际获取或用户提供的来源，至少 {contract.source_count} 个。")
+        lines.append(
+            f"在最终正文引用实际获取或用户提供的来源，至少 {contract.source_count} 个。"
+            "引用格式：正文结论后用 [N] 编号（如 [1][2]），文末输出「## 来源清单」表"
+            "（N / 标题 / 链接 / 发布时间），编号与正文一一对应。"
+        )
     if contract.minimum_chars:
         lines.append(f"最终正文至少 {contract.minimum_chars} 个非空白字符。")
     if "json_answer" in contract.completion_checks:

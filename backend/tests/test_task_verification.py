@@ -50,11 +50,21 @@ class TestTaskContract:
         c = build_task_contract("研究行业趋势")
         assert c.task_type == TASK_RESEARCH
         assert "citations_present" in c.completion_checks
+        assert "web_evidence" in c.completion_checks  # 研究任务必须有真实检索证据
         assert c.is_complex
 
         simple = build_task_contract("你好")
         assert simple.task_type in (TASK_OTHER, TASK_QA)
         assert not simple.is_complex
+
+    def test_web_evidence_omitted_when_web_disallowed(self):
+        # 用户明确禁网：不强加检索证据义务
+        c = build_task_contract("研究行业趋势，不要联网")
+        assert "citations_present" in c.completion_checks
+        assert "web_evidence" not in c.completion_checks
+        # 本次 Run 无网络检索工具（web_enabled=False 收窄后）：同样豁免
+        c2 = build_task_contract("研究行业趋势", web_searchable=False)
+        assert "web_evidence" not in c2.completion_checks
 
     def test_contract_dict(self):
         d = build_task_contract("查询数据库销售数据").to_dict()
@@ -149,6 +159,37 @@ class TestVerification:
 
         r2 = verify_task(c, "回答内容", [])
         assert r2.status == STATUS_PASSED
+
+    def test_research_web_evidence_hard_gate(self):
+        """研究任务无真实检索证据 → 直接 failed（防止凭记忆编造调研结论，143 任务教训）。"""
+        c = build_task_contract("深度研究 agent swarm 的进展")
+        assert "web_evidence" in c.completion_checks
+
+        # 0 次检索：即使引用了链接也不得交付
+        r = verify_task(c, "结论，详见 https://example.com/report", [])
+        assert r.status == STATUS_FAILED
+        ids = {x.id: x.passed for x in r.checks}
+        assert ids["web_evidence"] is False
+        web = next(x for x in r.checks if x.id == "web_evidence")
+        assert "web_search" in web.detail  # 反馈指引模型先去检索
+
+        # 检索尝试但全部失败：同样不通过（结论缺少可核验来源）
+        ev_fail = [ToolEvidence(tool_name="web_search", status="failed", output="timeout")]
+        r2 = verify_task(c, "结论", ev_fail)
+        assert r2.status == STATUS_FAILED
+
+        # 检索成功 + 引用真实来源：通过
+        ev_ok = [ToolEvidence(tool_name="web_search", status="succeeded",
+                              output="详见 https://src.example.com/1")]
+        r3 = verify_task(c, "结论 https://src.example.com/1", ev_ok)
+        assert r3.status == STATUS_PASSED
+
+        # 用户提供来源：豁免检索证据义务
+        c2 = build_task_contract("研究行业趋势，来源资料 https://s.example.com/1")
+        assert "web_evidence" in c2.completion_checks
+        r4 = verify_task(c2, "结论 https://s.example.com/1", [])
+        ids4 = {x.id: x.passed for x in r4.checks}
+        assert ids4["web_evidence"] is True
 
     def test_research_citations(self):
         c = build_task_contract("研究行业趋势")
@@ -314,6 +355,77 @@ class TestVerificationRuntimeIntegration:
         assert ver is not None
         assert ver["task_type"] == "research"
         assert ver["status"] == "passed" and ver["fix_rounds"] == 1
+
+    @pytest.mark.asyncio
+    async def test_subagent_events_published_through_runtime(self, monkeypatch):
+        """子代理过程透传：task 委派必须发布 subagent_started/completed（P0 痛点回归）。"""
+        import app.services.agent_runtime.factory as factory_mod
+        import app.services.agent_runtime.service as svc_mod
+        from langchain_core.language_models.chat_models import BaseChatModel
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        from app.services.agent_runtime import get_runtime_service
+
+        class ScriptedModel(BaseChatModel):
+            script: list = []
+
+            @property
+            def _llm_type(self):
+                return "fake-subagent"
+
+            def bind_tools(self, tools, **kwargs):
+                return self
+
+            def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+                item = self.script.pop(0) if self.script else AIMessage(content="（结束）")
+                msg = item() if callable(item) else item
+                return ChatResult(generations=[ChatGeneration(message=msg)])
+
+        async def fake_load_model(self, model_config_id):
+            return (
+                {"name": "fake-provider", "base_url": "http://fake.local/v1", "api_key": "none",
+                 "extra_config": {}},
+                {"name": "fake", "max_tokens": None, "supports_streaming": True,
+                 "supports_function_call": True, "extra_params": {}},
+            )
+
+        monkeypatch.setattr(svc_mod.AgentRuntimeService, "_load_model", fake_load_model)
+        monkeypatch.setattr(
+            factory_mod, "build_chat_model",
+            lambda *a, **k: ScriptedModel(script=[
+                AIMessage(content="", tool_calls=[{
+                    "name": "task", "id": "t1", "type": "tool_call",
+                    "args": {"description": "调研 A", "subagent_type": "researcher"},
+                }]),   # 主代理：委派 researcher
+                AIMessage(content="调研摘要内容"),   # researcher 子代理的模型回合
+                AIMessage(content="汇总完成"),       # 主代理收回结果后最终回答
+            ]),
+        )
+
+        svc = get_runtime_service()
+        result = await svc.run_to_completion(
+            agent_config={"id": 990303, "tools": ["web_search"], "capability_ids": ["web_research"],
+                          "system_prompt": "t", "temperature": "0.1"},
+            messages=[{"role": "user", "content": "帮我整理一下"}],
+            user_id=1,
+        )
+        assert result["status"] in ("completed", "failed")
+
+        from app.core.database import AsyncSessionLocal
+        from app.models.agent import AgentRunEvent
+        from sqlalchemy import select
+
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(
+                select(AgentRunEvent.event_type, AgentRunEvent.payload).where(
+                    AgentRunEvent.run_id == result["run_id"])
+            )).all()
+        types = [r[0] for r in rows]
+        assert "subagent_started" in types, types
+        assert "subagent_completed" in types, types
+        started = next(r[1] for r in rows if r[0] == "subagent_started")
+        assert started.get("name") == "researcher"
 
     @pytest.mark.asyncio
     async def test_simple_qa_no_verification_burden(self, monkeypatch):

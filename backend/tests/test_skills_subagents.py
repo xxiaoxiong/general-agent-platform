@@ -139,7 +139,7 @@ class TestSubAgentRegistry:
     def test_builtin_profiles_registered(self):
         reg = SubAgentRegistry()
         names = {p.name for p in reg.list_profiles()}
-        assert names == {"researcher", "data-analyst"}
+        assert names == {"researcher", "data-analyst", "general-purpose"}
         p = reg.get("researcher")
         assert p.model_policy == "inherit" and p.max_depth == 1
 
@@ -175,5 +175,5 @@ class TestSubAgentRegistry:
         """委派面 = 注册表白名单：未登记名字不出现在任何子代理配置。"""
         policy = ToolPolicy(allowed_tools={"calculator", "web_search"})
         names = {s["name"] for s in build_subagents(policy)}
-        assert names <= {"researcher", "data-analyst"}
+        assert names <= {"researcher", "data-analyst", "general-purpose"}
         assert "god-mode" not in names

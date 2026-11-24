@@ -151,6 +151,11 @@
                     <FileText :size="14" /><span>{{ block.label }}<template v-if="block.detail"> · {{ block.detail }}</template></span>
                   </div>
 
+                  <div v-else-if="block.kind === 'subagent'" class="subagent-line" :data-state="block.state">
+                    <Bot :size="14" />
+                    <span>子代理 {{ block.name }} · {{ block.state === 'running' ? '执行中' : block.state === 'failed' ? '执行失败' : '执行完成' }}</span>
+                  </div>
+
                   <details v-else-if="block.kind === 'plan'" class="process-disclosure" open>
                     <summary><ListTodo :size="15" />任务计划 <span>{{ planItems(block.todos).length }} 项</span></summary>
                     <ul>
@@ -471,6 +476,13 @@ onUnmounted(() => {
 .document-stage svg { flex: none; }
 .document-stage[data-tone="warning"] { color: var(--ui-warning); }
 .document-stage[data-tone="success"] { color: var(--ui-success); }
+.subagent-line {
+  display: flex; gap: 6px; align-items: center; padding: 3px 7px; font-size: 12px;
+  border: 1px dashed var(--ui-border); border-radius: var(--ui-radius-md); color: var(--ui-secondary);
+}
+.subagent-line svg { flex: none; color: var(--ui-accent); }
+.subagent-line[data-state="running"] { color: var(--ui-info); border-color: var(--ui-info); }
+.subagent-line[data-state="failed"] { color: var(--ui-danger); border-color: var(--ui-danger); }
 .document-context {
   display: flex; align-items: center; gap: 6px; margin: 3px 5px 2px; font-size: 12px;
   color: var(--ui-accent); overflow-wrap: anywhere;

@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     AGENT_MAX_TOOL_RETRIES: int = 2             # 工具调用失败重试次数
     AGENT_TOOL_TIMEOUT_SECONDS: int = 30        # 单次工具执行超时
     AGENT_MAX_SAME_TOOL_CALLS: int = 3          # 同一工具最大连续调用次数
+    AGENT_TOOL_MAX_CONSECUTIVE_FAILURES: int = 6  # 同一工具连续失败熔断阈值（防误用死循环）
     AGENT_TEMPERATURE: float = 0.3              # 30B 模型建议低温度
     AGENT_ENABLE_SELF_VERIFY: bool = True       # 启用自我校验
     AGENT_ENABLE_SOURCE_CITATION: bool = True   # 启用来源引用

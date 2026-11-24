@@ -73,18 +73,23 @@ def _reshape_data(name: str, event_type: str, payload: Dict[str, Any]) -> Dict[s
     """内部 payload -> v2 data（§7.1 字段口径）。"""
     payload = payload or {}
     if name == "tool.started":
-        return {
+        data = {
             "tool_name": payload.get("tool"),
             "tool_call_id": payload.get("tool_call_id", ""),
             "input": payload.get("input"),
             "summary": f"正在执行 {payload.get('tool')}",
         }
+        if payload.get("subagent"):
+            data["subagent"] = payload.get("subagent")
+        return data
     if name in ("tool.completed", "tool.failed"):
         data = {
             "tool_name": payload.get("tool"),
             "tool_call_id": payload.get("tool_call_id", ""),
             "summary": f"{payload.get('tool')} 执行{'完成' if name == 'tool.completed' else '失败'}",
         }
+        if payload.get("subagent"):
+            data["subagent"] = payload.get("subagent")
         if name == "tool.completed":
             data["output"] = payload.get("output")
             if payload.get("sources"):
@@ -98,7 +103,12 @@ def _reshape_data(name: str, event_type: str, payload: Dict[str, Any]) -> Dict[s
     if name == "assistant.delta":
         return {"text": payload.get("text") or ""}
     if name == "subagent.started" or name == "subagent.completed":
-        return {"name": payload.get("name")}
+        data = {"name": payload.get("name")}
+        if payload.get("tool_call_id"):
+            data["tool_call_id"] = payload.get("tool_call_id")
+        if payload.get("status"):
+            data["status"] = payload.get("status")
+        return data
     if name == "plan.updated":
         return {"todos": payload.get("todos") or []}
     if name == "approval.required":

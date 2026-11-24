@@ -11,6 +11,7 @@
           <CircleX v-else :size="14" />
         </span>
         <span class="tool-name">{{ toolLabel }}</span>
+        <span v-if="tool.subagent" class="tool-subagent" :title="`子代理 ${tool.subagent}`">{{ tool.subagent }}</span>
         <span v-if="tool.target && !tool.filePath" class="tool-target" :title="tool.target">{{ tool.target }}</span>
         <ChevronDown class="row-chevron" :class="{ expanded: open }" :size="14" />
       </button>
@@ -46,6 +47,7 @@
             <a class="source-link" :href="s.url" target="_blank" rel="noopener noreferrer" :title="s.url">
               <span class="source-id">{{ s.id }}</span>
               <span class="source-title">{{ s.title || s.url }}</span>
+              <span v-if="s.published" class="source-published" :title="`发布时间 ${s.published}`">{{ formatDate(s.published) }}</span>
               <span class="source-host">{{ hostOf(s.url) }}</span>
             </a>
           </li>
@@ -124,6 +126,11 @@ const outputText = computed(() => toDetailText(props.tool.output))
 /** 来源链接的主机名（来源卡片行内展示） */
 function hostOf(url: string): string {
   try { return new URL(url).hostname } catch { return '' }
+}
+/** 来源发布时间展示（时效判断）：有日期部分则截取 YYYY-MM-DD */
+function formatDate(value: string): string {
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(value))
+  return m ? m[1] : String(value).slice(0, 16).replace('T', ' ')
 }
 const durationText = computed(() => {
   const ms = props.tool.durationMs || 0
@@ -214,5 +221,10 @@ const diffStat = computed(() => {
   font-family: var(--ui-font-mono); font-size: 11px;
 }
 .source-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.source-published { flex: none; color: var(--ui-muted); font-family: var(--ui-font-mono); font-size: 11px; }
 .source-host { margin-inline-start: auto; flex: none; color: var(--ui-muted); font-family: var(--ui-font-mono); font-size: 11px; }
+.tool-subagent {
+  flex: none; padding: 1px 6px; border-radius: 999px;
+  background: var(--ui-accent-soft); color: var(--ui-accent); font-size: 11px;
+}
 </style>

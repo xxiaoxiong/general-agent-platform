@@ -46,6 +46,8 @@ export interface ToolSource {
   title: string
   url: string
   desc?: string
+  /** 来源发布时间（SearXNG publishedDate），时效判断依据 */
+  published?: string
 }
 
 export interface ToolBlock {
@@ -63,6 +65,18 @@ export interface ToolBlock {
   filePath?: string
   /** 结构化来源清单（如 web_search 搜索结果），供来源卡片展示 */
   sources?: ToolSource[]
+  /** 子代理归属（researcher 等），归入子代理分组展示 */
+  subagent?: string
+}
+
+/** 子代理执行分组（task 工具派发 researcher/data-analyst 的过程容器） */
+export interface SubagentBlock {
+  kind: 'subagent'
+  key: string
+  name: string
+  state: 'running' | 'done' | 'failed'
+  startedAt?: number
+  durationMs?: number
 }
 
 export interface DocumentArtifactBlock {
@@ -98,7 +112,7 @@ export interface DocumentStageBlock {
   tone?: 'warning' | 'success'
 }
 
-export type MsgBlock = TextBlock | ToolBlock | PlanBlock | DocumentArtifactBlock | ProfileDraftBlock
+export type MsgBlock = TextBlock | ToolBlock | SubagentBlock | PlanBlock | DocumentArtifactBlock | ProfileDraftBlock
   | InputRequestBlock | DocumentStageBlock | DocumentEditReviewBlock | TeamBlock | ProjectBlock | VerificationBlock
 
 /** 携带块流的运行消息（工具步骤实时穿插展示的最小状态） */
@@ -396,10 +410,43 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
         input: data.input,
         startedAt: Date.parse(ev.timestamp) || Date.now(),
         filePath: extractFilePath(String(data.tool_name || ''), data.input),
+        subagent: typeof data.subagent === 'string' && data.subagent ? data.subagent : undefined,
       })
-      msg.liveStatus = `正在执行 ${data.tool_name || '工具'}…`
+      msg.liveStatus = data.subagent
+        ? `子代理 ${data.subagent} 正在执行 ${data.tool_name || '工具'}…`
+        : `正在执行 ${data.tool_name || '工具'}…`
       msg.lastActivity = 'tool'
       break
+
+    case 'subagent.started':
+      blocks.push({
+        kind: 'subagent',
+        key: `sa-${data.tool_call_id || ev.sequence}`,
+        name: String(data.name || '子代理'),
+        state: 'running',
+        startedAt: Date.parse(ev.timestamp) || Date.now(),
+      })
+      msg.liveStatus = `子代理 ${data.name || ''} 开始执行…`
+      msg.lastActivity = 'tool'
+      break
+
+    case 'subagent.completed': {
+      const saKey = `sa-${data.tool_call_id || ''}`
+      let sa = blocks.find((b): b is SubagentBlock =>
+        b.kind === 'subagent' && (b.key === saKey || (!data.tool_call_id && b.state === 'running'))) as SubagentBlock | undefined
+      if (!sa) {
+        sa = { kind: 'subagent', key: saKey, name: String(data.name || '子代理'), state: 'done' }
+        blocks.push(sa)
+      }
+      sa.state = data.status === 'error' ? 'failed' : 'done'
+      if (sa.startedAt) {
+        const end = Date.parse(ev.timestamp) || Date.now()
+        if (end >= sa.startedAt) sa.durationMs = end - sa.startedAt
+      }
+      msg.liveStatus = `子代理 ${sa.name} 执行${sa.state === 'failed' ? '失败' : '完成'}`
+      msg.lastActivity = 'tool'
+      break
+    }
 
     case 'tool.completed':
     case 'tool.failed': {
@@ -423,6 +470,7 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
           input: data.input,
           startedAt: Date.parse(ev.timestamp) || undefined,
           filePath: extractFilePath(String(data.tool_name || ''), data.input),
+          subagent: typeof data.subagent === 'string' && data.subagent ? data.subagent : undefined,
         }
         blocks.push(blk)
       } else {

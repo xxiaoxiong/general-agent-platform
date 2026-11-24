@@ -382,9 +382,15 @@ class StreamMixin:
                         saved = await db.scalar(select(AgentRunRow.input_payload).where(AgentRunRow.id == run.run_id))
                     original_messages = (saved or {}).get("messages") or []
                 continued = (execution_context or {}).get("completion_resume") or {}
+                from app.services.tools import WEB_RETRIEVAL_TOOLS
+
                 ctx.task_contract = build_task_contract(
                     continued.get("request") or _last_user_input(original_messages),
                     capability_ids=agent_config.get("capability_ids"),
+                    # 无网络检索工具（能力包未含/web_enabled=False 收窄后）不强加检索证据义务
+                    web_searchable=any(
+                        s["name"] in WEB_RETRIEVAL_TOOLS for s in self._resolve_tool_specs(agent_config)
+                    ),
                 )
                 if continued:
                     from app.services.agent_runtime.completion import prepare_completion_continuation
@@ -903,6 +909,8 @@ class StreamMixin:
         # call_id -> 工具名：护栏拒绝的 ToolMessage（如并行 write_todos）name 为空，
         # 从发起调用时的 tool_calls 名称回填，避免事件里工具名丢失
         tool_names_by_call: Dict[str, str] = {}
+        # call_id -> 子代理名：task 工具是子代理入口，据此发布子代理开始/结束事件
+        subagent_by_call: Dict[str, str] = {}
         stream_options = {"durability": "sync"} if ctx.task_contract and ctx.task_contract.is_complex else {}
         async for mode, chunk in agent.astream(payload, config=run_config, stream_mode=["updates", "messages"], **stream_options):
             if mode == "messages":
@@ -940,6 +948,17 @@ class StreamMixin:
                         if isinstance(m, ToolMessage):
                             tcid = getattr(m, "tool_call_id", "") or ""
                             mname = getattr(m, "name", "") or tool_names_by_call.get(tcid, "")
+                            sub_name = subagent_by_call.pop(tcid, "")
+                            if sub_name:
+                                # 子代理执行结束（成功/失败）：过程事件收尾，前端归拢分组
+                                await bus.publish(RuntimeEvent(
+                                    type=SUBAGENT_COMPLETED, run_id=run.run_id,
+                                    data={
+                                        "name": sub_name,
+                                        "tool_call_id": tcid,
+                                        "status": "error" if getattr(m, "status", None) == "error" else "done",
+                                    },
+                                ))
                             if mname in platform_names:
                                 continue  # 平台工具已由 adapter 发事件
                             is_err = getattr(m, "status", None) == "error"
@@ -965,6 +984,16 @@ class StreamMixin:
                                 tc_id = (tc.get("id") or "") if isinstance(tc, dict) else ""
                                 if tc_id:
                                     tool_names_by_call[tc_id] = tc_name
+                                if tc_name == "task" and isinstance(tc, dict):
+                                    # 子代理入口：发布开始事件 + 归属标记，
+                                    # 子代理期间的工具步骤（带 subagent 标记）由前端归组展示
+                                    sa_name = str((tc.get("args") or {}).get("subagent_type") or "")
+                                    if sa_name and tc_id:
+                                        subagent_by_call[tc_id] = sa_name
+                                        await bus.publish(RuntimeEvent(
+                                            type=SUBAGENT_STARTED, run_id=run.run_id,
+                                            data={"name": sa_name, "tool_call_id": tc_id},
+                                        ))
                                 if tc_name and tc_name not in platform_names:
                                     await bus.publish(RuntimeEvent(
                                         type=TOOL_STARTED,

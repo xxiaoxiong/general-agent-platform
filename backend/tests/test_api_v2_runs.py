@@ -49,6 +49,32 @@ class TestEventProtocol:
                             payload={"tool": "calculator", "tool_call_id": "c2", "output": "42"})
         assert "sources" not in plain["data"]
 
+    def test_tool_and_subagent_events_carry_attribution(self):
+        """子代理工具事件带 subagent 归属；subagent.started/completed 携带 name 状态。"""
+        from app.services.agent_runtime.event_protocol import to_v2_event
+
+        tagged = to_v2_event(
+            run_id="r1", sequence=10, event_type="tool_completed",
+            payload={"tool": "web_search", "tool_call_id": "c3", "output": "…", "subagent": "researcher"},
+        )
+        assert tagged["event"] == "tool.completed"
+        assert tagged["data"]["subagent"] == "researcher"
+
+        plain = to_v2_event(run_id="r1", sequence=11, event_type="tool_completed",
+                            payload={"tool": "calculator", "tool_call_id": "c4", "output": "42"})
+        assert "subagent" not in plain["data"]
+
+        started = to_v2_event(run_id="r1", sequence=12, event_type="subagent_started",
+                              payload={"name": "researcher", "tool_call_id": "c5"})
+        assert started["event"] == "subagent.started"
+        assert started["data"]["name"] == "researcher"
+        assert started["data"]["tool_call_id"] == "c5"
+
+        done = to_v2_event(run_id="r1", sequence=13, event_type="subagent_completed",
+                           payload={"name": "researcher", "tool_call_id": "c5", "status": "done"})
+        assert done["event"] == "subagent.completed"
+        assert done["data"]["status"] == "done"
+
     def test_terminal_events(self):
         from app.services.agent_runtime.event_protocol import is_terminal, to_v2_event
 

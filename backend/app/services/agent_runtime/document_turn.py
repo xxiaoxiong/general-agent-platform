@@ -4,24 +4,38 @@ from __future__ import annotations
 
 import re
 
-from .task_router import recent_word_attachments, route_task
+from .task_router import recent_word_attachments, references_prior_content, route_task
 
 _MANUAL = re.compile(r"手册|指南|报告|方案|白皮书|说明书|简报|纪要|总结|文档|word|docx", re.I)
 _FOLLOW_UP = re.compile(
     r"^\s*(?:请)?继续[呀吧。！\s]*$|(?:说|用|换成|改成)(?:中文|英文|汉语|英语)"
-    r"|(?:自行|自己|你来|帮我).{0,6}(?:发挥|补全|补充|编写|编一些)"
+    r"|(?:自行|自己|你来|帮我).{0,6}(?:发挥|补全|补充|编一些)"
     r"|(?:前面|上面|之前|刚才|上一轮|上述|这份|当前).{0,30}(?:内容|草稿|构思|模板|文档|手册|报告|指南|方案|word)"
-    r"|(?:接着|继续).{0,18}(?:写|生成|输出|完成|编写|处理)", re.I,
+    r"|(?:接着|继续).{0,18}(?:写|生成|输出|完成|编写|处理)"
+    r"|(?:调研|研究|分析|检索)(?:结果|结论)|讨论(?:过)?的?(?:内容|结果|东西)", re.I,
 )
-_EXPORT = re.compile(r"下载|导出|交付成|写到.{0,10}(?:word|docx)|整理成.{0,10}(?:word|docx)", re.I)
-_REVISE = re.compile(r"重写|改写|修改|重做|润色|改版|新增|加上|增加|扩写|细化|补写|补上|调整|更新|"
-                     r"删掉|删除|改成|翻译|改为|完善|精简|写得更|(?:写|讲|展开)详细", re.I)
+_EXPORT = re.compile(
+    r"下载|导出|交付成|写到.{0,10}(?:word|docx)"
+    # "放到 word 文档中给我"：交付物在前、给/发在后
+    r"|(?:整理|放|存|转|做|写)(?:到|成|为).{0,10}(?:word|docx|文档)"
+    r"|(?:word|docx|文档|报告).{0,8}(?:给(?:到)?我|发(?:给)?我|下载|导出)"
+    # 指代前文 + 轻度交付动词（"把上面的内容生成一个文档""把这段话变成 word"）
+    r"|(?:上[面文述]|之前|此前|刚才|这[些段份篇]|以上).{0,20}"
+    r"(?:生成|整理|做成|变成|保存|输出|转|写).{0,12}(?:word|docx|文档|报告|文章)", re.I,
+)
+_REVISE = re.compile(r"重写|改写|修改|重做|润色|改版|新增|加上|增加|扩写|细化|补写|补上|补充|补全|"
+                     r"插入|追加|扩充|加入|调整|更新|删掉|删除|改成|翻译|改为|完善|精简|写得更|"
+                     r"(?:写|讲|展开)详细", re.I)
 _TEMPLATE = re.compile(r"模板|[以按照].{0,10}范本|参照.{0,12}(?:结构|格式|版式)", re.I)
 _EXAMPLE = re.compile(
     r"(?:自己发挥|自行发挥|自行补全|虚构|构造).{0,38}(?:测试|示例|样例|演示)|"
     r"(?:测试|示例|样例|演示).{0,38}(?:自己发挥|自行发挥|自行补全|虚构|构造)", re.S,
 )
 _HEADING = re.compile(r"^\s*#{1,4}\s+(.+)$", re.M)
+_CONTINUE_ONLY = re.compile(
+    r"^\s*(?:请)?(?:继续|接着|往下|go on|continue)[呀吧。！\s]*$"
+    r"|^\s*(?:请)?(?:继续|接着).{0,12}(?:写|生成|输出|完成|编写|处理)", re.I,
+)
 _QUESTION = re.compile(r"^(?:好[的，！\s]*，?)?(?:还需|请提供|请补充|我需要.{0,10}信息|I need more information)", re.I)
 _TOPIC_CHANGE = re.compile(r"(?:换个|聊个|另一个|切换|新)话题|先(?:聊|问|讨论)别的")
 _UNRELATED_QUESTION = re.compile(r"[?？]$|^(?:请问|你知道|你是谁|你用的什么|如何|怎样|为什么)")
@@ -32,15 +46,36 @@ def _main_text(message: dict) -> str:
     return str(message.get("content") or "").split("\n\n[附件]", 1)[0].strip()
 
 
+def _is_substantive(content: str) -> bool:
+    headings = list(_HEADING.finditer(content))
+    return len(content) >= 280 and len(headings) >= 2 and not _QUESTION.search(content[:180])
+
+
 def _substantive_draft(messages: list[dict]) -> str:
-    for item in reversed(messages):
-        if item.get("role") != "assistant":
-            continue
-        content = _main_text(item)
-        headings = list(_HEADING.finditer(content))
-        if len(content) >= 280 and len(headings) >= 2 and not _QUESTION.search(content[:180]):
-            return content[headings[0].start():].strip()
-    return ""
+    """拼接最近一段连续正文：同一报告常分多段生成，中间只隔「继续」类指令。"""
+    end = next((index for index in range(len(messages) - 1, -1, -1)
+                if messages[index].get("role") == "assistant"
+                and _is_substantive(_main_text(messages[index]))), None)
+    if end is None:
+        return ""
+    parts: list[str] = []
+    index: int | None = end
+    while index is not None:
+        content = _main_text(messages[index])
+        heading = _HEADING.search(content)
+        parts.insert(0, content[heading.start():].strip() if heading else content.strip())
+        previous = None
+        for cursor in range(index - 1, -1, -1):
+            item = messages[cursor]
+            if item.get("role") == "assistant":
+                previous = cursor
+                break
+            # 只跨越「继续/接着写」这类无新信息指令，遇到新话题或新要求即停止拼接
+            if item.get("role") == "user" and not _CONTINUE_ONLY.search(_main_text(item)):
+                break
+        index = previous if previous is not None and _is_substantive(
+            _main_text(messages[previous])) else None
+    return "\n\n".join(parts)
 
 
 def is_template_reference(message: str) -> bool:
@@ -54,11 +89,13 @@ def document_turn(message: str, history: list[dict], route: dict) -> tuple[dict,
     latest = message.strip()
     followup = bool(_FOLLOW_UP.search(latest))
     export = bool(_EXPORT.search(latest) and not _REVISE.search(latest))
-    if not (followup or export or route.get("task_type") == "document_generate"):
+    # 指代本会话已有内容（如「将调研结果…」）：即使不是"下载/导出"措辞，也必须注入前文正文
+    reference = references_prior_content(latest)
+    if not (followup or export or reference or route.get("task_type") == "document_generate"):
         return route, [], None
     anchor = None
     recent = [item for item in history[-24:] if isinstance(item, dict)]
-    if followup or export:
+    if followup or export or reference:
         for index, item in reversed(list(enumerate(recent))):
             if item.get("role") != "user":
                 continue
@@ -72,7 +109,8 @@ def document_turn(message: str, history: list[dict], route: dict) -> tuple[dict,
                 anchor = index
                 break
     related = recent[anchor:] if anchor is not None else []
-    draft = _substantive_draft(related or (recent if export else []))
+    # 明确导出或指代前文时才回溯最近连续正文；裸「继续」必须依赖文档锚点，避免误吞无关内容
+    draft = _substantive_draft(related or (recent if (export or reference) else []))
     if anchor is None and not draft and route.get("task_type") != "document_generate":
         return route, [], None
     if route.get("task_type") not in {"document_generate", "general_chat", "document_analyze"}:
@@ -96,9 +134,9 @@ def document_turn(message: str, history: list[dict], route: dict) -> tuple[dict,
     context = {
         "request": request, "draft": draft[:_DRAFT_LIMIT], "template_paths": [item["path"] for item in inherited],
         "example_mode": bool(_EXAMPLE.search("\n".join([*users, latest]))),
-        "export_existing": bool(export and draft and len(draft) <= _DRAFT_LIMIT and (
-            followup or re.search(r"^(?:下载|导出)|^(?:在界面中)?\s*(?:[给发](?:到)?我|我要|可以|帮我|请|直接).{0,20}(?:下载|导出)", latest)
-        ) and not is_template_reference(latest)),
+        # 明确交付意图 + 已有连续正文 = 直接把前文成稿为 Word，不再向用户索要正文资料
+        "export_existing": bool(export and draft and len(draft) <= _DRAFT_LIMIT
+                                and not is_template_reference(latest)),
     }
     anchor_run = related[0].get("document_run_id") if related else None
     return {**route, "document_context": context}, inherited, anchor_run

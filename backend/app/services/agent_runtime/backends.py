@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 from collections import OrderedDict
 from pathlib import PurePosixPath
@@ -20,12 +21,39 @@ from app.core.config import settings
 
 RUN_ARTIFACT_FOLDER = ".run-artifacts"
 
+# 宿主机/本地电脑风格路径（如 /Users/xxx、C:\Users\xxx）：平台无法写入用户电脑，
+# 模型容易幻觉出这类路径（143 实录）。识别后引导改写到工作区。
+_HOST_PATH = re.compile(r"^(?:/Users/|/home/|/root/|/Documents/|[A-Za-z]:[\\/]|\\\\)")
+
+
+def _host_path_error(file_path: str) -> str | None:
+    """宿主机风格路径：这类路径落到虚拟文件区，用户根本拿不到，直接拒绝并引导。"""
+    if _HOST_PATH.match((file_path or "").strip()):
+        return (
+            f"路径 `{file_path}` 是用户电脑上的路径，平台无法写入用户的本地磁盘。"
+            "请改写到工作区（如 `/workspace/报告.md`），交付文件保存到工作区后用户可直接下载。"
+        )
+    return None
+
 
 def build_backend(user_id: int, agent_id: int, session_id: Optional[int], *, store: Optional[Any] = None):
     from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
     from deepagents.backends.protocol import DeleteResult, EditResult, FileUploadResponse, WriteResult
 
-    default_backend = StateBackend()
+    class GuardedState(StateBackend):
+        """默认虚拟文件区：拦截宿主机风格路径（143 实录：/Users/... 落到这里，用户拿不到）。"""
+
+        def write(self, file_path, content):
+            if err := _host_path_error(file_path):
+                return WriteResult(error=err)
+            return super().write(file_path, content)
+
+        def edit(self, file_path, old_string, new_string, replace_all=False):
+            if err := _host_path_error(file_path):
+                return EditResult(error=err)
+            return super().edit(file_path, old_string, new_string, replace_all)
+
+    default_backend = GuardedState()
 
     base = getattr(settings, "AGENT_FILES_ROOT", "./data/agent_files")
     session_part = str(session_id) if session_id is not None else "ephemeral"
@@ -83,6 +111,8 @@ def build_backend(user_id: int, agent_id: int, session_id: Optional[int], *, sto
             return None
 
         def write(self, file_path, content):
+            if err := _host_path_error(file_path):
+                return WriteResult(error=err)
             if self._protected(file_path) or file_path.casefold().endswith(".docx"):
                 return WriteResult(error="原始附件和历史交付由平台管理。请将新文件保存到可编辑区域，Word 请使用文档任务。")
             if conflict := self._path_conflict(file_path):
@@ -90,6 +120,8 @@ def build_backend(user_id: int, agent_id: int, session_id: Optional[int], *, sto
             return super().write(file_path, content)
 
         def edit(self, file_path, old_string, new_string, replace_all=False):
+            if err := _host_path_error(file_path):
+                return EditResult(error=err)
             if self._protected(file_path) or file_path.casefold().endswith(".docx"):
                 return EditResult(error="原始附件和历史交付由平台管理。请编辑工作文件，Word 请使用文档任务。")
             if conflict := self._path_conflict(file_path):

@@ -12,6 +12,19 @@ from .backends import workspace_root
 
 DOCUMENT_GRAPH_TYPES = frozenset({"profile_extract", "document_generate", "document_edit"})
 _DOCUMENT_EXTENSIONS = {".docx", ".doc", ".pdf", ".md", ".txt", ".rtf", ".odt"}
+# 引用本会话已有内容（"调研结果/讨论过的内容/上面的结论"）：
+# 命中即必须把前文正文作为资料注入，不能让模型从零索要资料
+_PRIOR_CONTENT = re.compile(
+    r"上[面文一条述]|刚才|刚生成|前[文面]|之前|此前|前述|上述|这[些段份篇]|以上|"
+    r"讨论(?:过)?的?|聊过|(?:调研|研究|分析|检索)(?:结果|结论)|已有内容|现有内容", re.I
+)
+
+
+def references_prior_content(message: str) -> bool:
+    """用户是否在指代本会话已有内容（决定是否注入对话正文作为资料来源）。"""
+    return bool(_PRIOR_CONTENT.search(message or ""))
+
+
 _PROFILE = re.compile(
     r"(?:提炼|抽取|提取|建立|制作|创建|归纳|总结.{0,10}可复用|整理出).{0,25}(?:规范|模板|profile)"
     r"|(?:需要|想要|设计|定义|写|生成).{0,12}(?:一套|一份|一个).{0,20}(?:规范|模板)(?:$|[。！？，,\s])"
@@ -29,8 +42,8 @@ _EDIT_TARGET = re.compile(
     r"|\b(?:section|chapter|previous report|existing document)\b"
 )
 _GENERATE = re.compile(
-    r"(?:生成|制作|输出|导出|撰写|编写|写一[份个篇]|写成|整理成|转[成为]|形成|起草|交付)"
-    r".{0,28}(?:word|docx|文档|报告|公文|方案|简报|说明书|纪要|总结|手册|指南)"
+    r"(?:生成|制作|输出|导出|撰写|编写|写一[份个篇]|写成|整理成|转[成为]|形成|起草|交付|放到|存到|写到|保存到)"
+    r".{0,28}(?:word|docx|文档|报告|公文|方案|简报|说明书|纪要|总结|手册|指南|文章)"
     r"|(?:按照|根据|用|套用).{0,22}(?:规范|模板|profile).{0,15}(?:生成|制作|起草|编写|撰写|写|输出)"
     r"|\b(?:generate|write|draft|create|export)\b.{0,35}\b(?:report|document|word|docx)\b"
 )
@@ -41,6 +54,8 @@ _HOW_TO = re.compile(r"^(?:请问[，,\s]*)?(?:如何|怎么|怎样|为何|为�
 _DELIVERY = re.compile(
     r"(?:给(?:到)?我|发(?:给)?我|提供|导出).{0,18}(?:可下载|成品|word|docx|文档)"
     r"|(?:做|整理|写)成.{0,10}(?:word|docx|文档)|\bdownloadable\b.{0,15}\b(?:document|word|docx)\b"
+    # 「放到 word 文档中给到我」类语序：交付物在前、"给到我"在后
+    r"|(?:word|docx|文档|报告).{0,14}(?:给(?:到)?我|发(?:给)?我|交付)"
 )
 _MEDIA_TARGET = re.compile(r"第.{0,6}[张幅]图|图\s*[一二三四五六七八九十\d]+|图片|插图|配图")
 

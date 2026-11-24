@@ -289,8 +289,11 @@ class ToolAdapterFactory:
         self.bus = bus
         # 同工具同参调用计数（重复防护，key = 工具名 + 参数指纹）
         self._same_call_counts: Dict[str, int] = {}
+        # 同工具连续失败计数（误用熔断：参数各不相同的连续失败也拦，如拿 calculator 跑 shell）
+        self._consecutive_failures: Dict[str, int] = {}
 
-    def build(self, tool_specs: List[Dict[str, Any]]) -> List[StructuredTool]:
+    def build(self, tool_specs: List[Dict[str, Any]], *, source: Optional[str] = None) -> List[StructuredTool]:
+        """构建工具集。``source`` 为子代理名时，工具事件带 subagent 归属标记。"""
         tools: List[StructuredTool] = []
         for spec in tool_specs:
             name = spec["name"]
@@ -303,16 +306,16 @@ class ToolAdapterFactory:
                 register_side_effect_contract(
                     SideEffectContract(tool_name=name, **contract_cfg)
                 )
-            tools.append(self._make_tool(spec))
+            tools.append(self._make_tool(spec, source))
         return tools
 
-    def _make_tool(self, spec: Dict[str, Any]) -> StructuredTool:
+    def _make_tool(self, spec: Dict[str, Any], source: Optional[str] = None) -> StructuredTool:
         name = spec["name"]
         args_model = build_args_model(name, spec)
         description = spec.get("description") or spec.get("display_name") or name
 
         async def _coroutine(**kwargs: Any) -> str:
-            return await self._execute(name, kwargs)
+            return await self._execute(name, kwargs, source)
 
         return StructuredTool(
             name=name,
@@ -321,7 +324,7 @@ class ToolAdapterFactory:
             coroutine=_coroutine,
         )
 
-    async def _execute(self, name: str, args: Dict[str, Any]) -> str:
+    async def _execute(self, name: str, args: Dict[str, Any], source: Optional[str] = None) -> str:
         args = dict(args)
         # 稳定调用身份（InjectedToolCallId 运行时注入；直接调用时兜底生成）
         tool_call_id = args.pop("tool_call_id", None) or uuid.uuid4().hex
@@ -343,6 +346,16 @@ class ToolAdapterFactory:
                     f"{self._same_call_counts[count_key]} 次（上限 {max_same}），"
                     "疑似执行循环，已拒绝本次调用。请改变参数或直接给出最终回答。"
                 )
+
+        # 同工具连续失败熔断（防误用死循环，如拿 calculator 执行 shell 脚本）：
+        # 参数各不相同的连续失败同样计数；任一次成功即清零
+        max_fail = int(getattr(settings, "AGENT_TOOL_MAX_CONSECUTIVE_FAILURES", 6))
+        if max_fail > 0 and self._consecutive_failures.get(name, 0) >= max_fail:
+            return (
+                f"错误：工具 '{name}' 已连续失败 {self._consecutive_failures[name]} 次，"
+                f"疑似用法不对（如用 calculator 执行 shell 代码、用错参数格式），已熔断拒绝继续调用。"
+                f"请改用正确的工具完成任务，或直接向用户说明此路不通。"
+            )
 
         # 1) 授权 + 策略检查
         try:
@@ -384,10 +397,14 @@ class ToolAdapterFactory:
         # 2) 工具生命周期开始 + 执行预算记账（FR-10.7：预算超限显式终止）
         #    工具输入是执行证据（评测交付物采集来源）：只脱敏不截断（§15.2 E），
         #    持久化统一按事件类型截断，SSE 线缆仍由 LegacyEventAdapter 截断预览
+        started_data = {"tool": name, "tool_call_id": tool_call_id, "input": redact_secrets(args)}
+        if source:
+            # 子代理归属标记：前端据此把工具步骤归入子代理分组展示
+            started_data["subagent"] = source
         await self.bus.publish(RuntimeEvent(
             type=TOOL_STARTED,
             run_id=self.ctx.run_id,
-            data={"tool": name, "tool_call_id": tool_call_id, "input": redact_secrets(args)},
+            data=started_data,
         ))
         self.ctx.tool_calls += 1
         reason = self.ctx.budget.exhausted_reason(
@@ -475,6 +492,7 @@ class ToolAdapterFactory:
             duration_ms = int((time.monotonic() - started) * 1000)
 
             if tr.status == STATUS_SUCCEEDED:
+                self._consecutive_failures.pop(name, None)  # 成功即清零连续失败计数
                 # 远端/本地已确认成功：只有账本确认写入成功后才宣告成功（§5.2 D）
                 # §15.2 E：工具输出统一脱敏后再入账本/事件/回传
                 text = redact_secrets(tr.text)
@@ -485,6 +503,8 @@ class ToolAdapterFactory:
                     external_operation_id=tr.external_operation_id,
                 )
                 event_data = {"tool": name, "tool_call_id": tool_call_id, "output": text[:2000]}
+                if source:
+                    event_data["subagent"] = source
                 if tr.metadata.get("sources"):
                     # 结构化来源（如 web_search）：随事件透传，供前端引用卡片/来源区使用
                     event_data["sources"] = tr.metadata["sources"]
@@ -501,6 +521,7 @@ class ToolAdapterFactory:
                 return limit_for_context(text, ctx=self.ctx, tool_name=name)
 
             if tr.status == STATUS_FAILED:
+                self._consecutive_failures[name] = self._consecutive_failures.get(name, 0) + 1
                 # 业务错误不得伪装成功字符串（§7.2 C）：标记 failed 并回传失败文本
                 # §15.2 E：错误信息统一脱敏后再入账本/事件/日志
                 err_text = redact_secrets(tr.error or tr.text)[:_RESULT_PAYLOAD_LIMIT]
@@ -517,6 +538,7 @@ class ToolAdapterFactory:
                 return tr.text
 
             # STATUS_UNKNOWN：无法确认外部操作是否已生效（§7.2 A）
+            self._consecutive_failures[name] = self._consecutive_failures.get(name, 0) + 1
             err_text = redact_secrets(tr.error or tr.text)[:_RESULT_PAYLOAD_LIMIT]
             await self._ledger_mark(rec.id, "unknown", error=err_text)
             await self.bus.publish(RuntimeEvent(
@@ -539,6 +561,7 @@ class ToolAdapterFactory:
             raise
         except Exception as e:
             duration_ms = int((time.monotonic() - started) * 1000)
+            self._consecutive_failures[name] = self._consecutive_failures.get(name, 0) + 1
             is_definitive = isinstance(e, _DEFINITIVE_ERRORS)
             status = (
                 "failed" if is_definitive or tool_outcome_class(name) == CLASS_READ_ONLY else "unknown"

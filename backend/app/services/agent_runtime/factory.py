@@ -194,7 +194,10 @@ def build_agent(
 
 
 def _subagent_tools(subagent: Dict[str, Any], adapter: ToolAdapterFactory):
-    """把子代理工具名列表转为实际 StructuredTool（收窄后的交集）。"""
+    """把子代理工具名列表转为实际 StructuredTool（收窄后的交集）。
+
+    source=子代理名：工具事件带 subagent 归属标记，前端按子代理分组展示。
+    """
     from app.services.tools import get_tool_by_name
 
     specs = []
@@ -202,11 +205,15 @@ def _subagent_tools(subagent: Dict[str, Any], adapter: ToolAdapterFactory):
         spec = get_tool_by_name(name)
         if spec:
             specs.append(spec)
-    return adapter.build(specs)
+    return adapter.build(specs, source=subagent.get("name"))
 
 
 def _compose_system_prompt(ctx: RuntimeContext) -> str:
     parts = [ctx.agent_config.get("system_prompt") or "你是一个智能助手。"]
+    # 注入当前日期：模型知识有截止时间，时效判断必须知道"今天"，否则会把旧资料当现状
+    from datetime import date
+
+    parts.append(f"今天是 {date.today().isoformat()}。涉及「最新/进展/趋势」的问题必须联网检索核实，不得凭记忆断言现状。")
     if ctx.db_info and ctx.db_info.get("hint"):
         parts.append(ctx.db_info["hint"])
     if ctx.memory_context:
@@ -229,8 +236,9 @@ def _compose_system_prompt(ctx: RuntimeContext) -> str:
         "- 同一文件的写入/编辑/读取请串行进行，不要在同一步并行操作同一路径。\n"
         "- write_file 会自动创建工作区中的父目录。请直接填写最终文件路径，目录本身无需写成空文件。\n"
         "- 涉及外部副作用（HTTP POST/邮件/Webhook）的操作会在执行前要求人工审批。\n"
-        "- 网络检索得到的事实结论须标注来源，用 [标题](URL) 引用工具实际返回的 URL，"
-        "不得引用未在检索结果或用户输入中出现的链接。\n"
+        "- 网络检索得到的事实结论须标注来源：正文用 [N] 编号引用（如 [1]），"
+        "文末输出「## 来源清单」表（N / 标题 / 链接 / 发布时间），编号一一对应；"
+        "只引用工具实际返回的 URL，不得引用未在检索结果或用户输入中出现的链接。\n"
         "- 不要输出与任务无关的内容；最终回答直接给出结论。"
     )
     return "\n\n".join(parts)

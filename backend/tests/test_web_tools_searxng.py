@@ -109,6 +109,38 @@ async def test_searxng_json_results_sources_and_direct_connection(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_searxng_published_date_preserved(monkeypatch):
+    """SearXNG 的 publishedDate 必须保留到来源与文本输出（时效判断依据）。"""
+    calls = []
+    _patch_client(
+        monkeypatch,
+        {
+            "searxng": _FakeResponse(
+                200,
+                json_data={
+                    "results": [
+                        {"title": "新文章", "url": "https://example.com/new", "content": "摘要",
+                         "publishedDate": "2026-11-20T08:00:00Z"},
+                        {"title": "无日期", "url": "https://example.com/old", "content": ""},
+                    ]
+                },
+            ),
+        },
+        calls,
+    )
+    monkeypatch.setattr(settings, "SEARXNG_URL", "http://searxng:8080")
+
+    ret = await web_tools.execute_web_search({"query": "测试", "max_results": 5})
+
+    assert ret.status == "succeeded"
+    sources = ret.metadata.get("sources") or []
+    assert sources[0]["published"] == "2026-11-20T08:00:00Z"
+    assert sources[1]["published"] == ""
+    # 文本输出也带发布时间（模型据此判断时效）
+    assert "2026-11-20" in ret.text
+
+
+@pytest.mark.asyncio
 async def test_searxng_http_403_reports_json_format_hint(monkeypatch, caplog):
     """HTTP 403（JSON 格式未启用）需要给出清晰报错与日志。"""
     calls = []
