@@ -163,7 +163,13 @@ class RunWorker:
                 pass
             self._poll_task = None
 
-        tasks = set(self._inflight)
+        # 只处理绑定当前事件循环的任务：Worker 是进程级单例，可能被多个事件
+        # 循环复用（如测试进程内多个 TestClient 各自建 loop），遗留任务绑在已
+        # 关闭的 loop 上，直接 await 会抛 "attached to a different loop" 并
+        # 让关闭流程中断（后续生命周期全部失败）。
+        loop = asyncio.get_running_loop()
+        tasks = {t for t in self._inflight if t.get_loop() is loop and not t.done()}
+        self._inflight = tasks
         if tasks and graceful:
             _, pending = await asyncio.wait(tasks, timeout=self.shutdown_grace)
             tasks = pending

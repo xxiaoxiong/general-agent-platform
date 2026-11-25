@@ -55,8 +55,8 @@ async def create_run(
     from app.services.agent_runtime.repositories import IdempotencyConflict, SessionBusy
     from app.services.agent_runtime.source_bindings import SourceBindingError, check_source_bindings
     from app.services.agent_runtime.task_router import (
-        DOCUMENT_GRAPH_TYPES, choose_word_attachment, recent_word_attachments, resolve_attachment_refs,
-        route_task, word_candidates,
+        DOCUMENT_GRAPH_TYPES, choose_word_attachment, continuation_attachments,
+        recent_word_attachments, resolve_attachment_refs, route_task, word_candidates,
     )
 
     # 1) 会话定位（仅限当前用户）
@@ -171,6 +171,21 @@ async def create_run(
         has_document_context=any(message.get("document_run_id") for message in history if isinstance(message, dict)),
         has_word_attachment=bool(previous_word),
     )
+    # 会话上下文延续：用户指代此前内容（"这份报告/基于上面"）且本轮没有重新上传时，
+    # 自动沿用会话内最近上传的 Word，避免文档任务在缺少源资料时凭空生成
+    if session is not None:
+        for ref in continuation_attachments(
+            body.message, history, execution_context["task_type"], attachment_refs,
+        ):
+            try:
+                inherited_refs = await asyncio.to_thread(
+                    resolve_attachment_refs, [ref], user_id=current_user.id,
+                    agent_id=agent_id, session_id=body.conversation_id,
+                )
+            except (ValueError, OSError):
+                continue
+            attachment_refs.extend(inherited_refs)
+            declared_refs.extend(inherited_refs)
     inherited, anchor_run = [], None
     continued = None
     if (session and not body.team_mode and not attachment_refs

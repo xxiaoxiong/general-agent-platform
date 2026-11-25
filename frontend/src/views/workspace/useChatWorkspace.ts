@@ -326,6 +326,9 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
     const sentWebEnabled = st.webSearchOn.value
     const sentTeamMode = !continueTask && st.teamMode.value
     const sentTask = continueTask ? { mode: 'chat' as const } : { ...st.documentTask.value }
+    // 右侧正在预览的文档视为本轮编辑目标（所见即所改）；手动选文档或带附件时不覆盖
+    const sentPreview = !continueTask && !sentFiles.length && sentTask.mode === 'auto'
+      ? st.documentPreview.value : null
 
     if (!continueTask) {
       st.inputText.value = ''
@@ -356,6 +359,10 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
         ...(sentTeamMode ? { team_mode: true } : {}),
         attachments: sentFiles,
         ...documentTaskPayload(sentTask),
+        ...(sentPreview ? {
+          document_id: sentPreview.document_id,
+          task_options: { document_version_no: sentPreview.version_no },
+        } : {}),
       })
       if (entry.stopped) {
         if (!st.inactive.value) runApi.cancel(created.run_id, '用户主动停止').catch(() => {

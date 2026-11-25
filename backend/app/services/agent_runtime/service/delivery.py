@@ -1,6 +1,8 @@
 """会话写回与 Outbox 交付（自 service.py 机械拆分，逻辑零改动）。"""
 from __future__ import annotations
 
+import re
+
 from ._common import *  # noqa: F401,F403 机械拆分共享依赖
 from ._common import (
     _AGENT_CONFIG_VERSION_KEYS,
@@ -15,6 +17,29 @@ from ._common import (
     _synthetic_terminal_event,
     compute_request_hash,
 )
+
+# 平台文档版本特有的交付声明：模型在无文档版本事件时声称这些内容属于虚假交付
+_DOCUMENT_CLAIM = re.compile(r"第\s*\d+\s*版|\bdocx\b\s*文件已通过校验", re.I)
+_UNBACKED_NOTE = (
+    "\n\n> 系统核对：本次运行没有产生新的文档版本。"
+    "如需修改文档，请指明具体章节，或先在右侧打开目标文档再发起请求。"
+)
+
+
+def claims_document_version(final_text: str) -> bool:
+    return bool(_DOCUMENT_CLAIM.search(final_text or ""))
+
+
+async def _document_event_exists(db, run_id: str) -> bool:
+    from sqlalchemy import func, select
+
+    from app.models.agent import AgentRunEvent
+
+    count = await db.scalar(select(func.count()).select_from(AgentRunEvent).where(
+        AgentRunEvent.run_id == run_id,
+        AgentRunEvent.event_type.in_(("document.version.created", "document.profile_saved")),
+    ))
+    return bool(count)
 
 
 class DeliveryMixin:
@@ -32,6 +57,15 @@ class DeliveryMixin:
         with platform_span("session_writeback", run_id=run.run_id,
                            attributes={"session_id": run.session_id}):
             await self._deliver_outbox(run.run_id)
+
+    async def _delivered_text(self, db, run_id: str, row) -> str:
+        """写回正文；无文档版本事件却声称生成版本时追加客观核对说明。"""
+        content = (row.final_text or "") if row is not None else ""
+        if not content or not claims_document_version(content):
+            return content
+        if await _document_event_exists(db, run_id):
+            return content
+        return content + _UNBACKED_NOTE
 
     async def _deliver_outbox(self, run_id: str) -> None:
         """按 Outbox 记录执行一次 Session 写回（幂等、可重试）。"""
@@ -71,7 +105,7 @@ class DeliveryMixin:
                     [{
                         "message_id": uuid.uuid4().hex,
                         "role": "assistant",
-                        "content": (row.final_text or "") if row is not None else "",
+                        "content": await self._delivered_text(db, run_id, row),
                         "steps": steps,
                         "source_run_id": run_id,
                         "created_at": datetime.utcnow().isoformat(),

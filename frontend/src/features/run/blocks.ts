@@ -564,6 +564,14 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
       break
     }
 
+    case 'document.model.progress': {
+      // 长模型调用心跳：持续刷新已用时，避免用户误判为卡住
+      const seconds = Math.max(0, Math.round(Number(data.elapsed_s) || 0))
+      const elapsed = seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
+      setDocumentStage(msg, String(data.label || '正在处理文档'), `已用时 ${elapsed}`)
+      break
+    }
+
     case 'document.validation.started':
       setDocumentStage(msg, '正在校验文档')
       break

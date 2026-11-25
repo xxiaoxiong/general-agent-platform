@@ -81,8 +81,11 @@ def _validate_profile(draft: DocumentDraft, profile: ProfileDefinition) -> list[
     text = "\n".join([draft.title, draft.subtitle, draft.abstract, *[
         block_text(block) for section in draft.sections for block in section.blocks
     ]])
+    declared_ids = {field.id for field in profile.required_inputs}
     required_ids = {field.id for field in profile.required_inputs if field.required}
-    required_ids.update(field_id for section in profile.sections if section.id in actual for field_id in section.required_fields)
+    # 只有规范里真实声明的字段才能升级为必填；章节误填的章节名/标题只作为可选推导字段
+    required_ids.update(field_id for section in profile.sections if section.id in actual
+                        for field_id in section.required_fields if field_id in declared_ids)
     for field in profile.input_fields():
         field_id = field.id
         value = draft.field_values.get(field_id)
@@ -106,7 +109,9 @@ def validate_draft(draft: DocumentDraft, profile: ProfileDefinition | None = Non
     for section in draft.sections:
         for block in section.blocks:
             if set(block.source_ids) - sources:
-                issues.append(_issue("unknown_source", "正文引用了未登记的资料来源", section_id=section.id))
+                # 模型可能自造来源标识：正文已剔除这些引用，保留提示供复核，不阻断交付
+                issues.append(_issue("unknown_source", "正文引用了未登记的资料来源，已忽略该引用",
+                                     severity="warning", section_id=section.id))
     for field_id in sorted(set(draft.missing_fields) & set(draft.field_values)):
         issues.append(_issue("conflicting_input", f"字段 {field_id} 同时存在值和待补充标记"))
     if profile is not None:

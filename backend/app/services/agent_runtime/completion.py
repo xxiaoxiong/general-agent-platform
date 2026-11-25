@@ -40,6 +40,8 @@ class CompletionState(AgentState):
 
 
 _FILE_TOOLS = frozenset({"write_file", "edit_file"})
+# 内置文件读取工具只发 internal 事件、不写工具执行账本；验收证据需从事件补齐
+_READ_TOOLS = frozenset({"read_file"})
 _LIMIT_FINISH_REASONS = frozenset({"length", "max_tokens", "max_output_tokens"})
 # MySQL 现有 final_text 字段是 TEXT，预留空间给末尾的 UTF-8 字符。
 _MAX_ANSWER_BYTES = 60_000
@@ -328,21 +330,39 @@ def freeze_artifacts(ctx: RuntimeContext, artifacts: list[dict]) -> dict[str, st
     return published
 
 
+def _event_read_evidence(events, seen_calls: set[str]) -> list[ToolEvidence]:
+    """内置文件读取工具只发 internal 事件、不写执行账本，从事件补齐读取证据（按调用 ID 去重）。"""
+    evidence: list[ToolEvidence] = []
+    for _, event_type, payload in sorted(events, key=lambda row: row[0]):
+        if event_type != TOOL_COMPLETED or not isinstance(payload, dict) or not payload.get("internal"):
+            continue
+        tool, call_id = payload.get("tool"), str(payload.get("tool_call_id") or "")
+        if tool not in _READ_TOOLS or not call_id or call_id in seen_calls:
+            continue
+        seen_calls.add(call_id)
+        evidence.append(ToolEvidence(tool, "succeeded", output=str(payload.get("output") or "")))
+    return evidence
+
+
 async def _collect_evidence(ctx: RuntimeContext) -> tuple[list[ToolEvidence], list[dict[str, Any]], bool]:
     ledger, internal = AgentToolExecution, AgentRunEvent
     async with AsyncSessionLocal() as db:
-        rows = (await db.execute(select(ledger.tool_name, ledger.status, ledger.external_operation_id, ledger.result_payload)
+        rows = (await db.execute(select(ledger.tool_name, ledger.status, ledger.external_operation_id,
+                                        ledger.result_payload, ledger.tool_call_id)
                                  .where(ledger.run_id == ctx.run_id))).all()
         events = (await db.execute(select(internal.sequence, internal.event_type, internal.payload)
                                    .where(internal.run_id == ctx.run_id,
                                           internal.event_type.in_((TOOL_STARTED, TOOL_COMPLETED, TOOL_FAILED))))).all()
-    evidence = [ToolEvidence(row.tool_name, row.status, row.external_operation_id, str(row.result_payload or "")) for row in rows]
+    evidence = [ToolEvidence(row.tool_name, row.status, row.external_operation_id, str(row.result_payload or ""))
+                for row in rows]
+    seen_calls = {str(row.tool_call_id or "") for row in rows if row.tool_call_id}
+    evidence.extend(_event_read_evidence(events, seen_calls))
     # 已获得回执或仍需核对的外部操作均阻止自动返工，避免重新推理生成另一笔操作。
     external_handled = any(row.status in _UNRESOLVED_OR_EXECUTED
                            and get_side_effect_contract(row.tool_name).side_effect_class in _EXTERNAL_CLASSES for row in rows)
     writes: dict[str, str] = {}
     finished_paths: set[str] = set()
-    for _, event_type, payload in sorted(events, key=lambda row: row.sequence):
+    for _, event_type, payload in sorted(events, key=lambda row: row[0]):
         event = payload or {}
         if not event.get("internal") or event.get("tool") not in _FILE_TOOLS:
             continue

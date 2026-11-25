@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import Any, TypeVar
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -32,8 +33,11 @@ _SAFETY = (
 _FENCE = re.compile(r"\s*```(?:json)?\s*(.*?)\s*```\s*", re.DOTALL | re.IGNORECASE)
 _THINK = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
 _JSON_START = re.compile(r"(?:^|\n)\s*(?=\{)")
-_DECODER = json.JSONDecoder()
+# strict=False：模型改写长文时经常在 JSON 字符串里输出裸换行，严格模式会整单判失败
+_DECODER = json.JSONDecoder(strict=False)
 logger = logging.getLogger(__name__)
+# 长文档单次模型调用可能持续数分钟：定期上报进度，让前端与外部观察者看到任务仍在推进
+_PROGRESS_INTERVAL = 20.0
 
 
 def as_json(value: Any) -> str:
@@ -48,9 +52,35 @@ def model_messages(operation: str, instruction: str, data: dict) -> list:
             HumanMessage(content=as_json(data))]
 
 
+async def _invoke_with_progress(context, messages, config, operation: str, label: str):
+    """调用模型并定期上报进度；进度事件失败不得干扰正在进行的生成。"""
+    emit = getattr(context, "emit", None)
+    if emit is None:
+        return await context.model.ainvoke(messages, config=config)
+    started = time.monotonic()
+    task = asyncio.create_task(context.model.ainvoke(messages, config=config))
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=_PROGRESS_INTERVAL)
+            if task in done:
+                return task.result()
+            try:
+                await emit("document.model.progress", {
+                    "operation": operation, "label": label,
+                    "elapsed_s": round(time.monotonic() - started, 1),
+                })
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.warning("文档进度事件发送失败 operation=%s", operation, exc_info=True)
+    finally:
+        if not task.done():
+            task.cancel()
+
+
 async def model_json(context, config: RunnableConfig, operation: str, instruction: str,
                      data: dict, response_type: type[S], *, images: list[dict] | None = None,
-                     compact_retry: str = "", stage: str = "") -> S:
+                     compact_retry: str = "", stage: str = "", progress_label: str = "") -> S:
     if (team_brief := getattr(context, "team_brief", "")) and operation in {
         "extract_profile", "prepare_profile", "write_section", "edit_draft", "plan_office_edits", "review_draft",
     }:
@@ -68,7 +98,15 @@ async def model_json(context, config: RunnableConfig, operation: str, instructio
         messages = model_messages(operation, prompt, data)
         if images:
             messages[-1] = HumanMessage(content=[{"type": "text", "text": as_json(data)}, *images])
-        reply = await context.model.ainvoke(messages, config=config)
+        try:
+            reply = await _invoke_with_progress(context, messages, config, operation, progress_label)
+        except Exception as exc:  # noqa: BLE001 模型网关瞬时错误（超时/限流/5xx）允许一次重试
+            if attempt >= 2:
+                raise
+            logger.warning("文档模型调用失败 operation=%s attempt=%s: %r",
+                           operation, attempt + 1, exc)
+            await asyncio.sleep(2)
+            reply = await _invoke_with_progress(context, messages, config, operation, progress_label)
         raw = _THINK.sub("", reply.text).strip()
         match = _FENCE.fullmatch(raw)
         if not match:
@@ -90,14 +128,24 @@ async def model_json(context, config: RunnableConfig, operation: str, instructio
             tail = raw[end:].strip()
             if "{" in tail or "}" in tail:
                 raise ValueError("multiple_objects")
-            return response_type.model_validate(payload)
+            validated = response_type.model_validate(payload)
+            # 命中输出上限时即使 JSON 恰好可解析，正文也可能在句中被截断：
+            # 用压缩提示再生成一次，避免残缺章节进入审阅与返工
+            if issue == "truncated" and attempt < (3 if compact_retry else 2) - 1:
+                feedback = "\n上一份回复达到输出长度上限，正文可能不完整，请压缩后重新完整输出。"
+                continue
+            return validated
         except ValidationError as exc:
-            fields = [".".join(str(part)[:32] for part in error["loc"]) + " " + error["type"]
-                      for error in exc.errors(include_input=False, include_context=False)[:8]]
+            fields = [
+                ".".join(str(part)[:32] for part in error["loc"]) + " " + error["type"]
+                + (f"（{str(error.get('msg') or '')[:120]}）" if error.get("msg") else "")
+                for error in exc.errors(include_input=False, include_context=False)[:8]
+            ]
             feedback = "\n上一份回复包含无效字段，请修正并完整返回。位置及规则 " + "、".join(fields)
         except (ValueError, RecursionError):
             feedback = "\n上一份回复的 JSON 不完整或格式错误。请输出一个完整对象并关闭所有引号和括号。"
-        logger.warning("文档模型回包校验失败 operation=%s attempt=%s issue=%s", operation, attempt + 1, issue)
+        logger.warning("文档模型回包校验失败 operation=%s attempt=%s issue=%s feedback=%s",
+                       operation, attempt + 1, issue, feedback.strip()[:400])
     raise StructuredDocumentError(issue, stage=stage)
 
 
@@ -194,6 +242,21 @@ def valid_values(fields: list[InputField], values: dict) -> dict:
 
 
 def draft_excerpt(sections, limit: int = 9000) -> str:
-    parts = [f"{section.title}\n" + "\n".join(block_text(block) for block in section.blocks)
-             for section in sections]
-    return "\n\n".join(parts)[:limit]
+    """按章节边界截取摘录；超限时明确标注"未摘录不代表缺失"，避免审阅误判正文截断。"""
+    parts: list[str] = []
+    used = 0
+    total = len(sections)
+    for index, section in enumerate(sections):
+        text = f"{section.title}\n" + "\n".join(block_text(block) for block in section.blocks)
+        if parts and used + len(text) > limit:
+            parts.append(f"[摘录到此结束：全文共 {total} 节，以上为前 {index} 节；"
+                         "其余章节未摘录，不代表正文缺失]")
+            return "\n\n".join(parts)
+        if not parts and len(text) > limit:
+            parts.append(text[:limit])
+            parts.append(f"[摘录到此结束：全文共 {total} 节，当前节仅摘录前 {limit} 字；"
+                         "其余内容未摘录，不代表正文缺失]")
+            return "\n\n".join(parts)
+        parts.append(text)
+        used += len(text)
+    return "\n\n".join(parts)

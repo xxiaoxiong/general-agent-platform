@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict, deque
 from collections.abc import Collection, Iterator
+from difflib import SequenceMatcher
 from hashlib import sha256
 from itertools import count
 
@@ -22,9 +24,28 @@ def _with_sources(block, operation: PatchOperation, *, block_id: str | None = No
     return block.model_copy(deep=True, update=changes)
 
 
+def _content_similar(actual: str, expected: str) -> bool:
+    """抄写误差容忍度：空白、标点或少量省略不视为定位失效。
+
+    章节/内容块 ID 才是修改位置的唯一锚点，expected_before 只是模型自检；
+    完全按字符比对会把复制误差当成版本冲突，让整轮修改无谓失败。
+    """
+    left = re.sub(r"\s+", "", actual)
+    right = re.sub(r"\s+", "", expected)
+    if not left or not right:
+        return False
+    return SequenceMatcher(None, left, right).ratio() >= 0.6
+
+
 def _check_before(actual: str, operation: PatchOperation) -> None:
-    if operation.expected_before is not None and actual.strip() != operation.expected_before:
-        raise DocumentPatchError("目标内容已变化，请重新检查修改位置")
+    if operation.expected_before is None:
+        return
+    if actual.strip() == operation.expected_before.strip():
+        return
+    if _content_similar(actual, operation.expected_before):
+        return
+    excerpt = re.sub(r"\s+", " ", actual.strip())[:160]
+    raise DocumentPatchError(f"目标内容与原文不一致，请按原文重新定位修改位置。当前原文开头：{excerpt}")
 
 
 def _content_key(block: ContentBlock) -> str:
@@ -78,8 +99,8 @@ def _edited_blocks(section: DraftSection, operations: list[PatchOperation],
             continue
         if operation.block.id not in {None, anchor}:
             raise DocumentPatchError("替换内容必须保留现有内容锚点")
-        if operation.block.type != original[anchor].type:
-            raise DocumentPatchError("块内修改需保持原有段落、列表或表格类型。转换类型请按小节重写")
+        # 允许段落/列表/表格之间转换：结构如何表达由模型按用户要求决定，
+        # 具体改动由用户审阅确认（不再用固定的"保持原块类型"硬约束）
         new_content = _content_key(operation.block)
         if new_content in original_content and new_content != _content_key(original[anchor]):
             raise DocumentPatchError("待替换文字来自同节其他原文块，请确认引用位置或按小节重写")

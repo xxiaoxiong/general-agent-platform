@@ -37,7 +37,13 @@ _WRITE_TOOLS = {"write_file", "edit_file"}
 _DB_TOOLS = {"db_query", "db_count", "db_aggregate"}
 _EXEC_TOOLS = {"python_exec"}
 _WEB_TOOLS = {"web_search", "fetch_webpage", "http_get"}
+_READ_TOOLS = {"read_file"}
 _SIDE_EFFECT_TOOLS = {"http_post", "send_email_tool", "webhook_notify"}
+# 正文对已读本地资料的引用标注：编号引用、来源清单、明确指代源文件/附件/原文
+_LOCAL_CITATION = re.compile(
+    r"\[\d{1,3}\]|来源清单|参考(?:资料|文献|文件)|根据(?:附件|原文|源文件|文档|报告)"
+    r"|(?:附件|源文件|原文|上传的文件)", re.I,
+)
 _ROW_COUNTS = {
     "raw_rows": re.compile(r"(?:原始记录|原始数据|输入记录|\b(?:raw|original) (?:rows|records)\b)(?:条数|行数|数|共计|共|为)?[ \t*`：:|=]*(\d+)(?=\s*(?:[条行|。.；]|$))", re.M | re.I),
     "valid_rows": re.compile(r"(?:有效记录|有效数据|有效条数|有效行数|\bvalid (?:rows|records)\b)(?:条数|行数|数|共计|共|为)?[ \t*`：:|=]*(\d+)(?=\s*(?:[条行|。.；]|$))", re.M | re.I),
@@ -119,17 +125,27 @@ def _urls(text: str) -> set[tuple]:
 
 
 def _check_citations_present(final_text: str, evidence: Sequence[ToolEvidence], contract: TaskContract) -> CheckResult:
+    text = final_text or ""
     observed = _urls("\n".join(contract.supplied_urls))
+    read_local = False
     for entry in evidence:
-        if entry.status == "succeeded" and entry.tool_name in _WEB_TOOLS:
+        if entry.status != "succeeded":
+            continue
+        if entry.tool_name in _WEB_TOOLS:
             observed.update(_urls(entry.output))
-    cited = _urls(final_text)
+        elif entry.tool_name in _READ_TOOLS:
+            read_local = True
+    cited = _urls(text)
     verified = len(cited & observed)
+    # 用户提供的本地资料：成功读过且正文有引用标注（编号/来源清单/源文件指代）即算一个来源
+    file_cited = read_local and bool(_LOCAL_CITATION.search(text))
     required = max(1, contract.source_count)
-    if verified >= required:
+    if verified + (1 if file_cited else 0) >= required:
         # 客观数据：附带未经工具账本/用户输入核对的引用数量，供复核
         unverified = len(cited - observed)
         detail = f"已核对来源 {verified} 个"
+        if file_cited:
+            detail += "；已引用本次读取的本地资料"
         if unverified:
             detail += f"；另有 {unverified} 个引用链接未在工具账本中出现"
         return CheckResult("citations_present", True, detail)

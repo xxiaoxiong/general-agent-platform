@@ -76,10 +76,11 @@ function replyFor(body) {
       return { id, title, order, level, blocks: [{ type: 'paragraph', text, source_ids: id === 's3'
         ? ['request', data.sources.find(item => item.reference.kind === 'database').reference.id] : ['request'] }] };
     }
+    case 'plan_edit_scope':
+      return { section_ids: data.hint_section_ids ?? [], reason: '按请求命中的章节修改' };
     case 'edit_draft':
       assert.deepEqual(data.allowed_sections.map(section => section.id), ['s3']);
       if (data.request.includes('重写第三章')) {
-        assert.equal(data.allow_section_rewrite, true);
         return { summary: '将成果章节重写为可查阅的表格与步骤', operations: [{
           operation: 'replace_section', section_id: 's3', blocks: [
             { type: 'paragraph', text: '交付成果概览' },

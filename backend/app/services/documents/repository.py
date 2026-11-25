@@ -320,6 +320,22 @@ async def publish_document(
     return asset, version
 
 
+async def session_profile(
+    db: AsyncSession, candidates: list[DocumentProfile], session_id: int | None,
+) -> DocumentProfile | None:
+    """多份可用规范时优先本会话刚保存/发布的那份（会话上下文延续）。"""
+    if not session_id or not candidates:
+        return None
+    row = (await db.execute(
+        select(DocumentProfileVersion.profile_id)
+        .join(AgentRun, AgentRun.id == DocumentProfileVersion.created_by_run_id)
+        .where(DocumentProfileVersion.profile_id.in_([item.id for item in candidates]),
+               AgentRun.session_id == session_id)
+        .order_by(DocumentProfileVersion.created_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    return next((item for item in candidates if item.id == row), None) if row else None
+
+
 async def resolve_task_resources(
     db: AsyncSession, *, user_id: int, is_superuser: bool = False, session_id: int | None = None,
     task_type: str, message: str, profile_id: int | None = None, document_id: int | None = None,
@@ -372,6 +388,9 @@ async def resolve_task_resources(
             accessible = [item for item, _ in candidates if item.owner_id == user_id]
             if len(accessible) == 1:
                 profile = accessible[0]
+            else:
+                # 多份可用规范时，优先复用本会话刚提炼并发布的那一份
+                profile = await session_profile(db, accessible, session_id)
     if profile is not None:
         if profile.status == "archived":
             raise DocumentError(422, "该文档规范已归档")

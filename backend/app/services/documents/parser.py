@@ -482,6 +482,8 @@ def parse_conversation_draft(markdown: str) -> ParsedDocument:
     def plain(value: str) -> str:
         value = re.sub(r"\[([^\]]+)\]\(#[^)]*\)", r"\1", value)
         value = re.sub(r"\[([^\]]+)\]\((https?://[^)]*)\)", r"\1 (\2)", value)
+        # 其余链接（如 subagent: 内部引用）只保留标题文本，避免 Markdown 语法残留在 Word 正文
+        value = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", value)
         value = re.sub(r"(\*\*|__|\x60)(.+?)\1", r"\2", value)
         return value.strip()
 

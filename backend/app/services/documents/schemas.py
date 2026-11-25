@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import re
 from itertools import count
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StrictFloat, StrictInt, model_validator
+from pydantic import (
+    AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, StrictFloat, StrictInt, model_validator,
+)
 
 
 def _xml_text(value: str) -> str:
@@ -39,6 +41,33 @@ class DocumentSchema(BaseModel):
 def _unique(values, message: str) -> None:
     if len(set(values)) != len(values):
         raise ValueError(message)
+
+
+_ANCHOR_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
+
+
+def normalize_anchor(value: Any, fallback: str) -> str:
+    """把模型给出的中文/带标点标识归一为合法锚点（保留 ASCII 片段，否则用兜底）。"""
+    raw = str(value or "").strip()
+    if _ANCHOR_RE.fullmatch(raw):
+        return raw
+    parts = [part.strip("_-") for part in re.findall(r"[A-Za-z0-9_-]+", raw)]
+    candidate = "_".join(part for part in parts if part)[:32]
+    if not candidate:
+        candidate = fallback
+    candidate = re.sub(r"[^A-Za-z0-9_-]", "_", candidate)[:32]
+    if not candidate or not candidate[0].isalnum():
+        candidate = f"a{candidate}"[:32]
+    return candidate
+
+
+def unique_anchor(candidate: str, used: set[str]) -> str:
+    value, suffix = candidate, 2
+    while value in used:
+        value = f"{candidate[:28]}_{suffix}"
+        suffix += 1
+    used.add(value)
+    return value
 
 
 class InputField(DocumentSchema):
@@ -130,6 +159,56 @@ class ProfileDefinition(DocumentSchema):
     quality_rules: list[QualityRule] = Field(default_factory=list, max_length=40)
     uncertainties: Strings = Field(default_factory=list)
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_profile_shape(cls, value):
+        """归一键值形态：中文标识转合法锚点、章节顺序缺失或重复时按出现顺序重排。"""
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        data["document_type"] = normalize_anchor(data.get("document_type"), "document")
+        rename: dict[str, str] = {}
+        inputs, seen_inputs = [], set()
+        for index, field in enumerate(data.get("required_inputs") or []):
+            if not isinstance(field, dict):
+                inputs.append(field)
+                continue
+            field = dict(field)
+            original = str(field.get("id") or "")
+            field["id"] = unique_anchor(normalize_anchor(original, f"field{index + 1}"), seen_inputs)
+            rename[original] = field["id"]
+            inputs.append(field)
+        data["required_inputs"] = inputs
+
+        sections = [dict(item) if isinstance(item, dict) else item for item in data.get("sections") or []]
+        seen_sections = set()
+        for index, item in enumerate(sections):
+            if not isinstance(item, dict):
+                continue
+            item["id"] = unique_anchor(normalize_anchor(item.get("id"), f"s{index + 1}"), seen_sections)
+            renamed = []
+            for raw in item.get("required_fields") or []:
+                field_id = rename.get(str(raw)) or normalize_anchor(raw, "field")
+                if field_id not in renamed:
+                    renamed.append(field_id)
+            item["required_fields"] = renamed
+
+        rules = [dict(item) if isinstance(item, dict) else item for item in data.get("quality_rules") or []]
+        seen_rules = set()
+        for index, item in enumerate(rules):
+            if isinstance(item, dict):
+                item["id"] = unique_anchor(normalize_anchor(item.get("id"), f"rule{index + 1}"), seen_rules)
+        data["quality_rules"] = rules
+
+        orders = [item.get("order") if isinstance(item, dict) else None for item in sections]
+        if not (all(isinstance(order, int) and order >= 1 for order in orders)
+                and len(set(orders)) == len(orders)):
+            for index, item in enumerate(sections):
+                if isinstance(item, dict):
+                    item["order"] = index + 1
+        data["sections"] = sections
+        return data
+
     @model_validator(mode="after")
     def validate_profile(self):
         _validate_structure(self.sections)
@@ -144,7 +223,9 @@ class ProfileDefinition(DocumentSchema):
         for section in self.sections:
             for field_id in section.required_fields:
                 if field_id not in fields:
-                    fields[field_id] = InputField(id=field_id, label=field_id)
+                    # 章节引用了未声明的字段：保留为可选推导字段，不向用户强制索要
+                    # （模型常把章节 id 误填为 required_fields，强制必填会索要虚构资料）
+                    fields[field_id] = InputField(id=field_id, label=field_id, required=False)
                 elif section.required and not fields[field_id].required:
                     fields[field_id] = fields[field_id].model_copy(update={"required": True})
         return list(fields.values())
@@ -192,7 +273,108 @@ class TableBlock(_Block):
         return self
 
 
+# 模型常见输出形态归一：类名式 type、单元格/列表项写成对象、表格行写成 {cells: [...]}。
+# 内容结构由模型决定，格式差异不应让整轮生成失败后重试。
+_BLOCK_TYPES = {
+    "paragraph": "paragraph", "paragraphblock": "paragraph", "paragraph_block": "paragraph",
+    "text": "paragraph", "textblock": "paragraph",
+    "list": "list", "listblock": "list", "list_block": "list", "bullet": "list", "bullets": "list",
+    "table": "table", "tableblock": "table", "table_block": "table",
+}
+_BLOCK_FIELDS = {
+    "paragraph": {"id", "source_ids", "type", "text", "style"},
+    "list": {"id", "source_ids", "type", "items", "ordered"},
+    "table": {"id", "source_ids", "type", "rows", "header"},
+}
+_PARAGRAPH_STYLES = {"normal", "quote", "caption"}
+_MAX_TABLE_COLUMNS = 30
+
+
+def _cell_text(value: Any) -> Any:
+    if isinstance(value, dict):
+        for key in ("text", "content", "value", "title"):
+            if isinstance(value.get(key), str):
+                return value[key]
+        return " ".join(str(item) for item in value.values() if isinstance(item, str))
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return value
+
+
+def _coerce_block_shape(value: Any) -> Any:
+    """按等价语义归一单个内容块；无法承载内容时返回 None 由调用方丢弃。"""
+    if not isinstance(value, dict):
+        return value
+    data = dict(value)
+    kind = _BLOCK_TYPES.get(str(data.get("type") or "").strip().casefold())
+    if kind is None:
+        # 未知块类型按承载内容推断：模型有时写 section/chapter 或自造类型
+        if isinstance(data.get("text"), str) and data["text"].strip():
+            kind = "paragraph"
+        elif isinstance(data.get("items"), list):
+            kind = "list"
+        elif isinstance(data.get("rows"), list):
+            kind = "table"
+        else:
+            return None
+    # 只保留该块类型认识的字段：模型常给列表/表格块附上段落专属字段
+    data = {key: value for key, value in data.items() if key in _BLOCK_FIELDS[kind]}
+    data["type"] = kind
+    # 块锚点由系统分配：模型给出的超长/非法 id 直接丢弃，避免无意义校验失败
+    ident = data.get("id")
+    if ident is not None and (not isinstance(ident, str)
+                              or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}", ident)):
+        data.pop("id", None)
+    if kind == "paragraph":
+        text = data.get("text")
+        if isinstance(text, str) and not text.strip():
+            return None
+        if data.get("style") not in _PARAGRAPH_STYLES:
+            data["style"] = "normal"
+    if kind == "list" and isinstance(data.get("items"), list):
+        data["items"] = [cell for cell in (_cell_text(item) for item in data["items"])
+                         if isinstance(cell, str) and cell.strip()]
+        if not data["items"]:
+            return None
+    if kind == "table" and isinstance(data.get("rows"), list):
+        rows = []
+        for row in data["rows"]:
+            if isinstance(row, dict):
+                row = row.get("cells") or row.get("values") or []
+            if not isinstance(row, list):
+                continue
+            cells = [_cell_text(cell) for cell in row][:_MAX_TABLE_COLUMNS]
+            if any(isinstance(cell, str) and cell.strip() for cell in cells):
+                rows.append(cells)
+        if not rows:
+            return None
+        # 行宽不一致时按最大列数补空单元格，保留全部信息
+        width = max(len(row) for row in rows)
+        data["rows"] = [row + [""] * (width - len(row)) for row in rows]
+    return data
+
+
+def _coerce_blocks(value: Any) -> Any:
+    if not isinstance(value, list):
+        return value
+    result = []
+    for entry in value:
+        # 模型有时把章节对象塞进 blocks：展开其内部块列表
+        if isinstance(entry, dict) and str(entry.get("type") or "").strip().casefold() in {
+            "section", "subsection", "chapter",
+        } and isinstance(entry.get("blocks"), list):
+            result.extend(_coerce_blocks(entry["blocks"]))
+            continue
+        coerced = _coerce_block_shape(entry)
+        if coerced is not None:
+            result.append(coerced)
+    return result
+
+
 ContentBlock = Annotated[ParagraphBlock | ListBlock | TableBlock, Field(discriminator="type")]
+# 块列表与单块在进入判别联合之前先归一格式（判别联合本身不会调用成员的 before 校验）
+BlockList = Annotated[list[ContentBlock], BeforeValidator(_coerce_blocks)]
+BlockItem = Annotated[ContentBlock, BeforeValidator(_coerce_block_shape)]
 
 
 def block_text(block: ContentBlock) -> str:
@@ -208,7 +390,7 @@ class DraftSection(DocumentSchema):
     title: Title
     order: int = Field(ge=1, le=999)
     level: int = Field(default=1, ge=1, le=3)
-    blocks: list[ContentBlock] = Field(default_factory=list, max_length=300)
+    blocks: BlockList = Field(default_factory=list, max_length=300)
 
     @model_validator(mode="after")
     def assign_block_anchors(self):
@@ -299,11 +481,27 @@ class PatchOperation(DocumentSchema):
     operation: Literal["replace_section", "replace_block", "insert_block", "remove_block"]
     section_id: Anchor
     block_id: Anchor | None = None
-    blocks: list[ContentBlock] | None = Field(default=None, max_length=300)
-    block: ContentBlock | None = None
+    blocks: BlockList | None = Field(default=None, max_length=300)
+    block: BlockItem | None = None
     reason: ShortText = ""
     source_ids: list[Anchor] = Field(default_factory=list, max_length=40)
     expected_before: Text | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_model_shape(cls, value):
+        """纠正常见模型形状偏差：不改变内容语义，只丢弃互斥字段或单块列表。"""
+        if not isinstance(value, dict):
+            return value
+        operation, blocks, block = value.get("operation"), value.get("blocks"), value.get("block")
+        if operation == "replace_section" and isinstance(blocks, list) and blocks:
+            # 整节重写以 blocks 为准：误带的 block/block_id 不参与语义
+            return {**value, "block": None, "block_id": None}
+        if (operation in {"replace_block", "insert_block"} and block is None
+                and isinstance(blocks, list) and len(blocks) == 1 and isinstance(blocks[0], dict)):
+            # 块级操作误把单块放进 blocks：等价改写为 block
+            return {**value, "block": blocks[0], "blocks": None}
+        return value
 
     @model_validator(mode="after")
     def validate_target(self):

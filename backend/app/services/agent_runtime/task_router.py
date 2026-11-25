@@ -31,16 +31,38 @@ _PROFILE = re.compile(
     r"|\b(?:extract|derive|create)\b.{0,35}\b(?:profile|reusable template)\b"
 )
 _EDIT = re.compile(
-    r"(?:修改|改写|重写|重新写|重新整理|重组|重排|替换|删除|增加|补写|更新|润色|调整|勘误|"
-    r"插入|换掉|缩小|放大|去掉|清除|更换)"
+    r"(?:改|修改|改写|重写|重新写|重新整理|重组|重排|替换|删除|增加|补写|更新|润色|调整|勘误|"
+    r"插入|换掉|缩小|放大|去掉|清除|更换|优化|美化|统一|排版|调格式|完善|深化|细化|精简|梳理|"
+    r"合并|拆分|规范化|正规化|修正)"
     r"|\b(?:edit|revise|rewrite|replace|update)\b"
+)
+# 样式/排版类诉求：只调整格式，不改文字内容（"深度优化文档样式、排版"）
+_STYLE = re.compile(
+    r"样式|排版|版式|格式|字体|字号|行距|段间距|段前|段后|缩进|对齐|页边距|页眉|页脚|目录|配色", re.I
+)
+_STYLE_ACTION = re.compile(
+    r"优化|美化|统一|规范|调整|修改|重排|重新排|改版|升级|重新给|重新出|重新生成"
+    r"|套用.{0,10}(?:样式|模板|格式)", re.I
+)
+# 明确的内容改动（与样式诉求区分）："补充最新数据"属于改内容，不能只改格式
+_CONTENT_EDIT = re.compile(
+    r"(?:补充|增加|删除|重写|扩写|改写|修订|更新|修正).{0,12}(?:内容|正文|章节|数据|文字|事实)"
+    r"|(?:内容|正文|章节|数据|文字).{0,12}(?:补充|增加|删除|重写|扩写|改写|更新|修正)", re.I
+)
+# 结构性返工/合规改写：点名"不符合要求""需符合写作规范""深化迭代"时属于内容与结构
+# 返工，即使同时出现"样式/排版"也不能降级成只重排格式（143 实录：1s 直出 v3/v4 未改内容）
+_CONTENT_REVISION = re.compile(
+    r"不符合|不满足|未达到|达不到|写作规范|行文规范|内容规范"
+    r"|结构调整|调整结构|深化|迭代|返工|重做|重构|完善|补充|新增|删除|替换", re.I
 )
 _REPLACE = re.compile(r"(?:把|将).{0,110}(?:改成|改为|换成|换为|改掉|去掉)|(?:改成|更换|缩放|移除).{0,12}(?:图片|插图|配图)")
 _EDIT_TARGET = re.compile(
-    r"第[一二三四五六七八九十百零〇两\d]+[章节段条]|(?:文档|报告|word)(?:的|中|里)"
+    r"第\s*[一二三四五六七八九十百零〇两\d]+\s*[章节段条]|(?:文档|报告|word)(?:的|中|里)"
     r"|(?:上次|上一版|刚才|刚生成|原有|已有).{0,12}(?:文档|报告|总结|word|版)"
     r"|\b(?:section|chapter|previous report|existing document)\b"
 )
+# 文档对象指代：会话内已有文档时，带编辑动作的"全文/正文/表格"等诉求同样属于文档编辑
+_DOC_OBJECT = re.compile(r"全文|全篇|整篇|整份|文档|正文|章节|小节|段落|表格|图表")
 _GENERATE = re.compile(
     r"(?:生成|制作|输出|导出|撰写|编写|写一[份个篇]|写成|整理成|转[成为]|形成|起草|交付|放到|存到|写到|保存到)"
     r".{0,28}(?:word|docx|文档|报告|公文|方案|简报|说明书|纪要|总结|手册|指南|文章)"
@@ -76,13 +98,23 @@ def route_task(
     attachment_refs = tuple(attachment_refs)
     has_word = has_word_attachment or any(Path(ref["path"]).suffix.casefold() == ".docx" for ref in attachment_refs)
     edit = _EDIT.search(content) or _REPLACE.search(content)
+    # 只调样式/排版（不含内容改动与结构返工）且会话/附件里已有文档 → 编辑原文档，
+    # 绝不能当成新主题生成；同时点名章节/指出不符合要求时必须走真实内容修改流程
+    style_edit = bool(actionable and _STYLE.search(content) and _STYLE_ACTION.search(content)
+                      and not _CONTENT_EDIT.search(content) and not _CONTENT_REVISION.search(content))
     if task_mode != "auto":
         task_type = "general_chat" if task_mode == "chat" else task_mode
         confidence, reason = 1.0, "用户显式选择任务模式"
+    elif style_edit and (document_id or has_document_context or has_word or _PREVIOUS_DOCUMENT.search(content)):
+        task_type, confidence, reason = "document_edit", 0.95, "用户要求优化已有文档的样式或排版"
+    elif style_edit:
+        # 没有任何可优化文档时不得凭空生成"讲排版"的新文档，让对话澄清目标文档
+        task_type, confidence, reason = "general_chat", 0.7, "样式/排版优化需要先指明具体文档"
     elif actionable and edit and (
         document_id or _PREVIOUS_DOCUMENT.search(content)
         or (has_word and (_FILE_REFERENCE.search(content) or _EDIT_TARGET.search(content) or _MEDIA_TARGET.search(content)))
-        or (has_document_context and (_EDIT_TARGET.search(content) or _MEDIA_TARGET.search(content)))
+        or (has_document_context and (_EDIT_TARGET.search(content) or _MEDIA_TARGET.search(content)
+                                      or _DOC_OBJECT.search(content)))
     ):
         task_type, confidence, reason = "document_edit", 0.98, "用户要求修改已有文档"
     elif actionable and _PROFILE.search(content) and not document_profile_id:
@@ -105,6 +137,7 @@ def route_task(
         "reason": reason,
         "document_profile_id": document_profile_id,
         "document_id": document_id,
+        "style_edit": bool(style_edit and task_type == "document_edit"),
         "router_version": 1,
     }
 
@@ -136,6 +169,21 @@ def recent_word_attachments(history: list[dict]) -> list[dict[str, Any]]:
         if candidates:
             return candidates
     return []
+
+
+def continuation_attachments(
+    message: str, history: list[dict], task_type: str, current: Iterable[dict[str, Any]] = (),
+) -> list[dict[str, Any]]:
+    """后续文档任务自动沿用会话内最近上传的 Word。
+
+    用户上传资料后通常不会在追问时重复上传；指代前文（"这份报告/基于上面"）的
+    规范提炼与文档生成任务必须仍能读到源资料，否则只能凭空生成。
+    """
+    if tuple(current) or task_type not in {"profile_extract", "document_generate", "document_analyze"}:
+        return []
+    if not references_prior_content(message):
+        return []
+    return recent_word_attachments(history)
 
 
 def choose_word_attachment(message: str, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:

@@ -15,6 +15,28 @@ from app.services.agent_runtime.events import TOOL_COMPLETED, TOOL_FAILED, TOOL_
 from app.services.agent_runtime.tool_batches import _repeating_tool_rounds
 
 
+def test_internal_read_events_complete_citation_evidence():
+    """内置 read_file 不写工具账本：事件证据需补齐，且按调用 ID 去重。"""
+    events = [
+        (5, TOOL_STARTED, {"tool": "read_file", "tool_call_id": "call-1", "internal": True,
+                           "input": {"file_path": "/workspace/uploads/report.docx.extracted.txt"}}),
+        (6, TOOL_COMPLETED, {"tool": "read_file", "tool_call_id": "call-1", "internal": True,
+                             "output": "报告正文"}),
+        # 重试会重复发同一调用的完成事件
+        (7, TOOL_COMPLETED, {"tool": "read_file", "tool_call_id": "call-1", "internal": True,
+                             "output": "报告正文"}),
+        # 非读取工具、非 internal 事件不进入读取证据
+        (8, TOOL_COMPLETED, {"tool": "write_file", "tool_call_id": "call-2", "internal": True, "output": "ok"}),
+        (9, TOOL_COMPLETED, {"tool": "read_file", "tool_call_id": "call-3", "output": "外部"}),
+        (10, TOOL_FAILED, {"tool": "read_file", "tool_call_id": "call-4", "internal": True, "error": "not found"}),
+    ]
+    rows = completion._event_read_evidence(events, set())
+    assert [(row.tool_name, row.status) for row in rows] == [("read_file", "succeeded")]
+    assert rows[0].output == "报告正文"
+    # 账本已有记录的调用不重复补
+    assert completion._event_read_evidence(events, {"call-1"}) == []
+
+
 def test_repeated_tool_turns_pause_only_with_unchanged_read_or_failure_evidence():
     def round_output(index, tool, path, output, *, status="success"):
         call_id = f"call-{index}"

@@ -212,6 +212,41 @@ class TestVerification:
         ev[0].status = "failed"
         assert verify_task(c, "结论 https://src.example.com/1", ev).status == STATUS_FAILED
 
+    def test_uploaded_document_analysis_uses_local_citation(self):
+        """上传文档分析：来源义务由已读文件承担，不强制网络检索证据。"""
+        attachment = (
+            "深度解析这份调研报告的结构与论述不足\n\n[附件]（文件已存入会话工作区。回答前请务必先用 read_file 逐个读取以下文件）\n"
+            "- /workspace/uploads/report.docx（文本副本：/workspace/uploads/report.docx.extracted.txt）"
+        )
+        contract = build_task_contract(attachment)
+        assert "citations_present" in contract.completion_checks
+        assert "web_evidence" not in contract.completion_checks
+
+        # 未读取文件：即使正文写了引用也不通过
+        r = verify_task(contract, "报告结构完整，详见 [1]。", [])
+        assert {x.id: x.passed for x in r.checks}["citations_present"] is False
+
+        # 已成功读取且有编号引用：通过
+        evidence = [ToolEvidence(tool_name="read_file", status="succeeded", output="# 报告正文")]
+        r2 = verify_task(contract, "报告结论见 [1]，另见来源清单。", evidence)
+        assert {x.id: x.passed for x in r2.checks}["citations_present"] is True
+        assert r2.status == STATUS_PASSED
+
+        # 已成功读取但正文没有任何引用标注：仍不通过
+        r3 = verify_task(contract, "报告结构完整。", evidence)
+        assert {x.id: x.passed for x in r3.checks}["citations_present"] is False
+
+    def test_uploaded_document_with_explicit_web_intent_keeps_web_gate(self):
+        """附件 + 明确要求联网检索时，仍要求真实网络检索证据。"""
+        request = ("参考上传的报告，再联网调研 2025 年最新进展并给出对比\n\n[附件]（附件说明）\n"
+                   "- /workspace/uploads/report.docx")
+        contract = build_task_contract(request)
+        assert "web_evidence" in contract.completion_checks
+        evidence = [ToolEvidence(tool_name="read_file", status="succeeded", output="正文")]
+        r = verify_task(contract, "对比结论见 [1]。", evidence)
+        assert {x.id: x.passed for x in r.checks}["web_evidence"] is False
+        assert r.status == STATUS_FAILED
+
     def test_doc_artifact(self):
         c = build_task_contract("生成一份项目方案文档")
         r = verify_task(c, "已生成文档", [])
