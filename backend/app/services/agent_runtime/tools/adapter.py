@@ -496,10 +496,22 @@ class ToolAdapterFactory:
                 # 远端/本地已确认成功：只有账本确认写入成功后才宣告成功（§5.2 D）
                 # §15.2 E：工具输出统一脱敏后再入账本/事件/回传
                 text = redact_secrets(tr.text)
+                # 结构化来源（如 web_search）必须进入账本证据：正文后的页面摘要会占用
+                # result_payload 配额，若只存文本，尾部来源 URL 会被截断，导致引用核对
+                # 把真实引用误判为未核对（研究任务被错误返工）。
+                payload = text[:_RESULT_PAYLOAD_LIMIT]
+                source_urls = [
+                    str(source.get("url") or "")
+                    for source in (tr.metadata.get("sources") or [])
+                    if source.get("url")
+                ]
+                if source_urls:
+                    tail = "\n[SOURCE_URLS]\n" + "\n".join(dict.fromkeys(source_urls))
+                    payload = payload[:max(0, _RESULT_PAYLOAD_LIMIT - len(tail))] + tail
                 await self._ledger_mark(
                     rec.id,
                     "succeeded",
-                    result_payload=text[:_RESULT_PAYLOAD_LIMIT],
+                    result_payload=payload,
                     external_operation_id=tr.external_operation_id,
                 )
                 event_data = {"tool": name, "tool_call_id": tool_call_id, "output": text[:2000]}

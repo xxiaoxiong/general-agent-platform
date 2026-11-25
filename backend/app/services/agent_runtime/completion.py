@@ -45,6 +45,10 @@ _READ_TOOLS = frozenset({"read_file"})
 _LIMIT_FINISH_REASONS = frozenset({"length", "max_tokens", "max_output_tokens"})
 # MySQL 现有 final_text 字段是 TEXT，预留空间给末尾的 UTF-8 字符。
 _MAX_ANSWER_BYTES = 60_000
+# 回答被模型单次输出上限截断时的自动续写次数：续写是拼装同一份正文，不计入返工轮数。
+_MAX_ANSWER_CONTINUATIONS = 3
+# 续写拼接时检查的尾部/头部窗口（避免整段重复，同时控制大文本比较成本）。
+_CONTINUATION_WINDOW = 4000
 _RESERVED_ROOTS = {"uploads", "team-projects", "tool_results", "tool-outputs", "documents"}
 _REASONING_PREFIX = re.compile(r"^\s*<think>.*?</think>\s*", re.S | re.I)
 _CONTINUE_FILES = re.compile(
@@ -53,6 +57,60 @@ _CONTINUE_FILES = re.compile(
 _EXTERNAL_CLASSES = {CLASS_EXTERNAL_IDEMPOTENT, CLASS_NON_IDEMPOTENT}
 _UNRESOLVED_OR_EXECUTED = {"succeeded", "executing", "unknown", "needs_reconciliation"}
 _TODO_STATUSES = {"pending", "in_progress", "completed"}
+# 交付声明里的文件路径（只认绝对路径；URL 中的路径前面是单词字符，不会命中）
+_DELIVERY_PATH = re.compile(
+    r"(?<![\w/:])(/[\w.\-()/\u4e00-\u9fff]{1,180}\.(?:md|txt|docx|pdf|xlsx|xls|csv|pptx|zip))", re.I,
+)
+_DELIVERY_WORDS = re.compile(
+    r"已(?:保存|写入|生成|导出|创建|完成|整理)|可下载|下载地址|保存(?:到|至)|写入(?:到|至)", re.I,
+)
+
+
+def _delivery_path_claims(text: str) -> list[str]:
+    """最终回答里“已保存/可下载到某路径”的客观声明。"""
+    claims: list[str] = []
+    for match in _DELIVERY_PATH.finditer(text or ""):
+        path = match.group(1)
+        if path.startswith("//"):
+            continue
+        window = (text or "")[max(0, match.start() - 60): match.end() + 60]
+        if _DELIVERY_WORDS.search(window):
+            claims.append(path)
+    return list(dict.fromkeys(claims))
+
+
+def delivery_path_checks(
+    text: str, evidence: list[ToolEvidence], artifacts: list[dict],
+) -> list[CheckResult]:
+    """交付路径必须落在用户可见工作区，且确有对应写入记录。
+
+    - 非 /workspace/ 路径（/research/、/notes/、/tmp/ 等）是会话临时区，用户无法下载；
+    - /workspace/ 路径必须能在本轮工具账本/产物中找到，防止“声称已保存”但没有实际写入。
+    """
+    claims = _delivery_path_claims(text)
+    if not claims:
+        return []
+    # 正文本身足够长时，临时区路径只是过程说明；只有“把完整结果留在临时文件里”的短回复才算交付声明
+    substantive = len((text or "").strip()) >= 500
+    virtual = [path for path in claims if not path.startswith("/workspace/")]
+    if virtual and not substantive:
+        return [CheckResult(
+            "delivery_path", False,
+            "以下文件路径不在工作区，用户无法访问或下载：" + "、".join(virtual[:6])
+            + "。请把完整结果直接写在最终回答中；需要文件交付时写入 /workspace/ 并在回答中给出路径。",
+        )]
+    backed = {item.path for item in evidence
+              if item.tool_name in _FILE_TOOLS and item.status == "succeeded" and item.path}
+    backed |= {str(item.get("path") or "") for item in artifacts}
+    missing = [path.removeprefix("/workspace/") for path in claims
+               if path.removeprefix("/workspace/") not in backed]
+    if missing:
+        return [CheckResult(
+            "delivery_path", False,
+            "声称已保存文件，但工作区没有对应写入记录：" + "、".join(missing[:6])
+            + "。请先实际写入文件再交付。",
+        )]
+    return []
 _PROJECT_PENDING_CHECKS = {
     "project_errors": "复核已保存的工程，处理实际启动、接口或验收报错",
     "runtime_start": "在隔离环境启动工程并核对实际服务响应",
@@ -391,6 +449,22 @@ def bounded_answer(text: str) -> tuple[str, bool]:
     return raw[:_MAX_ANSWER_BYTES].decode(errors="ignore"), True
 
 
+def _continuation_join(prefix: str, text: str) -> str:
+    """把续写片段并入已截断正文：整稿重述直接采用，接缝处重叠自动去重。"""
+    if not prefix:
+        return text
+    if not text:
+        return prefix
+    if text.startswith(prefix):
+        return text
+    tail, head = prefix[-_CONTINUATION_WINDOW:], text[:_CONTINUATION_WINDOW]
+    for size in range(min(len(tail), len(head)), 39, -1):
+        if tail.endswith(head[:size]):
+            return prefix + text[size:]
+    separator = "" if prefix.endswith("\n") or text.startswith("\n") else "\n"
+    return prefix + separator + text
+
+
 def _include_project_artifacts(evidence: list[ToolEvidence], artifacts: list[dict], generated: list[dict]) -> list[dict]:
     paths = {item["path"] for item in generated}
     evidence.extend(ToolEvidence("write_file", path=path) for path in paths)
@@ -457,9 +531,10 @@ def completion_prompt(contract: TaskContract) -> str:
             )
     if contract.source_count:
         lines.append(
-            f"在最终正文引用实际获取或用户提供的来源，至少 {contract.source_count} 个。"
-            "引用格式：正文结论后用 [N] 编号（如 [1][2]），文末输出「## 来源清单」表"
+            f"在最终回答正文直接给出完整调研内容（不要只给摘要或只给文件路径），并引用实际获取或用户提供的来源，"
+            f"至少 {contract.source_count} 个。引用格式：正文结论后用 [N] 编号（如 [1][2]），文末输出「## 来源清单」表"
             "（N / 标题 / 链接 / 发布时间），编号与正文一一对应。"
+            "如果同时保存了报告文件，文件必须位于 /workspace/，且最终回答仍须包含核心结论与来源清单链接。"
         )
     if contract.minimum_chars:
         lines.append(f"最终正文至少 {contract.minimum_chars} 个非空白字符。")
@@ -562,8 +637,12 @@ class CompletionMiddleware(AgentMiddleware[CompletionState]):
         truncated = finish_reason in _LIMIT_FINISH_REASONS
         # 每次继续只拼接同一份因长度截断的答案。一般返工提交完整替换稿。
         prefix = previous.get("prefix", "")
-        if prefix and not text.startswith(prefix):
-            text = prefix + (("" if prefix.endswith("\n") or text.startswith("\n") else "\n") + text if text else "")
+        if prefix:
+            text = _continuation_join(prefix, text)
+        preserved = str(previous.get("preserve_answer") or "")
+        if preserved and text and len(text) < len(preserved) * 0.5:
+            # 仅补做计划/回执等短状态说明时，不用它覆盖已交付的正文。
+            text = preserved
         text, too_large = bounded_answer(text)
         open_tasks = [str(todo.get("content") or "").strip()[:120] for todo in state.get("todos") or []
                       if todo.get("status") in {"pending", "in_progress"} and str(todo.get("content") or "").strip()]
@@ -578,6 +657,7 @@ class CompletionMiddleware(AgentMiddleware[CompletionState]):
             # 普通问答保留既有返回语义，也允许调用方明确要求不输出文本。
             return None
         evidence, artifacts, external = await _collect_evidence(self.ctx) if self.contract.is_complex or execution_checks else ([], [], False)
+        execution_checks.extend(delivery_path_checks(text, evidence, artifacts))
         project = None
         if self.contract.project_scope:
             if external:
@@ -589,6 +669,7 @@ class CompletionMiddleware(AgentMiddleware[CompletionState]):
                     artifacts = _include_project_artifacts(evidence, artifacts, project.artifacts)
         result = verify_task(self.contract, text, evidence, execution_checks=execution_checks)
         rounds = previous.get("fix_rounds", 0)
+        continuations = int(previous.get("continuations") or 0)
         data = result.to_event_data()
         data.update(fix_rounds=rounds, artifacts=artifacts)
         failures = [item.id for item in result.failed_checks]
@@ -599,20 +680,51 @@ class CompletionMiddleware(AgentMiddleware[CompletionState]):
                        "verification_environment" if project and project.unavailable else
                        "length" if too_large else "no_progress" if signature == previous.get("signature") else
                        "rounds" if rounds >= settings.AGENT_VERIFICATION_MAX_ROUNDS else "")
-        review = {"run_id": self.ctx.run_id, "answer": text or previous.get("answer", ""), "signature": signature,
-                  "report": data, "fix_rounds": rounds, "stop_reason": stop_reason if failures else ""}
+        review = {"run_id": self.ctx.run_id,
+                  "answer": text or previous.get("preserve_answer") or previous.get("answer", ""),
+                  "signature": signature,
+                  "report": data, "fix_rounds": rounds, "continuations": continuations,
+                  "stop_reason": stop_reason if failures else ""}
         if not failures or stop_reason:
             return {"completion_review": review}
 
-        # JSON 回复需要由模型重新输出完整对象。其他文稿能够从截断处继续。
-        continuing = bool(text and truncated and failures == ["answer_complete"] and "json_answer" not in self.contract.completion_checks)
+        # 长度截断说明正文还没写完：先补齐余下内容，再做其他缺口的返工。
+        # JSON 回复无法拼接，必须由模型重新输出完整对象。
+        limit_truncated = truncated and "json_answer" not in self.contract.completion_checks
+        continuing = bool(text and limit_truncated and continuations < _MAX_ANSWER_CONTINUATIONS)
+        if limit_truncated and not continuing:
+            review["stop_reason"] = "length"
+            return {"completion_review": review}
         if continuing:
-            feedback = "上一份正文在生成长度上限处中断。紧接其末尾完成余下内容，省略已完成部分。"
+            feedback = ("上一份正文在生成长度上限处中断。紧接其末尾完成余下内容，省略已完成部分；"
+                        "计划项若有实际完成，随后用 write_todos 标记 completed。")
             review["prefix"] = text
         else:
-            feedback = result.feedback_text() + ("\n沿用原始任务和已经确认的证据，处理缺口后交付完整结果。"
-                                                 "若已有文件需要修正，先读取其内容，再按原路径编辑。")
-        review.update(fix_rounds=rounds + 1, continuing=True)
+            feedback = result.feedback_text()
+            failed_ids = {item.id for item in result.failed_checks}
+            if failed_ids == {"plan_finished"} and previous.get("answer"):
+                feedback = ("最终正文已完成并通过其余检查。只需用 write_todos 把实际已完成的计划项标记为 completed；"
+                            "不要重写、删减或重复输出正文。")
+                review["preserve_answer"] = previous["answer"]
+                review["answer"] = previous["answer"]
+            if "citations_present" in failed_ids:
+                feedback += (
+                    "\n请把完整报告正文直接作为最终回答输出，并在文末附「## 来源清单」表"
+                    "（编号 / 标题 / 链接 / 发布时间）；只把报告保存到工具文件里、或只回复文件路径/摘要，不算完成。"
+                )
+            if "plan_finished" in failed_ids and "preserve_answer" not in review:
+                feedback += "\n请用 write_todos 把已实际完成的项标记为 completed；未完成的项继续执行。"
+            if "delivery_path" in failed_ids:
+                feedback += (
+                    "\n交付文件必须位于 /workspace/；会话临时区（如 /research/、/notes/、/tmp/）用户无法下载，"
+                    "不要把临时文件写成交付结果。"
+                )
+            if "preserve_answer" not in review:
+                feedback += ("\n沿用原始任务和已经确认的证据，处理缺口后交付完整结果。"
+                             "若已有文件需要修正，先读取其内容，再按原路径编辑。")
+        review.update(fix_rounds=rounds if continuing else rounds + 1,
+                      continuations=continuations + 1 if continuing else continuations,
+                      continuing=True)
         return {"completion_review": review, "jump_to": "model", "messages": [
-            HumanMessage(content=feedback, id=f"completion-{self.ctx.run_id}-{rounds + 1}"),
+            HumanMessage(content=feedback, id=f"completion-{self.ctx.run_id}-{rounds + 1}-{continuations + 1}"),
         ]}

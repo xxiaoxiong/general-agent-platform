@@ -17,6 +17,32 @@ def _issue(code: str, message: str, *, severity: Severity = "error", section_id:
     return ValidationIssue(code=code, message=message, severity=severity, section_id=section_id)
 
 
+_REQUEST_MIN_CHARS = re.compile(r"(?:至少|不少于|不低于)\s*(\d{2,5})\s*(?:个汉字|字)(?![段节])")
+# 交付文档不得包含“（保留原文）”“（此处省略）”这类未展开占位符
+_PLACEHOLDER = re.compile(
+    r"[（(]\s*(?:保留|保持|沿用)\s*原文(?:内容|不变)?\s*[）)]"
+    r"|[（(]\s*(?:此处|这里)?\s*(?:省略|略去|略)\s*[）)]"
+    r"|\.\.\.\s*[（(]\s*略\s*[）)]"
+)
+
+
+def requested_min_chars(request: str) -> int:
+    """用户明确要求的最小正文长度（只认“至少 N 字”，不认章节数量等表述）。"""
+    match = _REQUEST_MIN_CHARS.search(request or "")
+    return int(match.group(1)) if match else 0
+
+
+def validate_requested_length(draft: DocumentDraft, request: str) -> list[ValidationIssue]:
+    """用户显式要求字数时必须真实达到，不能只声称完成。"""
+    minimum = requested_min_chars(request)
+    if not minimum:
+        return []
+    chars = sum(len(block_text(block)) for section in draft.sections for block in section.blocks)
+    if chars >= minimum:
+        return []
+    return [_issue("minimum_chars", f"正文约 {chars} 字，未达到用户要求的至少 {minimum} 字")]
+
+
 def valid_field(field: InputField, value) -> bool:
     if field.type == "number":
         return type(value) is int or (type(value) is float and math.isfinite(value))
@@ -102,16 +128,21 @@ def _validate_profile(draft: DocumentDraft, profile: ProfileDefinition) -> list[
 
 def validate_draft(draft: DocumentDraft, profile: ProfileDefinition | None = None) -> ValidationReport:
     issues = []
-    checks = ["content", "source_references", "tables"]
+    checks = ["content", "source_references", "tables", "placeholders"]
     if not any(block_text(block).strip(" |\n") for section in draft.sections for block in section.blocks):
         issues.append(_issue("empty_content", "文档正文为空"))
     sources = {source.id for source in draft.sources}
     for section in draft.sections:
+        placeholder = False
         for block in section.blocks:
             if set(block.source_ids) - sources:
                 # 模型可能自造来源标识：正文已剔除这些引用，保留提示供复核，不阻断交付
                 issues.append(_issue("unknown_source", "正文引用了未登记的资料来源，已忽略该引用",
                                      severity="warning", section_id=section.id))
+            if not placeholder and _PLACEHOLDER.search(block_text(block)):
+                placeholder = True
+                issues.append(_issue("placeholder_content", f"章节「{section.title}」包含未展开的占位内容",
+                                     section_id=section.id))
     for field_id in sorted(set(draft.missing_fields) & set(draft.field_values)):
         issues.append(_issue("conflicting_input", f"字段 {field_id} 同时存在值和待补充标记"))
     if profile is not None:

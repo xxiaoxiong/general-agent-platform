@@ -1014,7 +1014,9 @@ class StreamMixin:
                         ctx.completion_review = review
                     if review.get("continuing"):
                         await bus.publish(RuntimeEvent(type=RUN_RETRYING, run_id=run.run_id, data={
-                            "reason": "verification_fix", "round": review["fix_rounds"],
+                            "reason": "verification_fix",
+                            # 续写与返工分开计数，展示上合并为总轮次
+                            "round": review["fix_rounds"] + int(review.get("continuations") or 0),
                             # 截断续写（prefix 存在）只补余下内容；否则为整稿替换（前端据此撤回旧稿）
                             "continuation": bool(review.get("prefix")),
                             "failed_checks": [check for check in review["report"]["checks"] if not check["passed"]],

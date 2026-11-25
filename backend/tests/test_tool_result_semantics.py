@@ -444,6 +444,30 @@ async def test_adapter_normalizes_str_result_to_succeeded_ledger(monkeypatch):
     assert TOOL_COMPLETED in bus.published
 
 
+@pytest.mark.asyncio
+async def test_adapter_ledger_keeps_structured_source_urls(monkeypatch):
+    """搜索结果正文很长时，结构化来源 URL 仍须进入账本证据（引用核对依据）。"""
+    run_id, v1 = await _claimed_run()
+    bus = _RecordingBus()
+    adapter = _make_adapter(_make_ctx(run_id, lease_version=v1), ["web_search"], bus)
+    urls = [f"https://example.com/source/{index}" for index in range(1, 8)]
+
+    async def _exec(self, name, args, *, raise_on_error=False):
+        return ToolResult.succeeded(
+            "页面摘要" * 2000,
+            metadata={"sources": [{"url": url} for url in urls]},
+        )
+
+    monkeypatch.setattr(ToolExecutor, "execute", _exec)
+    await adapter._execute("web_search", {"query": "q", "tool_call_id": "tc-src"})
+
+    async with AsyncSessionLocal() as s:
+        rec = await ToolExecutionRepository(s).get(run_id, "tc-src")
+    assert rec.status == TOOL_EXEC_SUCCEEDED
+    assert "[SOURCE_URLS]" in rec.result_payload
+    assert all(url in rec.result_payload for url in urls)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 验收 6：长时间 SMTP 调用不会阻塞 Worker Heartbeat
 # ════════════════════════════════════════════════════════════════════════════

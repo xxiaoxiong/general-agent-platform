@@ -410,6 +410,44 @@ def test_document_turn_exports_referenced_content_phrasings():
         assert context["draft"].startswith("# 调研报告"), message
 
 
+def test_substantive_draft_stitches_research_refinement():
+    """先出全文、再补充某部分数据时，文档草稿必须同时包含前文与更新段。"""
+    part1 = ("# 调研报告\n\n## 一、背景\n\n" + "背景说明。" * 100
+             + "\n\n## 二、结论\n\n结论内容。")
+    part2 = ("## 五、基准数据\n\n" + "基准数据。" * 80
+             + "\n\n## 来源清单\n\n|1|来源|https://example.com/a|")
+    history = [
+        {"role": "user", "content": "请联网深度调研某个主题"},
+        {"role": "assistant", "content": part1},
+        {"role": "user", "content": "重新输出完整调研结论，补充基准数据"},
+        {"role": "assistant", "content": part2},
+    ]
+    message = "把上面的调研结论整理成 Word 文档给我"
+    route = document_turn(message, history, route_task(message))[0]
+    draft = route["document_context"]["draft"]
+    assert "## 一、背景" in draft
+    assert "## 五、基准数据" in draft
+
+
+def test_research_followup_stays_chat_unless_document_delivery_requested():
+    """追问/修订调研结论留在对话回答，不能因为指代前文就转成文档生成。"""
+    report = ("# 调研报告\n\n## 一、背景\n\n" + "背景说明。" * 80
+              + "\n\n## 二、发现\n\n正文[1]。\n\n## 来源清单\n\n|1|来源|https://example.com/a|")
+    history = [
+        {"role": "user", "content": "请联网深度调研某个主题，至少 8 个可核验来源"},
+        {"role": "assistant", "content": report},
+    ]
+    message = "第 4 部分的结论太笼统，补充 benchmark 数据后把更新后的完整调研结论重新发给我"
+    route = document_turn(message, history, route_task(message))[0]
+    assert route["task_type"] == "general_chat"
+    assert "document_context" not in route
+
+    export = "把上面的调研结果整理成一份 Word 文档给我"
+    route = document_turn(export, history, route_task(export))[0]
+    assert route["task_type"] == "document_generate"
+    assert route["document_context"]["export_existing"] is True
+
+
 def test_references_prior_content_detection():
     from app.services.agent_runtime.task_router import references_prior_content
 

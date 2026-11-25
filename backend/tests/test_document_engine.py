@@ -19,7 +19,9 @@ from app.services.documents.schemas import (
     ProfileDefinition, ProfileFormatting, ProfileSection, SourceReference, TableBlock,
 )
 from app.services.documents.restyle import apply_style_plan, style_plan_from_request
-from app.services.documents.validator import valid_field, validate_docx, validate_draft
+from app.services.documents.validator import (
+    valid_field, validate_docx, validate_draft, validate_requested_length,
+)
 
 
 @pytest.fixture
@@ -56,6 +58,23 @@ def draft():
             ]),
         ],
     )
+
+
+def test_requested_minimum_length_is_enforced(draft):
+    """用户显式要求字数时，必须由实际正文达到，不能只声称完成。"""
+    issues = validate_requested_length(draft, "请写一份至少 500 字的技术报告")
+    assert issues and issues[0].code == "minimum_chars" and issues[0].severity == "error"
+    assert validate_requested_length(draft, "请写一份至少 20 字的技术报告") == []
+    # 来源数量等要求不能被误当成字数
+    assert validate_requested_length(draft, "至少 8 个可核验来源") == []
+
+
+def test_placeholder_content_blocks_delivery(draft):
+    """「（保留原文）」等占位符必须视为未完成，不能发布为交付版本。"""
+    draft.sections[0].blocks.append(ParagraphBlock(text="场景化建议（保留原文）"))
+    report = validate_draft(draft)
+    assert not report.passed
+    assert any(issue.code == "placeholder_content" for issue in report.issues)
 
 
 def test_profile_validates_hierarchy_choices_and_inferred_fields():
@@ -184,6 +203,23 @@ def test_profile_drops_section_ids_mistaken_for_input_fields():
     assert fields["S1_architecture"].required is False
     assert fields["S2_frameworks"].required is False
     # 已声明字段被必填章节引用时升级为必填（既有语义），章节 id 不会被升级
+    assert fields["report_date"].required is True
+
+
+def test_derived_field_referenced_by_multiple_required_sections_stays_optional():
+    """未声明的推导字段被多个必填章节引用时也不得升级为必填，避免向用户索要无意义字段。"""
+    from app.services.documents.schemas import ProfileDefinition
+
+    profile = ProfileDefinition.model_validate({
+        "document_type": "report", "name": "技术调研报告规范",
+        "sections": [
+            {"id": "s1", "title": "甲", "order": 1, "required": True, "required_fields": ["id", "report_date"]},
+            {"id": "s2", "title": "乙", "order": 2, "required": True, "required_fields": ["id"]},
+        ],
+        "required_inputs": [{"id": "report_date", "label": "报告日期", "type": "date"}],
+    })
+    fields = {field.id: field for field in profile.input_fields()}
+    assert fields["id"].required is False
     assert fields["report_date"].required is True
 
 

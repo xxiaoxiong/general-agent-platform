@@ -219,6 +219,7 @@ class ProfileDefinition(DocumentSchema):
         return self
 
     def input_fields(self) -> list[InputField]:
+        declared = {item.id for item in self.required_inputs}
         fields = {item.id: item for item in self.required_inputs}
         for section in self.sections:
             for field_id in section.required_fields:
@@ -226,7 +227,8 @@ class ProfileDefinition(DocumentSchema):
                     # 章节引用了未声明的字段：保留为可选推导字段，不向用户强制索要
                     # （模型常把章节 id 误填为 required_fields，强制必填会索要虚构资料）
                     fields[field_id] = InputField(id=field_id, label=field_id, required=False)
-                elif section.required and not fields[field_id].required:
+                elif section.required and not fields[field_id].required and field_id in declared:
+                    # 只有规范中显式声明的字段才会被必填章节升级，误引用的推导字段始终保持可选
                     fields[field_id] = fields[field_id].model_copy(update={"required": True})
         return list(fields.values())
 

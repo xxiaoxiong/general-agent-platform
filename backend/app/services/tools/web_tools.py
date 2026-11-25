@@ -13,6 +13,7 @@
 import json
 import logging
 import re
+from html import unescape
 from typing import Dict, Any, List
 from urllib.parse import urlsplit, urlunsplit
 
@@ -78,17 +79,24 @@ TOOLS: List[Dict[str, Any]] = [
 
 
 def _parse_bing_html(html: str, max_results: int) -> List[Dict[str, str]]:
-    """从 Bing HTML 解析搜索结果"""
+    """从 Bing HTML 解析搜索结果。
+
+    Bing 的 <li class="b_algo"> 带附加属性且常省略 </li>，不能按固定标签闭合匹配；
+    以“下一个 b_algo 条目 / </ol>”作为块边界。
+    """
     results = []
-    # 匹配 Bing 搜索结果条目：<li class="b_algo">
-    blocks = re.findall(r'<li class="b_algo">(.*?)</li>', html, re.DOTALL)
-    for block in blocks[:max_results]:
+    pattern = re.compile(
+        r'<li[^>]*class="[^"]*\bb_algo\b[^"]*"[^>]*>(.*?)'
+        r'(?=<li[^>]*class="[^"]*\bb_algo\b|</ol>|</body>|$)',
+        re.DOTALL,
+    )
+    for block in pattern.findall(html)[:max_results]:
         title_m = re.search(r'<h2[^>]*>.*?<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.DOTALL)
-        desc_m  = re.search(r'<p[^>]*>(.*?)</p>', block, re.DOTALL)
+        desc_m = re.search(r'<p[^>]*>(.*?)</p>', block, re.DOTALL)
         if title_m:
-            url   = title_m.group(1)
-            title = re.sub(r'<[^>]+>', '', title_m.group(2)).strip()
-            desc  = re.sub(r'<[^>]+>', '', desc_m.group(1)).strip() if desc_m else ""
+            url = unescape(title_m.group(1))
+            title = unescape(re.sub(r'<[^>]+>', '', title_m.group(2))).strip()
+            desc = unescape(re.sub(r'<[^>]+>', '', desc_m.group(1))).strip() if desc_m else ""
             if url.startswith("http"):
                 results.append({"title": title, "url": url, "desc": desc[:200]})
     return results
@@ -272,6 +280,7 @@ async def execute_web_search(params: dict) -> Any:
     engine      = params.get("engine", "auto").lower()
 
     errors = []  # 记录每个引擎的失败原因
+    reachable = False  # 是否至少有一个搜索引擎给出了 HTTP 响应（0 结果 ≠ 网络不可达）
     timeout = settings.SEARCH_TIMEOUT or 25
     found_results = None
     found_engine = ""
@@ -292,6 +301,7 @@ async def execute_web_search(params: dict) -> Any:
                         params={"q": query, "format": "json", "language": _query_language(query)},
                         headers=_HEADERS,
                     )
+                reachable = True
                 if resp.status_code == 200:
                     try:
                         data = resp.json()
@@ -340,6 +350,7 @@ async def execute_web_search(params: dict) -> Any:
                         "Content-Type": "application/x-www-form-urlencoded",
                     },
                 )
+                reachable = True
                 if resp.status_code == 200:
                     results = _parse_duckduckgo_html(resp.text, max_results)
                     if results:
@@ -364,6 +375,7 @@ async def execute_web_search(params: dict) -> Any:
                     params={"q": query, "setlang": "zh-CN", "cc": "CN"},
                     headers=_HEADERS,
                 )
+                reachable = True
                 results = _parse_bing_html(resp.text, max_results)
                 if results:
                     found_results = results
@@ -385,6 +397,7 @@ async def execute_web_search(params: dict) -> Any:
                     params={"wd": query, "rn": str(max_results)},
                     headers={**_HEADERS, "Referer": "https://www.baidu.com/"},
                 )
+                reachable = True
                 results = _parse_baidu_html(resp.text, max_results)
                 if results:
                     found_results = results
@@ -411,20 +424,22 @@ async def execute_web_search(params: dict) -> Any:
                 metadata={"sources": _build_sources(found_results), "engine": found_engine},
             )
 
-    # 所有引擎均失败，返回详细错误信息
     error_detail = "; ".join(errors) if errors else "网络不可达"
-    is_network_error = any(kw in error_detail for kw in ("连接失败", "网络不可达", "ConnectError", "超时"))
-    if is_network_error:
+    if reachable:
+        # 引擎可达但无结果：这是确定性结果，不是瞬态网络故障。
+        # 不能返回“成功”（会把 0 结果计入检索证据），也不应自动重试（重试同样的查询没有意义）。
         return ToolResult.failed(
-            f"搜索 '{query}' 失败：无法连接到搜索引擎。\n"
-            f"错误详情: {error_detail}\n"
-            f"提示: 当前环境可能无法访问外部网络。请直接使用你的知识回答用户问题，并说明无法联网搜索。",
-            retryable=True,
+            f"搜索 '{query}' 未找到可用结果。\n"
+            f"引擎状态: {error_detail}\n"
+            "请调整查询词后重试（更宽泛的关键词，或去掉 site:、引号等限定符）；"
+            "如果多次检索仍无结果，请如实说明未检索到相关公开资料，不要编造来源。",
+            retryable=False,
         )
-    return (
-        f"搜索 '{query}' 未找到结果。\n"
-        f"尝试的搜索引擎状态: {error_detail}\n"
-        f"建议: 请直接使用你的知识回答用户问题，并注明未能找到搜索结果。"
+    return ToolResult.failed(
+        f"搜索 '{query}' 失败：无法连接到搜索引擎。\n"
+        f"错误详情: {error_detail}\n"
+        "请稍后重试；如果持续失败，请如实说明当前无法联网核实，不要凭记忆编造来源。",
+        retryable=True,
     )
 
 
@@ -444,12 +459,18 @@ async def execute_fetch_webpage(params: dict) -> str:
         text = re.sub(r'[ \t]{2,}', ' ', text)
         text = re.sub(r'\n{3,}', '\n\n', text)
         text = text.strip()
-        if not text:
-            return "未能提取到网页内容"
+        if len(text) < 50:
+            # 空正文/脚本渲染页不是可用来源：按失败上报，避免计入检索证据
+            return ToolResult.failed(
+                f"抓取网页失败：{url} 未提取到可用正文（页面可能由脚本渲染或拒绝访问）。"
+                "请换一个来源，或如实说明该页面无法读取，不要据此编造内容。",
+                retryable=False,
+            )
         suffix = f"\n\n...（内容已截断，原文共 {len(text)} 字符）" if len(text) > max_len else ""
         return f"网页内容（{url}）:\n\n{text[:max_len]}{suffix}"
     except Exception as e:
-        return ToolResult.failed(f"抓取网页失败: {e}", retryable=True)
+        detail = str(e) or type(e).__name__
+        return ToolResult.failed(f"抓取网页失败: {detail}", retryable=True)
 
 
 async def execute_weather(params: dict) -> str:

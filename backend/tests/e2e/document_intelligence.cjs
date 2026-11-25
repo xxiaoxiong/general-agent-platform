@@ -67,6 +67,10 @@ function replyFor(body) {
         delivered: 17, ...(data.request.includes('2026-09-30') ? { finish_date: '2026-09-30' } : {}),
       } };
     }
+    case 'cover_missing_fields':
+      return { field_values: {} };
+    case 'audit_input_fields':
+      return { public_fact_ids: [] };
     case 'write_section': {
       const { id, title, order, level } = data.section;
       if (id === 's3' && data.request.includes('断点验收') && sectionFailures++ < 3) return '{"blocks":[';

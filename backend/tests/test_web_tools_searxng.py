@@ -151,9 +151,9 @@ async def test_searxng_http_403_reports_json_format_hint(monkeypatch, caplog):
     with caplog.at_level("WARNING", logger="app.services.tools.web_tools"):
         ret = await web_tools.execute_web_search({"query": "anything"})
 
-    # 备用外网引擎全部连接失败 -> 可重试失败
+    # 引擎有响应（403）说明网络可达：属于配置/确定性失败，不自动重试，但要给出 JSON 格式提示
     assert isinstance(ret, ToolResult)
-    assert ret.status == "failed" and ret.retryable
+    assert ret.status == "failed" and not ret.retryable
     assert "HTTP 403" in str(ret.error)
     assert "JSON 格式未启用" in str(ret.error)
     assert any("403" in r.message for r in caplog.records)
@@ -218,6 +218,84 @@ async def test_search_results_dedup_by_normalized_url(monkeypatch):
     sources = ret.metadata["sources"]
     assert [s["id"] for s in sources] == [1, 2]
     assert sources[0]["title"] == "A"  # 保留首个出现
+
+
+@pytest.mark.asyncio
+async def test_zero_results_from_reachable_engine_is_not_retryable_success(monkeypatch):
+    """引擎可达但 0 结果：不得伪装成功（会污染检索证据），也不应自动重试同一查询。"""
+    calls = []
+    _patch_client(monkeypatch, {"searxng": _FakeResponse(200, json_data={"results": []})}, calls)
+    monkeypatch.setattr(settings, "SEARXNG_URL", "http://searxng:8080")
+    monkeypatch.setattr(settings, "AGENT_EGRESS_PROXY", "")
+
+    ret = await web_tools.execute_web_search({"query": "site:example.com 无结果查询"})
+
+    assert isinstance(ret, ToolResult)
+    assert ret.status == "failed"
+    assert ret.retryable is False
+    assert "未找到可用结果" in str(ret.error)
+    assert "SearXNG: 返回 0 条结果" in str(ret.error)
+    # 引擎可达时不得误报“无法连接到搜索引擎”，也不能引导模型凭记忆编造
+    assert "无法连接到搜索引擎" not in str(ret.error)
+    assert "使用你的知识" not in str(ret.error)
+    assert "请调整查询词" in str(ret.error)
+
+
+@pytest.mark.asyncio
+async def test_all_engines_unreachable_is_retryable_network_failure(monkeypatch):
+    """所有引擎都连不上时才是网络类瞬态失败，允许有限重试。"""
+    calls = []
+    _patch_client(
+        monkeypatch,
+        {
+            "searxng": httpx.ConnectError("connection refused"),
+            "duckduckgo": httpx.ConnectError("unreachable"),
+            "bing.com": httpx.ConnectError("unreachable"),
+            "baidu.com": httpx.ConnectError("unreachable"),
+        },
+        calls,
+    )
+    monkeypatch.setattr(settings, "SEARXNG_URL", "http://searxng:8080")
+    monkeypatch.setattr(settings, "AGENT_EGRESS_PROXY", "")
+
+    ret = await web_tools.execute_web_search({"query": "任意查询"})
+
+    assert isinstance(ret, ToolResult)
+    assert ret.status == "failed" and ret.retryable is True
+    assert "无法连接到搜索引擎" in str(ret.error)
+    assert "不要凭记忆编造来源" in str(ret.error)
+
+
+@pytest.mark.asyncio
+async def test_fetch_webpage_without_readable_body_is_failed(monkeypatch):
+    """空正文/纯脚本页面不是可用来源：按失败上报，不伪装成抓取成功。"""
+    calls = []
+    _patch_client(
+        monkeypatch,
+        {"example.com": _FakeResponse(200, text="<html><head><title>空页</title></head>"
+                                               "<body><script>var x=1;</script></body></html>")},
+        calls,
+    )
+
+    ret = await web_tools.execute_fetch_webpage({"url": "https://example.com/empty"})
+
+    assert isinstance(ret, ToolResult)
+    assert ret.status == "failed"
+    assert ret.retryable is False
+    assert "未提取到可用正文" in str(ret.error)
+
+
+def test_bing_parser_handles_attributes_and_missing_closing_li():
+    """Bing 的 b_algo 条目带附加属性且常省略 </li>，备用引擎不能因此解析为 0 条。"""
+    html = (
+        '<ol id="b_results"><li class="b_algo" data-id iid=SERP.1>'
+        '<h2><a href="https://example.com/a">标题 A &amp; B</a></h2><p>描述 A</p>'
+        '<li class="b_algo" data-id iid=SERP.2>'
+        '<h2><a href="https://example.com/b">标题 B</a></h2><p>描述 B</p></ol>'
+    )
+    rows = web_tools._parse_bing_html(html, 5)
+    assert [row["url"] for row in rows] == ["https://example.com/a", "https://example.com/b"]
+    assert rows[0]["title"] == "标题 A & B"
 
 
 def test_query_language_routing():

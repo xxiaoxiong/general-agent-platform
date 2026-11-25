@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import re
 import time
 from collections import Counter
@@ -39,11 +40,13 @@ from .schemas import (
     ProfileDefinition, SourceReference, Title, ValidationIssue, ValidationReport,
     block_text, normalize_anchor, unique_anchor,
 )
-from .validator import validate_docx, validate_draft
+from .validator import validate_docx, validate_draft, validate_requested_length
 from .workflow_support import (
     as_json, draft_excerpt, input_schema, model_json, model_messages,
     read_attachments, request_input, source_data, valid_values,
 )
+
+logger = logging.getLogger(__name__)
 
 _DB_TOOLS = {"db_schema", "db_query", "db_count", "db_aggregate"}
 # 允许大幅缩减/重构正文的明确诉求：术语统一、一致性修正等局部改动不得借此删减原文
@@ -161,11 +164,22 @@ class GenerationFacts(DocumentSchema):
         return data
 
 
+class CoveredFields(DocumentSchema):
+    """对话前文已覆盖字段的补充值（只输出已覆盖项）。"""
+
+    field_values: dict[str, InputValue] = Field(default_factory=dict, max_length=20)
+
+
+class InputFieldAudit(DocumentSchema):
+    """必填字段分类：公开可检索事实不应向用户索要。"""
+
+    public_fact_ids: list[str] = Field(default_factory=list, max_length=80)
+
+
 class SectionContent(DocumentSchema):
     # 章节名称、ID、层级和排序由工作流校验和赋值。
     model_config = ConfigDict(extra="ignore")
     blocks: BlockList = Field(min_length=1, max_length=45)
-
     @field_validator("blocks", mode="before")
     @classmethod
     def normalize_paragraphs(cls, value):
@@ -507,11 +521,51 @@ class DocumentWorkflow:
             "根据最初业务主题和后续修订组织章节。标题应体现业务主题，交付方式或'下载文档'不得用作文档标题。"
             "文章结构须满足用户要求，不创建永久规范，不从样例推断当前项目事实。"
             "materials 已含对话前文或完整正文时，按既有正文结构组织章节，"
-            "不得把正文已覆盖的信息设为需用户补充的必填字段。",
+            "不得把正文已覆盖的信息设为需用户补充的必填字段。"
+            "required_inputs 只允许用户独有的业务约束（预算、内部合规、组织规模、截止日期、内部系统限制等）。"
+            "公开可检索的客观事实（版本号、发布时间、基准测试数字、性能/延迟、价格、公开案例、厂商认证）"
+            "不得设为必填字段，也不得要求用户补充；这些由工作流联网检索或从对话前文取得。",
             {"request": _generation_request(state), "materials": state["sources"]}, ProfileDefinition,
             compact_retry="本次只保留 5 至 8 个核心章节与必要输入字段：required_fields 留空，不写章节说明。",
             stage="规划文档结构时遇到问题", progress_label="正在规划文档结构")
-        return {"profile": result.model_dump(mode="json")}
+        profile = await self._prune_public_inputs(result, config)
+        return {"profile": profile.model_dump(mode="json")}
+
+    async def _prune_public_inputs(self, profile: ProfileDefinition,
+                                   config: RunnableConfig) -> ProfileDefinition:
+        """公开可检索事实不是用户输入：避免让用户重复提供版本、基准、价格等资料。"""
+        if not profile.required_inputs:
+            return profile
+        try:
+            audit = await model_json(
+                self.context, config, "audit_input_fields",
+                "找出属于公开可检索事实的输入字段 ID：版本号、发布时间、基准测试数字、性能/延迟/吞吐、"
+                "价格/定价/成本、公开案例、厂商认证、官网或文档链接等。这些字段不应向用户索要，"
+                "应由工作流联网检索或从对话前文取得。只输出这些公开事实字段的 ID；"
+                "用户独有的业务约束（预算、内部合规、组织规模、截止日期、内部系统限制）不要输出。",
+                {"fields": [field.model_dump(mode="json") for field in profile.required_inputs]},
+                InputFieldAudit, stage="核对必填字段类型时遇到问题",
+                progress_label="正在核对必填字段")
+            public = {field_id for field_id in audit.public_fact_ids
+                      if any(field.id == field_id for field in profile.required_inputs)}
+            if not public:
+                return profile
+            inputs = [field for field in profile.required_inputs if field.id not in public]
+            sections = [
+                section.model_copy(update={
+                    "required_fields": [field_id for field_id in section.required_fields
+                                        if field_id not in public],
+                })
+                for section in profile.sections
+            ]
+            await self.context.emit("document.profile.inputs_pruned", {
+                "public_fact_ids": sorted(public),
+                "kept": [field.id for field in inputs],
+            })
+            return profile.model_copy(update={"required_inputs": inputs, "sections": sections})
+        except Exception as exc:  # noqa: BLE001 - 分类失败时保留原规范，不阻断生成
+            logger.warning("必填字段类型核对失败，保留原规范字段：%s", exc)
+            return profile
 
     async def materialize_history(self, state: WorkflowState, config: RunnableConfig) -> dict:
         try:
@@ -591,6 +645,8 @@ class DocumentWorkflow:
             "真实任务中无法证实的字段省略。明确授权的测试样例可按示例填充，并在成稿中注明。"
             "用户已授权按公开常识合理补全、或明确表示不要向其索要资料时，不得声明 additional_required_inputs。"
             "additional_required_inputs 只声明用户明确需要但资料与规范字段均未覆盖的业务事实；"
+            "公开可检索事实（版本号、基准数字、性能、价格、公开案例、厂商认证）不属于业务事实，"
+            "不得加入 additional_required_inputs，也不得向用户索要；"
             "章节 id、章节名或报告结构本身不是业务字段，禁止把它们当作需要补充的资料。",
             {"request": _generation_request(state), "profile": profile.model_dump(mode="json"), "sources": state["sources"],
              "submitted_fields": _document_context(state).get("carried_inputs") or {}},
@@ -604,9 +660,33 @@ class DocumentWorkflow:
         kinds = {ref.kind for ref in _references(state)}
         for kind, label, _tools, pattern in _SOURCE_RULES:
             if pattern.search(state["request"]) and kind not in kinds:
+                if kind == "web":
+                    # 公开网络事实不是用户输入：检索不到时由正文标注未核实，不向用户索要
+                    continue
                 field_id = f"{kind}_facts"
                 missing.setdefault(field_id, InputField(id=field_id, label=f"报告所需资料（{label}）",
                     description="当前任务未从该来源取得事实，请提供可核实的数据或说明。"))
+        # 对话前文已提供的调研/正文资料不应再次向用户索要：用一次定向核对把已覆盖字段补进 values
+        conversation = next((str(item.get("content") or "") for item in state["sources"]
+                             if (item.get("reference") or {}).get("label") == "对话前文"), "")
+        if missing and len(conversation.strip()) >= 500:
+            try:
+                covered = await model_json(
+                    self.context, config, "cover_missing_fields",
+                    "判断给定字段是否已被「对话前文」覆盖。已覆盖的字段给出可直接写入正文的简洁值"
+                    "（字符串，最多 2000 字，从对话前文摘取或归纳，不得编造）；未覆盖的字段不要输出。",
+                    {"fields": [field.model_dump(mode="json") for field in missing.values()],
+                     "conversation": conversation[:16000],
+                     "request": _generation_request(state)},
+                    CoveredFields, stage="核对对话前文覆盖情况时遇到问题",
+                    progress_label="正在核对已有资料")
+                merged = valid_values(fields, {**values, **covered.field_values})
+                for key in covered.field_values:
+                    if key in missing and merged.get(key) not in (None, "", []):
+                        missing.pop(key, None)
+                values = merged
+            except Exception as exc:  # noqa: BLE001 - 覆盖核对失败时回退到向用户索取
+                logger.warning("对话前文覆盖核对失败，保留字段索要：%s", exc)
         if _document_context(state).get("example_mode"):
             missing = {key: field for key, field in missing.items() if key.endswith("_facts")}
         return {"title": result.title, "values": values,
@@ -650,7 +730,8 @@ class DocumentWorkflow:
                  "tables_allowed": profile.formatting.tables_allowed, "field_values": state["values"],
                  "sources": state["sources"], "earlier_sections": draft_excerpt(earlier),
                  "review_issues": state.get("validation", {}).get("issues", [])}, SectionContent,
-                compact_retry="本次进一步压缩：最多 4 个正文块，每段不超过 120 字，表格不超过 6 行；只保留最关键内容。",
+                compact_retry="本次压缩但保持完整：最多 6 个正文块，每段不超过 220 字，表格不超过 10 行；"
+                              "覆盖本节要点，不要只写提纲或占位。",
                 stage=f"编写《{section.title}》时遇到问题", progress_label=f"正在撰写《{section.title}》")
             data = DraftSection(**section.model_dump(include={"id", "order", "title", "level"}),
                                 blocks=[block.model_copy(update={"id": None}) for block in result.blocks]).model_dump(mode="json")
@@ -780,6 +861,9 @@ class DocumentWorkflow:
             "统一术语、修正矛盾等局部改动必须保留原有段落、表格和全部未涉及内容，不得借整节重写删减原文。"
             "整节重写不得与同节其他操作混用。所有新增事实必须有用户要求或资料支持。"
             "不得虚构政策条款、法规编号、标准号或业务事实；原文和资料没有的内容不要新增。"
+            "只输出目标章节自身的正文：不得包含文档标题、其他章节标题，也不得用「（保留原文）」"
+            "「（此处省略）」等占位符代替内容；其他章节由系统原样保留，无需在输出中重复或占位。"
+            "review_issues 指出占位内容或内容缺失时，必须补全真实内容，不得再次输出占位符。"
             "原文中的字符画、Unicode 框图或 Markdown 文本表必须改写为正式表格或分层有序列表，不保留 ASCII 排版。"
         )
         for attempt in range(2):
@@ -867,6 +951,19 @@ class DocumentWorkflow:
         profile = _profile(state) if state.get("profile") else None
         await self.context.emit("document.validation.started", {"section_count": len(draft.sections)})
         report = validate_draft(draft, profile)
+        if state["execution_context"]["task_type"] == "document_generate":
+            # 用户显式要求的字数/表格必须真实达到；不足时进入返工，而不是直接发布
+            required_issues = list(validate_requested_length(draft, state["request"]))
+            if (re.search(r"表格|对比表|\btable\b", state["request"], re.I)
+                    and not any(block.type == "table"
+                                for section in draft.sections for block in section.blocks)):
+                required_issues.append(ValidationIssue(
+                    code="table_required", message="用户要求使用表格，但正文没有表格"))
+            if required_issues:
+                report = ValidationReport(
+                    issues=[*report.issues, *required_issues],
+                    checks=[*report.checks, "requested_requirements"],
+                )
         if report.passed:
             previous = DocumentDraft.model_validate(state["previous"]) if state.get("previous") else None
             target = [section for section in draft.sections if not previous or section.id in state["scope"]]
@@ -894,6 +991,12 @@ class DocumentWorkflow:
                 # 编辑由用户审阅最终稿：语义复查只作提示，不阻断交付（143 实录：评审模型
                 # 提出无法由文本块表达/无权修改的要求，返工必然失败，反倒丢掉整轮工作）
                 issues = [issue.model_copy(update={"severity": "warning"}) for issue in issues]
+            else:
+                # 生成任务：无法定位到具体章节的全局语义判断只作提示。评审模型常把
+                # “应补充某章节/应更多表格”等自造要求当成硬错误，触发整篇无意义返工；
+                # 用户显式要求（字数、表格）由确定性校验单独把关。
+                issues = [issue if issue.section_id
+                          else issue.model_copy(update={"severity": "warning"}) for issue in issues]
             report = ValidationReport(issues=report.issues + issues,
                                       checks=[*report.checks, "quality_rules_review"])
         record_document_validation(state["execution_context"]["task_type"], report.passed)

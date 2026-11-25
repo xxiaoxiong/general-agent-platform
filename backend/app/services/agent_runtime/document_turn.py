@@ -51,8 +51,13 @@ def _is_substantive(content: str) -> bool:
     return len(content) >= 280 and len(headings) >= 2 and not _QUESTION.search(content[:180])
 
 
-def _substantive_draft(messages: list[dict]) -> str:
-    """拼接最近一段连续正文：同一报告常分多段生成，中间只隔「继续」类指令。"""
+def _substantive_draft(messages: list[dict], *, stitch: bool = False) -> str:
+    """拼接最近一段连续正文：同一报告常分多段生成，中间只隔「继续」类指令。
+
+    stitch=True 时，也允许跨越“针对前文补充/修订”的追问，把完整报告与后续
+    更新段拼在一起（例如先出全文，再补充第 4 部分数据）。避免文档任务只拿到
+    最后一段更新而丢掉前半篇。
+    """
     end = next((index for index in range(len(messages) - 1, -1, -1)
                 if messages[index].get("role") == "assistant"
                 and _is_substantive(_main_text(messages[index]))), None)
@@ -70,8 +75,11 @@ def _substantive_draft(messages: list[dict]) -> str:
             if item.get("role") == "assistant":
                 previous = cursor
                 break
-            # 只跨越「继续/接着写」这类无新信息指令，遇到新话题或新要求即停止拼接
-            if item.get("role") == "user" and not _CONTINUE_ONLY.search(_main_text(item)):
+            # 只跨越「继续/接着写」这类无新信息指令；stitch 时也跨越指代前文的补充/修订
+            if item.get("role") == "user" and not (
+                _CONTINUE_ONLY.search(_main_text(item))
+                or (stitch and references_prior_content(_main_text(item)))
+            ):
                 break
         index = previous if previous is not None and _is_substantive(
             _main_text(messages[previous])) else None
@@ -110,7 +118,14 @@ def document_turn(message: str, history: list[dict], route: dict) -> tuple[dict,
                 break
     related = recent[anchor:] if anchor is not None else []
     # 明确导出或指代前文时才回溯最近连续正文；裸「继续」必须依赖文档锚点，避免误吞无关内容
-    draft = _substantive_draft(related or (recent if (export or reference) else []))
+    draft = _substantive_draft(related or (recent if (export or reference) else []),
+                               stitch=bool(export or reference))
+    # 只有明确的交付意图、模板引用或延续既有文档生成任务时才转文档生成。
+    # 单纯追问/修订调研结论（如「第 4 部分补充数据后重新发给我」）应留在对话中回答，
+    # 否则会把一次研究会话误判成文档生成，连带改变后续轮次意图。
+    if (route.get("task_type") == "general_chat" and not export
+            and anchor is None and not is_template_reference(latest)):
+        return route, [], None
     if anchor is None and not draft and route.get("task_type") != "document_generate":
         return route, [], None
     if route.get("task_type") not in {"document_generate", "general_chat", "document_analyze"}:
