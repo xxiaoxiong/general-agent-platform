@@ -29,6 +29,7 @@ from . import (
     notify_tools,
     web_tools,
     code_tools,
+    sandbox_tools,
 )
 
 # ── 汇总所有工具注册表 ────────────────────────────────────────────────────────
@@ -49,6 +50,10 @@ BUILTIN_TOOLS: List[Dict[str, Any]] = (
     + web_tools.TOOLS
     + code_tools.TOOLS
 )
+
+# Workspace Sandbox 工具（仅在 SANDBOX_ENABLED 且会话绑定项目时注入）
+SANDBOX_TOOLS: List[Dict[str, Any]] = sandbox_tools.TOOLS
+SANDBOX_TOOL_NAMES = sandbox_tools.SANDBOX_TOOL_NAMES
 
 # ── 工具路由表 ────────────────────────────────────────────────────────────────
 # 按调用签名分类（handler 返回 str | ToolResult，execute 边界统一归一化）：
@@ -77,13 +82,19 @@ _AGENT_HANDLERS: Dict[str, Any] = {
     **knowledge_tools.HANDLERS,
 }
 
+# 需要 Run Context 的工具（Workspace Sandbox）：handler(ctx, params)
+_CONTEXT_HANDLERS: Dict[str, Any] = {
+    **sandbox_tools.HANDLERS,
+}
+
 
 class ToolExecutor:
     """统一工具执行器，自动路由到对应分类模块"""
 
-    def __init__(self, db, agent_config: dict):
+    def __init__(self, db, agent_config: dict, ctx=None):
         self.db           = db
         self.agent_config = agent_config
+        self.ctx          = ctx
 
     async def execute(
         self, tool_name: str, tool_input: dict, *, raise_on_error: bool = False
@@ -109,6 +120,14 @@ class ToolExecutor:
                 return normalize(
                     await _AGENT_HANDLERS[tool_name](self.db, self.agent_config, tool_input)
                 )
+
+            # Run Context 工具（Workspace Sandbox）：需要 Run 身份与项目作用域
+            if tool_name in _CONTEXT_HANDLERS:
+                if self.ctx is None:
+                    return ToolResult.failed(
+                        f"工具 '{tool_name}' 需要 Run 上下文，当前执行环境不支持"
+                    )
+                return normalize(await _CONTEXT_HANDLERS[tool_name](self.ctx, tool_input))
 
             # MCP 工具（mcp__<server>__<tool>）：外部 MCP 服务调用
             if tool_name.startswith(MCP_TOOL_PREFIX):

@@ -118,6 +118,22 @@ def _bootstrap_builtin_profiles() -> None:
                         file_access=True, **non_idem),
         ToolRiskProfile("delete", ToolRisk.DANGEROUS, requires_approval=True,
                         file_access=True, **non_idem),
+        # Workspace Sandbox（项目级 Docker 隔离环境）：命令与服务启动属执行类，
+        # 仅 AGENT_SANDBOX_MODE=external 放行；命令/服务启动进入 HITL 审批
+        ToolRiskProfile("execute_command", ToolRisk.EXECUTE, requires_approval=True,
+                        exec_access=True, **non_idem),
+        ToolRiskProfile("get_command_status", ToolRisk.READ, **read_only),
+        ToolRiskProfile("get_command_output", ToolRisk.READ, **read_only),
+        ToolRiskProfile("cancel_command", ToolRisk.WRITE, **non_idem),
+        ToolRiskProfile("start_service", ToolRisk.EXECUTE, requires_approval=True,
+                        exec_access=True, **non_idem),
+        ToolRiskProfile("restart_service", ToolRisk.EXECUTE, requires_approval=True,
+                        exec_access=True, **non_idem),
+        ToolRiskProfile("stop_service", ToolRisk.WRITE, **non_idem),
+        ToolRiskProfile("list_services", ToolRisk.READ, **read_only),
+        ToolRiskProfile("get_service_status", ToolRisk.READ, **read_only),
+        ToolRiskProfile("get_service_logs", ToolRisk.READ, **read_only),
+        ToolRiskProfile("get_preview_url", ToolRisk.READ, **read_only),
     ]
     for p in entries:
         register_tool_risk(p)

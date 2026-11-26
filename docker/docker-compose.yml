@@ -143,6 +143,8 @@ services:
       # 代码执行逃生开关（仅开发/测评环境）：无外部沙箱时放行受限 python_exec，
       # 生产（APP_ENV=production）下代码强制忽略此开关
       AGENT_ALLOW_UNSAFE_PYTHON: ${AGENT_ALLOW_UNSAFE_PYTHON:-false}
+      # Sandbox 模式：启用 Workspace Sandbox 时必须为 external，执行类工具才放行
+      AGENT_SANDBOX_MODE: ${AGENT_SANDBOX_MODE:-restricted}
       # Agent 测评：Campaign 持久化 Worker（Lease / Heartbeat / 重启恢复）
       EVALUATION_WORKER_ENABLED: ${EVALUATION_WORKER_ENABLED:-true}
       EVALUATION_POLL_INTERVAL: ${EVALUATION_POLL_INTERVAL:-5.0}
@@ -151,6 +153,34 @@ services:
       EVALUATION_HEARTBEAT_INTERVAL: ${EVALUATION_HEARTBEAT_INTERVAL:-20.0}
       EVALUATION_INFRA_RETRY_MAX: ${EVALUATION_INFRA_RETRY_MAX:-1}
       EVALUATION_JUDGE_MODEL_CONFIG_ID: ${EVALUATION_JUDGE_MODEL_CONFIG_ID:-0}
+      # Workspace Sandbox Runtime（项目级持久化工作空间）
+      SANDBOX_ENABLED: ${SANDBOX_ENABLED:-false}
+      SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-docker}
+      SANDBOX_RUNNER_TOKEN: ${SANDBOX_RUNNER_TOKEN:-}
+      SANDBOX_RUNNER_CONTROL_URL: ${SANDBOX_RUNNER_CONTROL_URL:-http://sandbox-runner:9100}
+      SANDBOX_BACKEND_URL: ${SANDBOX_BACKEND_URL:-http://backend:8000}
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-general-agent-platform/workspace-sandbox:1.0.0}
+      SANDBOX_DEFAULT_PROFILE: ${SANDBOX_DEFAULT_PROFILE:-standard}
+      SANDBOX_MAX_ACTIVE_PER_USER: ${SANDBOX_MAX_ACTIVE_PER_USER:-2}
+      SANDBOX_MAX_ACTIVE_PER_TENANT: ${SANDBOX_MAX_ACTIVE_PER_TENANT:-20}
+      SANDBOX_IDLE_TIMEOUT: ${SANDBOX_IDLE_TIMEOUT:-1800}
+      SANDBOX_NETWORK_POLICY: ${SANDBOX_NETWORK_POLICY:-egress}
+      SANDBOX_VOLUME_QUOTA_MODE: ${SANDBOX_VOLUME_QUOTA_MODE:-soft}
+      SANDBOX_CPU_RESERVE: ${SANDBOX_CPU_RESERVE:-2}
+      SANDBOX_MEMORY_RESERVE: ${SANDBOX_MEMORY_RESERVE:-2048}
+      SANDBOX_DISK_RESERVE: ${SANDBOX_DISK_RESERVE:-20}
+      SANDBOX_RUNNER_DISK_GB: ${SANDBOX_RUNNER_DISK_GB:-100}
+      SANDBOX_RECONCILE_INTERVAL: ${SANDBOX_RECONCILE_INTERVAL:-30}
+      SANDBOX_JOB_LEASE_SECONDS: ${SANDBOX_JOB_LEASE_SECONDS:-90}
+      SANDBOX_COMMAND_TIMEOUT: ${SANDBOX_COMMAND_TIMEOUT:-600}
+      SANDBOX_SYNC_COMMAND_WAIT: ${SANDBOX_SYNC_COMMAND_WAIT:-30}
+      # Preview：本地使用 {token}.localhost:8081；生产必须配置独立 https 域名
+      PREVIEW_BASE_DOMAIN: ${PREVIEW_BASE_DOMAIN:-localhost}
+      PREVIEW_PUBLIC_BASE_URL: ${PREVIEW_PUBLIC_BASE_URL:-}
+      PREVIEW_TOKEN_TTL: ${PREVIEW_TOKEN_TTL:-3600}
+      PREVIEW_MAX_CONNECTIONS: ${PREVIEW_MAX_CONNECTIONS:-16}
+      PREVIEW_PROXY_PORT: ${PREVIEW_PROXY_PORT:-8081}
+      PREVIEW_PROXY_HOST_PORT: ${PREVIEW_PROXY_HOST_PORT:-8081}
       UVICORN_WORKERS: "2"
       # Langfuse 可观测（对接宿主机 langfuse-deploy 栈；未配密钥时整条链路 no-op）
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
@@ -174,6 +204,95 @@ services:
         condition: service_healthy
       searxng:
         condition: service_healthy
+
+  # ── Workspace Sandbox：独立 Runner（唯一持有 Docker Socket 的平台服务）─────
+  # 默认不启动；启用：docker compose --profile sandbox up -d
+  sandbox-runner:
+    build:
+      context: ..
+      dockerfile: docker/backend.Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+    container_name: ai_plat_sandbox_runner
+    restart: unless-stopped
+    command: ["python", "-m", "app.sandbox_runner"]
+    profiles: ["sandbox"]
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-ai_plat}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-ai_plat}
+      DATABASE_SYNC_URL: mysql+pymysql://${MYSQL_USER:-ai_plat}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-ai_plat}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required (openssl rand -hex 32)}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
+      SANDBOX_ENABLED: ${SANDBOX_ENABLED:-false}
+      SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-docker}
+      SANDBOX_RUNNER_ID: ${SANDBOX_RUNNER_ID:-runner-1}
+      SANDBOX_RUNNER_TOKEN: ${SANDBOX_RUNNER_TOKEN:-}
+      SANDBOX_RUNNER_PORT: "9100"
+      SANDBOX_BACKEND_URL: http://backend:8000
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-general-agent-platform/workspace-sandbox:1.0.0}
+      SANDBOX_NETWORK_POLICY: ${SANDBOX_NETWORK_POLICY:-egress}
+      SANDBOX_DOCKER_SOCKET: /var/run/docker.sock
+      SANDBOX_CPU_RESERVE: ${SANDBOX_CPU_RESERVE:-2}
+      SANDBOX_MEMORY_RESERVE: ${SANDBOX_MEMORY_RESERVE:-2048}
+      SANDBOX_DISK_RESERVE: ${SANDBOX_DISK_RESERVE:-20}
+      SANDBOX_RUNNER_DISK_GB: ${SANDBOX_RUNNER_DISK_GB:-100}
+      SANDBOX_RECONCILE_INTERVAL: ${SANDBOX_RECONCILE_INTERVAL:-30}
+      SANDBOX_JOB_LEASE_SECONDS: ${SANDBOX_JOB_LEASE_SECONDS:-90}
+      SANDBOX_JOB_HEARTBEAT_INTERVAL: ${SANDBOX_JOB_HEARTBEAT_INTERVAL:-20}
+      SANDBOX_AGENT_PORT: ${SANDBOX_AGENT_PORT:-19999}
+      AGENT_TIMEZONE: ${AGENT_TIMEZONE:-Asia/Shanghai}
+    volumes:
+      # 只有 Runner 允许挂载 Docker Socket；Backend / Preview Proxy / Sandbox 均不挂载
+      - /var/run/docker.sock:/var/run/docker.sock
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - default
+    depends_on:
+      backend:
+        condition: service_started
+
+  # ── Preview Proxy：Preview Grant 校验 + 子域路由（不持有 Docker Socket）────
+  preview-proxy:
+    build:
+      context: ..
+      dockerfile: docker/backend.Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+    container_name: ai_plat_preview_proxy
+    restart: unless-stopped
+    command: ["python", "-m", "app.preview_proxy"]
+    ports:
+      - "${PREVIEW_PROXY_HOST_PORT:-8081}:8081"
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-ai_plat}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-ai_plat}
+      DATABASE_SYNC_URL: mysql+pymysql://${MYSQL_USER:-ai_plat}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-ai_plat}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required (openssl rand -hex 32)}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
+      SANDBOX_ENABLED: ${SANDBOX_ENABLED:-false}
+      SANDBOX_RUNNER_TOKEN: ${SANDBOX_RUNNER_TOKEN:-}
+      SANDBOX_RUNNER_CONTROL_URL: ${SANDBOX_RUNNER_CONTROL_URL:-http://sandbox-runner:9100}
+      PREVIEW_BASE_DOMAIN: ${PREVIEW_BASE_DOMAIN:-localhost}
+      PREVIEW_PUBLIC_BASE_URL: ${PREVIEW_PUBLIC_BASE_URL:-}
+      PREVIEW_TOKEN_TTL: ${PREVIEW_TOKEN_TTL:-3600}
+      PREVIEW_MAX_CONNECTIONS: ${PREVIEW_MAX_CONNECTIONS:-16}
+      PREVIEW_PROXY_PORT: "8081"
+      PREVIEW_PROXY_HOST_PORT: ${PREVIEW_PROXY_HOST_PORT:-8081}
+    networks:
+      - default
+    depends_on:
+      backend:
+        condition: service_started
+
+  # ── Sandbox 基础镜像（只构建不常驻）：docker compose --profile sandbox-image build
+  workspace-sandbox-image:
+    image: ${SANDBOX_IMAGE:-general-agent-platform/workspace-sandbox:1.0.0}
+    build:
+      context: ../sandbox
+      dockerfile: Dockerfile
+    profiles: ["sandbox-image"]
+    command: ["true"]
 
   project_verifier:
     build:

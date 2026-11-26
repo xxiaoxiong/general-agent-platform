@@ -64,6 +64,8 @@ class RuntimeContext:
     thread_id: str
     agent_id: int
     session_id: Optional[int] = None
+    # 项目级 Workspace（Workspace Sandbox）：由 session.project_id 推导，仅服务端注入
+    project_id: Optional[int] = None
     trace_id: str = ""
     model_id: Optional[str] = None  # 模型配置名（可观测字段）
 

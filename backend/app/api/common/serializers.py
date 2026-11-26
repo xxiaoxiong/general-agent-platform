@@ -59,6 +59,7 @@ def conversation_to_dict(
             len(s.messages or []) if message_count is None else int(message_count)
         ),
         "active_run_id": s.active_run_id,
+        "project_id": getattr(s, "project_id", None),
         "created_at": s.created_at.isoformat() if s.created_at else None,
         "updated_at": s.updated_at.isoformat() if s.updated_at else None,
     }

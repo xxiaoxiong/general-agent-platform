@@ -20,6 +20,8 @@ from app.api.chat import conversations, files
 from app.api.run import router as run_router
 from app.api.document import documents as document_api
 from app.api.workspace import artifacts, workspace
+from app.api.sandbox import internal_router as sandbox_internal_router
+from app.api.sandbox import router as sandbox_router
 from app.api.ops import admin, evaluation, evolution, mcp, skills
 from app.services.audit.capture import install_audit_capture
 from app.services.audit.http import AuditHTTPMiddleware
@@ -79,10 +81,18 @@ async def lifespan(app: FastAPI):
         evolution_task = _asyncio.create_task(
             evaluator_loop(evolution_stop), name="evolution-evaluator")
 
+    # ── Workspace Sandbox：资源档位播种 + Reconciler（SANDBOX_ENABLED 时）──
+    from app.services.sandbox.bootstrap import start_sandbox_subsystem
+
+    await start_sandbox_subsystem()
+
     logger.info("所有子系统初始化完成")
     yield
 
     # ── 关闭时清理 ──
+    from app.services.sandbox.bootstrap import stop_sandbox_subsystem
+
+    await stop_sandbox_subsystem()
     if evolution_task is not None and not evolution_task.done():
         evolution_stop.set()
         evolution_task.cancel()
@@ -238,6 +248,18 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+# Workspace Sandbox 领域错误统一映射（403/404/409/429/502/503 + 稳定错误码）
+from app.services.sandbox.common import SandboxError  # noqa: E402
+
+
+@app.exception_handler(SandboxError)
+async def sandbox_error_handler(request: Request, exc: SandboxError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"code": exc.code, "message": exc.message},
+    )
+
+
 API_PREFIX = "/api/v1"
 app.include_router(auth.router, prefix=API_PREFIX)
 app.include_router(users.router, prefix=API_PREFIX)
@@ -266,6 +288,10 @@ app.include_router(evolution.router, prefix=API_V2_PREFIX)
 app.include_router(evaluation.router, prefix=API_V2_PREFIX)
 app.include_router(skills.router, prefix=API_V2_PREFIX)
 app.include_router(mcp.router, prefix=API_V2_PREFIX)
+# Workspace Sandbox 用户侧 API（/api/v2/projects、/api/v2/workspaces）
+app.include_router(sandbox_router, prefix=API_V2_PREFIX)
+# Sandbox Runner 内部 API（服务令牌认证，不走用户鉴权）
+app.include_router(sandbox_internal_router)
 
 
 @app.get("/api/health")

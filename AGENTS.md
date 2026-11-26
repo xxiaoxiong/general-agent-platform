@@ -38,15 +38,20 @@ backend/
     evaluation/       # Agent 测评
     inference/        # 模型连接池、请求队列
     mcp/              # MCP 客户端
-    tools/            # 工具注册表与执行器
-  app/observability/  # langfuse_tracing.py、otel_tracing.py
+    sandbox/          # Workspace Sandbox 控制面（manager/runtime/scheduler/jobs/preview/
+                      #   service_manager/agent_client/write_lease/reconciler/session_files）
+    tools/            # 工具注册表与执行器（含 sandbox_tools.py）
+  app/sandbox_runner/ # 独立 Sandbox Runner 进程（Docker Provider / Job 执行 / Gateway）
+  app/preview_proxy/  # 独立 Preview Proxy（Preview Grant 校验 + HTTP/WS 转发）
+  app/observability/  # langfuse_tracing.py、otel_tracing.py、metrics.py
   alembic/            # 数据库迁移
   tests/              # pytest 测试套件
 frontend/
-  src/api/            # API 封装按模块一文件（auth/models/.../conversations/runs/artifacts 等，
-                      #   index.ts 仅作薄 barrel re-export）
+  src/api/            # API 封装按模块一文件（auth/models/.../conversations/runs/artifacts/
+                      #   sandbox 等，index.ts 仅作薄 barrel re-export）
   src/views/          # 页面组件（workspace/、system/ 等按业务分子文件夹）
   src/features/       # 业务功能组件（run/ documents/ preview/）
+sandbox/              # workspace-sandbox 基础镜像（Dockerfile + workspace_agent.py）
 docker/               # docker-compose.yml + Dockerfile + entrypoint + grafana
 docs/                 # 需求设计、任务书、阶段交付说明（历史文档，勿改写）
 ```
@@ -66,6 +71,14 @@ cd frontend && npm run dev
 docker compose -f docker/docker-compose.yml build backend frontend
 docker compose -f docker/docker-compose.yml up -d
 docker compose -f docker/docker-compose.yml logs -f backend
+
+# Workspace Sandbox（项目级持久化开发环境）
+docker build -t general-agent-platform/workspace-sandbox:1.0.0 sandbox
+docker compose -f docker/docker-compose.yml --profile sandbox up -d
+# 真实 Docker 集成测试（在挂载 socket 的 Runner 容器内执行）
+docker compose -f docker/docker-compose.yml run --rm -e SANDBOX_DOCKER_TEST=1 \
+  -e DATABASE_URL=sqlite+aiosqlite:////tmp/it.db -e DATABASE_SYNC_URL=sqlite:////tmp/it.db \
+  sandbox-runner python -m pytest tests/test_sandbox_docker_integration.py -q
 
 # 数据库迁移
 cd backend && python -m alembic upgrade head
@@ -102,6 +115,12 @@ cd backend && python -m alembic upgrade head
 9. **Langfuse 密钥经环境变量注入**：`LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_PROJECT_ID` 在 `docker/.env`（gitignored），代码里不要硬编码。
 10. **端口约定**：前端 80（容器）/ 5173（dev）、后端 8000（容器）/ 8002（dev）、MySQL 3308、Redis 6379、checkpoint_pg 5433、Langfuse 3100。
 11. **`agent_runtime/service/` 是导入兼容层**：该包由原 `service.py` 机械拆包而来（core + 五个 Mixin + `_common`），`__init__.py` re-export 全部旧符号，既有 `from app.services.agent_runtime.service import ...` 无需改动。测试 monkeypatch 目标 `service.build_agent` / `service._service` / `service.settings` 必须保持在**包级属性**；各子模块持有独立的 `AsyncSessionLocal` 绑定，替换会话工厂时需逐一补丁（见 `test_document_runtime.py` 的 platform fixture）。新增模块级共享符号放 `_common.py`。
+12. **Workspace Sandbox 只有 Runner 能碰 Docker**：`app/sandbox_runner` 是唯一挂载 `/var/run/docker.sock` 的进程；Backend / Preview Proxy / Sandbox 容器都不得挂载 Socket。Sandbox 容器只能由 Runner 的 `DockerEngine`（unix socket HTTP）创建，HostConfig 全部服务端生成，不接受模型/用户传入镜像、挂载或 Capabilities。
+13. **启用 Sandbox 需两个开关同时打开**：`SANDBOX_ENABLED=true` 且 `AGENT_SANDBOX_MODE=external`；只开第一个时执行类工具会被 `ToolPolicy` 以 restricted 拒绝（fail-closed）。Runner/Preview Proxy 是独立 Compose 服务，需 `--profile sandbox` 启动（`preview-proxy` 默认启动，Runner 在 profile 内）。
+14. **项目会话的文件与命令必须同一份 `/workspace`**：项目会话由 `SandboxFilesBackend` 把 DeepAgents 文件工具路由到 Sandbox；未归属项目的存量会话继续使用 `data/agent_files/{user}/{agent}/{session}`。改文件工具时不要只改一边，附件上传 / file-list / file-preview / file-bytes / files.zip 都有 sandbox 分支（`app/services/sandbox/session_files.py`）。
+15. **Sandbox 工具需要 Run 上下文**：`execute_command` / `*_service` 等走 `ToolExecutor` 的 `_CONTEXT_HANDLERS(ctx, params)`；Run 的 `project_id` 只能由 `session.project_id` 推导（`RuntimeContext.project_id`），不得从模型参数读取。写操作先获取 Workspace 写租约（`write_lease.py`，owner=`run:{run_id}`），Run 结束在 `_drive` finally 释放。
+16. **本地 Preview 地址是 `{token}.localhost:8081`**：`*.localhost` 由浏览器解析到回环；生产必须 `PREVIEW_PUBLIC_BASE_URL=https://preview.example.com`（启动校验要求 https）。Preview Proxy 只代理 Grant 中登记的 Sandbox + Port，禁止任意 upstream URL；本地若浏览器不解析子域，用 `/p/{token}/` 兜底地址。
+17. **Sandbox 集成测试必须真实 Docker**：`test_sandbox_docker_integration.py` 只在 `SANDBOX_DOCKER_TEST=1` 时运行，且必须在挂载 Docker Socket 的容器内执行（DockerEngine 只支持 unix socket，Windows 宿主直跑不可用）；测试会创建/删除真实容器、网络与 Volume，名称带随机后缀。
 
 ## 修改范围原则
 

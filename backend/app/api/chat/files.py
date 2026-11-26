@@ -30,6 +30,7 @@ from app.services.audit.context import record_attachment_change
 from app.services.documents.errors import DocumentError
 from app.services.documents.office_preview import render_docx_pdf
 from app.services.documents.parser import DocumentParseError, parse_document, validate_reference_file
+from app.services.sandbox import session_files
 
 from .conversations import _get_owned_session
 
@@ -200,18 +201,70 @@ async def upload_conversation_file(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """上传附件到会话工作区 ``uploads/``（重复名自动加序号；超限 413）。"""
-    session = await _get_owned_session(db, session_id, current_user)
-    root = workspace_root(current_user.id, session.agent_id, session.id)
-    upload_dir = Path(_resolve_workspace_path(root, "uploads"))
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    """上传附件到会话工作区 ``uploads/``（重复名自动加序号；超限 413）。
 
+    项目会话（Workspace Sandbox）：写入 Sandbox 的 /workspace/uploads/，
+    与 Agent 的 read_file / execute_command 看到同一份文件。
+    """
+    session = await _get_owned_session(db, session_id, current_user)
     name = _safe_name(file.filename or "")
     if len(name.encode("utf-8")) > 230:
         raise HTTPException(status_code=400, detail="文件名过长")
     stem, ext = os.path.splitext(name)
     ext_l = ext.lstrip(".").lower()
     reserve_sidecar = ext_l in _EXTRACT_EXTS
+    max_bytes = int(getattr(settings, "AGENT_MAX_FILE_SIZE_MB", 10) * 1024 * 1024)
+
+    if session_files.uses_sandbox(session):
+        data = bytearray()
+        while chunk := await file.read(1024 * 1024):
+            data.extend(chunk)
+            if len(data) > max_bytes:
+                raise HTTPException(status_code=413, detail="文件超过大小限制")
+        upload_name = await session_files.unique_upload_name(
+            db, session, name, reserve_sidecar=reserve_sidecar)
+        raw = bytes(data)
+        await session_files.write_bytes(db, session, f"uploads/{upload_name}", raw)
+
+        text = ""
+        if ext_l in _EXTRACT_EXTS:
+            tmp_path = None
+            try:
+                import tempfile
+
+                handle = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+                handle.write(raw)
+                handle.close()
+                tmp_path = handle.name
+                if ext_l in _DOCUMENT_EXTS:
+                    try:
+                        text = await asyncio.to_thread(_document_text, tmp_path, file.content_type)
+                    except DocumentParseError as exc:
+                        raise HTTPException(status_code=422, detail=str(exc)) from exc
+                else:
+                    text = await _extract_office_text(tmp_path, ext)
+            finally:
+                if tmp_path:
+                    with suppress(OSError):
+                        os.unlink(tmp_path)
+        text_path = None
+        if reserve_sidecar:
+            has_text = bool(text) and not text.startswith(("[文档解析失败", "[音频转写"))
+            if has_text:
+                await session_files.write_text(
+                    db, session, f"uploads/{upload_name}.extracted.txt", text)
+                text_path = f"uploads/{upload_name}.extracted.txt"
+        record_attachment_change(session.id, after={"name": upload_name, "size": len(raw)})
+        await db.commit()
+        return {
+            "name": upload_name, "path": f"uploads/{upload_name}",
+            "text_path": text_path, "size": len(raw),
+        }
+
+    root = workspace_root(current_user.id, session.agent_id, session.id)
+    upload_dir = Path(_resolve_workspace_path(root, "uploads"))
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
     extracted = None
     for seq in count():
         if seq:
@@ -238,7 +291,6 @@ async def upload_conversation_file(
         break
 
     text_path = None
-    max_bytes = int(getattr(settings, "AGENT_MAX_FILE_SIZE_MB", 10) * 1024 * 1024)
     size = 0
     try:
         with out:
@@ -288,9 +340,18 @@ async def download_conversation_file(
 ):
     """下载已上传附件（前端图片预览用；仅限 uploads/ 目录内）。"""
     session = await _get_owned_session(db, session_id, current_user)
+    name = _safe_name(filename)
+    if session_files.uses_sandbox(session):
+        try:
+            raw, mime = await session_files.read_bytes(db, session, f"uploads/{name}")
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=404, detail="文件不存在") from exc
+        return Response(content=raw, media_type=mime, headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{name}",
+            "X-Content-Type-Options": "nosniff",
+        })
     root = workspace_root(current_user.id, session.agent_id, session.id)
     upload_dir = _resolve_workspace_path(root, "uploads")
-    name = _safe_name(filename)
     target = os.path.realpath(os.path.join(upload_dir, name))
     if not target.startswith(os.path.realpath(upload_dir) + os.sep):
         raise HTTPException(status_code=400, detail="非法文件名")
@@ -308,12 +369,18 @@ async def delete_conversation_file(
 ):
     """删除已上传附件（含文本副本；仅限 uploads/ 目录内）。"""
     session = await _get_owned_session(db, session_id, current_user)
-    root = workspace_root(current_user.id, session.agent_id, session.id)
-    upload_dir = _resolve_workspace_path(root, "uploads")
     name = _safe_name(filename)
     names = [name]
     if os.path.splitext(name)[1].lstrip(".").lower() in _EXTRACT_EXTS:
         names.append(f"{name}.extracted.txt")
+    if session_files.uses_sandbox(session):
+        for fname in names:
+            await session_files.delete_path(db, session, f"uploads/{fname}")
+        record_attachment_change(session.id, before={"name": name})
+        await db.commit()
+        return {"message": "已删除"}
+    root = workspace_root(current_user.id, session.agent_id, session.id)
+    upload_dir = _resolve_workspace_path(root, "uploads")
     for fname in names:
         target = os.path.realpath(os.path.join(upload_dir, fname))
         if not target.startswith(os.path.realpath(upload_dir) + os.sep):
@@ -373,6 +440,12 @@ async def list_conversation_files(
 ):
     """列出会话工作区文件（右侧文件面板：过程中产生的文件可点击预览）。"""
     session = await _get_owned_session(db, session_id, current_user)
+    if session_files.uses_sandbox(session):
+        entries, truncated = await session_files.list_files(db, session)
+        for entry in entries:
+            entry["kind"] = _classify(os.path.splitext(entry["path"])[1])[0]
+        await db.commit()
+        return {"files": entries, "truncated": truncated}
     root = workspace_root(current_user.id, session.agent_id, session.id)
     files, truncated = await asyncio.to_thread(_iter_workspace_files, root)
     entries = []
@@ -399,9 +472,53 @@ async def download_conversation_files_zip(
 ):
     """打包下载会话工作区文件（与 file-list 同一范围，条目名为工作区相对路径）。"""
     session = await _get_owned_session(db, session_id, current_user)
+    if session_files.uses_sandbox(session):
+        data = await session_files.build_zip(db, session)
+        await db.commit()
+        return Response(
+            content=data,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f"attachment; filename=workspace-{session.id}.zip",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
     root = workspace_root(current_user.id, session.agent_id, session.id)
     files, _ = await asyncio.to_thread(_iter_workspace_files, root)
     return zip_stream_response(files, f"workspace-{session.id}.zip")
+
+
+def _preview_payload(target: str, name: str, rel: str, layout_only: bool) -> dict:
+    """按扩展名生成预览载荷（本地文件；Sandbox 分支先物化临时文件）。"""
+    ext = os.path.splitext(name)[1]
+    kind, language = _classify(ext)
+    size = os.path.getsize(target)
+    mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+    if kind in ("text", "code", "markdown") and _looks_binary(target):
+        kind = "binary"
+        language = ""
+
+    data: dict = {
+        "name": name, "path": rel, "kind": kind, "size": size,
+        "mime": mime, "language": language, "truncated": False,
+    }
+    try:
+        if kind in ("text", "code", "markdown"):
+            data["text"], data["truncated"] = _read_text_capped(target)
+        elif kind == "table":
+            data["rows"], data["truncated"] = _read_table(target, ext)
+        elif kind == "office" and layout_only and ext.lower() == ".docx":
+            pass
+        elif kind == "office" and ext.lstrip(".").lower() in _DOCUMENT_EXTS:
+            data["text"] = _document_text(target)
+        elif kind == "pdf":
+            validate_reference_file(target)
+    except DocumentParseError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except csv.Error as exc:
+        raise HTTPException(status_code=422, detail="无法解析 CSV，请检查文件格式") from exc
+    return data
 
 
 @router.get("/{session_id}/file-preview")
@@ -420,45 +537,33 @@ async def preview_conversation_file(
     元信息（字节经 ``file-bytes`` 取）。
     """
     session = await _get_owned_session(db, session_id, current_user)
+    if session_files.uses_sandbox(session):
+        name = os.path.basename(path)
+        async with session_files.materialize_temp(db, session, path) as tmp:
+            if os.path.splitext(name)[1].lstrip(".").lower() in _DOCUMENT_EXTS:
+                # Office 解析在物化后的临时文件上执行
+                data = await asyncio.to_thread(_preview_payload, tmp, name, path, layout_only)
+            else:
+                data = await asyncio.to_thread(_preview_payload, tmp, name, path, layout_only)
+                if data["kind"] == "office" and not data.get("text") and not (
+                    layout_only and os.path.splitext(name)[1].lower() == ".docx"
+                ):
+                    data["text"] = await _extract_office_text(
+                        tmp, os.path.splitext(name)[1])
+        await db.commit()
+        return data
     root = workspace_root(current_user.id, session.agent_id, session.id)
     target = _resolve_workspace_path(root, path)
     if not os.path.isfile(target):
         raise HTTPException(status_code=404, detail="文件不存在")
-
-    name = os.path.basename(target)
-    ext = os.path.splitext(name)[1]
-    kind, language = _classify(ext)
-    size = os.path.getsize(target)
-    mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
     rel = os.path.relpath(target, root).replace(os.sep, "/")
-
-    # 文本类兜底：含 NUL 的"文本"按二进制处理（下载 + 元信息，不硬渲染乱码）
-    if kind in ("text", "code", "markdown") and _looks_binary(target):
-        kind = "binary"
-        language = ""
-
-    data: dict = {
-        "name": name, "path": rel, "kind": kind, "size": size,
-        "mime": mime, "language": language, "truncated": False,
-    }
-    try:
-        if kind in ("text", "code", "markdown"):
-            data["text"], data["truncated"] = await asyncio.to_thread(_read_text_capped, target)
-        elif kind == "table":
-            data["rows"], data["truncated"] = await asyncio.to_thread(_read_table, target, ext)
-        elif kind == "office" and layout_only and ext.lower() == ".docx":
-            # 版式端点会统一校验并转换，预览元数据无需重复抽取全文。
-            pass
-        elif kind == "office" and ext.lstrip(".").lower() in _DOCUMENT_EXTS:
-            data["text"] = await asyncio.to_thread(_document_text, target)
-        elif kind == "office":
-            data["text"] = await _extract_office_text(target, ext)
-        elif kind == "pdf":
-            await asyncio.to_thread(validate_reference_file, target)
-    except DocumentParseError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except csv.Error as exc:
-        raise HTTPException(status_code=422, detail="无法解析 CSV，请检查文件格式") from exc
+    ext = os.path.splitext(target)[1]
+    data = await asyncio.to_thread(
+        _preview_payload, target, os.path.basename(target), rel, layout_only)
+    if data["kind"] == "office" and not data.get("text") and not (
+        layout_only and ext.lower() == ".docx"
+    ):
+        data["text"] = await _extract_office_text(target, ext)
     return data
 
 
@@ -471,6 +576,16 @@ async def preview_conversation_word_layout(
 ):
     """按原始版式渲染工作区中的 DOCX。"""
     session = await _get_owned_session(db, session_id, current_user)
+    if session_files.uses_sandbox(session):
+        async with session_files.materialize_temp(db, session, path) as tmp:
+            await db.rollback()
+            try:
+                data = await render_docx_pdf(Path(tmp))
+            except DocumentError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+        return Response(data, media_type="application/pdf", headers={
+            "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+        })
     root = workspace_root(current_user.id, session.agent_id, session.id)
     target = Path(_resolve_workspace_path(root, path))
     if not target.is_file():
@@ -494,6 +609,15 @@ async def conversation_file_bytes(
 ):
     """返回工作区任意文件字节（图片/PDF 预览、二进制下载）。"""
     session = await _get_owned_session(db, session_id, current_user)
+    if session_files.uses_sandbox(session):
+        try:
+            raw, mime = await session_files.read_bytes(db, session, path)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=404, detail="文件不存在") from exc
+        await db.commit()
+        return Response(content=raw, media_type=mime, headers={
+            "X-Content-Type-Options": "nosniff",
+        })
     root = workspace_root(current_user.id, session.agent_id, session.id)
     target = _resolve_workspace_path(root, path)
     if not os.path.isfile(target):

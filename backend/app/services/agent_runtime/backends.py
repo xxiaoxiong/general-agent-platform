@@ -36,7 +36,8 @@ def _host_path_error(file_path: str) -> str | None:
     return None
 
 
-def build_backend(user_id: int, agent_id: int, session_id: Optional[int], *, store: Optional[Any] = None):
+def build_backend(user_id: int, agent_id: int, session_id: Optional[int], *, store: Optional[Any] = None,
+                  workspace_backend: Optional[Any] = None):
     from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
     from deepagents.backends.protocol import DeleteResult, EditResult, FileUploadResponse, WriteResult
 
@@ -54,6 +55,22 @@ def build_backend(user_id: int, agent_id: int, session_id: Optional[int], *, sto
             return super().edit(file_path, old_string, new_string, replace_all)
 
     default_backend = GuardedState()
+
+    if workspace_backend is not None:
+        # 项目级 Workspace：/workspace/ 路由到 Docker Sandbox（文件与命令同一份文件）
+        routes = {"/workspace/": workspace_backend}
+        if store is not None:
+            from deepagents.backends import StoreBackend
+
+            routes["/memory/"] = StoreBackend(
+                namespace=lambda _rt, _u=user_id: ("user_memory", str(_u)),
+                store=store,
+            )
+        return CompositeBackend(
+            default=default_backend,
+            routes=routes,
+            artifacts_root="/",
+        )
 
     base = getattr(settings, "AGENT_FILES_ROOT", "./data/agent_files")
     session_part = str(session_id) if session_id is not None else "ephemeral"

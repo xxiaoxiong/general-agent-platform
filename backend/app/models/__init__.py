@@ -16,6 +16,11 @@ from app.models.evaluation import (
 from app.models.document import (
     DocumentAsset, DocumentProfile, DocumentProfileVersion, DocumentVersion, RunInputRequest,
 )
+from app.models.sandbox import (
+    PreviewGrant, Project, ProjectMember, SandboxCommandOperation, SandboxEvent,
+    SandboxInstance, SandboxJob, SandboxResourceProfile, SandboxResourceReservation,
+    SandboxRunnerNode, Workspace, WorkspaceService,
+)
 
 __all__ = [
     "User", "Role", "Permission", "UserRole", "RolePermission",
@@ -31,4 +36,7 @@ __all__ = [
     "EvalDataset", "EvalDatasetItem", "EvalRun", "EvalRunItem",
     "EvalSuite", "EvalSuiteDataset", "EvalSuiteVersion", "EvalGrade",
     "DocumentAsset", "DocumentProfile", "DocumentProfileVersion", "DocumentVersion", "RunInputRequest",
+    "Project", "ProjectMember", "Workspace", "SandboxRunnerNode", "SandboxInstance",
+    "SandboxJob", "SandboxResourceReservation", "WorkspaceService", "PreviewGrant",
+    "SandboxCommandOperation", "SandboxEvent", "SandboxResourceProfile",
 ]

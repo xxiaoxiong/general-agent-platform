@@ -100,6 +100,69 @@ if _AVAILABLE:
         ["task_type", "outcome"], registry=REGISTRY,
     )
 
+    # ── Workspace Sandbox Runtime（任务书 §14）──────────────────────────
+    SANDBOX_RUNNER_ONLINE = Gauge(
+        "sandbox_runner_online", "在线 Sandbox Runner 数", registry=REGISTRY,
+    )
+    SANDBOX_RUNNER_HEARTBEAT_AGE = Gauge(
+        "sandbox_runner_heartbeat_age_seconds", "Runner 最近心跳距今秒数",
+        ["node"], registry=REGISTRY,
+    )
+    SANDBOX_ACTIVE_COUNT = Gauge(
+        "sandbox_active_count", "活动 Sandbox 数", registry=REGISTRY,
+    )
+    SANDBOX_QUEUE_DEPTH = Gauge(
+        "sandbox_queue_depth", "Sandbox Job 队列深度", registry=REGISTRY,
+    )
+    SANDBOX_QUEUE_WAIT = Histogram(
+        "sandbox_queue_wait_seconds", "Job 从入队到被领取的等待",
+        registry=REGISTRY, buckets=(0.1, 0.5, 1, 2, 5, 10, 30, 60, 120),
+    )
+    SANDBOX_PROVISION_DURATION = Histogram(
+        "sandbox_provision_duration_seconds", "Sandbox 创建到 Ready 耗时",
+        registry=REGISTRY, buckets=(1, 2, 5, 10, 20, 30, 60, 120),
+    )
+    SANDBOX_START_DURATION = Histogram(
+        "sandbox_start_duration_seconds", "Sandbox 启动耗时",
+        registry=REGISTRY, buckets=(0.5, 1, 2, 5, 10, 20, 30, 60),
+    )
+    SANDBOX_CPU_RESERVED = Gauge(
+        "sandbox_cpu_reserved", "Sandbox CPU 预留（核）", registry=REGISTRY,
+    )
+    SANDBOX_CPU_USAGE = Gauge(
+        "sandbox_cpu_usage", "Sandbox CPU 实际使用（核）", registry=REGISTRY,
+    )
+    SANDBOX_MEMORY_RESERVED = Gauge(
+        "sandbox_memory_reserved_bytes", "Sandbox 内存预留字节", registry=REGISTRY,
+    )
+    SANDBOX_MEMORY_USAGE = Gauge(
+        "sandbox_memory_usage_bytes", "Sandbox 内存实际使用字节", registry=REGISTRY,
+    )
+    SANDBOX_VOLUME_USAGE = Gauge(
+        "sandbox_volume_usage_bytes", "Workspace Volume 使用字节", registry=REGISTRY,
+    )
+    SANDBOX_JOB_RETRY = Counter(
+        "sandbox_job_retry_total", "Sandbox Job 重试次数", registry=REGISTRY,
+    )
+    SANDBOX_RECONCILE_MISMATCH = Counter(
+        "sandbox_reconcile_mismatch_total", "Desired/Observed 不一致次数",
+        registry=REGISTRY,
+    )
+    SANDBOX_OOM = Counter(
+        "sandbox_oom_total", "Sandbox OOM 次数", registry=REGISTRY,
+    )
+    SERVICE_RESTART = Counter(
+        "workspace_service_restart_total", "Service 重启次数",
+        ["result"], registry=REGISTRY,
+    )
+    SERVICE_HEALTH = Gauge(
+        "workspace_service_health", "Service 健康状态（1=healthy）",
+        ["workspace", "service"], registry=REGISTRY,
+    )
+    PREVIEW_REQUESTS = Counter(
+        "preview_request_total", "Preview 请求数", ["result"], registry=REGISTRY,
+    )
+
 
 def _safe(fn):
     """指标记录防御式包装：任何指标异常只记日志、不影响业务。"""
@@ -188,6 +251,77 @@ def observe_document_stage(task_type: str, stage: str, outcome: str, seconds: fl
 @_safe
 def record_document_validation(task_type: str, passed: bool) -> None:
     DOCUMENT_VALIDATION.labels(task_type=task_type, outcome="passed" if passed else "failed").inc()
+
+
+# ── Workspace Sandbox Runtime ─────────────────────────────────────────────
+
+@_safe
+def set_sandbox_capacity(runner_count: int, active_count: int, queue_depth: int,
+                         cpu_reserved_millis: int = 0, memory_reserved_bytes: int = 0) -> None:
+    SANDBOX_RUNNER_ONLINE.set(runner_count)
+    SANDBOX_ACTIVE_COUNT.set(active_count)
+    SANDBOX_QUEUE_DEPTH.set(queue_depth)
+    SANDBOX_CPU_RESERVED.set(cpu_reserved_millis / 1000.0)
+    SANDBOX_MEMORY_RESERVED.set(memory_reserved_bytes)
+
+
+@_safe
+def set_runner_heartbeat_age(node: str, seconds: float) -> None:
+    SANDBOX_RUNNER_HEARTBEAT_AGE.labels(node=node).set(max(0.0, seconds))
+
+
+@_safe
+def observe_sandbox_queue_wait(seconds: float) -> None:
+    SANDBOX_QUEUE_WAIT.observe(max(0.0, seconds))
+
+
+@_safe
+def observe_sandbox_provision(seconds: float) -> None:
+    SANDBOX_PROVISION_DURATION.observe(max(0.0, seconds))
+
+
+@_safe
+def observe_sandbox_start(seconds: float) -> None:
+    SANDBOX_START_DURATION.observe(max(0.0, seconds))
+
+
+@_safe
+def set_sandbox_usage(cpu_cores: float = 0.0, memory_bytes: int = 0,
+                      volume_bytes: int = 0) -> None:
+    SANDBOX_CPU_USAGE.set(max(0.0, cpu_cores))
+    SANDBOX_MEMORY_USAGE.set(max(0, memory_bytes))
+    SANDBOX_VOLUME_USAGE.set(max(0, volume_bytes))
+
+
+@_safe
+def inc_sandbox_job_retry() -> None:
+    SANDBOX_JOB_RETRY.inc()
+
+
+@_safe
+def inc_sandbox_reconcile_mismatch() -> None:
+    SANDBOX_RECONCILE_MISMATCH.inc()
+
+
+@_safe
+def inc_sandbox_oom() -> None:
+    SANDBOX_OOM.inc()
+
+
+@_safe
+def inc_service_restart(result: str = "ok") -> None:
+    SERVICE_RESTART.labels(result=result).inc()
+
+
+@_safe
+def set_service_health(workspace_id: int, service: str, healthy: bool) -> None:
+    SERVICE_HEALTH.labels(workspace=str(workspace_id), service=service).set(
+        1 if healthy else 0)
+
+
+@_safe
+def inc_preview_request(denied: bool = False) -> None:
+    PREVIEW_REQUESTS.labels(result="denied" if denied else "ok").inc()
 
 
 def render() -> tuple[bytes, str]:

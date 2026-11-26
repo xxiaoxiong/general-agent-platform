@@ -81,6 +81,9 @@ class AgentSession(Base):
     id = Column(Integer, primary_key=True, index=True)
     agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # 项目归属（Workspace Sandbox）：为空 = 存量会话，继续使用旧文件后端；
+    # 非空 = 会话共享 Project 对应的持久化 Workspace（任务书 §18 兼容策略）
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True, index=True)
     title = Column(String(200), default="新对话")
     # 用户可以把标题改回「新对话」，此时仍以手动标题为准。
     title_edited = Column(Boolean, nullable=False, default=False, server_default=false())

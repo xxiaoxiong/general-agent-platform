@@ -296,6 +296,7 @@ class StreamMixin:
         is_team_run = (execution_context or {}).get("team_mode") is True
         private_document_content = is_document_run or task_type == "document_analyze"
         ctx: Optional[RuntimeContext] = None
+        project_id: Optional[int] = None
         verification: Optional[Dict[str, Any]] = None  # P4-02：验证结果（异常路径保持 None）
         team_stats: dict[str, Any] = {}
         team_incomplete: str | None = None
@@ -314,6 +315,13 @@ class StreamMixin:
             if agent_config is None:
                 agent_config = await self._load_agent_config(run.agent_id)
             agent_config = dict(agent_config)
+            # Workspace Sandbox：会话 → 项目 → 持久化 Workspace；仅服务端推导，
+            # 模型无法通过工具参数指定其他项目/沙箱（任务书 §9.2）
+            if settings.SANDBOX_ENABLED:
+                project_id = await self._load_session_project_id(run.session_id)
+                if project_id:
+                    agent_config["sandbox_enabled"] = True
+                    agent_config["_project_id"] = project_id
             mem_ctx = use_memory_context or agent_config.pop("_memory_context", "")
             extra_db_info = db_info if db_info is not None else agent_config.pop("_db_info", None)
             # 运行开始事件先于语义决策发布：决策模型调用期间前端也能看到运行已启动
@@ -482,6 +490,7 @@ class StreamMixin:
                 thread_id=run.thread_id,
                 agent_id=run.agent_id,
                 session_id=run.session_id,
+                project_id=project_id,
                 trace_id=run.run_id,
                 model_id=log_fields["model_id"],
                 agent_config=agent_config,
@@ -559,6 +568,13 @@ class StreamMixin:
                 for _tname, _tmeta in ((_mcp_entry.get("tools") or {}).items()):
                     if _tmeta.get("requires_approval"):
                         policy.hitl_tools.add(_tname)
+            # Workspace Sandbox 执行类工具进入 HITL 审批面（命令 / 服务启动）
+            if agent_config.get("sandbox_enabled"):
+                from app.services.tools.sandbox_tools import SANDBOX_HITL_TOOLS
+
+                for _name in SANDBOX_HITL_TOOLS:
+                    if _name in policy.allowed_tools:
+                        policy.hitl_tools.add(_name)
 
             # 工具 db 会话：独立 session，避免污染请求生命周期
             async with AsyncSessionLocal() as tool_db:
@@ -979,6 +995,14 @@ class StreamMixin:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # Workspace 写租约释放：Run 结束后其他写任务可立即接管（任务书 §3.2）
+            if settings.SANDBOX_ENABLED and project_id:
+                try:
+                    from app.services.sandbox.write_lease import release_run_write_lease
+
+                    await release_run_write_lease(project_id, run.run_id)
+                except Exception:  # noqa: BLE001 释放失败由租约 TTL 兜底
+                    logger.warning("run %s 释放 Workspace 写租约失败", run.run_id)
 
     async def _with_document_preview(
         self, run: RunHandle, messages: List[Dict[str, Any]], route: Dict[str, Any]

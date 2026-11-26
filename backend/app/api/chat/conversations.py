@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
 
 from app.api.deps import get_current_user
+from app.core.config import settings
 from app.core.database import get_db
 from app.models.agent import Agent, AgentRun, AgentSession, session_message_count_expr
 from app.models.evolution import AgentEvaluation
@@ -22,7 +23,9 @@ from app.services.agent_runtime.lifecycle import TERMINAL_STATUSES
 from app.services.agent_runtime.repositories.run_repository import _sql_now
 from app.services.agent_runtime.repositories.session_repository import SessionRepository
 
-from app.api.common.schemas import ConversationCreate, ConversationPatch
+from app.api.common.schemas import (
+    ConversationCreate, ConversationPatch, ConversationProjectPatch,
+)
 from app.api.common.serializers import conversation_to_dict
 
 router = APIRouter(prefix="/conversations", tags=["conversations-v2"])
@@ -102,6 +105,21 @@ async def create_conversation(
         agent_id=agent_id, user_id=current_user.id,
         title=body.title or "新对话", messages=[],
     )
+    # Workspace Sandbox：显式项目需校验权限；未指定时在启用 Sandbox 的情况下
+    # 挂接用户默认项目，保证文件工具 / 命令工具 / 文件面板共享同一 Workspace。
+    if getattr(settings, "SANDBOX_ENABLED", False):
+        from app.services.sandbox import acl as sandbox_acl
+        from app.services.sandbox.projects import default_project
+
+        if body.project_id is not None:
+            project, _role = await sandbox_acl.require_project_access(
+                db, body.project_id, current_user, "operator",
+            )
+        else:
+            project = await default_project(db, current_user)
+        session.project_id = project.id
+    elif body.project_id is not None:
+        raise HTTPException(status_code=400, detail="Sandbox 未启用，不能指定项目")
     db.add(session)
     await db.commit()
     await db.refresh(session)
@@ -119,8 +137,7 @@ async def get_conversation(
 
 
 @router.patch("/{session_id}")
-async def update_conversation(
-    session_id: int,
+async def update_conversation(    session_id: int,
     body: ConversationPatch,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -141,6 +158,45 @@ async def update_conversation(
     result = conversation_to_dict(session, message_count=count)
     await db.commit()
     return result
+
+
+@router.patch("/{session_id}/project")
+async def set_conversation_project(
+    session_id: int,
+    body: ConversationProjectPatch,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """切换会话所属项目（Workspace Sandbox）：只影响后续 Run，不改动历史文件。"""
+    session = await _get_owned_session(db, session_id, current_user)
+    if session.active_run_id:
+        raise HTTPException(status_code=409, detail="任务执行中，暂不能切换项目")
+    if not getattr(settings, "SANDBOX_ENABLED", False):
+        raise HTTPException(status_code=400, detail="Sandbox 未启用")
+    if body.project_id is not None:
+        from app.services.sandbox import acl as sandbox_acl
+
+        project, _role = await sandbox_acl.require_project_access(
+            db, body.project_id, current_user, "operator",
+        )
+        session.project_id = project.id
+        # 切换项目后旧的写租约/预览不属于当前项目，前端会重新获取
+        from app.models.sandbox import Workspace
+        from app.services.sandbox import runtime
+
+        workspace = (await db.execute(
+            select(Workspace).where(
+                Workspace.project_id == project.id, Workspace.deleted_at.is_(None))
+        )).scalar_one_or_none()
+        if workspace is None:
+            workspace = await runtime.ensure_workspace(
+                db, project.id, project.owner_id, project.tenant_id)
+        await runtime.touch_workspace(db, workspace.id)
+    else:
+        session.project_id = None
+    await db.commit()
+    await db.refresh(session)
+    return conversation_to_dict(session)
 
 
 @router.get("/{session_id}/messages")

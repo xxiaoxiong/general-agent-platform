@@ -194,6 +194,48 @@ class Settings(BaseSettings):
     EVALUATION_INFRA_RETRY_MAX: int = 1         # 基础设施故障保守重试次数（无成功副作用时）
     EVALUATION_JUDGE_MODEL_CONFIG_ID: int = 0   # 独立 Judge 模型（0=回退 EVOLUTION_JUDGE_MODEL_CONFIG_ID）
 
+    # ── Workspace Sandbox Runtime（项目级持久化工作空间，任务书 §13.4）──
+    SANDBOX_ENABLED: bool = False               # 总开关（关闭时全部 Sandbox API/工具/面板不可用）
+    SANDBOX_PROVIDER: str = "docker"            # 第一阶段仅 docker
+    SANDBOX_RUNNER_ID: str = ""                 # Runner 节点标识（缺省 hostname）
+    SANDBOX_RUNNER_TOKEN: str = ""              # Runner 内部服务令牌（启用时必填，fail-closed）
+    SANDBOX_RUNNER_CONTROL_URL: str = "http://sandbox-runner:9100"
+    SANDBOX_RUNNER_PORT: int = 9100             # Runner 内部 API / Gateway 监听端口
+    SANDBOX_BACKEND_URL: str = "http://backend:8000"  # Runner 回调 Backend 内部 API
+    SANDBOX_RUNNER_DISK_GB: int = 100           # Runner 节点磁盘总量（用于预留记账）
+    SANDBOX_RUNNER_HEARTBEAT_INTERVAL: float = 15.0
+    SANDBOX_JOB_LEASE_SECONDS: int = 90         # Job 租约时长
+    SANDBOX_JOB_HEARTBEAT_INTERVAL: float = 20.0
+    SANDBOX_RECONCILE_INTERVAL: float = 30.0    # 对账 / 空闲回收 / 租约回收扫描间隔
+    SANDBOX_DEFAULT_PROFILE: str = "standard"
+    SANDBOX_MAX_ACTIVE_PER_USER: int = 2        # 每用户最大活动 Sandbox 数（0=不限）
+    SANDBOX_MAX_ACTIVE_PER_TENANT: int = 20     # 每租户/组织最大活动 Sandbox 数（0=不限）
+    SANDBOX_IDLE_TIMEOUT: int = 1800            # 空闲回收秒数（0=不自动回收）
+    SANDBOX_IMAGE: str = "general-agent-platform/workspace-sandbox:1.0.0"
+    SANDBOX_NETWORK_POLICY: str = "egress"      # egress=允许公网出站；none=完全断网
+    SANDBOX_VOLUME_QUOTA_MODE: str = "soft"     # soft=监控预警；hard=宿主支持时硬配额
+    SANDBOX_CPU_RESERVE: float = 2.0            # 宿主机为 OS/平台保留的 CPU 核数
+    SANDBOX_MEMORY_RESERVE: int = 2048          # 宿主机保留内存（MB）
+    SANDBOX_DISK_RESERVE: int = 20              # 宿主机保留磁盘（GB）
+    SANDBOX_DOCKER_SOCKET: str = "/var/run/docker.sock"
+    SANDBOX_AGENT_PORT: int = 19999             # Sandbox 内 workspace-agent 端口
+    SANDBOX_COMMAND_TIMEOUT: int = 600          # 长命令最大运行时长（秒）
+    SANDBOX_COMMAND_MAX_OUTPUT_BYTES: int = 200_000  # 单次命令输出上限（截断）
+    SANDBOX_SYNC_COMMAND_WAIT: float = 30.0     # execute_command 同步等待上限（超过转异步）
+    SANDBOX_VOLUME_PREFIX: str = "gap-ws-"
+    SANDBOX_CONTAINER_PREFIX: str = "gap-sbx-"
+    SANDBOX_RUNNER_CONTAINER: str = ""          # 为空时使用容器内 HOSTNAME（= 容器 ID）
+    SANDBOX_WRITE_LEASE_SECONDS: int = 120      # Workspace 写租约时长
+    SANDBOX_WRITE_LEASE_HEARTBEAT_INTERVAL: float = 30.0
+    SANDBOX_JOB_MAX_ATTEMPTS: int = 3
+    SANDBOX_JOB_AGING_SECONDS: float = 60.0     # 每等待 60s 提升一级优先级（防饥饿）
+    PREVIEW_BASE_DOMAIN: str = "localhost"      # 生产配置独立 Preview 域名（含 TLS）
+    PREVIEW_PUBLIC_BASE_URL: str = ""           # 空=按 {token}.{PREVIEW_BASE_DOMAIN}:{端口} 生成
+    PREVIEW_TOKEN_TTL: int = 3600               # Preview Grant 有效期（秒）
+    PREVIEW_MAX_CONNECTIONS: int = 16           # 单 Preview 并发连接上限
+    PREVIEW_PROXY_PORT: int = 8081              # Preview Proxy 容器端口
+    PREVIEW_PROXY_HOST_PORT: int = 8081         # 浏览器可达端口（compose 映射）
+
     OTEL_ENABLED: bool = False                  # OpenTelemetry 导出（P1-02）
     OTEL_EXPORTER_OTLP_ENDPOINT: str = ""       # 如 http://localhost:4317
     OTEL_SERVICE_NAME: str = "general-agent-platform"
@@ -226,6 +268,7 @@ class Settings(BaseSettings):
             )
         if self.asr_enabled:
             self._validate_asr_settings()
+        self._validate_sandbox_settings()
         verifier_directory = self.AGENT_PROJECT_VERIFIER_DIR.strip()
         if verifier_directory and not Path(verifier_directory).is_absolute():
             raise RuntimeError("配置非法：AGENT_PROJECT_VERIFIER_DIR 须为共享队列的绝对路径。")
@@ -239,6 +282,29 @@ class Settings(BaseSettings):
                     "多 Worker 部署必须使用 PostgreSQL 以共享 Graph State。"
                 )
             self._validate_production_secrets()
+
+    def _validate_sandbox_settings(self) -> None:
+        """Workspace Sandbox 配置校验：启用时 fail-closed（缺内部令牌拒绝启动）。"""
+        if self.SANDBOX_PROVIDER not in {"docker"}:
+            raise RuntimeError("配置非法：SANDBOX_PROVIDER 第一阶段仅支持 docker。")
+        if self.SANDBOX_NETWORK_POLICY not in {"egress", "none"}:
+            raise RuntimeError("配置非法：SANDBOX_NETWORK_POLICY 只能为 egress / none。")
+        if self.SANDBOX_VOLUME_QUOTA_MODE not in {"soft", "hard"}:
+            raise RuntimeError("配置非法：SANDBOX_VOLUME_QUOTA_MODE 只能为 soft / hard。")
+        if not self.SANDBOX_ENABLED:
+            return
+        if len((self.SANDBOX_RUNNER_TOKEN or "").strip()) < 16:
+            raise RuntimeError(
+                "配置非法，拒绝启动：SANDBOX_ENABLED=true 时 SANDBOX_RUNNER_TOKEN 必须为"
+                "至少 16 位的内部服务令牌（Runner / Preview Proxy / Backend 共用）。"
+            )
+        if self.APP_ENV.lower() in ("production", "prod"):
+            base = (self.PREVIEW_PUBLIC_BASE_URL or "").strip()
+            if base and not base.startswith("https://"):
+                raise RuntimeError(
+                    "配置非法：生产环境 PREVIEW_PUBLIC_BASE_URL 必须为 https:// 地址"
+                    "（Preview 与控制台必须不同 Origin）。"
+                )
 
     def _validate_asr_settings(self) -> None:
         error = "配置非法：ASR_BASE_URL 必须是无认证、查询参数和片段的 HTTP(S) 服务地址。"

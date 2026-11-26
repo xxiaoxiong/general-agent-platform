@@ -134,7 +134,17 @@ def build_agent(
     # 文件工具看不到真实磁盘工作区（上传附件 / tool-outputs 卸载文件都读不到）
     from deepagents.middleware.filesystem import FilesystemMiddleware
 
-    backend = build_backend(ctx.scope.user_id, ctx.agent_id, ctx.session_id, store=store)
+    if ctx.project_id and settings.SANDBOX_ENABLED:
+        # 项目会话：文件工具走 Sandbox 的 /workspace（与 execute_command 同一份文件）
+        from .sandbox_backend import build_sandbox_backend
+
+        backend = build_backend(
+            ctx.scope.user_id, ctx.agent_id, ctx.session_id, store=store,
+            workspace_backend=build_sandbox_backend(
+                ctx.project_id, ctx.run_id, ctx.scope.user_id),
+        )
+    else:
+        backend = build_backend(ctx.scope.user_id, ctx.agent_id, ctx.session_id, store=store)
     file_tools = build_fs_tools(policy, backend)
     fs_middleware = FilesystemMiddleware(tools=file_tools, backend=backend)
     subagents = [
@@ -239,6 +249,23 @@ def _compose_system_prompt(ctx: RuntimeContext) -> str:
         "- 只在图表确实能提升理解时使用；数据不足时直接说明无法绘制，不得编造数据；"
         "图表前后保留必要的文字说明，不要让回答只剩图表源码。"
     )
+    if ctx.project_id and settings.SANDBOX_ENABLED:
+        parts.append(
+            "## 项目工作空间（Docker Sandbox）\n"
+            "- 你在该项目专属的隔离 Docker Sandbox 中工作：`/workspace` 是持久化项目目录，"
+            "文件工具（read_file / write_file / edit_file / ls / glob / grep）与命令工具看到同一份文件。\n"
+            "- 用 `execute_command` 执行命令（依赖安装、测试、构建、脚本）；长时间命令返回 running 与 "
+            "operation_id，用 `get_command_status` / `get_command_output` 查询，`cancel_command` 取消。\n"
+            "- 用 `start_service` 启动长期服务（如 `npm run dev -- --host 0.0.0.0`、`uvicorn app:app --port 8000`），"
+            "用 `list_services` / `get_service_status` / `get_service_logs` 查看状态与日志，"
+            "用 `stop_service` / `restart_service` 管理生命周期。\n"
+            "- 服务启动并通过健康检查后，用 `get_preview_url` 获取受授权的浏览器预览地址；"
+            "该地址会展示在右侧 Preview 区域。\n"
+            "- Sandbox 已配置 CPU / 内存 / PID / 磁盘限制与只读 rootfs；不要在 `/workspace` 之外写文件，"
+            "不要尝试访问 Docker Socket、其他项目或其他用户的数据。\n"
+            "- 安装依赖请优先使用项目内包管理器（npm install / pip install --user），"
+            "以免写入系统目录失败。"
+        )
     if ctx.db_info and ctx.db_info.get("hint"):
         parts.append(ctx.db_info["hint"])
     if ctx.memory_context:

@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.core.config import settings
 from app.core.database import get_db
 from app.models.user import User
 
@@ -44,5 +45,11 @@ async def workspace_bootstrap(
             "file_upload_enabled": True,
             "memory_enabled": True,
             "hitl_enabled": True,
+        },
+        # Workspace Sandbox：前端据此显示 Preview / Services Tab 与项目选择
+        "sandbox": {
+            "enabled": bool(getattr(settings, "SANDBOX_ENABLED", False)),
+            "preview_domain": getattr(settings, "PREVIEW_BASE_DOMAIN", "localhost"),
+            "default_profile": getattr(settings, "SANDBOX_DEFAULT_PROFILE", "standard"),
         },
     }

@@ -1,0 +1,107 @@
+{
+  "title": "General Agent Platform Workspace Sandbox",
+  "uid": "workspace-sandbox-runtime",
+  "tags": ["general-agent-platform", "sandbox"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "15s",
+  "time": { "from": "now-3h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Runner 在线数",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "targets": [{ "expr": "sandbox_runner_online", "legendFormat": "online" }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "活动 Sandbox 数",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "targets": [{ "expr": "sandbox_active_count", "legendFormat": "active" }]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Job 队列深度",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "targets": [{ "expr": "sandbox_queue_depth", "legendFormat": "queued" }]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Runner 心跳延迟（秒）",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+      "targets": [{ "expr": "max(sandbox_runner_heartbeat_age_seconds)", "legendFormat": "max" }]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "资源预留 vs 实际使用（CPU 核）",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        { "expr": "sandbox_cpu_reserved", "legendFormat": "reserved" },
+        { "expr": "sandbox_cpu_usage", "legendFormat": "usage" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "资源预留 vs 实际使用（内存字节）",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        { "expr": "sandbox_memory_reserved_bytes", "legendFormat": "reserved" },
+        { "expr": "sandbox_memory_usage_bytes", "legendFormat": "usage" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Job 排队等待 / Provision / Start 耗时",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(sandbox_queue_wait_seconds_bucket[5m])))", "legendFormat": "queue p95" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(sandbox_provision_duration_seconds_bucket[5m])))", "legendFormat": "provision p95" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(sandbox_start_duration_seconds_bucket[5m])))", "legendFormat": "start p95" }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Job 重试 / 对账不一致 / OOM",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "targets": [
+        { "expr": "rate(sandbox_job_retry_total[5m])", "legendFormat": "job retry" },
+        { "expr": "rate(sandbox_reconcile_mismatch_total[5m])", "legendFormat": "reconcile mismatch" },
+        { "expr": "rate(sandbox_oom_total[5m])", "legendFormat": "oom" }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Service 重启 / 健康度",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+      "targets": [
+        { "expr": "sum by (result) (rate(workspace_service_restart_total[5m]))", "legendFormat": "restart {{result}}" },
+        { "expr": "avg by (service) (workspace_service_health)", "legendFormat": "health {{service}}" }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Preview 请求 / 拒绝",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+      "targets": [
+        { "expr": "sum by (result) (rate(preview_request_total[5m]))", "legendFormat": "{{result}}" }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Workspace Volume 使用量",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 30 },
+      "targets": [{ "expr": "sandbox_volume_usage_bytes", "legendFormat": "volume bytes" }]
+    }
+  ]
+}

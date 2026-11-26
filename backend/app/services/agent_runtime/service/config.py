@@ -147,7 +147,29 @@ class ConfigMixin:
         # MCP 工具面（装配期写入，见 _load_mcp_runtime）：与内置工具同口径进入
         # 工具面/事件桥接/授权集合
         specs.extend(agent_config.get("mcp_tool_specs") or [])
+        # Workspace Sandbox 工具：仅当 Run 绑定项目且 SANDBOX_ENABLED 时注入
+        if agent_config.get("sandbox_enabled"):
+            from app.services.tools import SANDBOX_TOOLS
+
+            existing = {spec["name"] for spec in specs}
+            for spec in SANDBOX_TOOLS:
+                if spec["name"] not in existing:
+                    specs.append(spec)
         return specs
+
+    async def _load_session_project_id(self, session_id: Optional[int]) -> Optional[int]:
+        """读取会话的项目归属（Workspace Sandbox）；存量会话为 None。"""
+        if not session_id:
+            return None
+        from sqlalchemy import select
+
+        from app.models.agent import AgentSession
+
+        async with AsyncSessionLocal() as db:
+            value = (await db.execute(
+                select(AgentSession.project_id).where(AgentSession.id == session_id)
+            )).scalar_one_or_none()
+        return int(value) if value else None
 
     async def _load_mcp_runtime(
         self, agent_id: Optional[int], agent_config: Dict[str, Any]

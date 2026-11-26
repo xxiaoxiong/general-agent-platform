@@ -483,8 +483,12 @@ class ToolAdapterFactory:
                 connection = db_info.get("bound_database")
                 if name in DATABASE_TOOLS and connection is not None:
                     db = await stack.enter_async_context(read_bound_database(connection))
+                # ToolExecutor 保持 (db, agent_config) 既有构造签名（测试注入 fake
+                # executor 兼容）；Run Context 通过属性传入，供 Sandbox 工具使用。
+                executor = ToolExecutor(db, self.ctx.agent_config)
+                executor.ctx = self.ctx
                 result = await execute_with_retry(
-                    name, args, ToolExecutor(db, self.ctx.agent_config),
+                    name, args, executor,
                     bus=self.bus, run_id=self.ctx.run_id,
                     contract=get_side_effect_contract(name),
                 )

@@ -49,6 +49,14 @@ class AssistantDraftRequest(BaseModel):
 class ConversationCreate(BaseModel):
     assistant_id: Optional[int] = None  # 缺省 = 默认助手
     title: str = "新对话"
+    # 项目归属（Workspace Sandbox）：缺省由服务端按 SANDBOX_ENABLED 决定是否挂接默认项目
+    project_id: Optional[int] = None
+
+
+class ConversationProjectPatch(BaseModel):
+    """切换会话所属项目（Workspace Sandbox）；活动 Run 期间禁止切换。"""
+
+    project_id: Optional[int] = None
 
 
 class ConversationPatch(BaseModel):
