@@ -16,15 +16,15 @@
 
     <!-- 头部：标题 + 文件数 + 刷新/打包下载/放大/关闭 -->
     <header class="wf-head">
-      <FolderOpen :size="16" aria-hidden="true" />
-      <strong>工作目录</strong>
-      <span v-if="files.length" class="wf-count">{{ files.length }} 个文件</span>
+      <component :is="tab === 'preview' ? Globe : tab === 'services' ? Server : FolderOpen" :size="16" aria-hidden="true" />
+      <strong>{{ tabTitle }}</strong>
+      <span v-if="tab === 'files' && files.length" class="wf-count">{{ files.length }} 个文件</span>
       <div class="wf-actions">
-        <button type="button" class="wf-icon-btn" title="刷新" aria-label="刷新文件列表" :disabled="loading" @click="$emit('refresh')">
+        <button v-if="tab === 'files'" type="button" class="wf-icon-btn" title="刷新" aria-label="刷新文件列表" :disabled="loading" @click="$emit('refresh')">
           <LoaderCircle v-if="loading" class="mini-spin" :size="15" />
           <RefreshCw v-else :size="15" />
         </button>
-        <button type="button" class="wf-icon-btn" title="打包下载（ZIP）" aria-label="打包下载全部文件"
+        <button v-if="tab === 'files'" type="button" class="wf-icon-btn" title="打包下载（ZIP）" aria-label="打包下载全部文件"
           :disabled="downloading || !files.length" @click="$emit('download-zip')">
           <LoaderCircle v-if="downloading" class="mini-spin" :size="15" />
           <Download v-else :size="15" />
@@ -39,7 +39,23 @@
       </div>
     </header>
 
-    <div class="wf-body">
+    <!-- Files / Preview / Services 切换（仅 Sandbox 启用时显示） -->
+    <div v-if="sandboxEnabled" class="wf-tabs" role="tablist" aria-label="工作区面板">
+      <button type="button" role="tab" class="wf-tab" :class="{ active: tab === 'files' }"
+        :aria-selected="tab === 'files'" @click="setTab('files')">
+        <FolderOpen :size="14" />文件
+      </button>
+      <button type="button" role="tab" class="wf-tab" :class="{ active: tab === 'preview' }"
+        :aria-selected="tab === 'preview'" @click="setTab('preview')">
+        <Globe :size="14" />预览
+      </button>
+      <button type="button" role="tab" class="wf-tab" :class="{ active: tab === 'services' }"
+        :aria-selected="tab === 'services'" @click="setTab('services')">
+        <Server :size="14" />服务
+      </button>
+    </div>
+
+    <div v-show="tab === 'files'" class="wf-body">
       <!-- 左：项目文件树（层级索引） -->
       <ul class="wf-tree" aria-label="工作目录文件树">
         <li v-if="loading && !files.length" class="wf-state" role="status">
@@ -109,6 +125,15 @@
         </div>
       </section>
     </div>
+
+    <SandboxPreviewPane
+      v-if="sandboxEnabled && tab === 'preview'"
+      :project-id="projectId ?? null" :active="tab === 'preview'"
+    />
+    <SandboxServicesPane
+      v-else-if="sandboxEnabled && tab === 'services'"
+      :project-id="projectId ?? null" :active="tab === 'services'"
+    />
   </aside>
 </template>
 
@@ -118,13 +143,15 @@
  * 左侧项目文件树作层级索引（目录在前、可展开折叠），点文件名 → 右侧原位预览内容；
  * 支持手动刷新、打包下载（ZIP）、拖动调宽与放大。
  */
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import {
-  ChevronRight, CircleAlert, Download, FileSearch, Folder, FolderOpen,
-  LoaderCircle, Maximize, Minimize, RefreshCw, X,
+  ChevronRight, CircleAlert, Download, FileSearch, Folder, FolderOpen, Globe,
+  LoaderCircle, Maximize, Minimize, RefreshCw, Server, X,
 } from '@lucide/vue'
 import type { PreviewContent, WorkspaceFile } from '@/api/conversations'
 import FilePreviewBody from './FilePreviewBody.vue'
+import SandboxPreviewPane from './SandboxPreviewPane.vue'
+import SandboxServicesPane from './SandboxServicesPane.vue'
 import { fileKindMeta } from './fileKinds'
 import { buildFileTree, flattenFileTree, type FileTreeRowView } from './fileTree'
 import { useResizablePanel } from './useResizablePanel'
@@ -144,6 +171,10 @@ const props = defineProps<{
     error: string
     data: PreviewContent | null
   } | null
+  /** Sandbox 是否启用（启用后显示 Files / Preview / Services Tab） */
+  sandboxEnabled?: boolean
+  /** 当前会话所属项目（Preview / Services 作用于该项目 Workspace） */
+  projectId?: number | null
 }>()
 
 const emit = defineEmits<{
@@ -155,6 +186,24 @@ const emit = defineEmits<{
   'open-original': [path: string]
   'close-preview': []
 }>()
+
+// ── Files / Preview / Services Tab ─────────────────────────────────────────
+const TAB_KEY = 'workspace-dock-tab'
+const tab = ref<'files' | 'preview' | 'services'>(
+  (localStorage.getItem(TAB_KEY) as 'files' | 'preview' | 'services') || 'files',
+)
+const tabTitle = computed(() => (
+  tab.value === 'preview' ? '页面预览' : tab.value === 'services' ? '项目服务' : '工作目录'
+))
+
+function setTab(next: 'files' | 'preview' | 'services') {
+  tab.value = next
+  localStorage.setItem(TAB_KEY, next)
+}
+
+watch(() => props.sandboxEnabled, (enabled) => {
+  if (!enabled) tab.value = 'files'
+})
 
 // ── 文件树（默认全部展开，折叠状态记在 collapsed 集合）──────────────────────
 const collapsed = reactive(new Set<string>())
@@ -255,6 +304,19 @@ function closeOverlay() {
 .wf-head > svg { flex: none; color: var(--ui-accent); }
 .wf-count { color: var(--ui-muted); font-size: 11px; }
 .wf-actions { display: flex; align-items: center; gap: 2px; margin-inline-start: auto; }
+.wf-tabs {
+  flex: none; display: flex; gap: 2px; padding: 4px 8px;
+  border-bottom: 1px solid var(--ui-border); background: var(--ui-bg);
+}
+.wf-tab {
+  display: inline-flex; align-items: center; gap: 5px; padding: 5px 9px;
+  border: 1px solid transparent; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-secondary); font-size: 12px; cursor: pointer;
+}
+.wf-tab:hover { background: var(--ui-hover); color: var(--ui-text); }
+.wf-tab.active {
+  color: var(--ui-accent); background: var(--ui-accent-soft); border-color: var(--ui-accent);
+}
 .wf-icon-btn {
   width: 28px; height: 28px; padding: 0; border: none; border-radius: var(--ui-radius-sm);
   background: transparent; color: var(--ui-secondary); cursor: pointer;

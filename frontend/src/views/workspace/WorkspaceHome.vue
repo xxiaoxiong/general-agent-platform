@@ -39,6 +39,21 @@
         <div class="thread-heading">
           <span>{{ currentConversation?.title || '新对话' }}</span>
         </div>
+        <div v-if="sandboxEnabled && currentConversation" class="project-switch">
+          <FolderKanban :size="14" aria-hidden="true" />
+          <select
+            :value="currentConversation?.project_id ?? ''" :disabled="projectBusy || !!currentConversation?.active_run_id"
+            aria-label="切换项目" title="当前会话所属项目（工作空间）"
+            @change="changeProject"
+          >
+            <option value="">未绑定项目</option>
+            <option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }}</option>
+          </select>
+          <button type="button" class="icon-button project-add" title="新建项目" aria-label="新建项目"
+            :disabled="projectBusy" @click="createProjectPrompt">
+            <Plus :size="14" />
+          </button>
+        </div>
         <span class="assistant-name"><Bot :size="15" />{{ currentAssistant?.name || '通用助手' }}</span>
         <button
           type="button" class="icon-button" :aria-pressed="filesPanelOpen"
@@ -286,6 +301,7 @@
       v-else-if="filesPanelOpen"
       :files="fileList" :loading="filesLoading" :error="filesError" :truncated="filesTruncated"
       :downloading="workspaceZipBusy" :preview="preview"
+      :sandbox-enabled="sandboxEnabled" :project-id="currentConversation?.project_id ?? null"
       @open="openPreview" @refresh="refreshFileList(true)" @close="closeFilesPanel"
       @download-zip="downloadWorkspaceZip" @download="downloadPreview"
       @open-original="openPreview" @close-preview="closePreview"
@@ -317,15 +333,17 @@
  * useDocumentTask（文档任务）/ useFileAttachments（附件+预览）/
  * useThreadScroll（粘底滚动）/ chatDisplay（展示辅助）。
  */
-import { computed, onMounted, onUnmounted } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
   ArrowDown, Bot, BookOpen, ChartNoAxesCombined, CircleAlert, CirclePause,
-  Copy, ExternalLink, FilePenLine, FileText, FolderOpen, Layers, ListTodo, LoaderCircle, PanelLeft, RotateCcw, Search, X,
+  Copy, ExternalLink, FilePenLine, FileText, FolderKanban, FolderOpen, Layers,
+  ListTodo, LoaderCircle, PanelLeft, Plus, RotateCcw, Search, X,
 } from '@lucide/vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { modelApi } from '@/api'
 import { workspaceApi } from '@/api/workspace'
-import type { Conversation } from '@/api/conversations'
+import { conversationApi, type Conversation } from '@/api/conversations'
+import { sandboxApi, type ProjectSummary } from '@/api/sandbox'
 import {
   documentReviewInput, executionPause, isDocumentReviewInput,
 } from '@/features/run/blocks'
@@ -399,6 +417,68 @@ const {
   refreshFileList, closeFilesPanel, toggleFilesPanel, downloadWorkspaceZip, workspaceZipBusy,
 } = files
 
+// ── 项目（Workspace Sandbox）─────────────────────────────────────────────────
+const sandboxEnabled = ref(false)
+const projects = ref<ProjectSummary[]>([])
+const projectBusy = ref(false)
+
+async function loadProjects() {
+  try {
+    projects.value = (await sandboxApi.listProjects()).items
+  } catch { /* Sandbox 未启用或暂时不可用时静默 */ }
+}
+
+async function changeProject(event: Event) {
+  const target = event.target as HTMLSelectElement
+  const projectId = target.value ? Number(target.value) : null
+  const conversation = currentConversation.value
+  if (!conversation || projectBusy.value) return
+  if ((conversation.project_id ?? null) === projectId) return
+  projectBusy.value = true
+  try {
+    const updated = await conversationApi.setProject(conversation.id, projectId)
+    currentConversation.value = updated
+    await refreshFileList(true)
+    ElMessage.success(projectId ? '已切换项目' : '已解除项目绑定')
+    if (projectId) void loadProjects()
+  } catch (exc: any) {
+    ElMessage.error(exc?.response?.data?.detail || exc?.response?.data?.message || '切换项目失败')
+    await loadConversations(true)
+  } finally {
+    projectBusy.value = false
+  }
+}
+
+async function createProjectPrompt() {
+  if (projectBusy.value) return
+  try {
+    const result = await ElMessageBox.prompt('输入项目名称', '新建项目', {
+      confirmButtonText: '创建',
+      cancelButtonText: '取消',
+      inputPattern: /\S+/,
+      inputErrorMessage: '项目名称不能为空',
+      inputPlaceholder: '例如：官网重构',
+    }) as any
+    const name = String(result?.value || '').trim()
+    if (!name) return
+    projectBusy.value = true
+    const project = await sandboxApi.createProject({ name })
+    await loadProjects()
+    if (currentConversation.value) {
+      currentConversation.value = await conversationApi.setProject(
+        currentConversation.value.id, project.id,
+      )
+      await refreshFileList(true)
+    }
+    ElMessage.success(`项目「${project.name}」已创建`)
+  } catch (exc: any) {
+    if (exc === 'cancel' || exc === 'close') return
+    ElMessage.error(exc?.response?.data?.detail || exc?.response?.data?.message || '创建项目失败')
+  } finally {
+    projectBusy.value = false
+  }
+}
+
 // ── 展示辅助 ────────────────────────────────────────────────────────────────
 const messageBlocks = computed(() => messages.value.map(displayBlocks))
 const conversationStatus = (c: Conversation) =>
@@ -453,6 +533,8 @@ onMounted(async () => {
   scroll.startResizeObserver()
   workspaceApi.bootstrap().then((boot) => {
     currentAssistant.value = boot.default_assistant
+    sandboxEnabled.value = Boolean(boot.sandbox?.enabled)
+    if (sandboxEnabled.value) void loadProjects()
   }).catch(() => { /* 默认助手仍可由服务端选择 */ })
   modelApi.listConfigs({ model_type: 'chat' }).then((list) => {
     modelOptions.value = (list || []).filter((m: any) => m.is_active)
@@ -518,6 +600,21 @@ onUnmounted(() => {
 .thread-heading { flex: 1; min-width: 0; padding-inline: 4px; }
 .thread-heading span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; color: var(--ui-text); }
 .assistant-name { display: inline-flex; align-items: center; flex: none; gap: 6px; font-size: 12px; color: var(--ui-secondary); }
+.project-switch {
+  display: inline-flex; align-items: center; flex: none; gap: 4px;
+  padding: 2px 4px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  color: var(--ui-secondary); background: var(--ui-surface);
+}
+.project-switch > svg { flex: none; color: var(--ui-accent); }
+.project-switch select {
+  max-width: 150px; border: 0; background: transparent; color: var(--ui-text);
+  font-size: 12px; cursor: pointer; outline: none;
+}
+.project-switch:focus-within { border-color: var(--ui-accent); }
+.project-add { width: 22px; height: 22px; }
+@media (max-width: 620px) {
+  .project-switch { display: none; }
+}
 .icon-button {
   display: inline-flex; flex: none; align-items: center; justify-content: center; width: 30px; height: 30px;
   border: 0; background: transparent; color: var(--ui-muted); border-radius: var(--ui-radius-sm); cursor: pointer;

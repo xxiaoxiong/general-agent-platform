@@ -12,6 +12,8 @@ export interface Conversation {
   pinned_at: string | null
   message_count: number
   active_run_id: string | null
+  /** 项目归属（Workspace Sandbox）；旧会话为 null */
+  project_id?: number | null
   created_at: string | null
   updated_at: string | null
 }
@@ -56,10 +58,15 @@ export const conversationApi = {
   list: (params?: any) =>
     request.get<any, { items: Conversation[]; total: number }>('/conversations', { params }),
   get: (id: number) => inlineRequest.get<unknown, Conversation>(`/conversations/${id}`),
-  create: (data: { assistant_id?: number; title?: string } = {}) =>
+  create: (data: { assistant_id?: number; title?: string; project_id?: number } = {}) =>
     request.post<any, Conversation>('/conversations', data),
   update: (id: number, data: ConversationMetadata) =>
     inlineRequest.patch<unknown, Conversation>(`/conversations/${id}`, data),
+  /** 切换会话所属项目（活动 Run 期间后端返回 409） */
+  setProject: (id: number, projectId: number | null) =>
+    inlineRequest.patch<unknown, Conversation>(`/conversations/${id}/project`, {
+      project_id: projectId,
+    }),
   messages: (id: number) => request.get<any, { items: any[] }>(`/conversations/${id}/messages`),
   delete: (id: number) => request.delete(`/conversations/${id}`),
   /** 上传会话附件（写入会话工作区 uploads/，二进制文档同步抽取文本副本） */

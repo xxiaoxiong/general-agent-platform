@@ -26,6 +26,7 @@ export const workspaceApi = {
       default_assistant: Assistant
       capabilities: any[]
       workspace: Record<string, any>
+      sandbox?: { enabled: boolean; preview_domain: string; default_profile: string }
     }>('/workspace/bootstrap'),
   capabilities: () => request.get<any, { items: any[] }>('/capabilities'),
 }
