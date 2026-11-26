@@ -216,7 +216,8 @@ class Settings(BaseSettings):
     SANDBOX_IDLE_TIMEOUT: int = 1800            # 空闲回收秒数（0=不自动回收）
     SANDBOX_IMAGE: str = "general-agent-platform/workspace-sandbox:1.0.0"
     SANDBOX_NETWORK_POLICY: str = "egress"      # egress=允许公网出站；none=完全断网
-    SANDBOX_VOLUME_QUOTA_MODE: str = "soft"     # soft=监控预警；hard=宿主支持时硬配额
+    SANDBOX_VOLUME_QUOTA_MODE: str = "soft"     # soft=监控预警（超限停止）；hard=宿主支持时硬配额
+    SANDBOX_VOLUME_QUOTA_WARN_PERCENT: int = 85  # 软配额预警阈值（%），达到后发布事件
     SANDBOX_CPU_RESERVE: float = 2.0            # 宿主机为 OS/平台保留的 CPU 核数
     SANDBOX_MEMORY_RESERVE: int = 2048          # 宿主机保留内存（MB）
     SANDBOX_DISK_RESERVE: int = 20              # 宿主机保留磁盘（GB）

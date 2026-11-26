@@ -183,6 +183,8 @@ async def report_sandboxes(
             memory_bytes=int(usage.get("memory_bytes") or 0),
             volume_bytes=int(usage.get("volume_bytes") or 0),
         )
+        quota = await runtime.check_volume_quotas(db, usage.get("sandboxes") or [])
+        result["volume_quota"] = quota
     if result.get("oom"):
         for _ in range(int(result["oom"])):
             metrics.inc_sandbox_oom()

@@ -74,6 +74,7 @@ curl -s http://localhost:8081/health      # preview-proxy
 | `SANDBOX_IDLE_TIMEOUT` | 1800 | 空闲自动停止秒数（0=不回收） |
 | `SANDBOX_NETWORK_POLICY` | egress | `none` 创建 internal 网络（完全断网） |
 | `SANDBOX_VOLUME_QUOTA_MODE` | soft | 硬配额需宿主文件系统支持（见 §5） |
+| `SANDBOX_VOLUME_QUOTA_WARN_PERCENT` | 85 | 软配额预警阈值；超配额自动停止 Sandbox（Volume 保留） |
 | `SANDBOX_CPU_RESERVE / MEMORY_RESERVE / DISK_RESERVE` | 2 核 / 2048MB / 20GB | Runner 可分配 = 总量 - 保留 |
 | `SANDBOX_RUNNER_DISK_GB` | 100 | 节点磁盘记账总量 |
 | `SANDBOX_JOB_LEASE_SECONDS` | 90 | Job 租约；过期由 Reconciler 回收 |
@@ -147,7 +148,10 @@ workspace-agent 只监听 Sandbox 网络内的 `:19999`，使用 Runner 派生 T
   - large：1 / 2 核 / 1GB / 2GB / 10GB。
 - 磁盘配额：
   - `SANDBOX_VOLUME_QUOTA_MODE=soft`（默认）：记录 `disk_quota_bytes` 并在 Dashboard 监控，
-    **不是**文件系统硬限制；
+    **不是**文件系统硬限制；Runner 每轮对账采样单个 Sandbox 的 `/workspace` 占用
+    （限前 5 个运行中 Sandbox），达到 `SANDBOX_VOLUME_QUOTA_WARN_PERCENT` 发布
+    `sandbox.volume_quota_warning`，达到配额上限发布 `sandbox.volume_quota_exceeded`
+    并停止该 Sandbox（只释放计算资源，Volume 保留，可清理后手动启动）；
   - `hard`：仅当 Docker Storage Driver 与宿主文件系统支持（如 XFS project quota /
     Btrfs qgroup）时才有效，部署前必须实测并写入本手册；
   - 不得把 `du` 统计宣称为硬配额。
@@ -193,7 +197,7 @@ Sandbox 容器本身是可丢弃的，恢复后由 Runner 按 Desired State 重�
 | Preview 白屏但服务 healthy | 检查 Service 是否监听 `0.0.0.0`；Vite 需 `--host 0.0.0.0`；应用是否强制 HTTPS |
 | Vite HMR 断连 | 确认 Preview Proxy 与 Runner WebSocket 转发未被反向代理截断；Nginx 需 `proxy_read_timeout 3600s` |
 | 容器 OOM | `docker inspect` 查看 `OOMKilled`；调大 profile 内存上限或优化依赖 |
-| 磁盘写满 | 检查 Volume 使用量（Dashboard）；清理依赖缓存或扩容；`soft` 模式不会自动阻断 |
+| 磁盘写满 | 检查 Volume 使用量（Dashboard）；`soft` 模式超配额会停止 Sandbox（Volume 保留），清理依赖缓存后手动启动；持续不足需扩容或调大资源档位 |
 | Runner 崩溃后 Job 卡住 | 默认 90s 租约过期后自动重新入队；超过 `max_attempts` 标记 failed，可重新点启动 |
 | Runner 重启后预览/命令 502 | Runner 启动与对账周期会自动重新接入所有既有 Sandbox 网络（`platform.network` 标签）；确认日志出现「Runner 已重新接入 N 个 Sandbox 网络」 |
 | 容器被外部删除 | Reconciler 检测 `container_missing` 后自动入队 start（10 分钟冷却），并记录 `sandbox.auto_recover_queued`；连续失败会保持 degraded 并留事件 |

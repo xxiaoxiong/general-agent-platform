@@ -601,6 +601,58 @@ async def test_service_state_sync_emits_events_and_updates_health(monkeypatch):
         assert exited_events[0].payload.get("reason") == "process_missing"
 
 
+async def test_volume_soft_quota_warns_once_and_stops(monkeypatch):
+    """软磁盘配额：预警一次；超限停止 Sandbox（Volume 保留，任务书 §6.5）。"""
+    monkeypatch.setattr(settings, "SANDBOX_VOLUME_QUOTA_MODE", "soft")
+    user = await _user("u-vol")
+    _project, workspace, sandbox = await _ready_for_session(user)
+    quota = int(sandbox.disk_quota_bytes)
+    warn_usage = int(quota * 0.9)
+
+    async with AsyncSessionLocal() as s:
+        summary = await runtime.check_volume_quotas(
+            s, [{"sandbox_id": sandbox.id, "volume_bytes": warn_usage}])
+        await s.commit()
+        assert summary == {"warned": 1, "stopped": 0}
+
+    async with AsyncSessionLocal() as s:
+        warnings = (await s.execute(
+            select(SandboxEvent).where(
+                SandboxEvent.event_type == "sandbox.volume_quota_warning")
+        )).scalars().all()
+        assert len(warnings) == 1
+        assert warnings[0].payload.get("quota_bytes") == quota
+        summary = await runtime.check_volume_quotas(
+            s, [{"sandbox_id": sandbox.id, "volume_bytes": warn_usage}])
+        await s.commit()
+        assert summary == {"warned": 0, "stopped": 0}
+
+    async with AsyncSessionLocal() as s:
+        summary = await runtime.check_volume_quotas(
+            s, [{"sandbox_id": sandbox.id, "volume_bytes": quota + 1}])
+        await s.commit()
+        assert summary["stopped"] == 1
+        row = await s.get(SandboxInstance, sandbox.id)
+        assert row.desired_state == "stopped"
+        exceeded = (await s.execute(
+            select(SandboxEvent).where(
+                SandboxEvent.event_type == "sandbox.volume_quota_exceeded")
+        )).scalars().all()
+        assert len(exceeded) == 1
+        stop_jobs = (await s.execute(
+            select(SandboxJob).where(
+                SandboxJob.sandbox_id == sandbox.id, SandboxJob.job_type == "stop")
+        )).scalars().all()
+        assert len(stop_jobs) == 1
+
+    # 重复上报不得重复停止 / 重复事件
+    async with AsyncSessionLocal() as s:
+        summary = await runtime.check_volume_quotas(
+            s, [{"sandbox_id": sandbox.id, "volume_bytes": quota + 1}])
+        await s.commit()
+        assert summary == {"warned": 0, "stopped": 0}
+
+
 async def test_quota_denied_emits_resource_event(monkeypatch):
     """配额拒绝发布 resource.denied，前端可见（任务书 §12.3）。"""
     monkeypatch.setattr(settings, "SANDBOX_MAX_ACTIVE_PER_USER", 1)

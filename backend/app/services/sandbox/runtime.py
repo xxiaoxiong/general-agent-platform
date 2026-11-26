@@ -19,8 +19,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.agent import AgentRun, AgentSession
 from app.models.sandbox import (
-    SandboxCommandOperation, SandboxInstance, SandboxJob, SandboxResourceProfile,
-    SandboxRunnerNode, Workspace, WorkspaceService,
+    SandboxCommandOperation, SandboxEvent, SandboxInstance, SandboxJob,
+    SandboxResourceProfile, SandboxRunnerNode, Workspace, WorkspaceService,
 )
 
 from . import jobs, scheduler
@@ -440,6 +440,86 @@ async def report_sandbox_states(
             )
         updated += 1
     return {"updated": updated, "unknown": unknown, "oom": oom}
+
+
+async def check_volume_quotas(db: AsyncSession, usages: list[dict]) -> dict:
+    """软磁盘配额预警 / 停止策略（任务书 §6.5）。
+
+    - Runner 上报单个 Sandbox 的 Volume 实际占用；
+    - 达到 ``SANDBOX_VOLUME_QUOTA_WARN_PERCENT`` 发布一次
+      ``sandbox.volume_quota_warning``；
+    - 软配额模式下达到配额上限发布 ``sandbox.volume_quota_exceeded`` 并停止
+      Sandbox（只释放计算资源，Volume 保留），避免继续写入拖垮宿主机；
+    - 硬配额模式由宿主文件系统负责，这里只预警。
+    """
+    summary = {"warned": 0, "stopped": 0}
+    warn_percent = max(1, min(99, int(settings.SANDBOX_VOLUME_QUOTA_WARN_PERCENT or 85)))
+    for item in usages or []:
+        try:
+            sandbox_id = int(item.get("sandbox_id") or 0)
+            used = int(item.get("volume_bytes") or 0)
+        except (TypeError, ValueError):
+            continue
+        if sandbox_id <= 0 or used <= 0:
+            continue
+        sandbox = await db.get(SandboxInstance, sandbox_id)
+        if sandbox is None or sandbox.desired_state == "deleted":
+            continue
+        quota = int(sandbox.disk_quota_bytes or 0)
+        if quota <= 0 or used * 100 < quota * warn_percent:
+            continue
+
+        async def _event_seen(event_type: str) -> bool:
+            row = (await db.execute(
+                select(SandboxEvent.id).where(
+                    SandboxEvent.sandbox_id == sandbox.id,
+                    SandboxEvent.generation == sandbox.generation,
+                    SandboxEvent.event_type == event_type,
+                ).limit(1)
+            )).first()
+            return row is not None
+
+        workspace = await db.get(Workspace, sandbox.workspace_id)
+        if workspace is None or workspace.deleted_at is not None:
+            continue
+        if not await _event_seen("sandbox.volume_quota_warning"):
+            await emit_event(
+                db, "sandbox.volume_quota_warning",
+                tenant_id=workspace.tenant_id, project_id=workspace.project_id,
+                workspace_id=workspace.id, sandbox_id=sandbox.id,
+                generation=sandbox.generation,
+                payload={"used_bytes": used, "quota_bytes": quota,
+                         "warn_percent": warn_percent},
+            )
+            summary["warned"] += 1
+        if used < quota or settings.SANDBOX_VOLUME_QUOTA_MODE != "soft":
+            continue
+        if sandbox.observed_state != "ready" or await _event_seen(
+            "sandbox.volume_quota_exceeded"
+        ):
+            continue
+        await emit_event(
+            db, "sandbox.volume_quota_exceeded",
+            tenant_id=workspace.tenant_id, project_id=workspace.project_id,
+            workspace_id=workspace.id, sandbox_id=sandbox.id,
+            generation=sandbox.generation,
+            payload={"used_bytes": used, "quota_bytes": quota,
+                     "action": "stop_sandbox"},
+        )
+        try:
+            await request_lifecycle(
+                db, workspace, sandbox, "stop", workspace.owner_user_id,
+            )
+            summary["stopped"] += 1
+        except Exception as exc:  # noqa: BLE001 停止失败不影响上报主流程
+            await emit_event(
+                db, "sandbox.volume_quota_stop_failed",
+                tenant_id=workspace.tenant_id, project_id=workspace.project_id,
+                workspace_id=workspace.id, sandbox_id=sandbox.id,
+                generation=sandbox.generation,
+                payload={"error": str(exc)[:300]},
+            )
+    return summary
 
 
 # ── Job 结果落库 ───────────────────────────────────────────────────────────

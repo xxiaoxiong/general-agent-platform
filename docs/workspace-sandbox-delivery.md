@@ -105,18 +105,24 @@
   （手动/自动重启）已实际写入。
 - **资源事件**：配额拒绝发布 `resource.denied`、节点容量不足发布 `resource.waiting`；
   失败路径用独立会话提交审计事件，避免主事务回滚吞掉事件。
+- **磁盘软配额策略**：Runner 上报单个 Sandbox 的 `/workspace` 实际占用；达到
+  `SANDBOX_VOLUME_QUOTA_WARN_PERCENT` 发布 `sandbox.volume_quota_warning`，
+  达到配额上限发布 `sandbox.volume_quota_exceeded` 并停止 Sandbox
+  （只释放计算资源，Volume 保留；同一 Generation 不重复告警/停止）。
 
 ## 3. 验证记录（真实执行）
 
 | 验证 | 命令 / 方式 | 结果 |
 | --- | --- | --- |
-| 后端全量回归 | `cd backend && python -m pytest -q` | **1065 passed, 13 skipped, 102.31s** |
-| Sandbox 专项（模型/调度/Lease/ACL/预览/工具/文件后端/写租约/自动恢复/限流/登录态） | `pytest tests/test_sandbox_runtime.py tests/test_sandbox_security.py tests/test_sandbox_api.py -q` | **28 passed** |
+| 后端全量回归 | `cd backend && python -m pytest -q` | **1069 passed, 13 skipped, 103.46s** |
+| Sandbox 专项（模型/调度/Lease/ACL/预览/工具/文件后端/写租约/自动恢复/限流/登录态/事件/软配额） | `pytest tests/test_sandbox_runtime.py tests/test_sandbox_security.py tests/test_sandbox_api.py -q` | **32 passed** |
 | 真实 Docker 集成 | 在 Runner 容器内 `SANDBOX_DOCKER_TEST=1 pytest tests/test_sandbox_docker_integration.py` | **1 passed 39.90s**（容器安全基线、Runner 断网重连、Docker Socket 未挂载、取消命令无孤儿进程、命令、文件一致性、只读 rootfs、网络隔离含平台服务名、Service 健康 + HTTP、删除容器后新 Generation 文件保留、幂等创建） |
 | Vite HMR / WebSocket | 在 Runner 容器内 `SANDBOX_DOCKER_VITE=1 pytest tests/test_sandbox_docker_vite.py -q -s` | **1 passed 13.43s**（Vite 安装、dev server、`vite-hmr` WS、修改源码收到 `full-reload`） |
 | 真实端到端（服务层） | 容器内脚本：项目 → Provision → 命令（uid=10001）→ Service → Preview | `exec succeeded`、`service healthy`、子域预览 200、兜底 200、坏 Token 401 |
-| 浏览器 E2E | `npm run test:e2e:sandbox`（真实 Edge + 已部署栈） | **1 passed 22.4s**：项目创建 → Sandbox Ready → Service healthy → iframe 真实页面 → 刷新后预览 → 切换项目不串显 → Services 面板；截图见 `docs/assets/` |
+| 浏览器 E2E | `npm run test:e2e:sandbox`（真实 Edge + 已部署栈） | **1 passed 14.6s**：项目创建 → Sandbox Ready → Service healthy → iframe 真实页面 → 刷新后预览 → 切换项目不串显 → Services 面板；截图见 `docs/assets/` |
 | 登录态 Preview（`PREVIEW_REQUIRE_LOGIN=true`） | 真实栈脚本：匿名 / 他人 Token / 本人 Token / Cookie | 匿名 403、他人 Token 403、本人 Token 200、首次响应下发 Cookie 且后续仅 Cookie 200 |
+| 重启恢复（真实栈故障注入） | 项目 → Sandbox Ready → Service healthy → 预览 200；`docker restart backend` / `docker restart sandbox-runner`；Sandbox stop → start；删除项目 | 后端重启后 Sandbox 继续运行、Service healthy、预览 200；Runner 重启后 Gateway 重新接入、预览 200；stop→start 同 Generation 文件保留、Service 按 Desired State 自动恢复 healthy、预览 200；删除项目后容器与 Volume 均清理 |
+| 事件流（部署栈） | `GET /api/v2/workspaces/{id}/events`（Bearer） | `workspace.provisioning` / `workspace.created` 帧带 project/workspace 标识；非成员 404；keepalive 正常 |
 | 性能基准 | `BENCH_ITERATIONS=3 python scripts/sandbox_benchmark.py`（Backend 容器内） | Provision→Ready P50 13.07s / P95 13.07s；命令 P50 0.124s；Service→Healthy P50 1.68s；Preview 首次访问 P50 0.040s（详见性能报告） |
 | 前端类型检查/构建 | `cd frontend && npm run build` | 通过 |
 | Compose 校验 | `docker compose --profile sandbox --profile sandbox-image config -q` | 通过 |
@@ -140,7 +146,8 @@
 ## 5. 未完成 / 未验证事项（如实说明）
 
 1. **多 Runner 实际调度未做双节点真机验证**：注册、心跳、容量、目标 Runner、排空接口已实现，单节点验收通过。
-2. **磁盘硬配额未实测**：默认 `soft` 模式；`hard` 依赖 XFS project quota / Btrfs qgroup，本机环境未验证。
+2. **磁盘硬配额未实测**：默认 `soft` 模式（占用监控 + 85% 预警 + 超限停止）；
+   `hard` 依赖 XFS project quota / Btrfs qgroup，本机环境未验证。
 3. **MySQL downgrade 未执行**：仅验证升级与服务运行；SQLite / PostgreSQL 均已验证双向迁移。
 4. **性能基准样本有限**：已完成 3 轮真实 Docker 基准（环境/方法/数据见 `docs/workspace-sandbox-performance.md`），P95 等同于最大值；生产需在目标硬件扩大采样并覆盖并发创建、大型依赖安装、PID/磁盘压满等场景。
 5. **SSE 事件推送已接入，但断线期间仍依赖轮询兜底**：Services / Preview 面板订阅
@@ -151,6 +158,12 @@
 7. **Docker Desktop 环境限制**：宿主机 LAN / 云元数据隔离需宿主防火墙；生产建议 Linux + 独立 Runner 主机。
 8. **Playwright 仅覆盖单浏览器（Edge）+ 单项目流程**：未覆盖 Firefox / WebKit 与多用户并行浏览器会话。
 9. **租户级配额并发**：用户级 Provision 已串行化；租户级配额跨用户并发仍为“检查后创建”，极端并发下可能短暂超出，后续可用租户锁/配额表强化。
+10. **部分故障注入未做真实破坏性演练**：Backend / Runner 重启、Sandbox stop→start、项目删除清理已实测；
+    Runner 领取 Job 后被杀、Docker create 成功后 DB 更新前被杀、Docker Daemon 重启、
+    Sandbox 进程崩溃未做真实破坏性演练（幂等创建、租约回收、标签对账、自动恢复已有单元/集成测试覆盖）。
+11. **资源压力矩阵未做极限破坏性压测**：PID fork bomb、磁盘写满、100+ 并发创建、
+    大型 `npm install` 期间的生命周期操作未逐条真实压测；PID/CPU/内存限制已由容器
+    inspect 与单测校验，预留/队列/配额并发已有单测覆盖。
 
 ## 6. 已知风险与规避
 

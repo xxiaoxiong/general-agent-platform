@@ -417,6 +417,7 @@ class RunnerExecutor:
         cpu_cores = 0.0
         memory_bytes = 0
         volume_bytes = 0
+        sandbox_usage: list[dict] = []
         async with httpx.AsyncClient(timeout=10.0) as client:
             for index, item in enumerate(running[:10]):
                 try:
@@ -426,7 +427,7 @@ class RunnerExecutor:
                     memory_bytes += memory
                 except DockerEngineError:
                     continue
-                # Volume 实际占用（限前 5 个，du 有成本）
+                # Volume 实际占用（限前 5 个，du 有成本）；同时上报单个 Sandbox 用量供软配额预警
                 if index < 5 and item.get("container_ip"):
                     token = agent_token(int(item["sandbox_id"]), int(item["generation"]))
                     try:
@@ -435,13 +436,19 @@ class RunnerExecutor:
                             headers={"Authorization": f"Bearer {token}"},
                         )
                         if response.status_code == 200:
-                            volume_bytes += int(response.json().get("bytes") or 0)
+                            used = int(response.json().get("bytes") or 0)
+                            volume_bytes += used
+                            sandbox_usage.append({
+                                "sandbox_id": int(item["sandbox_id"]),
+                                "volume_bytes": used,
+                            })
                     except (httpx.HTTPError, ValueError):
                         pass
         return {
             "cpu_cores": round(cpu_cores, 3),
             "memory_bytes": int(memory_bytes),
             "volume_bytes": int(volume_bytes),
+            "sandboxes": sandbox_usage,
         }
 
     async def usage(self) -> dict:
