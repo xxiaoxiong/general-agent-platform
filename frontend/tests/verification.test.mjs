@@ -7,7 +7,7 @@ function replay(message, event, data) {
     sequence: (message.lastSeq || 0) + 1, timestamp: '2026-11-21T12:00:00Z' })
 }
 
-test('补齐交付后只展示最终正文并保留步骤和下载', () => {
+test('补齐交付后按执行顺序保留步骤与验收卡，只补正文缺尾', () => {
   const chat = { blocks: [] }
   replay(chat, 'assistant.delta', { text: '先给出初稿。' })
   replay(chat, 'tool.started', { tool_name: 'write_file', tool_call_id: 'file-1' })
@@ -19,13 +19,14 @@ test('补齐交付后只展示最终正文并保留步骤和下载', () => {
     artifacts: [{ name: 'audit.json', size: 20, download_url: '/api/v2/artifacts/MjphaQ' },
       { name: '远端', size: 10, download_url: '//外部站点/a' }] }
   replay(chat, 'verification.completed', verified)
-  replay(chat, 'run.completed', { final_text: '经核对，两个文件均已保存。', summary: { verification: verified } })
-  assert.deepEqual(chat.blocks.map(block => block.kind), ['tool', 'verification', 'text'])
-  assert.equal(chat.blocks[1].artifacts.length, 1)
-  assert.equal(chat.blocks[2].text, '经核对，两个文件均已保存。')
+  replay(chat, 'run.completed', { final_text: '先给出初稿。经核对，两个文件均已保存。', summary: { verification: verified } })
+  // 执行顺序原样展示：过程文字在前，工具与验收卡保持原位，final_text 缺尾追加到尾部文本
+  assert.deepEqual(chat.blocks.map(block => block.kind), ['text', 'tool', 'verification', 'text'])
+  assert.equal(chat.blocks[2].artifacts.length, 1)
+  assert.equal(chat.blocks[3].text, '经核对，两个文件均已保存。')
 })
 
-test('未通过验收保留草稿，预算停止状态在重连时不变', () => {
+test('未通过验收不搬移既有正文，预算停止状态在重连时不变', () => {
   const chat = { blocks: [], streaming: true }
   replay(chat, 'assistant.delta', { text: '一份旧稿。' })
   replay(chat, 'run.failed', { status: 'limit_exceeded', error: '执行预算已用完', final_text: '已保存的报告草稿。',
@@ -33,8 +34,10 @@ test('未通过验收保留草稿，预算停止状态在重连时不变', () =>
       checks: [{ id: 'artifact_produced', passed: false, detail: '缺少交付文件' }] } } })
   finalizeRunMessage(chat, 'run.failed')
   assert.equal(chat.runStatus, 'limit_exceeded')
-  assert.equal(chat.blocks[0].state, 'incomplete')
-  assert.equal(chat.blocks[1].text, '已保存的报告草稿。')
+  assert.equal(chat.blocks[0].kind, 'text')
+  assert.equal(chat.blocks[0].text, '一份旧稿。')
+  assert.equal(chat.blocks[1].kind, 'verification')
+  assert.equal(chat.blocks[1].state, 'incomplete')
   assert.equal(chat.error, undefined)
   assert.equal(executionPause(chat)?.canContinue, true)
 })

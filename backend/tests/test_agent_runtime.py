@@ -112,6 +112,18 @@ def make_ctx(run_id="test-run", **kw) -> RuntimeContext:
     )
 
 
+def test_system_prompt_contains_time_and_rich_content_protocol():
+    """系统提示必须包含当前时间与受控富内容协议（mermaid / chart），禁止手写 ECharts Option。"""
+    from app.services.agent_runtime.factory import _compose_system_prompt
+
+    prompt = _compose_system_prompt(make_ctx())
+    assert "当前时间：" in prompt
+    assert "```mermaid" in prompt
+    assert "```chart" in prompt
+    assert "ECharts Option" in prompt
+    assert "stacked_bar" in prompt
+
+
 async def make_db_ctx(**kw) -> RuntimeContext:
     """P0-03：工具账本写入必须持有真实执行权（真实 run + claim）。"""
     from app.core.database import AsyncSessionLocal

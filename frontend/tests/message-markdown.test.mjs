@@ -20,3 +20,9 @@ test('空行清理保留正常分行、内联标记和代码原文', () => {
   assert.match(rendered, /<p>上一行<br>下一行含有 <code>\u2063<\/code> 和 👩‍💻<\/p>/u)
   assert.match(rendered, /<pre><code>\u2063\n原文<\/code><\/pre>/u)
 })
+
+test('普通文本中的竖线不误判为表格', () => {
+  const rendered = renderMessageMarkdown('这是一行普通文本 | 带有竖线，不是表格。')
+  assert.ok(!rendered.includes('<table'))
+  assert.match(rendered, /普通文本 \| 带有竖线/)
+})

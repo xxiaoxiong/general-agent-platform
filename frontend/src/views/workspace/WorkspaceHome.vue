@@ -110,7 +110,8 @@
                 <template v-for="(block, blockIdx) in messageBlocks[idx]"
                   :key="block.kind === 'tool' ? block.key : block.kind === 'input_request' ? block.request.request_id
                     : block.kind === 'document_edit_review' ? `review-${block.review.ordinal}` : blockIdx">
-                  <MessageMarkdown v-if="block.kind === 'text'" :text="block.text" />
+                  <MessageMarkdown v-if="block.kind === 'text'" :text="block.text"
+                    :streaming="Boolean(m.streaming) && blockIdx === messageBlocks[idx].length - 1" />
                   <div v-else-if="block.kind === 'steer'" class="steer-block">
                     <span class="steer-label">执行中补充<template v-if="block.applied"> · 已纳入</template><template v-else-if="block.pending"> · 提交中…</template></span>
                     <MessageMarkdown :text="block.text" />

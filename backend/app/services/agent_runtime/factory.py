@@ -225,6 +225,20 @@ def _compose_system_prompt(ctx: RuntimeContext) -> str:
         "引用网络资料时必须注明其发布时间；若检索到的最新资料明显早于当前时间，"
         "必须在回答中说明资料截止时间，不得把旧资料当作当前状态。"
     )
+    # 富内容渲染规范：前端只识别受控协议，避免模型手写 SVG/HTML/ECharts Option 造成安全问题
+    parts.append(
+        "## 富内容输出规范\n"
+        "- 解释执行流程、系统架构、调用关系或状态流转时，用 ```mermaid 代码围栏输出 Mermaid 图；"
+        "不要手写 SVG、HTML 或 Mermaid 以外的绘图代码。\n"
+        "- 展示数量、趋势、占比等数据时，用 ```chart 代码围栏输出严格 JSON："
+        '{"type":"bar|line|area|pie|stacked_bar","title":"图表标题","labels":["标签1","标签2"],'
+        '"series":[{"name":"系列名","data":[1,2]}],"unit":"单位"}。'
+        "labels 与每个 series.data 长度必须一致，数值只能是有限数字；饼图只允许一个系列；"
+        "禁止输出 ECharts Option、函数、formatter、HTML 或额外字段。\n"
+        "- 比较多个对象用 Markdown 表格；代码实现用普通代码块，不要放进 mermaid/chart 围栏。\n"
+        "- 只在图表确实能提升理解时使用；数据不足时直接说明无法绘制，不得编造数据；"
+        "图表前后保留必要的文字说明，不要让回答只剩图表源码。"
+    )
     if ctx.db_info and ctx.db_info.get("hint"):
         parts.append(ctx.db_info["hint"])
     if ctx.memory_context:
