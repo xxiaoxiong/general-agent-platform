@@ -47,6 +47,9 @@ class DocumentGraphContext:
         self._flush_budget = flush_budget
         self.summary: dict[str, Any] = {}
         self.team_brief = ""
+        # 目标模式：执行中补充要求（跨节点累积，后续模型调用持续生效）
+        self._steering_ids: set[str] = set()
+        self._steering_messages: list[str] = []
         self.supports_vision = bool(model_config.get("supports_vision"))
         self.model = build_chat_model(
             provider, model_config, streaming=False,
@@ -125,6 +128,19 @@ class DocumentGraphContext:
         self.run.bus.notify_persisted(event)
         if event_type == "artifact.created":
             self._record_artifact(payload)
+
+    async def steering_prompt(self) -> str:
+        """取回执行中补充要求（通用能力：任意文档任务，累积生效，按稳定 ID 去重）。"""
+        from .steering import load_steering, mark_steering_delivered, publish_steering_applied
+
+        rows = await load_steering(self.run.run_id)
+        fresh = [row for row in rows if row["message_id"] not in self._steering_ids]
+        if fresh:
+            self._steering_ids.update(row["message_id"] for row in fresh)
+            self._steering_messages.extend(row["content"] for row in fresh)
+            await mark_steering_delivered([row["id"] for row in fresh], "document")
+            await publish_steering_applied(self.run.bus, self.run.run_id, self.run.thread_id, fresh)
+        return "\n".join(f"- {text}" for text in self._steering_messages)
 
     def _record_artifact(self, payload: dict[str, Any]) -> None:
         self.summary.update({

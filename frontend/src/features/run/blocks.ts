@@ -112,8 +112,19 @@ export interface DocumentStageBlock {
   tone?: 'warning' | 'success'
 }
 
+/** 执行中补充要求：按提交时机插入运行块流的最新执行位置 */
+export interface SteerBlock {
+  kind: 'steer'
+  text: string
+  messageId?: string
+  /** 本地已发出、等待服务端受理 */
+  pending?: boolean
+  /** 已注入模型上下文 */
+  applied?: boolean
+}
+
 export type MsgBlock = TextBlock | ToolBlock | SubagentBlock | PlanBlock | DocumentArtifactBlock | ProfileDraftBlock
-  | InputRequestBlock | DocumentStageBlock | DocumentEditReviewBlock | TeamBlock | ProjectBlock | VerificationBlock
+  | InputRequestBlock | DocumentStageBlock | DocumentEditReviewBlock | SteerBlock | TeamBlock | ProjectBlock | VerificationBlock
 
 /** 携带块流的运行消息（工具步骤实时穿插展示的最小状态） */
 export interface RunStreamMessage {
@@ -136,6 +147,10 @@ export interface RunStreamMessage {
   lastEventTs?: number
   /** 任务耗时（run.started -> 最近事件），终态后固化展示 */
   runDurationMs?: number
+  /** 目标模式运行（不限调用次数/执行时长） */
+  goalMode?: boolean
+  /** 团队协作运行（执行中补充暂不支持） */
+  teamMode?: boolean
 }
 
 export function executionPause(message: RunStreamMessage) {
@@ -514,8 +529,41 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
       break
 
     case 'task.routed': {
+      if (data.goal_mode === true) msg.goalMode = true
+      if (data.team_mode === true) msg.teamMode = true
       const label = DOCUMENT_TASK_LABELS[String(data.task_type || '')]
       if (label) setDocumentStage(msg, label)
+      break
+    }
+
+    // ── 执行中补充要求：按提交时机插入运行块流 ──────────────────────────────
+    case 'run.steered': {
+      const text = String(data.content || '')
+      const messageId = String(data.message_id || '')
+      if (text) {
+        const existing = blocks.find((b): b is SteerBlock => b.kind === 'steer'
+          && ((!!messageId && b.messageId === messageId) || (!!b.pending && b.text === text)))
+        if (existing) {
+          if (messageId) existing.messageId = messageId
+          existing.pending = false
+        } else {
+          blocks.push({ kind: 'steer', text, messageId: messageId || undefined })
+        }
+      }
+      msg.liveStatus = '已收到补充要求，将在下一步执行中纳入…'
+      msg.lastActivity = 'other'
+      break
+    }
+
+    case 'run.steering_applied': {
+      const items = Array.isArray(data.messages) ? data.messages : []
+      for (const item of items) {
+        const block = blocks.find((b): b is SteerBlock => b.kind === 'steer'
+          && !!b.messageId && b.messageId === String((item as any)?.message_id || ''))
+        if (block) block.applied = true
+      }
+      msg.liveStatus = '补充要求已纳入执行'
+      msg.lastActivity = 'other'
       break
     }
 

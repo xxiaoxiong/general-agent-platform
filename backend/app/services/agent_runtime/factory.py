@@ -159,6 +159,10 @@ def build_agent(
     # 预算 <=0 = 不限制：不挂对应 Limit 中间件（防真死循环仍由重复调用防护兜底）
     # FilesystemMiddleware 替换基栈同名中间件（按名替换、保留顺序），继承 permissions
     middleware = [fs_middleware, TodoListMiddleware(), NativeToolBatchMiddleware()]
+    # 执行中补充要求是通用能力（不限目标模式）：每次模型调用前按稳定 ID 注入
+    from .steering import SteeringMiddleware
+
+    middleware.insert(0, SteeringMiddleware(ctx, bus))
     if ctx.task_contract is not None:
         from .completion import CompletionMiddleware
 
@@ -226,6 +230,11 @@ def _compose_system_prompt(ctx: RuntimeContext) -> str:
         from .completion import continuation_prompt
 
         parts.append(continuation_prompt(ctx))
+    if ctx.goal_mode:
+        # 目标模式不是“只去限制”：注入目标协议（计划强制 + 交付核对 + 诚实缺口）
+        from .goal import goal_protocol_prompt
+
+        parts.append(goal_protocol_prompt(ctx))
     parts.append(
         "## 执行约束\n"
         "- 始终使用用户提问所用的语言回答（用户用中文则用中文）。\n"

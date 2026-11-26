@@ -83,6 +83,9 @@ async def retry_document_run(runtime, run_id: str, user_id: int, *, expected_seq
         run.lease_expires_at = None
         run.lease_version += 1
         timeout = settings.AGENT_RUN_TIMEOUT
+        if (run.agent_config_snapshot or {}).get("goal_mode"):
+            # 目标模式：断点续跑同样不设执行时长上限
+            timeout = 0
         run.budget_deadline_at = now + timedelta(seconds=timeout) if timeout > 0 else None
         # 原消息保留。新终态重新投递并就地更新同一个助手消息。
         await db.execute(delete(SessionResultOutbox).where(SessionResultOutbox.run_id == run_id))

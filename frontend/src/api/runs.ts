@@ -18,6 +18,8 @@ export interface RunInfo {
   session_id: number | null
   error: string | null
   cancel_requested: boolean
+  /** 目标模式（不限调用次数/执行时长，执行中可补充要求） */
+  goal_mode?: boolean
   pending_actions?: any[]
   pending_input?: InputRequest | null
   last_event_seq?: number
@@ -53,6 +55,8 @@ export const runApi = {
     model_config_id?: number
     /** 当前会话手动启用团队协作时随本次 Run 提交 */
     team_mode?: boolean
+    /** 目标模式：不限模型/工具调用与执行时长，执行中可补充要求 */
+    goal_mode?: boolean
     task_mode?: DocumentMode
     document_profile_id?: number
     document_id?: number
@@ -60,12 +64,17 @@ export const runApi = {
     /** 会话附件（上传接口返回的项） */
     attachments?: Array<{ name: string; path: string; text_path?: string | null }>
   }) =>
-    request.post<any, { run_id: string; conversation_id: number; status: string; events_url: string }>(
-      '/runs', data,
-    ),
+    request.post<any, {
+      run_id: string; conversation_id: number; status: string; events_url: string; goal_mode?: boolean
+    }>('/runs', data),
   get: (runId: string) => request.get<any, RunInfo>(`/runs/${runId}`),
   cancel: (runId: string, reason = '') =>
     request.post<any, { run_id: string; status: string; message: string }>(`/runs/${runId}/cancel`, { reason }),
+  /** 目标模式执行中补充要求（不新起 Run，下一次模型调用前生效） */
+  steer: (runId: string, message: string) =>
+    request.post<any, { run_id: string; status: string; message_id: string; events_url: string }>(
+      `/runs/${runId}/steer`, { message },
+    ),
   resume: (runId: string, decisions: Array<{ type: string; message?: string; action_id?: string | null }>) =>
     request.post<any, { run_id: string; status: string; message: string }>(`/runs/${runId}/resume`, { decisions }),
   submitInput: (runId: string, requestId: string, values: Record<string, unknown>) =>

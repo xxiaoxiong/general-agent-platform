@@ -340,11 +340,30 @@ class StreamMixin:
                 and _approval_mode != "auto"
             )
             # P4-05/06：Run 级预算优先取 AgentVersion 快照的 execution_budget
-            # （P2-01 版本绑定语义），缺省回落全局 settings
+            # （P2-01 版本绑定语义），缺省回落全局 settings。
+            # 目标模式（/goal）：不限模型调用/工具调用/步数/执行时长——
+            # 预算全部置 0（0=不限制，不挂 Limit 中间件）且不设墙钟截止。
+            goal_mode = bool(agent_config.get("goal_mode"))
             _budget_cfg = agent_config.get("execution_budget") or {}
-            run_timeout = settings.AGENT_RUN_TIMEOUT
-            if run_timeout > 0:
-                run_timeout = max(run_timeout, float(_budget_cfg.get("run_timeout_seconds", 0) or 0))
+            if goal_mode:
+                run_timeout = 0.0
+                budget = ExecutionBudget(
+                    max_steps=0, max_tool_calls=0, max_model_calls=0,
+                    run_timeout_seconds=0.0,
+                )
+            else:
+                run_timeout = settings.AGENT_RUN_TIMEOUT
+                if run_timeout > 0:
+                    run_timeout = max(run_timeout, float(_budget_cfg.get("run_timeout_seconds", 0) or 0))
+                budget = ExecutionBudget(
+                    max_steps=_budget_cfg.get(
+                        "max_steps", settings.AGENT_MAX_STEPS),
+                    max_tool_calls=_budget_cfg.get(
+                        "max_tool_calls", settings.AGENT_MAX_TOOL_CALLS),
+                    max_model_calls=_budget_cfg.get(
+                        "max_model_calls", settings.AGENT_MAX_MODEL_CALLS),
+                    run_timeout_seconds=run_timeout,
+                )
             ctx = RuntimeContext(
                 scope=scope,
                 run_id=run.run_id,
@@ -355,24 +374,28 @@ class StreamMixin:
                 model_id=log_fields["model_id"],
                 agent_config=agent_config,
                 memory_context=mem_ctx,
-                budget=ExecutionBudget(
-                    max_steps=_budget_cfg.get(
-                        "max_steps", settings.AGENT_MAX_STEPS),
-                    max_tool_calls=_budget_cfg.get(
-                        "max_tool_calls", settings.AGENT_MAX_TOOL_CALLS),
-                    max_model_calls=_budget_cfg.get(
-                        "max_model_calls", settings.AGENT_MAX_MODEL_CALLS),
-                    run_timeout_seconds=run_timeout,
-                ),
+                budget=budget,
                 enable_hitl=enable_hitl,
                 sandbox_mode=getattr(settings, "AGENT_SANDBOX_MODE", "restricted"),
                 allow_network=getattr(settings, "AGENT_ALLOW_NETWORK", True),
                 worker_id=run.worker_id,
                 lease_version=run.lease_version or 0,
+                goal_mode=goal_mode,
             )
 
             # P1-05 §13：加载 Run 级预算历史累计（跨恢复不重置），取绝对 deadline
             await self._load_budget(ctx, run)
+            if ctx.goal_mode:
+                # 目标模式：把用户原始目标固定进上下文（恢复时从输入快照重建），
+                # 供系统提示的目标协议与最终完成核对使用
+                goal_source = messages
+                if goal_source is None:
+                    async with AsyncSessionLocal() as db:
+                        saved = await db.scalar(
+                            select(AgentRunRow.input_payload).where(AgentRunRow.id == run.run_id)
+                        )
+                    goal_source = (saved or {}).get("messages") or []
+                ctx.agent_config["_goal_objective"] = _last_user_input(goal_source)
             if not (is_document_run or is_team_run) and settings.AGENT_VERIFICATION_ENABLED:
                 from app.services.assistant.task_contract import build_task_contract
 
@@ -464,6 +487,7 @@ class StreamMixin:
                     route = dict(execution_context)
                     route.pop("document_context", None)
                     route["attachment_count"] = len(route.pop("attachment_refs", []))
+                    route["goal_mode"] = ctx.goal_mode
                     if source_attachment := route.pop("source_attachment", None):
                         route["source_name"] = source_attachment.get("name")
                     await bus.publish(RuntimeEvent(type="task.routed", run_id=run.run_id, data=route))
@@ -496,9 +520,13 @@ class StreamMixin:
                 # 约消耗 10~14 步：before/after model 钩子 + model + tools + 工具钩子），
                 # 过小的系数会让长任务误触发 GraphRecursionError。预算上限本身由
                 # ModelCallLimit/ToolCallLimit 与 ctx.budget 独立执行，这里只是兜底。
-                config["recursion_limit"] = (
-                    max(ctx.budget.max_steps, ctx.budget.max_model_calls, 1000) * 16 + 40
-                )
+                # 目标模式不设业务上限：递归上限只保留技术性兜底（防真正的死循环图）。
+                if ctx.goal_mode:
+                    config["recursion_limit"] = 1_000_000
+                else:
+                    config["recursion_limit"] = (
+                        max(ctx.budget.max_steps, ctx.budget.max_model_calls, 1000) * 16 + 40
+                    )
                 run_config = config
 
                 # FR-09：挂起/重启恢复后从事件日志重建已产生的最终文本片段，

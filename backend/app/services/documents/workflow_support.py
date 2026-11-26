@@ -78,6 +78,27 @@ async def _invoke_with_progress(context, messages, config, operation: str, label
             task.cancel()
 
 
+async def attach_steering(context, messages: list) -> list:
+    """目标模式：把执行中补充要求与目标交付约束追加进本次模型调用。"""
+    runtime = getattr(context, "runtime", None)
+    goal_mode = bool(getattr(runtime, "goal_mode", False))
+    prompt = getattr(context, "steering_prompt", None)
+    steering = await prompt() if prompt is not None else ""
+    parts = []
+    if goal_mode:
+        parts.append(
+            "目标模式：本次任务需完整交付，不得因耗时或轮次提前收敛；"
+            "不得用占位、省略或「保留原文」代替实际内容；交付前核对章节与数据的完整性。"
+        )
+    if steering:
+        from app.services.agent_runtime.steering import STEERING_MESSAGE_PREFIX
+
+        parts.append(f"{STEERING_MESSAGE_PREFIX}\n{steering}")
+    if not parts:
+        return messages
+    return [*messages, HumanMessage(content="\n\n".join(parts))]
+
+
 async def model_json(context, config: RunnableConfig, operation: str, instruction: str,
                      data: dict, response_type: type[S], *, images: list[dict] | None = None,
                      compact_retry: str = "", stage: str = "", progress_label: str = "") -> S:
@@ -98,6 +119,7 @@ async def model_json(context, config: RunnableConfig, operation: str, instructio
         messages = model_messages(operation, prompt, data)
         if images:
             messages[-1] = HumanMessage(content=[{"type": "text", "text": as_json(data)}, *images])
+        messages = await attach_steering(context, messages)
         try:
             reply = await _invoke_with_progress(context, messages, config, operation, progress_label)
         except Exception as exc:  # noqa: BLE001 模型网关瞬时错误（超时/限流/5xx）允许一次重试

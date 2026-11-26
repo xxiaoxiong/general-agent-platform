@@ -52,6 +52,9 @@ V2_EVENT_NAMES: Dict[str, str] = {
     "verification_completed": "verification.completed",
     "artifact_created": "artifact.created",
     "run_cancelling": "run.cancelling",
+    # 执行中补充要求（通用能力）
+    "run_steered": "run.steered",
+    "run_steering_applied": "run.steering_applied",
 }
 
 # 终止事件（消费者收到即结束本次事件流）

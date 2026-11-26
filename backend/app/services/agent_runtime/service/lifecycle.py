@@ -254,6 +254,7 @@ class LifecycleMixin:
                 "thread_id": row.thread_id,
                 "error": row.error,
                 "cancel_requested": bool(row.cancel_requested),
+                "goal_mode": bool((row.agent_config_snapshot or {}).get("goal_mode")),
                 "created_at": row.created_at.isoformat() if row.created_at else None,
                 "finished_at": row.finished_at.isoformat() if row.finished_at else None,
                 "last_event_seq": row.last_event_seq or 0,

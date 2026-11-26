@@ -42,7 +42,7 @@ from .schemas import (
 )
 from .validator import validate_docx, validate_draft, validate_requested_length
 from .workflow_support import (
-    as_json, draft_excerpt, input_schema, model_json, model_messages,
+    as_json, attach_steering, draft_excerpt, input_schema, model_json, model_messages,
     read_attachments, request_input, source_data, valid_values,
 )
 
@@ -68,6 +68,14 @@ _PICTURE = re.compile(r"第\s*([一二三四五六七八九十两\d]+)\s*[幅张
 _FULL_EDIT = re.compile(r"全文|整[份篇]|所有章节|\b(?:entire|whole)\b", re.I)
 _ENTIRE_SECTION = re.compile(r"整(?:个|体|章|节)|全(?:章|节)|全部(?:正文|内容|重写|替换|重做)")
 _KEEP = re.compile(r"不要|别改|别动|保留原|保持不变|无需改|不用改|do not|unchanged", re.I)
+# 用户在请求中点名的文档标题（《…》）：导出既有稿件时优先作为文档标题，
+# 避免素材首个章节标题（如「关键结论」）变成文档名
+_REQUESTED_TITLE = re.compile(r"《([^》\n]{2,120})》")
+
+
+def requested_document_title(request: str) -> str:
+    match = _REQUESTED_TITLE.search(request or "")
+    return match.group(1).strip() if match else ""
 _CN_DIGITS = {char: num for num, char in enumerate("零一二三四五六七八九")} | {"两": 2}
 _SPANS = {
     "load_sources": "document_parse",
@@ -573,7 +581,8 @@ class DocumentWorkflow:
         except DocumentParseError as exc:
             raise DocumentError(422, str(exc)) from None
         draft = DocumentDraft(
-            title=parsed.title, sections=parsed.sections, sources=_references(state),
+            title=requested_document_title(_generation_request(state)) or parsed.title,
+            sections=parsed.sections, sources=_references(state),
             subtitle="演示示例 · 功能与配置以实际产品为准" if _document_context(state).get("example_mode") else "",
         )
         report = validate_draft(draft)
@@ -602,6 +611,7 @@ class DocumentWorkflow:
             "查询公开网络时只使用公开检索词，不传递业务数据、凭据或内部标识符。",
             {"request": state["request"], "source_kind": kind,
              "fields": [{"id": field.id, "label": field.label} for field in _profile(state).input_fields()]})
+        messages = await attach_steering(self.context, messages)
         sources = []
         seen = set()
         for _ in range(3):

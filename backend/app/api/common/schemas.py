@@ -80,6 +80,9 @@ class RunCreate(BaseModel):
     model_config_id: Optional[int] = None
     # 每次运行须由调用方显式开启团队，省略时继续使用现有单助手路线。
     team_mode: StrictBool = False
+    # 目标模式（/goal）：不限模型调用/工具调用/执行时长，并允许执行中补充要求。
+    # 随 Run 创建写入 agent_config 快照，崩溃恢复/断点续跑后保持原值。
+    goal_mode: StrictBool = False
     # 会话附件（uploads/ 下的相对路径），随用户消息注入读取注记
     attachments: List[Dict[str, Any]] = Field(default_factory=list)
     task_mode: Literal[
@@ -112,6 +115,11 @@ class RunInputSubmission(BaseModel):
 
 class RunCancelRequest(BaseModel):
     reason: str = ""
+
+
+class RunSteerRequest(BaseModel):
+    """执行中的补充要求（任意运行中的对话均可提交，不新起 Run）。"""
+    message: str = Field(min_length=1, max_length=8000)
 
 
 # ── Workspace ─────────────────────────────────────────────────────────────────

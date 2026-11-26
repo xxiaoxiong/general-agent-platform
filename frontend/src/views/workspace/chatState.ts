@@ -71,9 +71,23 @@ export function useWorkspaceState() {
     if (!runId) return
     return messages.value.find((m) => m.runId === runId && m.streaming && !m.pendingActions?.length && !pendingDocInput(m))
   })
+  /** 正在执行、可接收补充要求的当前 Run（通用能力；团队协作/暂停等待除外） */
+  const steerTarget = computed<ChatMessage | undefined>(() => {
+    const conversation = currentConversation.value
+    if (!conversation) return undefined
+    // 读取响应式运行集合，保证 activeRuns（普通 Map）变化能触发重算
+    const running = runningConvIds.value.includes(conversation.id)
+    const entry = running ? activeRuns.get(conversation.id) : undefined
+    const message = entry?.msg || historyRun.value
+    if (!message?.streaming || !message.runId || message.teamMode) return undefined
+    if (message.pendingActions?.length || pendingDocInput(message)) return undefined
+    if (message.runStatus && !['pending', 'running'].includes(message.runStatus)) return undefined
+    return message
+  })
   const blockedReason = computed(() => {
     const request = messages.value.map(pendingDocInput).find(Boolean)?.request
     if (request) return isDocumentReviewInput(request) ? '当前有修改稿待处理，可在消息中查看、保存或放弃。' : '请先处理消息中的文档补充请求。'
+    if (streaming.value && steerTarget.value) return ''
     if (streaming.value) return '任务运行中，可以停止生成。'
     if (messages.value.some((m) => m.pendingActions?.length)) return '请先处理消息中的审批请求。'
     if (messages.value.some((m) => m.streaming)) return '正在恢复执行进度…'
@@ -134,6 +148,42 @@ export function useWorkspaceState() {
     set(enabled: boolean) {
       if (currentConversation.value) rememberTeamMode(currentConversation.value.id, enabled)
       else draftTeamMode.value = enabled
+    },
+  })
+
+  // ── 目标模式偏好（/goal，按用户 + 会话记忆）────────────────────────────────
+  // 开启后本次 Run 不限制模型/工具调用次数与执行时长，且执行中可补充要求。
+  const draftGoalMode = ref(false)
+  const rememberedGoalModes = reactive(new Map<string, boolean>())
+
+  function goalPreferenceKey(conversationId: number): string | undefined {
+    const userId = authStore.user?.id
+    if (userId !== undefined) return `workspace:goal:${userId}:${conversationId}`
+  }
+
+  function rememberGoalMode(conversationId: number, enabled: boolean) {
+    const key = goalPreferenceKey(conversationId)
+    if (!key) return
+    rememberedGoalModes.set(key, enabled)
+    try {
+      if (enabled) sessionStorage.setItem(key, '1')
+      else sessionStorage.removeItem(key)
+    } catch { /* 浏览器禁用会话存储时仍使用当前页面状态 */ }
+  }
+
+  const goalMode = computed({
+    get() {
+      const conversation = currentConversation.value
+      if (!conversation) return draftGoalMode.value
+      const key = goalPreferenceKey(conversation.id)
+      if (!key) return false
+      const remembered = rememberedGoalModes.get(key)
+      if (remembered !== undefined) return remembered
+      try { return sessionStorage.getItem(key) === '1' } catch { return false }
+    },
+    set(enabled: boolean) {
+      if (currentConversation.value) rememberGoalMode(currentConversation.value.id, enabled)
+      else draftGoalMode.value = enabled
     },
   })
 
@@ -286,10 +336,11 @@ export function useWorkspaceState() {
     route, router,
     convMessages, conversations, currentConversation, messages, convArr, pushMsg,
     activeRuns, historyStreams, pendingDecisions, runningConvIds, inactive,
-    setActiveRun, clearActiveRun, streaming, historyRun, blockedReason,
+    setActiveRun, clearActiveRun, streaming, historyRun, blockedReason, steerTarget,
     inputText, sending, repairingProject, projectRepairErrors, projectRepairKeys, uploading,
     approvalMode, webSearchOn, modelOptions, selectedModelId, currentAssistant, clock,
     authStore, draftTeamMode, rememberedTeamModes, teamPreferenceKey, rememberTeamMode, teamMode,
+    draftGoalMode, rememberedGoalModes, goalPreferenceKey, rememberGoalMode, goalMode,
     composer, historyToggle, historyMedia, historyOpen, historyLoading, historyFailed,
     historyLoadingMore, historyTotal, historyLoadedPages, historyPageSize, hasMoreConversations,
     creatingConversation, deletingId, loadingMessagesFor, failedMessagesFor,

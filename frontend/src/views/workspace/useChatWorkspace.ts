@@ -16,6 +16,7 @@ import {
   addDocInput, applyRunEvent, executionPause, finalizeRunMessage,
   pendingDocInput,
 } from '@/features/run/blocks'
+import type { SteerBlock } from '@/features/run/blocks'
 import { documentTaskPayload } from '@/features/documents/taskModes'
 import { messageAttachments } from './attachmentHistory'
 import type { ChatMessage } from './chatDisplay'
@@ -93,6 +94,7 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
     if (st.creating.value) return st.creating.value
     const origin = st.currentConversation.value?.id
     const inheritTeam = transferDraftTeam && origin === undefined && st.draftTeamMode.value
+    const inheritGoal = transferDraftTeam && origin === undefined && st.draftGoalMode.value
     st.creatingConversation.value = true
     st.creating.value = conversationApi.create({ assistant_id: st.currentAssistant.value?.id }).then((c) => {
       st.conversations.value.unshift(c)
@@ -100,6 +102,7 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
       if (st.currentConversation.value?.id === origin) {
         switchConversation(c)
         if (inheritTeam) st.rememberTeamMode(c.id, true)
+        if (inheritGoal) st.rememberGoalMode(c.id, true)
       }
       void loadConversations(true)
       return c
@@ -123,6 +126,7 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
       st.resetDocumentTask()
     }
     st.draftTeamMode.value = false
+    st.draftGoalMode.value = false
     st.currentConversation.value = c
     st.syncConversationUrl(c?.id)
     scroll.resetFollow()
@@ -190,8 +194,13 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
       const assistantRuns = new Set(raw.filter((item) => item.role === 'assistant').map((item) => item.source_run_id))
       for (const m of raw) {
         if (m.role === 'user') {
+          // 执行中补充要求由 Run 事件（run.steered）在块流中按提交时机原位重建，
+          // 不再作为独立的用户消息重复展示
+          if (m.steering_run_id) continue
           const { text, files } = messageAttachments(m.content || '', m.attachments)
-          const msg = st.pushMsg(c.id, { role: 'user', content: text, blocks: [], files })
+          const msg = st.pushMsg(c.id, {
+            role: 'user', content: text, blocks: [], files,
+          })
           // 图片附件懒加载预览（不阻塞历史渲染；经响应式代理赋值触发视图刷新）
           files.forEach((f, fi) => {
             if (st.isImageName(f.name)) {
@@ -302,7 +311,44 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
 
   // ── 发送与事件流消费（§7.1 v2 协议 + §8.4 重连）──────────────────────────────
 
+  /** 执行中补充要求（通用能力）：按提交时机插入当前运行块流，不新起 Run */
+  async function steerMessage() {
+    const target = st.steerTarget.value
+    const convId = st.currentConversation.value?.id
+    const text = st.inputText.value.trim()
+    if (!target?.runId || !convId || !text || st.sending.value || st.uploading.value
+      || st.loadingMessages.value || st.messagesFailed.value) return
+    const localId = `local-${globalThis.crypto?.randomUUID?.() || Date.now()}`
+    const block: SteerBlock = { kind: 'steer', text, messageId: localId, pending: true }
+    target.blocks.push(block)
+    st.sending.value = true
+    try {
+      const created = await runApi.steer(target.runId, text)
+      block.messageId = created.message_id
+      block.pending = false
+      st.inputText.value = ''
+      ElMessage.success('补充要求已提交，将在下一步执行中纳入')
+      if (st.currentConversation.value?.id === convId) void scroll.scrollToBottom()
+    } catch {
+      if (String(block.messageId || '').startsWith('local-')) {
+        // 未被服务端受理：撤回本地块并恢复输入，便于重试
+        const index = target.blocks.indexOf(block)
+        if (index >= 0) target.blocks.splice(index, 1)
+        st.inputText.value = text
+      } else {
+        // 服务端已受理（事件已到）但响应丢失：保留块，不再重复提交
+        block.pending = false
+      }
+    } finally {
+      st.sending.value = false
+    }
+  }
+
   async function sendMessage(continueTask = false) {
+    if (!continueTask && st.steerTarget.value) {
+      await steerMessage()
+      return
+    }
     const latest = st.messages.value[st.messages.value.length - 1]
     if (continueTask && (!latest?.runId || latest.streaming || !executionPause(latest)?.canContinue)) return
     const text = continueTask ? '继续' : st.inputText.value.trim()
@@ -325,6 +371,8 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
     const sentMode = st.approvalMode.value
     const sentWebEnabled = st.webSearchOn.value
     const sentTeamMode = !continueTask && st.teamMode.value
+    // 目标模式（/goal）：随本次 Run 提交，不限调用次数与执行时长
+    const sentGoalMode = !continueTask && st.goalMode.value
     const sentTask = continueTask ? { mode: 'chat' as const } : { ...st.documentTask.value }
     // 右侧正在预览的文档视为本轮编辑目标（所见即所改）；手动选文档或带附件时不覆盖
     const sentPreview = !continueTask && !sentFiles.length && sentTask.mode === 'auto'
@@ -343,6 +391,7 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
       role: 'assistant', content: '', blocks: [], streaming: true,
       lastActivity: 'other', lastEventAt: Date.now(),
       liveStatus: '正在创建任务…', runStatus: 'pending', pendingActions: [],
+      goalMode: sentGoalMode, teamMode: sentTeamMode,
     })
     const entry = { abort: new AbortController(), stopped: false, msg: aMsg }
     st.setActiveRun(convId, entry)
@@ -357,6 +406,7 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
         web_enabled: sentWebEnabled,
         model_config_id: sentModelId || undefined,
         ...(sentTeamMode ? { team_mode: true } : {}),
+        ...(sentGoalMode ? { goal_mode: true } : {}),
         attachments: sentFiles,
         ...documentTaskPayload(sentTask),
         ...(sentPreview ? {
@@ -371,6 +421,7 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
         return
       }
       aMsg.runId = created.run_id
+      aMsg.goalMode = created.goal_mode ?? sentGoalMode
       subscribeActiveRun(convId, entry, created.run_id)
     } catch {
       if (entry.stopped) return

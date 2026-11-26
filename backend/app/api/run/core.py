@@ -25,7 +25,9 @@ from app.core.database import get_db
 from app.models.agent import Agent, AgentRun, AgentRunEvent, AgentSession
 from app.models.user import User
 
-from app.api.common.schemas import RunCancelRequest, RunCreate, RunInputSubmission, RunResumeRequest
+from app.api.common.schemas import (
+    RunCancelRequest, RunCreate, RunInputSubmission, RunResumeRequest, RunSteerRequest,
+)
 
 from .common import _attachment_note, _drain_legacy_stream, _get_run_or_404, _load_agent_config
 
@@ -104,6 +106,14 @@ async def create_run(
     # 崩溃恢复/断点续跑后仍保持原开关状态
     if body.web_enabled is not None:
         agent_config["web_enabled"] = bool(body.web_enabled)
+    # 目标模式（/goal）：不限模型调用/工具调用/执行时长，并允许执行中补充要求。
+    # 写入配置快照，恢复时由执行侧据此解除预算；团队协作暂不支持执行中补充。
+    if body.goal_mode:
+        if body.team_mode:
+            raise HTTPException(status_code=422, detail="目标模式暂不支持团队协作，请关闭团队后重试")
+        agent_config["goal_mode"] = True
+    else:
+        agent_config["goal_mode"] = False
     # ensure_version 可能写入 agent_versions（flush 持写锁）：先提交释放，
     # 避免与 start_run_with_session 的独立会话写入互相阻塞（SQLite 必需）
     await db.commit()
@@ -156,6 +166,7 @@ async def create_run(
                 "run_id": existing.id,
                 "conversation_id": existing.session_id,
                 "status": existing.status,
+                "goal_mode": bool((existing.agent_config_snapshot or {}).get("goal_mode")),
                 "idempotent_reuse": True,
                 "events_url": f"/api/v2/runs/{existing.id}/events",
             }
@@ -318,6 +329,7 @@ async def create_run(
         "run_id": run_id,
         "conversation_id": conversation_id,
         "status": "running",
+        "goal_mode": bool(agent_config.get("goal_mode")),
         "events_url": f"/api/v2/runs/{run_id}/events",
     }
 
@@ -460,6 +472,22 @@ async def submit_input(
     try:
         result = await submit_run_input(run_id, current_user.id, body.request_id, body.values)
     except RunInputError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e)) from None
+    return {**result, "events_url": f"/api/v2/runs/{run_id}/events"}
+
+
+@router.post("/{run_id}/steer")
+async def steer_run(
+    run_id: str,
+    body: RunSteerRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """执行中提交补充要求（通用能力，不新起 Run，下一次模型调用前生效）。"""
+    from app.services.agent_runtime.steering import SteeringError, submit_steering
+
+    try:
+        result = await submit_steering(run_id, current_user.id, body.message)
+    except SteeringError as e:
         raise HTTPException(status_code=e.status_code, detail=str(e)) from None
     return {**result, "events_url": f"/api/v2/runs/{run_id}/events"}
 

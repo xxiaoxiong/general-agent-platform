@@ -42,13 +42,26 @@
         </li>
       </ul>
 
+      <div v-if="paletteOpen" class="command-palette" role="listbox" aria-label="命令">
+        <button
+          v-if="goalMatches" type="button" class="command-item"
+          :class="{ active: paletteIndex === 0 }" role="option" :aria-selected="paletteIndex === 0"
+          @mousedown.prevent="chooseGoal" @mouseenter="paletteIndex = 0"
+        >
+          <Flag :size="15" aria-hidden="true" />
+          <span class="command-name">/goal</span>
+          <span class="command-desc">{{ goalMode ? '关闭目标模式' : '开启目标模式：不限调用次数与执行时长，执行中可补充要求' }}</span>
+          <span class="command-state">{{ goalMode ? '已开启' : '未开启' }}</span>
+        </button>
+      </div>
+
       <textarea
         ref="textarea"
         v-model="text"
         rows="2"
         :disabled="locked"
         aria-label="消息"
-        placeholder="给智能体发送消息…"
+        :placeholder="steerable ? '执行中：输入补充要求，会在下一步即时纳入当前任务…（输入 / 唤起命令）' : '给智能体发送消息…（输入 / 唤起命令）'"
         @keydown="onKeydown"
         @paste="onPaste"
       />
@@ -64,7 +77,7 @@
             type="button" class="selector team-switch" role="switch" aria-label="智能体团队"
             :aria-checked="teamMode" :disabled="locked || sending || stoppable || Boolean(blockedReason) || uploading > 0"
             :title="teamMode ? '关闭当前会话的团队协作' : '开启当前会话的团队协作，会增加模型调用'"
-            @click="teamMode = !teamMode"
+            @click="toggleTeamMode"
           >
             <UsersRound :size="16" aria-hidden="true" /><span>团队</span>
             <span class="team-indicator" aria-hidden="true"></span>
@@ -131,7 +144,11 @@
           <button v-if="stoppable" type="button" class="button-send button-stop" aria-label="停止生成" title="停止生成" @click="$emit('stop')">
             <Square :size="14" fill="currentColor" />
           </button>
-          <button v-else type="submit" class="button-send" :disabled="!canSend" aria-label="发送消息" title="发送消息">
+          <button
+            v-if="!stoppable || steerable" type="submit" class="button-send"
+            :disabled="!canSend" :aria-label="steerable ? '提交补充要求' : '发送消息'"
+            :title="steerable ? '提交补充要求：在当前任务执行中即时生效' : '发送消息'"
+          >
             <LoaderCircle v-if="sending" class="spin" :size="16" />
             <ArrowUp v-else :size="18" />
           </button>
@@ -140,15 +157,17 @@
     </form>
     <div class="composer-meta">
       <span v-if="blockedReason" class="blocked">{{ blockedReason }}</span>
+      <span v-else-if="steerable" class="goal-enabled">{{ goalMode ? '目标模式执行中' : '任务执行中' }} · 可随时补充要求，内容会在下一步纳入当前任务</span>
+      <span v-else-if="goalMode" class="goal-enabled">目标模式已开启 · 输入 /goal 可关闭 · 不限调用次数与执行时长</span>
       <span v-else-if="teamMode" class="team-enabled">团队模式已开启 · 多角色协作会增加模型调用</span>
-      <span v-else><kbd>Enter</kbd> 发送 <span class="shortcut-gap">·</span> <kbd>Shift</kbd> + <kbd>Enter</kbd> 换行</span>
+      <span v-else><kbd>Enter</kbd> 发送 <span class="shortcut-gap">·</span> <kbd>Shift</kbd> + <kbd>Enter</kbd> 换行 <span class="shortcut-gap">·</span> 输入 <kbd>/</kbd> 唤起命令</span>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { ArrowUp, Check, ChevronDown, CircleAlert, CircleCheck, Cpu, FileText, Globe, LoaderCircle, Mic, Paperclip, ShieldCheck, Square, UsersRound, X } from '@lucide/vue'
+import { ArrowUp, Check, ChevronDown, CircleAlert, CircleCheck, Cpu, FileText, Flag, Globe, LoaderCircle, Mic, Paperclip, ShieldCheck, Square, UsersRound, X } from '@lucide/vue'
 import {
   DropdownMenuContent, DropdownMenuItemIndicator, DropdownMenuPortal, DropdownMenuRadioGroup,
   DropdownMenuRadioItem, DropdownMenuRoot, DropdownMenuTrigger,
@@ -163,6 +182,8 @@ const props = defineProps<{
   uploading: number
   sending: boolean
   stoppable: boolean
+  /** 目标模式执行中：允许把输入作为补充要求提交到当前 Run */
+  steerable: boolean
   blockedReason?: string
   locked: boolean
 }>()
@@ -179,6 +200,7 @@ const text = defineModel<string>('text', { required: true })
 const teamMode = defineModel<boolean>('teamMode', { required: true })
 const approvalMode = defineModel<'manual' | 'auto'>('approvalMode', { required: true })
 const webEnabled = defineModel<boolean>('webEnabled', { required: true })
+const goalMode = defineModel<boolean>('goalMode', { required: true })
 const selectedModel = defineModel<number>('model', { required: true })
 const modelId = computed({
   get: () => String(selectedModel.value),
@@ -189,7 +211,48 @@ const modelOptions = computed(() => [
   ...props.options.map((option) => ({ value: String(option.id), label: option.display_name || option.name })),
 ])
 const modelLabel = computed(() => modelOptions.value.find((option) => option.value === modelId.value)?.label || '默认模型')
-const canSend = computed(() => Boolean(text.value.trim()) && !props.locked && !props.sending && !props.stoppable && !props.uploading && !props.blockedReason)
+/** 运行中不允许切换目标模式（只影响下一次 Run，避免误解为当前任务已生效） */
+const goalToggleDisabled = computed(() => props.locked || props.sending || props.stoppable)
+
+// ── / 命令面板（输入 / 唤起；/goal 切换目标模式）──────────────────────────────
+const paletteIndex = ref(0)
+const paletteDismissed = ref(false)
+const paletteQuery = computed(() => {
+  const value = text.value
+  if (!value.startsWith('/') || value.includes(' ')) return null
+  return value.slice(1).toLowerCase()
+})
+const paletteOpen = computed(() => {
+  const query = paletteQuery.value
+  if (query === null || paletteDismissed.value || props.locked || props.sending) return false
+  // 只对已知命令前缀展示面板；普通以 "/" 开头的文本仍可直接发送
+  return query === '' || 'goal'.startsWith(query)
+})
+const goalMatches = computed(() => 'goal'.startsWith(paletteQuery.value ?? ''))
+// 命令面板打开时先完成命令选择，不把 "/goal" 当普通消息发送
+const canSend = computed(() => Boolean(text.value.trim()) && !paletteOpen.value
+  && !props.locked && !props.sending && (!props.stoppable || props.steerable)
+  && !props.uploading && !props.blockedReason)
+
+function chooseGoal() {
+  if (!goalMatches.value || goalToggleDisabled.value) return
+  toggleGoalMode()
+  text.value = ''
+  paletteDismissed.value = false
+  void nextTick(() => textarea.value?.focus())
+}
+
+function toggleGoalMode() {
+  goalMode.value = !goalMode.value
+  if (goalMode.value) teamMode.value = false
+}
+
+function toggleTeamMode() {
+  teamMode.value = !teamMode.value
+  if (teamMode.value) goalMode.value = false
+}
+
+watch(text, () => { paletteDismissed.value = false; paletteIndex.value = 0 })
 
 const textarea = ref<HTMLTextAreaElement>()
 const picker = ref<HTMLInputElement>()
@@ -247,6 +310,28 @@ function resizeTextarea() {
 watch(text, resizeTextarea, { flush: 'post' })
 
 function onKeydown(event: KeyboardEvent) {
+  if (paletteOpen.value && !event.isComposing) {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      paletteDismissed.value = true
+      return
+    }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      paletteIndex.value = 0
+      return
+    }
+    if ((event.key === 'Enter' || event.key === 'Tab') && !event.shiftKey) {
+      if (goalToggleDisabled.value) {
+        // 运行中不切换目标模式：收起命令面板，下一次 Enter 按普通消息发送
+        paletteDismissed.value = true
+        return
+      }
+      event.preventDefault()
+      chooseGoal()
+      return
+    }
+  }
   if (!isSendKey(event)) return
   event.preventDefault()
   submit()
@@ -323,7 +408,23 @@ defineExpose({ focus: () => textarea.value?.focus(), cancelDictation })
 .composer-meta kbd { font: inherit; }
 .composer-meta .blocked { color: var(--ui-secondary); }
 .composer-meta .team-enabled { color: var(--ui-accent); }
+.composer-meta .goal-enabled { color: var(--ui-warning, #b26a00); }
 .shortcut-gap { margin: 0 3px; }
+.command-palette {
+  margin: 2px 4px 6px; padding: 4px; background: var(--ui-surface);
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-md);
+  box-shadow: var(--ui-shadow-sm);
+}
+.command-item {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 9px;
+  border: 0; background: transparent; color: var(--ui-text); border-radius: var(--ui-radius-sm);
+  font-size: 13px; text-align: left; cursor: pointer;
+}
+.command-item.active, .command-item:hover { background: var(--ui-hover); }
+.command-item svg { flex: none; color: var(--ui-secondary); }
+.command-name { flex: none; font-weight: 600; font-variant-numeric: tabular-nums; }
+.command-desc { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ui-muted); font-size: 12px; }
+.command-state { flex: none; margin-inline-start: auto; color: var(--ui-accent); font-size: 12px; }
 .composer-feedback { display: flex; align-items: center; gap: 6px; padding-inline: 8px; color: var(--ui-info); font-size: 12px; }
 .composer-feedback svg { flex: none; }
 .dictation-feedback { display: flex; align-items: center; gap: 4px; }

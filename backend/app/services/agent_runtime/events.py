@@ -55,6 +55,9 @@ WORKSPACE_PROJECT_REVIEWED = "workspace_project_reviewed"
 RUN_RETRYING = "run_retrying"
 RUN_RECOVERING = "run_recovering"
 TEAM_UPDATED = "team.updated"
+# 执行中补充要求（通用能力）：已受理 / 已注入模型上下文
+RUN_STEERED = "run_steered"
+RUN_STEERING_APPLIED = "run_steering_applied"
 
 # 流边界事件：消费者收到即结束本次事件流（Run 可能稍后由其他 Worker 恢复，
 # 恢复后的执行产生新的事件流）。任务书 §12.2：SSE 消费者必须能终止。

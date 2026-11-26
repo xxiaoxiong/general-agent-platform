@@ -111,6 +111,9 @@ class RuntimeContext:
     sandbox_mode: str = "restricted"      # restricted / disabled / external
     allow_network: bool = True
 
+    # 目标模式（/goal）：不限模型调用/工具调用/执行时长，允许执行中补充要求
+    goal_mode: bool = False
+
     def elapsed(self) -> float:
         return time.monotonic() - self.started_at
 

@@ -286,3 +286,26 @@ class AgentRunEvent(Base):
     event_type = Column(String(48), nullable=False)
     payload = Column(JSON, nullable=True)               # 脱敏后的事件数据
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AgentRunSteering(Base):
+    """执行中的用户补充要求（通用能力，不限 /goal 模式）。
+
+    与 Run 事件日志同事务写入：API 受理后由执行侧在最近的安全边界
+    （下一次模型调用前）注入模型上下文；``delivered_at`` 仅用于可观测性，
+    注入本身按 ``message_id`` 稳定 ID 去重，崩溃恢复后可重复读取不丢消息。
+    """
+    __tablename__ = "agent_run_steering"
+
+    __table_args__ = (
+        Index("ix_run_steering_run_id", "run_id", "id"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(36), nullable=False)
+    user_id = Column(Integer, nullable=False)
+    message_id = Column(String(64), nullable=False, unique=True)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    delivered_at = Column(DateTime, nullable=True)
+    delivered_via = Column(String(32), nullable=True)   # agent / document

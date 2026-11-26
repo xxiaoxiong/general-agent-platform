@@ -111,6 +111,10 @@
                   :key="block.kind === 'tool' ? block.key : block.kind === 'input_request' ? block.request.request_id
                     : block.kind === 'document_edit_review' ? `review-${block.review.ordinal}` : blockIdx">
                   <MessageMarkdown v-if="block.kind === 'text'" :text="block.text" />
+                  <div v-else-if="block.kind === 'steer'" class="steer-block">
+                    <span class="steer-label">执行中补充<template v-if="block.applied"> · 已纳入</template><template v-else-if="block.pending"> · 提交中…</template></span>
+                    <MessageMarkdown :text="block.text" />
+                  </div>
                   <ToolStep v-else-if="block.kind === 'tool'" :tool="block" @preview="openPreview" />
                   <TeamRunCard v-else-if="block.kind === 'team'" :progress="block.progress" :active="Boolean(m.streaming)" />
                   <VerificationCard v-else-if="block.kind === 'verification'" :report="block" :run-id="m.runId" />
@@ -243,6 +247,7 @@
           ref="composer"
           v-model:text="inputText"
           v-model:team-mode="teamMode"
+          v-model:goal-mode="goalMode"
           v-model:approval-mode="approvalMode"
           v-model:web-enabled="webSearchOn"
           v-model:model="selectedModelId"
@@ -251,6 +256,7 @@
           :uploading="uploading"
           :sending="sending"
           :stoppable="streaming || !!historyRun"
+          :steerable="!!steerTarget"
           :blocked-reason="blockedReason"
           :locked="loadingMessages || messagesFailed"
           @send="sendMessage"
@@ -364,8 +370,8 @@ const {
   historyLoading, historyFailed, creatingConversation, deletingId,
   hasMoreConversations, historyLoadingMore, showWelcome, historyToggle,
   currentAssistant, loadingMessages, messagesFailed, messages,
-  inputText, teamMode, approvalMode, webSearchOn, selectedModelId, modelOptions,
-  attachments, uploading, sending, streaming, historyRun, blockedReason,
+  inputText, teamMode, goalMode, approvalMode, webSearchOn, selectedModelId, modelOptions,
+  attachments, uploading, sending, streaming, historyRun, blockedReason, steerTarget,
   pendingDecisions, documentContext, documentTask, documentInputsBusy,
   documentInputErrors, repairingProject, projectRepairErrors, downloadingDocuments,
   filesPanelOpen, fileList, filesLoading, filesError, filesTruncated,
@@ -560,6 +566,12 @@ onUnmounted(() => {
 .msg-file img { width: 40px; height: 40px; object-fit: cover; border-radius: var(--ui-radius-sm); }
 .msg-file span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .msg-file svg { flex: none; }
+.steer-block {
+  display: grid; gap: 4px; padding: 8px 10px; border-inline-start: 3px solid var(--ui-warning, #b26a00);
+  background: var(--ui-warning-soft, rgba(255, 170, 0, .08)); border-radius: var(--ui-radius-sm);
+}
+.steer-label { color: var(--ui-warning, #b26a00); font-size: 11px; font-weight: 600; }
+.steer-block :deep(.response-markdown) { font-size: 13px; }
 .msg-assistant { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 10px; align-items: start; }
 .assistant-mark {
   display: grid; place-items: center; width: 30px; height: 30px;

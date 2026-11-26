@@ -28,6 +28,7 @@ from app.models.agent import AgentRun, AgentRunEvent, AgentToolExecution
 from .backends import RUN_ARTIFACT_FOLDER, workspace_root
 from .context import RuntimeContext
 from .events import PLAN_UPDATED, TOOL_COMPLETED, TOOL_FAILED, TOOL_STARTED, WORKSPACE_PROJECT_REVIEWED, EventBus, RuntimeEvent
+from .goal import GOAL_AUDIT_HEADING
 from .persistence import CheckpointerFactory, make_run_config
 from .tools.classification import CLASS_EXTERNAL_IDEMPOTENT, CLASS_NON_IDEMPOTENT, get_side_effect_contract
 from .tools.policy import BudgetExceededError
@@ -649,6 +650,14 @@ class CompletionMiddleware(AgentMiddleware[CompletionState]):
         execution_checks = []
         if open_tasks:
             execution_checks.append(CheckResult("plan_finished", False, "计划中还有未完成项 " + "、".join(open_tasks[:6])))
+        if self.ctx.goal_mode:
+            # 目标模式：长程任务必须有可验证计划与交付前完成核对（不是只解除预算）
+            if not any(str(todo.get("content") or "").strip() for todo in state.get("todos") or []):
+                execution_checks.append(CheckResult(
+                    "goal_plan_present", False, "目标模式需先用 write_todos 制定可验证计划"))
+            if GOAL_AUDIT_HEADING not in text:
+                execution_checks.append(CheckResult(
+                    "goal_audit_present", False, "最终回答需包含「目标核对」完成清单（目标项/完成情况/证据）"))
         if truncated or too_large:
             execution_checks.append(CheckResult("answer_complete", False, "输出达到长度上限，需要补全交付"))
         if answer.invalid_tool_calls:
@@ -718,6 +727,16 @@ class CompletionMiddleware(AgentMiddleware[CompletionState]):
                 feedback += (
                     "\n交付文件必须位于 /workspace/；会话临时区（如 /research/、/notes/、/tmp/）用户无法下载，"
                     "不要把临时文件写成交付结果。"
+                )
+            if "goal_plan_present" in failed_ids:
+                feedback += (
+                    "\n目标模式必须先调用 write_todos 制定可验证计划：每项对应可核对输出"
+                    "（交付物/文件/数据/来源/结论），完成后逐项标记 completed。"
+                )
+            if "goal_audit_present" in failed_ids:
+                feedback += (
+                    "\n交付前请补上「## 目标核对」表：逐条列出目标项/计划项、完成情况（已完成/未完成/受阻）"
+                    "和证据（文件路径、来源链接或工具回执）；未完成项如实列出，不得虚报完成。"
                 )
             if "preserve_answer" not in review:
                 feedback += ("\n沿用原始任务和已经确认的证据，处理缺口后交付完整结果。"
