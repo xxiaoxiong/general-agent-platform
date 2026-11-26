@@ -601,6 +601,32 @@ async def test_service_state_sync_emits_events_and_updates_health(monkeypatch):
         assert exited_events[0].payload.get("reason") == "process_missing"
 
 
+async def test_service_count_and_port_limits_enforced():
+    """Project 级最大 Service 数 / Preview 端口数（任务书 §11.3）。"""
+    user = await _user("u-svc-limit")
+    _project, workspace, sandbox = await _ready_for_session(user)
+    async with AsyncSessionLocal() as s:
+        profile = await s.get(SandboxResourceProfile, workspace.resource_profile_id)
+        profile.max_services = 1
+        profile.max_ports = 1
+        s.add(WorkspaceService(
+            workspace_id=workspace.id, sandbox_id=sandbox.id, name="exists",
+            command="python3 -m http.server 5000", working_directory="/workspace",
+            port=5000, desired_state="running", observed_state="healthy",
+        ))
+        await s.commit()
+
+    async with AsyncSessionLocal() as s:
+        workspace_row = await s.get(Workspace, workspace.id)
+        sandbox_row = await runtime.active_sandbox(s, workspace.id)
+        user_row = await s.get(User, user.id)
+        with pytest.raises(SandboxQuotaError):
+            await service_manager.create_service(
+                s, workspace_row, sandbox_row, user_row,
+                name="another", command="python3 -m http.server 5001", port=5001,
+            )
+
+
 async def test_report_sandbox_states_reconciles_and_quarantines_unknown():
     """Runner 上报：已知 Sandbox 更新 Observed State / OOM；无标签容器只告警不接管。"""
     user = await _user("u-report")

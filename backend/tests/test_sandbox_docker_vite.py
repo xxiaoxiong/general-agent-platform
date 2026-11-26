@@ -110,6 +110,7 @@ async def test_vite_hmr_websocket_inside_sandbox():
             ip, token,
             env + "cd /workspace/app && npm install --no-audit --no-fund",
         )
+        start_at = asyncio.get_event_loop().time()
         service = await _agent(ip, token, "POST", "/services", json={
             "name": "vite",
             "command": (
@@ -135,10 +136,13 @@ async def test_vite_hmr_websocket_inside_sandbox():
                 break
             await asyncio.sleep(2)
         assert healthy, status
+        healthy_seconds = asyncio.get_event_loop().time() - start_at
 
         async with httpx.AsyncClient(timeout=20) as client:
             page = await client.get(f"http://{ip}:5173/")
             assert page.status_code == 200 and "vite" in page.text.lower()
+            print(f"[vite-bench] start_to_healthy={healthy_seconds:.3f}s "
+                  f"first_page_seconds={asyncio.get_event_loop().time() - start_at:.3f}s")
             client_js = await client.get(f"http://{ip}:5173/@vite/client")
             match = re.search(r'const wsToken = "([^"]+)"', client_js.text)
             assert match, "Vite client 未找到 wsToken"

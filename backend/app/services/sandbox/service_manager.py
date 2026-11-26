@@ -54,6 +54,10 @@ async def _check_limits(db: AsyncSession, workspace: Workspace) -> None:
         raise SandboxQuotaError(
             f"项目最大 Service 数为 {profile.max_services}，请先停止/删除不再使用的服务"
         )
+    if int(profile.max_ports or 0) > 0 and count >= int(profile.max_ports):
+        raise SandboxQuotaError(
+            f"项目最大 Preview 端口数为 {profile.max_ports}，请先清理不再使用的服务"
+        )
 
 
 async def list_services(db: AsyncSession, workspace: Workspace) -> list[WorkspaceService]:

@@ -32,7 +32,9 @@ docker exec -e PYTHONPATH=/app -w /app -e BENCH_ITERATIONS=3 ai_plat_backend \
 1. `provision_ready_seconds`：Project 创建 → Sandbox Provision Job → 容器启动 → workspace-agent `/health` 就绪；
 2. `command_seconds`：`execute_command("echo bench-ok")` 往返；
 3. `service_healthy_seconds`：`start_service(python3 -m http.server 8123)` → HTTP 健康检查通过；
-4. `preview_grant_first_request_seconds`：签发 Preview Grant + 经 Preview Proxy 首次 HTTP 200。
+4. `preview_grant_first_request_seconds`：签发 Preview Grant + 经 Preview Proxy 首次 HTTP 200；
+5. Vite 启动（补充实测，见 `test_sandbox_docker_vite.py`）：`npm run dev` 发起 →
+   Service `/services/vite` 变为 healthy 且首页返回 200（依赖已安装）。
 
 失败样本不剔除，脚本输出 `failed` 计数。
 
@@ -44,6 +46,7 @@ docker exec -e PYTHONPATH=/app -w /app -e BENCH_ITERATIONS=3 ai_plat_backend \
 | 简单命令执行 | 0.124s | 0.150s | 0.123s | 0.150s |
 | Service 启动 → Healthy | 1.678s | 1.755s | 1.613s | 1.755s |
 | Preview Grant + 首次访问 | 0.040s | 0.045s | 0.039s | 0.045s |
+| Vite 启动 → Healthy + 首页 200 | 2.018s | —（N=1） | 2.018s | 2.025s |
 
 原始样本：
 
@@ -60,5 +63,7 @@ docker exec -e PYTHONPATH=/app -w /app -e BENCH_ITERATIONS=3 ai_plat_backend \
 - 首轮 7.5s 与后续 13.1s 的差异主要来自 Volume/Network 创建与 Docker Desktop 文件系统：首轮镜像层已缓存，但新 Volume 初始化路径不同；生产 Linux 通常更稳定。
 - 采样数 3，P95 实际等于最大值；该结果用于确认量级与瓶颈，不作为统计显著性结论。
 - 未测：并发创建压力（多用户）、大型 `npm install` 对生命周期操作的影响、PID/磁盘打满、Docker Daemon 重启。
-- 未测 Vite 启动到 Preview Ready 的完整耗时（Vite HMR 功能测试见 `docs/workspace-sandbox-delivery.md`；安装依赖受网络影响大，单独测量意义有限）。
+- Vite 启动实测为 Runner → workspace-agent → Vite 直连（N=1，依赖已安装，2.018s）；
+  未包含 `npm install` 耗时与 Preview Proxy 转发（后者实测 0.040s 量级）。
+  Vite HMR 功能测试见 `docs/workspace-sandbox-delivery.md`；安装依赖受网络影响大，未纳入基准。
 - 生产复测建议：目标硬件上至少 30 次采样，区分冷/热 Volume、冷/热镜像、并发用户数，并记录 Docker Storage Driver 与文件系统。
