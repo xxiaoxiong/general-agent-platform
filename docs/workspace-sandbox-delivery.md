@@ -116,7 +116,7 @@
 | --- | --- | --- |
 | 后端全量回归 | `cd backend && python -m pytest -q` | **1071 passed, 13 skipped, 102.48s** |
 | Sandbox 专项（模型/调度/Lease/ACL/预览/工具/文件后端/写租约/自动恢复/限流/登录态/事件/软配额/对账/服务配额） | `pytest tests/test_sandbox_runtime.py tests/test_sandbox_security.py tests/test_sandbox_api.py -q` | **34 passed** |
-| 真实 Docker 集成 | 在 Runner 容器内 `SANDBOX_DOCKER_TEST=1 pytest tests/test_sandbox_docker_integration.py` | **1 passed 39.90s**（容器安全基线、Runner 断网重连、Docker Socket 未挂载、取消命令无孤儿进程、命令、文件一致性、只读 rootfs、网络隔离含平台服务名、Service 健康 + HTTP、删除容器后新 Generation 文件保留、幂等创建） |
+| 真实 Docker 集成 | 在 Runner 容器内 `SANDBOX_DOCKER_TEST=1 pytest tests/test_sandbox_docker_integration.py` | **1 passed 40.03s**（容器安全基线、Runner 断网重连、Docker Socket 未挂载、取消命令无孤儿进程、命令、文件一致性、只读 rootfs、网络隔离含平台服务名、Service 健康 + HTTP、删除容器后新 Generation 文件保留、幂等创建） |
 | Vite HMR / WebSocket | 在 Runner 容器内 `SANDBOX_DOCKER_VITE=1 pytest tests/test_sandbox_docker_vite.py -q -s` | **1 passed 10.81s**（Vite 安装、dev server、`vite-hmr` WS、修改源码收到 `full-reload`）；启动→Healthy + 首页 200 = **2.018s** |
 | 真实端到端（服务层） | 容器内脚本：项目 → Provision → 命令（uid=10001）→ Service → Preview | `exec succeeded`、`service healthy`、子域预览 200、兜底 200、坏 Token 401 |
 | 浏览器 E2E | `npm run test:e2e:sandbox`（真实 Edge + 已部署栈） | **1 passed 14.6s**：项目创建 → Sandbox Ready → Service healthy → iframe 真实页面 → 刷新后预览 → 切换项目不串显 → Services 面板；截图见 `docs/assets/` |
