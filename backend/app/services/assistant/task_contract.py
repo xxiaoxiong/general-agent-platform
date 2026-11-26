@@ -29,6 +29,22 @@ TASK_OTHER = "other"
 
 ProjectScope = Literal["fullstack", "frontend", "backend"]
 
+# 已校验 RunDecision.intent → 任务契约类型（决策优先，避免再维护第二套 Router）
+_DECISION_TASK_TYPES = {
+    "general_chat": TASK_QA,
+    "research": TASK_RESEARCH,
+    "data_analysis": TASK_DATA,
+    "database_query": TASK_DB,
+    "coding": TASK_CODE,
+    "business_action": TASK_BUSINESS,
+    "document_analyze": TASK_DOC,
+    "document_generate": TASK_DOC,
+    "document_edit": TASK_DOC,
+    "profile_extract": TASK_DOC,
+    "software_project": TASK_CODE,
+    "unknown": TASK_OTHER,
+}
+
 # 能力包 → 任务类型（能力包是更强的信号，优先于关键词）
 _CAPABILITY_TASK_TYPES = {
     "web_research": TASK_RESEARCH,
@@ -182,8 +198,13 @@ def infer_task_type(
     capability_ids: Optional[Sequence[str]] = None,
     *,
     tool_names: Optional[Sequence[str]] = None,
+    decision_intent: Optional[str] = None,
 ) -> tuple:
-    """推断任务类型（capability > 已用工具 > 关键词 > other）。返回 (type, source)。"""
+    """推断任务类型（decision > capability > 已用工具 > 关键词 > other）。"""
+    # 0) 已校验决策优先：任务语义由 Decision 模块负责，契约只描述验收义务
+    if decision_intent in _DECISION_TASK_TYPES:
+        return _DECISION_TASK_TYPES[decision_intent], "decision"
+
     # 1) 能力包信号（排除 general/knowledge 这类无强类型指向的包）
     for cid in (capability_ids or []):
         t = _CAPABILITY_TASK_TYPES.get(cid)
@@ -216,16 +237,25 @@ def build_task_contract(
     tool_names: Optional[Sequence[str]] = None,
     goal_limit: int = 200,
     web_searchable: bool = True,
+    decision_intent: Optional[str] = None,
+    project_scope_override: Optional[str] = None,
 ) -> TaskContract:
     """用户目标 → 结构化任务契约（确定性，不调用模型）。"""
     request = (user_input or "").split("\n\n[附件]", 1)[0].split("\n\n[参考文档]", 1)[0].strip()
     local_sources = tuple(_ATTACHMENT_NOTE.findall(user_input or ""))
     goal = request[:goal_limit]
     # 能力包负责提供工具。验收义务由本次用户要求确定，避免给咨询强加写入、查询或发送动作。
-    task_type, source = infer_task_type(request, capability_ids, tool_names=tool_names)
+    task_type, source = infer_task_type(
+        request, capability_ids, tool_names=tool_names, decision_intent=decision_intent,
+    )
     advisory = bool(_ADVICE.match(request))
     text_only = bool(_TEXT_ONLY.search(request))
-    project_scope = _software_project_scope(request) if not advisory else None
+    project_scope = None
+    if not advisory:
+        if project_scope_override in {"fullstack", "frontend", "backend"}:
+            project_scope = project_scope_override
+        elif decision_intent in (None, "software_project"):
+            project_scope = _software_project_scope(request)
     project_checks: tuple[str, ...] = ()
     project_archive_path = project_openapi_path = None
     checks = ["answer_present"]
@@ -281,6 +311,18 @@ def build_task_contract(
         checks.append("db_evidence")
     if not (advisory or text_only) and _EXTERNAL_ACTION.search(request):
         checks.append("side_effect_evidence")
+    # 已校验决策补充验收义务（语义判断来自 Decision，契约只负责如何核验）
+    if not (advisory or text_only):
+        if decision_intent == "research":
+            checks.append("citations_present")
+            source_count = max(source_count, 1)
+            explicit_web = bool(_WEB_INTENT.search(request))
+            if web_searchable and not _NO_WEB.search(request) and (explicit_web or not local_sources):
+                checks.append("web_evidence")
+        elif decision_intent == "database_query":
+            checks.append("db_evidence")
+        elif decision_intent == "business_action":
+            checks.append("side_effect_evidence")
     minimum = _CHAR_COUNT.search(request)
     minimum_chars = int(minimum.group(1)) if minimum and not paths and not formats else 0
     if minimum_chars:

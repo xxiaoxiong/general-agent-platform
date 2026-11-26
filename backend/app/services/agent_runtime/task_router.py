@@ -197,13 +197,16 @@ def route_task(
     return {
         "task_type": task_type,
         "task_mode": task_mode,
+        # confidence 仅为兼容旧事件字段保留，不再代表模型校准后的可信度；
+        # 决策来源与确定性请以 intent_source / decision_status 为准
         "confidence": confidence,
+        "intent_source": "rules",
         "reason": reason,
         "document_profile_id": document_profile_id,
         "document_id": document_id,
         "style_edit": bool(style_edit and task_type == "document_edit"),
         "deliverable_format": deliverable_format,
-        "router_version": 2,
+        "router_version": 3,
     }
 
 

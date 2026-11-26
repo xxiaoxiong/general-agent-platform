@@ -541,7 +541,9 @@ class LifecycleMixin:
                 await sess_repo.append_messages(
                     resolved_session_id,
                     [{
-                        "message_id": uuid.uuid4().hex,
+                        # 自动模式决策发生在 Run 内：沿用调用方稳定 message_id，
+                        # 便于决策后补写 document_run_id 标记
+                        "message_id": user_message.get("message_id") or uuid.uuid4().hex,
                         "role": user_message.get("role") or "user",
                         "content": content,
                         "created_at": datetime.utcnow().isoformat(),

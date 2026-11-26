@@ -133,6 +133,8 @@ class IntentProbe:
         for event in watch["timeline"]:
             by_name.setdefault(str(event.get("event")), []).append(event)
         routed = (by_name.get("task.routed") or [{}])[0].get("data") or {}
+        decisions = by_name.get("task.decision") or []
+        decision = (decisions[-1].get("data") or {}) if decisions else {}
         completed = by_name.get("run.completed") or []
         failed = by_name.get("run.failed") or []
         final_text = ""
@@ -149,6 +151,7 @@ class IntentProbe:
             "task_type": routed.get("task_type"),
             "reason": routed.get("reason"),
             "intent_source": routed.get("intent_source"),
+            "decision": decision,
             "deliverable": routed.get("deliverable"),
             "document_versions": len(versions),
             "artifacts": len(artifacts),
@@ -237,6 +240,11 @@ async def main() -> int:
         md_files = [item for item in (markdown or {}).get("files", []) if str(item.get("name", "")).lower().endswith(".md")]
         check("markdown_routed_general_chat", bool(markdown and markdown["task_type"] == "general_chat"),
               markdown and markdown["task_type"])
+        md_decision = (markdown or {}).get("decision") or {}
+        check("markdown_decision_applied",
+              bool(md_decision.get("decision_source") == "llm" and md_decision.get("applied")
+                   and md_decision.get("effective_task_type") == "general_chat"),
+              md_decision)
         check("markdown_deliverable_format", bool(markdown and (markdown.get("deliverable") or {}).get("format") == "md"),
               markdown and markdown.get("deliverable"))
         check("markdown_no_new_docx", bool(markdown and markdown["document_versions"] == 0),
@@ -248,6 +256,11 @@ async def main() -> int:
         plain = turn("plain_question")
         check("plain_question_general_chat", bool(plain and plain["task_type"] == "general_chat"),
               plain and plain["task_type"])
+        plain_decision = (plain or {}).get("decision") or {}
+        check("plain_question_decision_applied",
+              bool(plain_decision.get("decision_source") == "llm"
+                   and plain_decision.get("effective_task_type") == "general_chat"),
+              plain_decision)
         check("plain_question_no_artifact", bool(plain and plain["artifacts"] == 0 and plain["document_versions"] == 0),
               plain and (plain["artifacts"], plain["document_versions"]))
         check("plain_question_answered", bool(plain and plain["final_text_chars"] > 40),
@@ -256,12 +269,22 @@ async def main() -> int:
         edit = turn("edit_word")
         check("edit_word_routed", bool(edit and edit["task_type"] == "document_edit"),
               edit and edit["task_type"])
+        edit_decision = (edit or {}).get("decision") or {}
+        check("edit_word_decision_applied",
+              bool(edit_decision.get("decision_source") == "llm"
+                   and edit_decision.get("intent") == "document_edit"),
+              edit_decision)
         check("edit_word_new_version", bool(edit and edit["document_versions"] >= 1),
               edit and edit["document_versions"])
 
         switch = turn("switch_topic")
         check("switch_topic_general_chat", bool(switch and switch["task_type"] == "general_chat"),
               switch and switch["task_type"])
+        switch_decision = (switch or {}).get("decision") or {}
+        check("switch_topic_decision_applied",
+              bool(switch_decision.get("decision_source") == "llm"
+                   and switch_decision.get("effective_task_type") == "general_chat"),
+              switch_decision)
         check("switch_topic_no_artifact", bool(switch and switch["artifacts"] == 0 and switch["document_versions"] == 0),
               switch and (switch["artifacts"], switch["document_versions"]))
 

@@ -13,17 +13,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.database import get_db
-from app.models.agent import Agent, AgentRun, AgentRunEvent, AgentSession
+from app.models.agent import Agent, AgentRun, AgentSession
 from app.models.document import DocumentAsset
 from app.models.user import User
 
@@ -57,7 +58,10 @@ async def _session_documents(
 ) -> List[Dict[str, Any]]:
     """会话最近产生的文档产物（窄列投影，避免排序大字段）。"""
     rows = (await db.execute(
-        select(DocumentAsset.id, DocumentAsset.title, DocumentAsset.current_version)
+        select(
+            DocumentAsset.id, DocumentAsset.title, DocumentAsset.current_version,
+            DocumentAsset.created_by_run_id,
+        )
         .where(
             DocumentAsset.session_id == session_id,
             DocumentAsset.owner_id == user_id,
@@ -67,35 +71,32 @@ async def _session_documents(
         .limit(limit)
     )).all()
     return [
-        {"document_id": row[0], "title": row[1], "format": "docx", "version_no": row[2]}
+        {
+            "document_id": row[0], "title": row[1], "format": "docx",
+            "version_no": row[2], "created_by_run_id": row[3],
+        }
         for row in rows
     ]
 
 
-async def _classify_run_intent(
-    db: AsyncSession,
-    message: str,
-    *,
-    agent_config: Dict[str, Any],
-    history: List[Dict[str, Any]],
-    artifacts: List[Dict[str, Any]],
-    preview_document: Optional[Dict[str, Any]],
-    attachments: List[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-    """模型分诊：任何失败都返回 None，由规则路由兜底（建 Run 不被阻塞）。"""
-    from app.services.agent_runtime import get_runtime_service
-    from app.services.agent_runtime.intent import classify_intent
-
-    try:
-        provider, model_config = await get_runtime_service()._load_model(agent_config.get("model_config_id"))
-        return await classify_intent(
-            message, provider=provider, model_config=model_config,
-            history=history, artifacts=artifacts,
-            preview_document=preview_document, attachments=attachments,
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.warning("意图分诊不可用，回退规则路由: %s", e)
-        return None
+async def _session_recent_runs(
+    db: AsyncSession, session_id: int, user_id: int, limit: int = 3,
+) -> List[Dict[str, Any]]:
+    """会话最近运行摘要（窄列投影，供决策判断未完成/失败任务）。"""
+    rows = (await db.execute(
+        select(AgentRun.id, AgentRun.status, AgentRun.created_at)
+        .where(AgentRun.session_id == session_id, AgentRun.user_id == user_id)
+        .order_by(AgentRun.created_at.desc())
+        .limit(limit)
+    )).all()
+    return [
+        {
+            "run_id": row[0],
+            "status": row[1],
+            "created_at": row[2].isoformat() if row[2] else None,
+        }
+        for row in rows
+    ]
 
 
 # ── Run 生命周期 ──────────────────────────────────────────────────────────────
@@ -114,13 +115,12 @@ async def create_run(
     幂等（P1-01）：同 Key 同摘要复用原 Run；同 Key 不同摘要 409。
     """
     from app.services.agent_runtime import get_runtime_service
-    from app.services.agent_runtime.document_turn import document_turn, is_template_reference
     from app.services.agent_runtime.service import compute_request_hash
     from app.services.agent_runtime.repositories import IdempotencyConflict, SessionBusy
     from app.services.agent_runtime.source_bindings import SourceBindingError, check_source_bindings
     from app.services.agent_runtime.task_router import (
-        DOCUMENT_GRAPH_TYPES, choose_word_attachment, continuation_attachments,
-        recent_word_attachments, resolve_attachment_refs, route_task, word_candidates,
+        DOCUMENT_GRAPH_TYPES, recent_word_attachments, resolve_attachment_refs,
+        route_task, word_candidates,
     )
 
     # 1) 会话定位（仅限当前用户）
@@ -237,163 +237,107 @@ async def create_run(
     declared_refs = list(attachment_refs)
     current_word = word_candidates(attachment_refs)
     previous_word = recent_word_attachments(history) if session and not current_word else []
-    execution_context = route_task(
-        body.message, task_mode=body.task_mode,
-        document_profile_id=body.document_profile_id, document_id=body.document_id,
-        attachment_refs=attachment_refs,
-        has_document_context=any(message.get("document_run_id") for message in history if isinstance(message, dict)),
-        has_word_attachment=bool(previous_word),
-    )
-    # 意图分诊：仅在自动模式且用户未显式选择文档/规范时启用。会话历史里有文档
-    # 不代表本轮仍是文档任务，让模型基于本轮消息判断任务形态；显式选择始终优先。
     preview_hint = (
         await _document_hint(db, body.preview_document_id, current_user.id)
         if body.preview_document_id else None
     )
+    if preview_hint and body.preview_document_version_no:
+        preview_hint["version_no"] = body.preview_document_version_no
     artifacts = (
         await _session_documents(db, session.id, current_user.id) if session is not None else []
     )
-    decision = None
-    if (settings.AGENT_INTENT_ROUTER_ENABLED and body.task_mode == "auto"
-            and not body.document_id and not body.document_profile_id
-            and (history or attachment_refs or preview_hint)):
-        decision = await _classify_run_intent(
-            db, body.message, agent_config=agent_config, history=history,
-            artifacts=artifacts, preview_document=preview_hint, attachments=attachment_refs,
-        )
-    if decision is not None:
-        from app.services.agent_runtime.intent import apply_intent
+    recent_runs = (
+        await _session_recent_runs(db, session.id, current_user.id) if session is not None else []
+    )
+    execution_context = route_task(
+        body.message, task_mode=body.task_mode,
+        document_profile_id=body.document_profile_id, document_id=body.document_id,
+        attachment_refs=attachment_refs,
+        has_document_context=bool(artifacts) or any(
+            message.get("document_run_id") for message in history if isinstance(message, dict)
+        ),
+        has_word_attachment=bool(previous_word),
+    )
+    # Decision Architecture：API 只做确定性预检。自动模式且存在需要结合上下文判断的
+    # 内容时，把语义决策延迟到 Run 内执行（具备 Run ID/事件/Trace/恢复能力），
+    # 显式任务模式与显式文档资源始终优先。
+    from app.services.agent_runtime.decision.orchestrator import should_defer_semantic
 
-        execution_context = apply_intent(
-            decision, execution_context,
-            has_existing_document=bool(preview_hint or artifacts),
-            has_attachments=bool(attachment_refs),
-        )
-        # 模型判定要针对"当前预览的文档"：此时才把预览文档作为本轮编辑/分析目标
-        if (execution_context["task_type"] in {"document_edit", "document_analyze"}
-                and preview_hint is not None and not body.document_id):
-            body.document_id = preview_hint["document_id"]
-            if preview_hint.get("version_no"):
-                body.task_options = {
-                    **(body.task_options or {}),
-                    "document_version_no": preview_hint["version_no"],
-                }
-            execution_context["document_id"] = body.document_id
-            execution_context["document_version"] = preview_hint.get("version_no")
-    # 会话上下文延续：用户指代此前内容（"这份报告/基于上面"）且本轮没有重新上传时，
-    # 自动沿用会话内最近上传的 Word，避免文档任务在缺少源资料时凭空生成
-    if session is not None:
-        for ref in continuation_attachments(
-            body.message, history, execution_context["task_type"], attachment_refs,
-        ):
-            try:
-                inherited_refs = await asyncio.to_thread(
-                    resolve_attachment_refs, [ref], user_id=current_user.id,
-                    agent_id=agent_id, session_id=body.conversation_id,
-                )
-            except (ValueError, OSError):
-                continue
-            attachment_refs.extend(inherited_refs)
-            declared_refs.extend(inherited_refs)
-    inherited, anchor_run = [], None
-    continued = None
-    if (session and not body.team_mode and not attachment_refs
-            and not (body.document_id or body.document_profile_id or body.task_options)
-            and execution_context["task_type"] == "general_chat"):
-        from app.services.agent_runtime.completion import resolve_completion_resume
-
-        continued = await resolve_completion_resume(db, current_user.id, session.id, body.message, history)
-    if continued:
-        execution_context["completion_resume"] = continued
-        execution_context["reason"] = "继续本会话未完成的文件交付"
+    defer_semantic = should_defer_semantic(
+        settings.AGENT_DECISION_MODE,
+        task_mode=body.task_mode,
+        document_id=body.document_id,
+        document_profile_id=body.document_profile_id,
+        task_options=body.task_options,
+        team_mode=body.team_mode,
+        has_context=bool(history or attachment_refs or preview_hint),
+    )
+    message_id = uuid.uuid4().hex
+    if defer_semantic:
+        execution_context.update({
+            "attachment_refs": attachment_refs,
+            "decision_pending": True,
+            "decision_input": {
+                "message": body.message,
+                "artifacts": artifacts,
+                "recent_runs": recent_runs,
+                "preview_document": preview_hint,
+                "attachments": [
+                    {key: ref.get(key) for key in ("name", "path", "text_path", "size")
+                     if ref.get(key) is not None}
+                    for ref in attachment_refs
+                ],
+                "explicit": {"task_mode": body.task_mode},
+                "is_superuser": bool(current_user.is_superuser),
+                "message_id": message_id,
+                "document_id": body.document_id,
+                "document_profile_id": body.document_profile_id,
+                "task_options": body.task_options,
+            },
+        })
     else:
-        # 模型已明确本轮不是 Word 文档任务时，禁止 document_turn 再用历史把
-        # general_chat 提升成 document_generate（会话文档不得绑架新任务）
-        execution_context, inherited, anchor_run = document_turn(
-            body.message, history, execution_context,
-            allow_upgrade=decision is None or execution_context["task_type"] == "document_generate",
-        )
-    if body.team_mode:
-        from app.services.agent_runtime.team_project_intent import project_scope
+        if body.team_mode:
+            from app.services.agent_runtime.team_project_intent import project_scope
 
-        execution_context["team_mode"] = True
-        scope = project_scope(
-            body.message, body.task_mode, has_selected_document=bool(body.document_id or body.document_profile_id),
-        )
-        if scope and execution_context["task_type"] not in {"document_edit", "profile_extract"}:
-            execution_context.pop("document_context", None)
-            execution_context.update({"task_type": "software_project", "project_scope": scope,
-                                      "reason": "用户要求实际构建可交付的软件项目"})
-    context = execution_context.get("document_context")
-    if context is not None:
-        template_refs = current_word if is_template_reference(body.message) else []
-        known = {ref["path"] for ref in attachment_refs}
-        for ref in inherited if not template_refs else ():
-            if ref["path"] in known:
-                continue
-            try:
-                resolved = (await asyncio.to_thread(
-                    resolve_attachment_refs, [ref], user_id=current_user.id,
-                    agent_id=agent_id, session_id=body.conversation_id,
-                ))[0]
-            except (ValueError, OSError):
-                continue
-            attachment_refs.append(resolved)
-            template_refs.append(resolved)
-            known.add(resolved["path"])
-        context["template_paths"] = [ref["path"] for ref in template_refs]
-        if anchor_run:
-            from app.models.document import RunInputRequest
-
-            responses = (await db.scalars(select(RunInputRequest.response).join(
-                AgentRun, AgentRun.id == RunInputRequest.run_id,
-            ).where(AgentRun.id == anchor_run, AgentRun.user_id == current_user.id,
-                    AgentRun.session_id == body.conversation_id, RunInputRequest.status == "submitted")
-                .order_by(RunInputRequest.ordinal))).all()
-            context["carried_inputs"] = {
-                key: value for response in responses if isinstance(response, dict)
-                for key, value in response.items()
-            }
-    execution_context["attachment_refs"] = attachment_refs
-    if (execution_context["task_type"] in DOCUMENT_GRAPH_TYPES
-            or execution_context["task_type"] == "document_analyze"
-            or body.document_profile_id or body.document_id):
+            execution_context["team_mode"] = True
+            scope = project_scope(
+                body.message, body.task_mode,
+                has_selected_document=bool(body.document_id or body.document_profile_id),
+            )
+            if scope and execution_context["task_type"] not in {"document_edit", "profile_extract"}:
+                execution_context.pop("document_context", None)
+                execution_context.update({"task_type": "software_project", "project_scope": scope,
+                                          "reason": "用户要求实际构建可交付的软件项目"})
+        from app.services.agent_runtime.decision.preparer import prepare_execution
         from app.services.documents.errors import DocumentError
-        from app.services.documents.repository import resolve_task_resources
 
         try:
-            editing = execution_context["task_type"] == "document_edit" and not body.document_id
-            candidates = (current_word or previous_word) if editing else []
-            chosen = choose_word_attachment(body.message, candidates)
-            prefer_attachment = bool(current_word and editing) or bool(chosen and any(
-                term in body.message for term in ("原文件", "原附件", str(chosen.get("name") or chosen["path"]))
-            ))
-            resources = await resolve_task_resources(
-                db, user_id=current_user.id, is_superuser=current_user.is_superuser,
-                session_id=body.conversation_id, task_type=execution_context["task_type"],
-                message=context["request"] if context else body.message,
-                profile_id=body.document_profile_id, document_id=body.document_id,
-                task_options=body.task_options, prefer_attachment=prefer_attachment,
-                has_attachment=bool(candidates),
+            prepared = await prepare_execution(
+                db, message=body.message, history=history, route=execution_context,
+                user_id=current_user.id, agent_id=agent_id,
+                session_id=body.conversation_id,
+                is_superuser=bool(current_user.is_superuser),
+                attachment_refs=attachment_refs,
+                document_id=body.document_id,
+                document_profile_id=body.document_profile_id,
+                task_options=body.task_options,
+                allow_upgrade=True,
+                artifacts=artifacts,
             )
-            if editing and not resources.get("document_id") and candidates:
-                if chosen is None:
-                    raise DocumentError(422, "有多份 Word 可编辑，请在消息中写明一个文件名")
-                if not current_word:
-                    try:
-                        chosen = (await asyncio.to_thread(
-                            resolve_attachment_refs, [chosen], user_id=current_user.id,
-                            agent_id=agent_id, session_id=body.conversation_id,
-                        ))[0]
-                    except (ValueError, OSError):
-                        raise DocumentError(422, "之前的 Word 附件已不可用，请重新上传") from None
-                resources["source_attachment"] = chosen
         except DocumentError as e:
             raise HTTPException(status_code=e.status_code, detail=e.message) from None
-        execution_context.update(resources)
+        execution_context = prepared.execution_context
+        attachment_refs = prepared.attachment_refs
+        declared_refs = prepared.declared_refs
     # 附件注记随普通会话持久化；专用 Graph 从快照中的附件引用读取。
-    note = "" if execution_context["task_type"] in DOCUMENT_GRAPH_TYPES else _attachment_note(attachment_refs)
-    user_message = {"role": "user", "content": body.message + note}
+    # 自动模式决策前不知道最终路线，统一带上注记（文档图用 document_context.request，
+    # 历史解析会剥离注记），不影响 Word 流水线。
+    note = (
+        _attachment_note(attachment_refs)
+        if defer_semantic or execution_context["task_type"] not in DOCUMENT_GRAPH_TYPES
+        else ""
+    )
+    user_message = {"message_id": message_id, "role": "user", "content": body.message + note}
     if declared_refs:
         user_message["attachments"] = [
             {key: ref[key] for key in ("name", "path", "text_path", "size") if key in ref}

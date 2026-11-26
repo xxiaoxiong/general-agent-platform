@@ -245,6 +245,29 @@ def _compose_system_prompt(ctx: RuntimeContext) -> str:
             "给出文件名、下载位置与关键结论。不得只把内容贴在对话里充当文件交付，"
             "也不得在文件尚未创建时声称已生成或可下载。"
         )
+    decision = ctx.agent_config.get("_decision")
+    if isinstance(decision, dict):
+        lines = ["## 本轮任务决策（已由服务端校验）"]
+        if decision.get("goal"):
+            lines.append(f"- 目标：{decision['goal']}")
+        if decision.get("constraints"):
+            lines.append("- 约束：" + "；".join(map(str, decision["constraints"][:6])))
+        if decision.get("acceptance_criteria"):
+            lines.append("- 验收标准：" + "；".join(map(str, decision["acceptance_criteria"][:6])))
+        if decision.get("clarification_question"):
+            lines.append(
+                "- 本轮存在关键歧义：先用一句话向用户提出这个澄清问题，"
+                f"不要执行工具或生成交付物：{decision['clarification_question']}"
+            )
+        if len(lines) > 1:
+            parts.append("\n".join(lines))
+    attachments = ctx.agent_config.get("_attachments")
+    if isinstance(attachments, list) and attachments:
+        parts.append(
+            "## 本轮可用附件\n" + "\n".join(f"- {path}" for path in attachments[:30])
+            + "\n回答前必须先用 read_file 逐个读取上述文件（图片可读后直接查看），再基于内容回答；"
+            "未读取前不要猜测内容，也不要让用户重新上传。"
+        )
     parts.append(
         "## 执行约束\n"
         "- 始终使用用户提问所用的语言回答（用户用中文则用中文）。\n"

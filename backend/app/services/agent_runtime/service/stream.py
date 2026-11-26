@@ -316,7 +316,9 @@ class StreamMixin:
             agent_config = dict(agent_config)
             mem_ctx = use_memory_context or agent_config.pop("_memory_context", "")
             extra_db_info = db_info if db_info is not None else agent_config.pop("_db_info", None)
-            # 本轮文件交付要求（非 Word 格式）：由意图分诊写入上下文，系统提示据此
+            # 运行开始事件先于语义决策发布：决策模型调用期间前端也能看到运行已启动
+            await bus.publish(RuntimeEvent(type=RUN_STARTED, run_id=run.run_id))
+            # 本轮文件交付要求（非 Word 格式）：由决策写入上下文，系统提示据此
             # 要求模型真实产出工作区文件后再声明可下载
             deliverable = (execution_context or {}).get("deliverable")
             if isinstance(deliverable, dict) and deliverable.get("format"):
@@ -334,6 +336,61 @@ class StreamMixin:
 
             provider, model_config = await self._load_model(agent_config.get("model_config_id"))
             log_fields["model_id"] = model_config.get("name")
+
+            # Decision Architecture：语义决策在 Run 内完成（一次调用，失败回退规则）。
+            # 显式模式/资源操作不会带 decision_pending；恢复时复用已持久化决策。
+            if execution_context is not None:
+                from app.services.agent_runtime.decision.orchestrator import resolve_run_decision
+
+                original_context = execution_context
+                resolved_context, decision_payload = await resolve_run_decision(
+                    run_id=run.run_id,
+                    session_id=run.session_id,
+                    user_id=user_id or run.user_id,
+                    execution_context=execution_context,
+                    messages=messages,
+                    agent_config=agent_config,
+                    provider=provider,
+                    model_config=model_config,
+                    auto_team=bool(getattr(settings, "AGENT_AUTO_TEAM_ENABLED", False)),
+                )
+                # 保持与 Worker RunJob / Registry 的同一引用：释放策略需看到最终路线
+                if resolved_context is not original_context:
+                    original_context.clear()
+                    original_context.update(resolved_context)
+                    execution_context = original_context
+                if decision_payload is not None:
+                    await bus.publish(RuntimeEvent(
+                        type="task_decision", run_id=run.run_id, data=decision_payload,
+                    ))
+                task_type = execution_context.get("task_type")
+                is_document_run = task_type in DOCUMENT_GRAPH_TYPES
+                is_team_run = execution_context.get("team_mode") is True
+                private_document_content = is_document_run or task_type == "document_analyze"
+                deliverable = execution_context.get("deliverable")
+                if isinstance(deliverable, dict) and deliverable.get("format"):
+                    agent_config["_deliverable"] = deliverable
+                else:
+                    agent_config.pop("_deliverable", None)
+                decision = execution_context.get("decision")
+                if isinstance(decision, dict):
+                    agent_config["_decision"] = {
+                        "goal": decision.get("goal") or "",
+                        "intent": decision.get("intent") or "",
+                        "constraints": decision.get("constraints") or [],
+                        "acceptance_criteria": decision.get("acceptance_criteria") or [],
+                        "clarification_question": decision.get("clarification_question") or "",
+                        "deliverable_format": decision.get("deliverable_format") or "none",
+                    }
+                # 决策后可能补入历史附件（延续任务）：系统提示显式列出可用文件，
+                # 避免通用 Agent 只看到初始注记而漏读后续解析出的附件
+                attachment_paths = [
+                    f"/workspace/{ref['path']}"
+                    for ref in (execution_context.get("attachment_refs") or [])
+                    if isinstance(ref, dict) and ref.get("path")
+                ]
+                if attachment_paths:
+                    agent_config["_attachments"] = attachment_paths[:30]
 
             scope = RunScope(user_id=user_id or run.user_id)
             # 权限模块（审批模式）：Run 级 manual/auto 优先（创建时写入配置并
@@ -412,12 +469,24 @@ class StreamMixin:
                 continued = (execution_context or {}).get("completion_resume") or {}
                 from app.services.tools import WEB_RETRIEVAL_TOOLS
 
+                decision_meta = (execution_context or {}).get("decision") or {}
+                applied_intent = (
+                    decision_meta.get("intent")
+                    if decision_meta.get("applied") and decision_meta.get("decision_source") == "llm"
+                    else None
+                )
                 ctx.task_contract = build_task_contract(
                     continued.get("request") or _last_user_input(original_messages),
                     capability_ids=agent_config.get("capability_ids"),
                     # 无网络检索工具（能力包未含/web_enabled=False 收窄后）不强加检索证据义务
                     web_searchable=any(
                         s["name"] in WEB_RETRIEVAL_TOOLS for s in self._resolve_tool_specs(agent_config)
+                    ),
+                    # TaskContract 不再承担第二套 Router：任务类型优先取已校验决策
+                    decision_intent=applied_intent,
+                    project_scope_override=(
+                        decision_meta.get("project_scope")
+                        if applied_intent == "software_project" else None
                     ),
                 )
                 if continued:
@@ -484,16 +553,31 @@ class StreamMixin:
                         checkpointer=checkpointer, store=store,
                     )
 
-                await bus.publish(RuntimeEvent(type=RUN_STARTED, run_id=run.run_id))
                 if ctx.task_contract and ctx.task_contract.is_complex and run.attempt == 1:
                     await bus.publish(RuntimeEvent(type=VERIFICATION_STARTED, run_id=run.run_id,
                                                    data=ctx.task_contract.to_dict()))
                 if execution_context and run.attempt == 1:
-                    route = dict(execution_context)
-                    route.pop("document_context", None)
-                    route["attachment_count"] = len(route.pop("attachment_refs", []))
+                    # 只发布最终执行路线所需字段：完整决策快照走 task.decision，
+                    # 避免 goal/constraints 等长字段把事件 payload 截断
+                    route = {
+                        key: execution_context.get(key)
+                        for key in (
+                            "task_type", "task_mode", "intent", "intent_source",
+                            "reason", "intent_reason", "style_edit", "edit_scope",
+                            "deliverable_format", "deliverable",
+                            "document_id", "document_version",
+                            "document_profile_id", "document_profile_version",
+                            "team_mode", "project_scope", "wants_software_project",
+                            "decision_status", "clarify_question", "router_version",
+                            "confidence",
+                        )
+                        if execution_context.get(key) is not None
+                    }
+                    if execution_context.get("completion_resume"):
+                        route["completion_resume"] = True
+                    route["attachment_count"] = len(execution_context.get("attachment_refs") or [])
                     route["goal_mode"] = ctx.goal_mode
-                    if source_attachment := route.pop("source_attachment", None):
+                    if source_attachment := execution_context.get("source_attachment"):
                         route["source_name"] = source_attachment.get("name")
                     await bus.publish(RuntimeEvent(type="task.routed", run_id=run.run_id, data=route))
                 telemetry.record_run(log_fields, status="running")

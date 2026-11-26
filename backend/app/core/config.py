@@ -122,11 +122,13 @@ class Settings(BaseSettings):
     AGENT_CHECKPOINT_DSN: str = "memory"        # memory | sqlite:///./data/agent_checkpoints.db | postgresql+asyncpg://...
     AGENT_STORE_DSN: str = ""                   # 跨线程记忆 Store（空=不启用）
     AGENT_ENABLE_HITL: bool = True              # 人工审批（高危工具 interrupt_on）
-    # 模型驱动的意图识别：会话有历史/附件/预览文档时，用一次轻量模型调用判定
-    # 本轮任务形态（对话/文档生成/编辑/分析），规则路由仅作快速通道与兜底
-    AGENT_INTENT_ROUTER_ENABLED: bool = True
-    AGENT_INTENT_ROUTER_TIMEOUT: float = 8.0    # 秒；超时回退规则路由，不阻塞建 Run
-    AGENT_INTENT_ROUTER_MAX_TOKENS: int = 320
+    # 模型驱动的语义决策（Decision Architecture）：
+    # off=只用规则路由；shadow=同时计算模型决策但执行规则结果；llm=校验后执行模型决策
+    AGENT_DECISION_MODE: str = "llm"
+    AGENT_DECISION_TIMEOUT: float = 12.0        # 秒；超时/非法输出回退规则路由
+    AGENT_DECISION_MAX_TOKENS: int = 600        # 结构化决策输出上限
+    # 自动模式下是否允许软件项目意图自动进入团队工程路线（默认关闭，保持兼容）
+    AGENT_AUTO_TEAM_ENABLED: bool = False
     AGENT_SANDBOX_MODE: str = "restricted"      # restricted / disabled / external（disabled 时禁用高危执行工具）
     AGENT_ALLOW_UNSAFE_PYTHON: bool = False     # 代码执行逃生开关（仅开发）：restricted 不是安全沙箱，生产强制禁用 python_exec/execute
     AGENT_EGRESS_PROXY: str = ""                # 受控 Egress Proxy（HTTP 出口统一收口；DNS Rebinding 防护的等价机制）
@@ -205,6 +207,10 @@ class Settings(BaseSettings):
         生产环境禁止 Durable Runtime 使用 Memory Checkpointer——Memory 是进程内
         单例，多 Worker / 重启后 Graph State 无法恢复。
         """
+        if self.AGENT_DECISION_MODE not in {"off", "shadow", "llm"}:
+            raise RuntimeError(
+                "配置非法：AGENT_DECISION_MODE 只能为 off / shadow / llm。"
+            )
         if self.asr_enabled:
             self._validate_asr_settings()
         verifier_directory = self.AGENT_PROJECT_VERIFIER_DIR.strip()

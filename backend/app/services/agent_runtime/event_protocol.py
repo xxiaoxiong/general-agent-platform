@@ -55,6 +55,8 @@ V2_EVENT_NAMES: Dict[str, str] = {
     # 执行中补充要求（通用能力）
     "run_steered": "run.steered",
     "run_steering_applied": "run.steering_applied",
+    # Decision Architecture：模型建议 + 服务端最终接受结果（与 task.routed 分离）
+    "task_decision": "task.decision",
 }
 
 # 终止事件（消费者收到即结束本次事件流）
