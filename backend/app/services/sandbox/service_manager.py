@@ -18,11 +18,19 @@ from app.models.sandbox import (
     SandboxInstance, SandboxResourceProfile, Workspace, WorkspaceService,
 )
 from app.models.user import User
+from app.observability import metrics
 
 from . import agent_client
 from .common import (
     SandboxNotReadyError, SandboxOperationError, SandboxQuotaError, emit_event, utcnow,
 )
+
+# 状态同步时发布的事件（任务书 §12.3）；starting/stopping 由操作入口发布。
+_OBSERVED_EVENT_TYPES = {
+    "healthy": "service.healthy",
+    "unhealthy": "service.unhealthy",
+    "exited": "service.exited",
+}
 
 
 async def _profile(db: AsyncSession, workspace: Workspace) -> Optional[SandboxResourceProfile]:
@@ -181,6 +189,7 @@ async def restart_service(
     service.last_started_at = utcnow()
     result = await agent_client.restart_service(service.sandbox_id or 0, service.name)
     service.observed_state = str(result.get("observed_state") or "starting")
+    metrics.inc_service_restart("manual")
     await emit_event(
         db, "service.starting", user_id=user.id, tenant_id=workspace.tenant_id,
         project_id=workspace.project_id, workspace_id=workspace.id,
@@ -215,17 +224,44 @@ async def sync_service_states(
             if service.desired_state == "running" and service.observed_state in (
                 "healthy", "starting", "unhealthy",
             ):
-                service.observed_state = "stopped"
+                service.observed_state = "exited"
                 changed += 1
+                await emit_event(
+                    db, "service.exited",
+                    tenant_id=workspace.tenant_id,
+                    project_id=workspace.project_id, workspace_id=workspace.id,
+                    sandbox_id=sandbox.id, generation=sandbox.generation,
+                    payload={"name": service.name, "port": service.port,
+                             "reason": "process_missing"},
+                )
+            metrics.set_service_health(
+                workspace.id, service.name, service.observed_state == "healthy")
             continue
         observed = str(state.get("observed_state") or "")
         if observed and observed != service.observed_state:
+            previous = service.observed_state
             service.observed_state = observed
             changed += 1
-        if state.get("process_id"):
-            service.process_id = str(state["process_id"])
+            event_type = _OBSERVED_EVENT_TYPES.get(observed)
+            if event_type:
+                await emit_event(
+                    db, event_type,
+                    tenant_id=workspace.tenant_id,
+                    project_id=workspace.project_id, workspace_id=workspace.id,
+                    sandbox_id=sandbox.id, generation=sandbox.generation,
+                    payload={"name": service.name, "port": service.port,
+                             "previous": previous, "observed_state": observed},
+                )
+        new_pid = str(state.get("process_id") or "")
+        if new_pid:
+            if service.process_id and new_pid != service.process_id:
+                # workspace-agent 自动重启：进程 ID 变化（任务书 §8.5）
+                metrics.inc_service_restart("auto")
+            service.process_id = new_pid
         if state.get("exit_code") is not None:
             service.exit_code = int(state["exit_code"])
+        metrics.set_service_health(
+            workspace.id, service.name, service.observed_state == "healthy")
     return changed
 
 

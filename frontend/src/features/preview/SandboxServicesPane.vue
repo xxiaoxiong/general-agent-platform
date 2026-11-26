@@ -104,7 +104,10 @@ import {
   Server, Square,
 } from '@lucide/vue'
 import { ElMessage } from 'element-plus'
-import { sandboxApi, type SandboxInfo, type WorkspaceInfo, type WorkspaceServiceInfo } from '@/api/sandbox'
+import {
+  consumeSandboxEvents, sandboxApi,
+  type SandboxInfo, type WorkspaceInfo, type WorkspaceServiceInfo,
+} from '@/api/sandbox'
 
 const props = defineProps<{
   projectId: number | null
@@ -125,6 +128,9 @@ const logsName = ref('')
 const logsTail = 300
 let logsServiceId: number | null = null
 let pollTimer: number | undefined
+let eventAbort: AbortController | undefined
+let eventRefreshTimer: number | undefined
+let eventConnected = false
 
 const form = reactive({ name: '', command: '', port: '' })
 
@@ -281,13 +287,53 @@ async function reloadLogs() {
   }
 }
 
+function scheduleReload() {
+  if (eventRefreshTimer) return
+  eventRefreshTimer = window.setTimeout(() => {
+    eventRefreshTimer = undefined
+    if (props.active) void load(true)
+  }, 300)
+}
+
+function startEvents() {
+  stopEvents()
+  const workspaceId = workspace.value?.id
+  if (!props.active || !workspaceId) return
+  eventAbort = new AbortController()
+  void consumeSandboxEvents(workspaceId, {
+    signal: eventAbort.signal,
+    onStateChange: (state) => {
+      const connected = state === 'connected'
+      if (connected === eventConnected) return
+      eventConnected = connected
+      startPolling()
+    },
+    onEvent: (event) => {
+      if (!event.type.startsWith('service.') && !event.type.startsWith('sandbox.')
+        && !event.type.startsWith('workspace.')) return
+      scheduleReload()
+    },
+  })
+}
+
+function stopEvents() {
+  eventAbort?.abort()
+  eventAbort = undefined
+  if (eventRefreshTimer) {
+    clearTimeout(eventRefreshTimer)
+    eventRefreshTimer = undefined
+  }
+}
+
 function startPolling() {
   stopPolling()
   if (!props.projectId) return
+  // SSE 正常时低频兜底；SSE 不可用时恢复 4s 轮询
+  const interval = eventConnected ? 30_000 : 4000
   pollTimer = window.setInterval(() => {
     if (document.visibilityState === 'hidden') return
     void load(true)
-  }, 4000)
+  }, interval)
 }
 
 function stopPolling() {
@@ -304,21 +350,29 @@ onMounted(() => {
   }
 })
 
-onUnmounted(stopPolling)
+onUnmounted(() => {
+  stopPolling()
+  stopEvents()
+})
 
 watch(() => props.projectId, () => {
   sandbox.value = null
   workspace.value = null
   services.value = []
+  stopEvents()
   if (props.active) void load(false)
 })
+
+watch(() => workspace.value?.id, () => startEvents())
 
 watch(() => props.active, (active) => {
   if (active) {
     void load(true)
     startPolling()
+    startEvents()
   } else {
     stopPolling()
+    stopEvents()
   }
 })
 </script>

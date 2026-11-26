@@ -118,8 +118,8 @@ import {
 } from '@lucide/vue'
 import { ElMessage } from 'element-plus'
 import {
-  sandboxApi, type PreviewGrantInfo, type SandboxInfo, type WorkspaceInfo,
-  type WorkspaceServiceInfo,
+  consumeSandboxEvents, sandboxApi,
+  type PreviewGrantInfo, type SandboxInfo, type WorkspaceInfo, type WorkspaceServiceInfo,
 } from '@/api/sandbox'
 
 const props = defineProps<{
@@ -145,6 +145,9 @@ const iframeTimedOut = ref(false)
 const grants = new Map<number, { url: string; fallback: string; expires: number; id: string }>()
 let pollTimer: number | undefined
 let frameTimer: number | undefined
+let eventAbort: AbortController | undefined
+let eventRefreshTimer: number | undefined
+let eventConnected = false
 let mounted = false
 let autoStartAttempted = false
 let usingFallback = false
@@ -421,13 +424,53 @@ async function copyUrl() {
   }
 }
 
+function scheduleReload() {
+  if (eventRefreshTimer) return
+  eventRefreshTimer = window.setTimeout(() => {
+    eventRefreshTimer = undefined
+    if (props.active) void load(true)
+  }, 400)
+}
+
+function startEvents() {
+  stopEvents()
+  const workspaceId = workspace.value?.id
+  if (!props.active || !workspaceId) return
+  eventAbort = new AbortController()
+  void consumeSandboxEvents(workspaceId, {
+    signal: eventAbort.signal,
+    onStateChange: (state) => {
+      const connected = state === 'connected'
+      if (connected === eventConnected) return
+      eventConnected = connected
+      startPolling()
+    },
+    onEvent: (event) => {
+      if (!event.type.startsWith('service.') && !event.type.startsWith('sandbox.')
+        && !event.type.startsWith('preview.')) return
+      scheduleReload()
+    },
+  })
+}
+
+function stopEvents() {
+  eventAbort?.abort()
+  eventAbort = undefined
+  if (eventRefreshTimer) {
+    clearTimeout(eventRefreshTimer)
+    eventRefreshTimer = undefined
+  }
+}
+
 function startPolling() {
   stopPolling()
   if (!props.projectId) return
+  // SSE 正常时低频兜底；SSE 不可用时恢复 4s 轮询
+  const interval = eventConnected ? 30_000 : 4000
   pollTimer = window.setInterval(() => {
     if (document.visibilityState === 'hidden') return
     void load(true)
-  }, 4000)
+  }, interval)
 }
 
 function stopPolling() {
@@ -448,21 +491,27 @@ onMounted(() => {
 onUnmounted(() => {
   mounted = false
   stopPolling()
+  stopEvents()
   stopFrameTimer()
 })
 
 watch(() => props.projectId, () => {
   reset()
+  stopEvents()
   if (props.active) void load(false)
 })
+
+watch(() => workspace.value?.id, () => startEvents())
 
 watch(() => props.active, (active) => {
   if (!mounted) return
   if (active) {
     void load(true)
     startPolling()
+    startEvents()
   } else {
     stopPolling()
+    stopEvents()
   }
 })
 </script>

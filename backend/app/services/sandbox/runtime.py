@@ -26,7 +26,8 @@ from app.models.sandbox import (
 from . import jobs, scheduler
 from .common import (
     SandboxNotFoundError, SandboxNotReadyError, SandboxOperationError,
-    emit_event, sha256_text, utcnow,
+    SandboxQuotaError, SandboxResourceUnavailable, emit_event, emit_event_detached,
+    sha256_text, utcnow,
 )
 from .profiles import get_profile
 
@@ -183,15 +184,32 @@ async def provision_workspace(
         await request_lifecycle(db, workspace, sandbox, "start", requested_by)
         return sandbox
 
-    await scheduler.lock_owner_for_quota(db, workspace.owner_user_id)
-    await scheduler.check_quota(db, workspace.owner_user_id, workspace.tenant_id)
-    profile = await get_profile(db, profile_name)
-    if workspace.resource_profile_id != profile.id:
-        workspace.resource_profile_id = profile.id
-        workspace.storage_quota_bytes = int(profile.disk_quota_bytes)
+    try:
+        await scheduler.lock_owner_for_quota(db, workspace.owner_user_id)
+        await scheduler.check_quota(db, workspace.owner_user_id, workspace.tenant_id)
+        profile = await get_profile(db, profile_name)
+        if workspace.resource_profile_id != profile.id:
+            workspace.resource_profile_id = profile.id
+            workspace.storage_quota_bytes = int(profile.disk_quota_bytes)
+        runner = await scheduler.select_runner(db, profile)
+    except SandboxQuotaError as exc:
+        await emit_event_detached(
+            "resource.denied", tenant_id=workspace.tenant_id,
+            user_id=requested_by or workspace.owner_user_id,
+            project_id=workspace.project_id, workspace_id=workspace.id,
+            payload={"reason": "quota", "message": str(exc)[:300]},
+        )
+        raise
+    except SandboxResourceUnavailable as exc:
+        await emit_event_detached(
+            "resource.waiting", tenant_id=workspace.tenant_id,
+            user_id=requested_by or workspace.owner_user_id,
+            project_id=workspace.project_id, workspace_id=workspace.id,
+            payload={"reason": "runner_capacity", "message": str(exc)[:300]},
+        )
+        raise
 
     generation = await _next_generation(db, workspace.id)
-    runner = await scheduler.select_runner(db, profile)
     sandbox = SandboxInstance(
         workspace_id=workspace.id,
         generation=generation,
@@ -211,7 +229,17 @@ async def provision_workspace(
     # 新 Generation 不继承旧容器的命令：旧 Operation 标记 interrupted
     await _interrupt_operations(db, workspace.id, sandbox.id)
 
-    await scheduler.reserve(db, runner, workspace, profile, sandbox_id=sandbox.id)
+    try:
+        await scheduler.reserve(db, runner, workspace, profile, sandbox_id=sandbox.id)
+    except SandboxResourceUnavailable as exc:
+        await emit_event_detached(
+            "resource.waiting", tenant_id=workspace.tenant_id,
+            user_id=requested_by or workspace.owner_user_id,
+            project_id=workspace.project_id, workspace_id=workspace.id,
+            sandbox_id=sandbox.id, generation=generation,
+            payload={"reason": "reserve_race", "message": str(exc)[:300]},
+        )
+        raise
     services = await _workspace_services(db, workspace.id)
     job, _created = await jobs.enqueue_job(
         db,
@@ -259,7 +287,17 @@ async def request_lifecycle(
         sandbox.desired_state = "running"
         if sandbox.observed_state in ("stopped", "failed") and sandbox.runner_id:
             # 停止/失败时可能已释放 CPU/RAM，启动前必须重新原子预留（不超卖）
-            await scheduler.reserve_compute_for_sandbox(db, sandbox)
+            try:
+                await scheduler.reserve_compute_for_sandbox(db, sandbox)
+            except SandboxResourceUnavailable as exc:
+                await emit_event_detached(
+                    "resource.waiting", tenant_id=workspace.tenant_id,
+                    user_id=requested_by or workspace.owner_user_id,
+                    project_id=workspace.project_id, workspace_id=workspace.id,
+                    sandbox_id=sandbox.id, generation=sandbox.generation,
+                    payload={"reason": "restart_capacity", "message": str(exc)[:300]},
+                )
+                raise
     elif action == "stop":
         if sandbox.observed_state in ("stopped", "queued") and sandbox.desired_state == "stopped":
             raise SandboxNotReadyError("Sandbox 已停止或尚未启动")

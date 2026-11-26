@@ -93,6 +93,87 @@ export interface ProjectWorkspaceDetail {
   preview_grants?: PreviewGrantInfo[]
 }
 
+export interface SandboxEventEnvelope {
+  id: number
+  type: string
+  project_id?: number | null
+  workspace_id?: number | null
+  sandbox_id?: number | null
+  generation?: number | null
+  job_id?: number | null
+  run_id?: string | null
+  payload?: Record<string, unknown>
+  created_at?: string | null
+}
+
+export interface SandboxEventStreamOptions {
+  onEvent: (event: SandboxEventEnvelope) => void
+  /** connected=首帧到达；reconnecting=断线重试中 */
+  onStateChange?: (state: 'connected' | 'reconnecting') => void
+  afterId?: number
+  signal?: AbortSignal
+}
+
+/**
+ * 消费 Workspace 事件流（SSE）：断线指数退避重连，按 after_id 续传。
+ * 只订阅当前用户有权限的 Workspace（后端每次请求复核 ACL）。
+ */
+export async function consumeSandboxEvents(
+  workspaceId: number,
+  options: SandboxEventStreamOptions,
+): Promise<void> {
+  let lastId = options.afterId ?? 0
+  let attempt = 0
+  while (!options.signal?.aborted) {
+    try {
+      const response = await fetch(
+        `/api/v2/workspaces/${workspaceId}/events?after_id=${lastId}`,
+        {
+          headers: { Authorization: `Bearer ${localStorage.getItem('access_token')}` },
+          signal: options.signal,
+        },
+      )
+      if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`)
+      attempt = 0
+      options.onStateChange?.('connected')
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      try {
+        while (!options.signal?.aborted) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          const frames = buffer.split('\n\n')
+          buffer = frames.pop() || ''
+          for (const frame of frames) {
+            const dataLine = frame.split('\n').find((line) => line.startsWith('data: '))
+            if (!dataLine) continue
+            try {
+              const envelope = JSON.parse(dataLine.slice(6)) as SandboxEventEnvelope
+              if (envelope.id > lastId) lastId = envelope.id
+              options.onEvent(envelope)
+            } catch (e) {
+              console.warn('[sandbox-events] JSON 解析失败，已跳过:', (e as Error).message)
+            }
+          }
+        }
+      } finally {
+        await reader.cancel().catch(() => {})
+        reader.releaseLock()
+      }
+      if (options.signal?.aborted) return
+      throw new Error('事件流提前关闭')
+    } catch {
+      if (options.signal?.aborted) return
+      attempt += 1
+      options.onStateChange?.('reconnecting')
+      const delay = Math.min(15_000, 1000 * 2 ** Math.min(attempt, 4))
+      await new Promise((resolve) => setTimeout(resolve, delay))
+    }
+  }
+}
+
 export const sandboxApi = {
   listProjects: () => request.get<any, { items: ProjectSummary[] }>('/projects'),
   getProject: (projectId: number) =>

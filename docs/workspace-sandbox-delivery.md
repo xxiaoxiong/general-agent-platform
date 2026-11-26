@@ -96,6 +96,15 @@
   （绑定 Grant + User）并实时复核 Project ACL；首次文档请求下发同源 HttpOnly Cookie，
   子资源与 WebSocket 复用；匿名/他人 Token 403。
 - **灰度开关**：`SANDBOX_ROLLOUT_USER_IDS` / `SANDBOX_ROLLOUT_PROJECT_IDS` 按用户/项目灰度。
+- **事件驱动 UI**：前端订阅 `GET /api/v2/workspaces/{id}/events` SSE（Bearer 认证、
+  `after_id` 断点续传、指数退避重连）；Services / Preview 面板收到
+  `service.* / sandbox.* / preview.* / workspace.*` 事件即刷新；SSE 正常时轮询降为
+  30s 兜底，SSE 不可用时恢复 4s 轮询。
+- **Service 事件与指标**：状态同步发布 `service.healthy` / `service.unhealthy` /
+  `service.exited`；`workspace_service_health` gauge 与 `workspace_service_restart_total`
+  （手动/自动重启）已实际写入。
+- **资源事件**：配额拒绝发布 `resource.denied`、节点容量不足发布 `resource.waiting`；
+  失败路径用独立会话提交审计事件，避免主事务回滚吞掉事件。
 
 ## 3. 验证记录（真实执行）
 
@@ -134,7 +143,10 @@
 2. **磁盘硬配额未实测**：默认 `soft` 模式；`hard` 依赖 XFS project quota / Btrfs qgroup，本机环境未验证。
 3. **MySQL downgrade 未执行**：仅验证升级与服务运行；SQLite / PostgreSQL 均已验证双向迁移。
 4. **性能基准样本有限**：已完成 3 轮真实 Docker 基准（环境/方法/数据见 `docs/workspace-sandbox-performance.md`），P95 等同于最大值；生产需在目标硬件扩大采样并覆盖并发创建、大型依赖安装、PID/磁盘压满等场景。
-5. **Preview UI 状态刷新使用 4s 轮询**：后端已提供 `GET /api/v2/workspaces/{id}/events` SSE；前端当前用轮询保证状态及时可见，未接入 SSE 推送。
+5. **SSE 事件推送已接入，但断线期间仍依赖轮询兜底**：Services / Preview 面板订阅
+   Workspace SSE（重连 + `after_id` 续传）；SSE 不可用时回退 4s 轮询。
+   多副本 Backend 部署时，事件流受各自进程内连接影响，但事件本身已持久化在
+   `sandbox_events`，重连后可按 `after_id` 补齐。
 6. **未实现**：GPU Sandbox、Kubernetes / gVisor / Kata / Firecracker、Warm Pool、Hibernate、跨节点 Volume 迁移、完整在线 IDE、Terminal Tab、多 Agent 并行修改同一工作树。
 7. **Docker Desktop 环境限制**：宿主机 LAN / 云元数据隔离需宿主防火墙；生产建议 Linux + 独立 Runner 主机。
 8. **Playwright 仅覆盖单浏览器（Edge）+ 单项目流程**：未覆盖 Firefox / WebKit 与多用户并行浏览器会话。

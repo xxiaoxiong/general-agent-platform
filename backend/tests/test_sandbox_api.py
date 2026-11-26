@@ -1,4 +1,5 @@
 """Workspace Sandbox API：项目/工作空间/服务/Preview/Runner 内部 API 契约。"""
+import json
 import os
 
 import pytest
@@ -153,6 +154,36 @@ def test_cross_user_cannot_access_project(client, sandbox_enabled):
     members = client.get(f"/api/v2/projects/{project_id}/members", headers=_auth(owner_id))
     assert members.status_code == 200
     assert members.json()["items"][0]["role"] == "admin"
+
+
+def test_workspace_events_sse_auth_and_incremental(client, sandbox_enabled):
+    """Workspace SSE：只有成员可订阅，事件带 workspace/generation 标识（§12.3）。"""
+    owner_id = _user("sbxapi-sse")
+    other_id = _user("sbxapi-sse-x")
+    created = client.post("/api/v2/projects", json={"name": "SSE 项目"},
+                          headers=_auth(owner_id))
+    assert created.status_code == 200, created.text
+    workspace_id = created.json()["workspace"]["id"]
+
+    denied = client.get(f"/api/v2/workspaces/{workspace_id}/events",
+                        headers=_auth(other_id))
+    assert denied.status_code == 404
+
+    with client.stream("GET", f"/api/v2/workspaces/{workspace_id}/events?after_id=0",
+                       headers=_auth(owner_id)) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        lines: list[str] = []
+        for line in response.iter_lines():
+            if line:
+                lines.append(line)
+            if any(item.startswith("data: ") for item in lines):
+                break
+    payload_line = next(item for item in lines if item.startswith("data: "))
+    event = json.loads(payload_line[6:])
+    assert event["type"] in ("workspace.provisioning", "workspace.created")
+    assert event["workspace_id"] == workspace_id
+    assert event["id"] >= 1
 
 
 def test_sandbox_disabled_returns_503(client, monkeypatch):

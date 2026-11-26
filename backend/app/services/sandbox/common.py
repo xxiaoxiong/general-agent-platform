@@ -140,6 +140,22 @@ async def emit_event(
     ))
 
 
+async def emit_event_detached(event_type: str, **fields: Any) -> None:
+    """失败路径的审计事件：独立会话提交，避免主事务回滚吞掉事件。
+
+    仅用于「业务操作被拒绝」这类随后会抛错、主会话必然回滚的场景；
+    正常路径仍用 ``emit_event`` 与业务写入同事务提交。
+    """
+    from app.core.database import AsyncSessionLocal
+
+    try:
+        async with AsyncSessionLocal() as session:
+            await emit_event(session, event_type, **fields)
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001 审计失败不得掩盖原始业务错误
+        logger.warning("沙箱审计事件写入失败（%s）：%s", event_type, exc)
+
+
 def lease_expiry(seconds: Optional[int] = None) -> datetime:
     return utcnow() + timedelta(seconds=seconds or settings.SANDBOX_JOB_LEASE_SECONDS)
 

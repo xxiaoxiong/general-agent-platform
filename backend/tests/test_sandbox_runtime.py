@@ -18,7 +18,9 @@ from app.models.sandbox import (
 )
 from app.models.user import User
 from app.models.agent import AgentSession
-from app.services.sandbox import jobs, projects, runtime, scheduler, session_files
+from app.services.sandbox import (
+    jobs, projects, runtime, scheduler, service_manager, session_files,
+)
 from app.services.sandbox.common import (
     SandboxAccessDenied, SandboxNotFoundError, SandboxQuotaError,
     SandboxResourceUnavailable, SandboxWriteBusy, sandbox_enabled_for,
@@ -540,3 +542,83 @@ async def _ready_for_session(user: User):
         await s.refresh(workspace)
         await s.refresh(sandbox)
         return project, workspace, sandbox
+
+
+async def test_service_state_sync_emits_events_and_updates_health(monkeypatch):
+    """Service 状态变化发布 service.healthy / service.exited（任务书 §12.3）。"""
+    user = await _user("u-svc")
+    project, workspace, sandbox = await _ready_for_session(user)
+    async with AsyncSessionLocal() as s:
+        service = WorkspaceService(
+            workspace_id=workspace.id, sandbox_id=sandbox.id, name="frontend",
+            command="npm run dev", working_directory="/workspace", port=5173,
+            desired_state="running", observed_state="starting",
+        )
+        s.add(service)
+        await s.commit()
+
+    async def _healthy(_sandbox_id):
+        return {"services": [{"name": "frontend", "observed_state": "healthy",
+                              "process_id": "4242", "exit_code": None}]}
+
+    monkeypatch.setattr(service_manager.agent_client, "list_services", _healthy)
+    async with AsyncSessionLocal() as s:
+        workspace_row = await s.get(Workspace, workspace.id)
+        sandbox_row = await runtime.active_sandbox(s, workspace.id)
+        changed = await service_manager.sync_service_states(s, workspace_row, sandbox_row)
+        await s.commit()
+        assert changed == 1
+
+    async with AsyncSessionLocal() as s:
+        service_row = (await s.execute(select(WorkspaceService))).scalar_one()
+        assert service_row.observed_state == "healthy"
+        assert service_row.process_id == "4242"
+        healthy_events = (await s.execute(
+            select(SandboxEvent).where(SandboxEvent.event_type == "service.healthy")
+        )).scalars().all()
+        assert len(healthy_events) == 1
+        assert healthy_events[0].generation == sandbox.generation
+        assert healthy_events[0].workspace_id == workspace.id
+
+    async def _missing(_sandbox_id):
+        return {"services": []}
+
+    monkeypatch.setattr(service_manager.agent_client, "list_services", _missing)
+    async with AsyncSessionLocal() as s:
+        workspace_row = await s.get(Workspace, workspace.id)
+        sandbox_row = await runtime.active_sandbox(s, workspace.id)
+        changed = await service_manager.sync_service_states(s, workspace_row, sandbox_row)
+        await s.commit()
+        assert changed == 1
+
+    async with AsyncSessionLocal() as s:
+        service_row = (await s.execute(select(WorkspaceService))).scalar_one()
+        assert service_row.observed_state == "exited"
+        exited_events = (await s.execute(
+            select(SandboxEvent).where(SandboxEvent.event_type == "service.exited")
+        )).scalars().all()
+        assert len(exited_events) == 1
+        assert exited_events[0].payload.get("reason") == "process_missing"
+
+
+async def test_quota_denied_emits_resource_event(monkeypatch):
+    """配额拒绝发布 resource.denied，前端可见（任务书 §12.3）。"""
+    monkeypatch.setattr(settings, "SANDBOX_MAX_ACTIVE_PER_USER", 1)
+    user = await _user("u-deny")
+    _p1, w1 = await _project_with_workspace(user, "配额项目1")
+    _p2, w2 = await _project_with_workspace(user, "配额项目2")
+    await _runner(name="runner-deny")
+    async with AsyncSessionLocal() as s:
+        await runtime.provision_workspace(s, w1)
+        await s.commit()
+    async with AsyncSessionLocal() as s:
+        with pytest.raises(SandboxQuotaError):
+            await runtime.provision_workspace(s, w2)
+        await s.rollback()
+    async with AsyncSessionLocal() as s:
+        events = (await s.execute(
+            select(SandboxEvent).where(SandboxEvent.event_type == "resource.denied")
+        )).scalars().all()
+        assert len(events) == 1
+        assert events[0].project_id == _p2.id
+        assert events[0].payload.get("reason") == "quota"
