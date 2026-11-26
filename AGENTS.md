@@ -83,6 +83,10 @@ docker compose -f docker/docker-compose.yml run --rm -e SANDBOX_DOCKER_TEST=1 \
 docker compose -f docker/docker-compose.yml run --rm -e SANDBOX_DOCKER_VITE=1 \
   -e DATABASE_URL=sqlite+aiosqlite:////tmp/vite.db -e DATABASE_SYNC_URL=sqlite:////tmp/vite.db \
   sandbox-runner python -m pytest tests/test_sandbox_docker_vite.py -q
+# 性能基准（Backend 容器内，输出环境/样本/P50/P95）
+docker cp backend/scripts/sandbox_benchmark.py ai_plat_backend:/tmp/sandbox_benchmark.py
+docker exec -e PYTHONPATH=/app -w /app -e BENCH_ITERATIONS=3 ai_plat_backend \
+  python /tmp/sandbox_benchmark.py
 
 # 数据库迁移
 cd backend && python -m alembic upgrade head

@@ -2,7 +2,8 @@
 
 > 目标：每个 Project 拥有长期持久化 Workspace；Agent 在隔离 Docker Sandbox 中执行命令、
 > 读写项目文件、运行 Service；用户在对话工作区 Preview 看到真实页面；单节点先行，
-> 多 Runner 可扩展。架构与模型见 `docs/architecture/workspace-sandbox-runtime.md`。
+> 多 Runner 可扩展。架构与模型见 `docs/architecture/workspace-sandbox-runtime.md`，
+> 性能基准见 `docs/workspace-sandbox-performance.md`。
 
 ## 1. 组件与安全边界
 
@@ -25,6 +26,8 @@
 - Runner 需要访问 `/var/run/docker.sock`；生产建议独立 Linux 主机。
 - 宿主机资源建议：≥ 4 vCPU / 8GB RAM / 50GB 磁盘（可配置保留量）。
 - 生产 Preview 需要独立域名（`PREVIEW_BASE_DOMAIN`）与 TLS；本地默认 `*.localhost`。
+- Backend `8000`、Frontend `80`、Preview `8081` 默认只绑定 `127.0.0.1`，避免 Sandbox
+  经宿主网关访问平台管理面；如需局域网访问，请通过受控反向代理（Caddy/Nginx）暴露。
 
 > Docker Desktop（Windows/macOS）可以运行 Runner 容器并创建 Sandbox 容器；
 > 但宿主机 LAN 隔离、磁盘硬配额与网络策略能力弱于 Linux，生产请使用 Linux。
@@ -79,6 +82,9 @@ curl -s http://localhost:8081/health      # preview-proxy
 | `PREVIEW_BASE_DOMAIN` | localhost | Preview 子域后缀 |
 | `PREVIEW_PUBLIC_BASE_URL` | 空 | 生产填写 `https://preview.example.com` |
 | `PREVIEW_PROXY_HOST_PORT` | 8081 | 浏览器访问端口 |
+| `PREVIEW_TOKEN_TTL` | 3600 | Preview Grant 有效期（秒） |
+| `PREVIEW_MAX_CONNECTIONS` | 16 | 单 Grant 并发连接上限 |
+| `PREVIEW_RATE_LIMIT_PER_MINUTE` | 600 | 单 Grant 每分钟请求上限（0=不限） |
 
 ## 4. 使用流程
 
@@ -234,6 +240,7 @@ docker compose -f docker/docker-compose.yml run --rm \
 - [ ] 生产 Preview 使用独立 HTTPS 域名，未向 Preview Origin 下发平台 Cookie。
 - [ ] 宿主机防火墙阻断 Sandbox 网段访问 LAN 管理地址与云元数据（`169.254.169.254`）。
 - [ ] 普通用户不能修改资源档位、配额、镜像、Runner。
+- [ ] Backend / Frontend / Preview Proxy 端口默认只绑定 `127.0.0.1`；对外访问经受控反向代理。
 - [ ] Project 成员移除后 Preview Grant 立即失效（后端 `revoke_grants_for_user`）。
 
 ## 9. 已知限制（第一阶段）

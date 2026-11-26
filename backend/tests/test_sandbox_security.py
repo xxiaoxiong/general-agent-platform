@@ -266,6 +266,16 @@ async def test_tool_executor_routes_context_handlers(monkeypatch):
     assert captured["ctx"] is ctx
 
 
+async def test_preview_rate_limit(monkeypatch):
+    from app.preview_proxy.app import _rate_allowed
+
+    monkeypatch.setattr(settings, "PREVIEW_RATE_LIMIT_PER_MINUTE", 2)
+    grant_id = "rate-test-grant"
+    assert await _rate_allowed(grant_id) is True
+    assert await _rate_allowed(grant_id) is True
+    assert await _rate_allowed(grant_id) is False
+
+
 async def test_sandbox_files_backend_maps_workspace_and_blocks_host_paths(monkeypatch):
     from app.services.agent_runtime.sandbox_backend import SandboxFilesBackend
 

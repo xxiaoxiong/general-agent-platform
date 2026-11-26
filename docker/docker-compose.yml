@@ -96,7 +96,8 @@ services:
     container_name: ai_plat_backend
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      # 仅回环绑定：Sandbox 不能经宿主机网关访问平台管理 API（生产再用反向代理暴露）
+      - "127.0.0.1:8000:8000"
     environment:
       APP_ENV: ${APP_ENV:-production}
       DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-ai_plat}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-ai_plat}
@@ -181,6 +182,7 @@ services:
       PREVIEW_PUBLIC_BASE_URL: ${PREVIEW_PUBLIC_BASE_URL:-}
       PREVIEW_TOKEN_TTL: ${PREVIEW_TOKEN_TTL:-3600}
       PREVIEW_MAX_CONNECTIONS: ${PREVIEW_MAX_CONNECTIONS:-16}
+      PREVIEW_RATE_LIMIT_PER_MINUTE: ${PREVIEW_RATE_LIMIT_PER_MINUTE:-600}
       PREVIEW_PROXY_PORT: ${PREVIEW_PROXY_PORT:-8081}
       PREVIEW_PROXY_HOST_PORT: ${PREVIEW_PROXY_HOST_PORT:-8081}
       UVICORN_WORKERS: "2"
@@ -265,7 +267,8 @@ services:
     restart: unless-stopped
     command: ["python", "-m", "app.preview_proxy"]
     ports:
-      - "${PREVIEW_PROXY_HOST_PORT:-8081}:8081"
+      # 仅回环绑定；生产通过独立 Preview 域名 + 反代暴露
+      - "127.0.0.1:${PREVIEW_PROXY_HOST_PORT:-8081}:8081"
     environment:
       APP_ENV: ${APP_ENV:-production}
       DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-ai_plat}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-ai_plat}
@@ -281,6 +284,7 @@ services:
       PREVIEW_PUBLIC_BASE_URL: ${PREVIEW_PUBLIC_BASE_URL:-}
       PREVIEW_TOKEN_TTL: ${PREVIEW_TOKEN_TTL:-3600}
       PREVIEW_MAX_CONNECTIONS: ${PREVIEW_MAX_CONNECTIONS:-16}
+      PREVIEW_RATE_LIMIT_PER_MINUTE: ${PREVIEW_RATE_LIMIT_PER_MINUTE:-600}
       PREVIEW_PROXY_PORT: "8081"
       PREVIEW_PROXY_HOST_PORT: ${PREVIEW_PROXY_HOST_PORT:-8081}
     networks:
@@ -355,7 +359,7 @@ services:
     container_name: ai_plat_frontend
     restart: unless-stopped
     ports:
-      - "80:80"
+      - "127.0.0.1:80:80"
     depends_on:
       - backend
 

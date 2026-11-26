@@ -12,6 +12,7 @@
 | 现状审查（Phase 0） | `docs/architecture/workspace-sandbox-current-state.md` |
 | 架构文档（ER / 状态机 / 时序 / 安全边界） | `docs/architecture/workspace-sandbox-runtime.md` |
 | 部署运维手册（备份 / 恢复 / 故障排查 / 安全清单） | `docs/workspace-sandbox-deployment.md` |
+| 性能基准报告（环境 / 方法 / 数据） | `docs/workspace-sandbox-performance.md`、`backend/scripts/sandbox_benchmark.py` |
 | 数据模型 | `backend/app/models/sandbox.py`（Project / ProjectMember / Workspace / SandboxInstance / SandboxJob / Runner / Reservation / Service / PreviewGrant / CommandOperation / Event / ResourceProfile） |
 | 数据库迁移 | `backend/alembic/versions/f0a1b2c3d4e5_add_workspace_sandbox_runtime.py` |
 | 控制面服务 | `backend/app/services/sandbox/`（runtime / scheduler / jobs / projects / acl / preview / service_manager / agent_client / write_lease / reconciler / session_files / profiles / bootstrap） |
@@ -86,18 +87,24 @@
   修复 npm/pip 缓存 EACCES 与 npx 二进制 Permission denied。
 - **Vite HMR**：Preview Proxy WebSocket 使用去掉 `/p/{token}` 前缀后的真实路径，
   Runner 去重 Host/Origin/Sec-WebSocket-Protocol 头；Vite 8 `?token=` 由页面客户端自动附加并透传。
+- **预览限流与端口收敛**：单个 Preview Grant 增加每分钟请求上限与并发连接上限；
+  Backend / Frontend / Preview Proxy 的宿主端口默认只绑定 `127.0.0.1`，避免 Sandbox
+  经宿主网关访问平台管理面。
+- **安全回归测试**：Docker Socket 未挂载、平台服务名不可解析、取消命令无孤儿进程
+  已加入真实 Docker 集成测试。
 - **灰度开关**：`SANDBOX_ROLLOUT_USER_IDS` / `SANDBOX_ROLLOUT_PROJECT_IDS` 按用户/项目灰度。
 
 ## 3. 验证记录（真实执行）
 
 | 验证 | 命令 / 方式 | 结果 |
 | --- | --- | --- |
-| 后端全量回归 | `cd backend && python -m pytest -q` | **1063 passed, 13 skipped, 111.45s** |
-| Sandbox 专项（模型/调度/Lease/ACL/预览/工具/文件后端/写租约/自动恢复） | `pytest tests/test_sandbox_runtime.py tests/test_sandbox_security.py tests/test_sandbox_api.py -q` | **26 passed** |
-| 真实 Docker 集成 | 在 Runner 容器内 `SANDBOX_DOCKER_TEST=1 pytest tests/test_sandbox_docker_integration.py` | **1 passed**（容器安全基线、Runner 断网后重新接入恢复 Gateway、命令、文件一致性、只读 rootfs、网络隔离、Service 健康 + HTTP、删除容器后新 Generation 文件保留、幂等创建） |
+| 后端全量回归 | `cd backend && python -m pytest -q` | **1064 passed, 13 skipped, 102.99s** |
+| Sandbox 专项（模型/调度/Lease/ACL/预览/工具/文件后端/写租约/自动恢复/限流） | `pytest tests/test_sandbox_runtime.py tests/test_sandbox_security.py tests/test_sandbox_api.py -q` | **27 passed** |
+| 真实 Docker 集成 | 在 Runner 容器内 `SANDBOX_DOCKER_TEST=1 pytest tests/test_sandbox_docker_integration.py` | **1 passed 39.90s**（容器安全基线、Runner 断网重连、Docker Socket 未挂载、取消命令无孤儿进程、命令、文件一致性、只读 rootfs、网络隔离含平台服务名、Service 健康 + HTTP、删除容器后新 Generation 文件保留、幂等创建） |
 | Vite HMR / WebSocket | 在 Runner 容器内 `SANDBOX_DOCKER_VITE=1 pytest tests/test_sandbox_docker_vite.py -q -s` | **1 passed 13.43s**（Vite 安装、dev server、`vite-hmr` WS、修改源码收到 `full-reload`） |
 | 真实端到端（服务层） | 容器内脚本：项目 → Provision → 命令（uid=10001）→ Service → Preview | `exec succeeded`、`service healthy`、子域预览 200、兜底 200、坏 Token 401 |
 | 浏览器 E2E | `npm run test:e2e:sandbox`（真实 Edge + 已部署栈） | **1 passed 16.0s**：项目创建 → Sandbox Ready → Service healthy → iframe 真实页面 → 刷新后预览 → 切换项目不串显 → Services 面板；截图见 `docs/assets/` |
+| 性能基准 | `BENCH_ITERATIONS=3 python scripts/sandbox_benchmark.py`（Backend 容器内） | Provision→Ready P50 13.07s / P95 13.07s；命令 P50 0.124s；Service→Healthy P50 1.68s；Preview 首次访问 P50 0.040s（详见性能报告） |
 | 前端类型检查/构建 | `cd frontend && npm run build` | 通过 |
 | Compose 校验 | `docker compose --profile sandbox --profile sandbox-image config -q` | 通过 |
 | SQLite 迁移 | `alembic upgrade head` + `downgrade base` | 通过 |
@@ -122,7 +129,7 @@
 1. **多 Runner 实际调度未做双节点真机验证**：注册、心跳、容量、目标 Runner、排空接口已实现，单节点验收通过。
 2. **磁盘硬配额未实测**：默认 `soft` 模式；`hard` 依赖 XFS project quota / Btrfs qgroup，本机环境未验证。
 3. **MySQL downgrade 未执行**：仅验证升级与服务运行；SQLite / PostgreSQL 均已验证双向迁移。
-4. **性能指标未做基准压测**：Warm Sandbox Ready P50/P95、命令执行 P50/P95、Vite 启动耗时未形成压测报告（当前仅记录单次端到端耗时）。
+4. **性能基准样本有限**：已完成 3 轮真实 Docker 基准（环境/方法/数据见 `docs/workspace-sandbox-performance.md`），P95 等同于最大值；生产需在目标硬件扩大采样并覆盖并发创建、大型依赖安装、PID/磁盘压满等场景。
 5. **Preview UI 状态刷新使用 4s 轮询**：后端已提供 `GET /api/v2/workspaces/{id}/events` SSE；前端当前用轮询保证状态及时可见，未接入 SSE 推送。
 6. **未实现**：GPU Sandbox、Kubernetes / gVisor / Kata / Firecracker、Warm Pool、Hibernate、跨节点 Volume 迁移、完整在线 IDE、Terminal Tab、多 Agent 并行修改同一工作树。
 7. **Docker Desktop 环境限制**：宿主机 LAN / 云元数据隔离需宿主防火墙；生产建议 Linux + 独立 Runner 主机。

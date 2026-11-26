@@ -155,13 +155,36 @@ async def test_real_docker_sandbox_lifecycle_and_isolation():
         })
         assert readonly["exit_code"] != 0
 
+        # ── Docker Socket 不得挂载进 Sandbox ────────────────────────────
+        socket_check = await _agent(ip, token, "POST", "/exec", json={
+            "command": "test -S /var/run/docker.sock && echo PRESENT || echo ABSENT",
+            "working_directory": "/workspace", "timeout_seconds": 30, "wait_seconds": 10,
+        })
+        assert "ABSENT" in socket_check["stdout"], socket_check
+
+        # ── 取消命令：进程组清理，无孤儿进程 ─────────────────────────────
+        long_op = await _agent(ip, token, "POST", "/exec", json={
+            "command": "sleep 300", "working_directory": "/workspace",
+            "timeout_seconds": 600, "wait_seconds": 1,
+        })
+        assert long_op["status"] == "running"
+        cancelled = await _agent(
+            ip, token, "POST", f"/exec/{long_op['operation_id']}/cancel")
+        assert cancelled["status"] == "cancelled", cancelled
+        await asyncio.sleep(2)
+        orphan = await _agent(ip, token, "POST", "/exec", json={
+            "command": "pgrep -x sleep || true", "working_directory": "/workspace",
+            "timeout_seconds": 30, "wait_seconds": 10,
+        })
+        assert not orphan["stdout"].strip(), orphan["stdout"]
+
         # ── 网络隔离：不能解析平台服务名 ─────────────────────────────────
         isolation = await _agent(ip, token, "POST", "/exec", json={
             "command": (
                 "python3 - <<'PY'\n"
                 "import socket\n"
                 "socket.setdefaulttimeout(1)\n"
-                "for name in ('backend','mysql','redis','checkpoint_pg'):\n"
+                "for name in ('backend','mysql','redis','checkpoint_pg','sandbox-runner','preview-proxy'):\n"
                 "    try:\n"
                 "        socket.gethostbyname(name)\n"
                 "        print(name, 'RESOLVED')\n"

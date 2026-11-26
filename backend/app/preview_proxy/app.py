@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from typing import Optional
 
 import httpx
@@ -37,6 +38,28 @@ _PATH_TOKEN_RE = re.compile(r"^/p/([A-Za-z0-9_-]{16,128})(/.*)?$")
 
 _connection_lock = asyncio.Lock()
 _connections: dict[str, int] = {}
+_rate_lock = asyncio.Lock()
+_rate_windows: dict[str, list[float]] = {}
+
+
+async def _rate_allowed(grant_id: str) -> bool:
+    """单 Grant 每分钟请求上限（滑动窗口，进程内；多副本部署按副本计）。"""
+    limit = int(settings.PREVIEW_RATE_LIMIT_PER_MINUTE or 0)
+    if limit <= 0:
+        return True
+    now = time.monotonic()
+    async with _rate_lock:
+        window = [stamp for stamp in _rate_windows.get(grant_id, []) if now - stamp < 60.0]
+        if len(window) >= limit:
+            _rate_windows[grant_id] = window
+            return False
+        window.append(now)
+        _rate_windows[grant_id] = window
+        if len(_rate_windows) > 2000:
+            empty = [key for key, stamps in _rate_windows.items() if not stamps]
+            for key in empty[:1000]:
+                _rate_windows.pop(key, None)
+        return True
 
 
 def _runner_base() -> str:
@@ -143,6 +166,11 @@ async def proxy_http(request: Request, path: str):
         metrics.inc_preview_request(denied=True)
         return JSONResponse(status_code=exc.status_code,
                             content={"code": exc.code, "message": exc.message})
+    if not await _rate_allowed(target["grant_id"]):
+        metrics.inc_preview_request(denied=True)
+        return JSONResponse(status_code=429,
+                            content={"code": "preview_rate_limited",
+                                     "message": "预览请求过于频繁，请稍后重试"})
     if not await _acquire(target["grant_id"]):
         metrics.inc_preview_request(denied=True)
         return JSONResponse(status_code=429,
@@ -228,6 +256,10 @@ async def proxy_ws(websocket: WebSocket, path: str):
         await websocket.close(code=1011)
         return
     if not await _acquire(target["grant_id"]):
+        await websocket.close(code=4429)
+        return
+    if not await _rate_allowed(target["grant_id"]):
+        await _release(target["grant_id"])
         await websocket.close(code=4429)
         return
     try:
