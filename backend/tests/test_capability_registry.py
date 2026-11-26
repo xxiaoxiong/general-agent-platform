@@ -129,8 +129,27 @@ class TestRuntimeIntegration:
         })
         assert [s["name"] for s in specs] == ["calculator"]
 
-        # 未关闭（None/True）时保持原有工具面，只做收窄不做扩张
+        # 已配置网络检索工具时不重复添加（其余只读检索工具按开关补齐）
         specs = AgentRuntimeService._resolve_tool_specs(None, {
             "tools": ["web_search", "calculator"], "web_enabled": True,
         })
-        assert [s["name"] for s in specs] == ["web_search", "calculator"]
+        names = [s["name"] for s in specs]
+        assert "web_search" in names and "calculator" in names
+        assert names.count("web_search") == 1
+
+    def test_web_enabled_true_grants_readonly_retrieval_tools(self):
+        """联网开关是用户级显式授权：未配置网络能力的 Agent 也要能用只读检索。"""
+        from app.services.agent_runtime.service import AgentRuntimeService
+
+        specs = AgentRuntimeService._resolve_tool_specs(None, {
+            "capability_ids": ["general"], "tools": [], "web_enabled": True,
+        })
+        names = [s["name"] for s in specs]
+        assert "web_search" in names and "fetch_webpage" in names
+        assert "http_get" not in names, "只补只读检索，不补通用 HTTP 请求工具"
+
+        # Agent 显式 enabled=False 的工具不补（Agent 级收窄优先）
+        specs = AgentRuntimeService._resolve_tool_specs(None, {
+            "tools": [{"name": "web_search", "enabled": False}], "web_enabled": True,
+        })
+        assert "web_search" not in [s["name"] for s in specs]

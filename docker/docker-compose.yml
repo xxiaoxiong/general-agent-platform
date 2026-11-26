@@ -118,6 +118,8 @@ services:
       # 网页搜索：内网 SearXNG 元搜索（独立容器，经服务名访问）；留空则仅用外网引擎
       SEARXNG_URL: ${SEARXNG_URL:-http://searxng:8080}
       SEARCH_TIMEOUT: ${SEARCH_TIMEOUT:-25}
+      # 提示词"当前时间"时区（容器为 UTC，避免北京时间凌晨日期差一天）
+      AGENT_TIMEZONE: ${AGENT_TIMEZONE:-Asia/Shanghai}
       # 注意：默认值内的单引号属于 YAML 引用，不能放进 ${} 插值内部，
       # 否则会作为字面量混入 JSON 导致 json.loads 失败（启动崩溃）
       CORS_ORIGINS: '${CORS_ORIGINS:-["http://localhost:5173","http://localhost:3000","http://localhost:80"]}'
@@ -130,6 +132,11 @@ services:
       AGENT_MAX_MODEL_CALLS: ${AGENT_MAX_MODEL_CALLS:-1000}
       AGENT_MAX_TOOL_CALLS: ${AGENT_MAX_TOOL_CALLS:-1000}
       AGENT_RUN_TIMEOUT: ${AGENT_RUN_TIMEOUT:-0}
+      # 语义决策（Decision Architecture）：off / shadow / llm
+      AGENT_DECISION_MODE: ${AGENT_DECISION_MODE:-llm}
+      AGENT_DECISION_TIMEOUT: ${AGENT_DECISION_TIMEOUT:-15}
+      AGENT_DECISION_MAX_TOKENS: ${AGENT_DECISION_MAX_TOKENS:-600}
+      AGENT_AUTO_TEAM_ENABLED: ${AGENT_AUTO_TEAM_ENABLED:-false}
       AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT: ${AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT:-false}
       AGENT_INNER_TIMEOUT_RETRIES: ${AGENT_INNER_TIMEOUT_RETRIES:-1}
       AGENT_PROJECT_VERIFIER_DIR: ${AGENT_PROJECT_VERIFIER_DIR-/var/lib/project-verifier}

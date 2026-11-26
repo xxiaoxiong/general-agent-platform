@@ -56,7 +56,8 @@ SUBAGENT_PROFILES: Dict[str, SubAgentProfile] = {
                 "3. 迭代补搜：先宽搜建立概念，再针对缺口补搜；关键事实（数字/日期/排名）"
                 "尽量用 2 个独立来源交叉核对，无法核对的信息标注「单一来源」。\n"
                 "4. 时效要求：涉及「最新/进展/趋势」的问题必须检索，并优先采用带发布日期的"
-                "近期资料；引用时注明信息时间，过时信息要明确说明其时间。\n"
+                "近期资料；引用时注明信息时间，过时信息要明确说明其时间。检索到的最新资料"
+                "若明显早于当前时间，必须标注资料截止时间，不得把旧资料当作当前状态。\n"
                 "5. 引用规范：正文中每条事实结论后用 [N] 编号引用（如 [1][2]），文末输出"
                 "「## 来源清单」表（N / 标题 / URL / 发布时间），编号一一对应；"
                 "URL 必须来自检索结果，不得引用未在检索结果中出现的链接。\n"
@@ -105,11 +106,11 @@ class SubAgentRegistry:
 
 def build_subagents(policy: ToolPolicy, registry: Optional[SubAgentRegistry] = None) -> List[Dict[str, Any]]:
     """按当前运行策略生成 deepagents subagents 配置（工具收窄到交集）。"""
-    from datetime import date
+    from app.core.time_context import current_time_text
 
     reg = registry or SubAgentRegistry()
-    # 注入当前日期：子代理系统提示独立于主提示，时效判断同样依赖"今天是几号"
-    today_line = f"\n\n今天是 {date.today().isoformat()}。"
+    # 注入当前时间：子代理系统提示独立于主提示，时效判断同样依赖"现在几点"
+    today_line = f"\n\n当前时间：{current_time_text()}。"
     out = []
     for p in reg.list_profiles():
         allowed = sorted(set(p.tools) & policy.allowed_tools)

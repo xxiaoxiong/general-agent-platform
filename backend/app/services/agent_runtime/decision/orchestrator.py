@@ -31,15 +31,18 @@ def should_defer_semantic(
     document_profile_id: int | None = None,
     task_options: dict[str, Any] | None = None,
     team_mode: bool = False,
-    has_context: bool = False,
 ) -> bool:
-    """自动模式且存在需要结合上下文判断的内容时，才把语义决策延迟到 Run 内。"""
+    """自动模式一律把语义决策延迟到 Run 内执行（含新会话第一条消息）。
+
+    显式任务模式、显式文档资源、显式团队模式是用户的确定性指令，直接执行；
+    其余都交给 Run 内决策器，避免关键词规则把「查查最新进展」这类时效任务
+    误判为普通对话（决策因此具备 Run ID、事件、Trace 与恢复能力）。
+    """
     return bool(
         mode in {"shadow", "llm"}
         and task_mode == "auto"
         and not document_id and not document_profile_id
         and not task_options and not team_mode
-        and has_context
     )
 
 
@@ -180,6 +183,7 @@ async def resolve_run_decision(
     model_config: dict[str, Any],
     mode: str | None = None,
     auto_team: bool = False,
+    tools: list[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """返回 (最终执行上下文, 决策事件数据)。非决策 Run 原样返回。"""
     mode = mode or settings.AGENT_DECISION_MODE
@@ -217,7 +221,8 @@ async def resolve_run_decision(
             preview_document=decision_input.get("preview_document"),
             attachments=decision_input.get("attachments") or [],
             capabilities=agent_config.get("capability_ids") or [],
-            tools=_tool_names(agent_config),
+            # 决策器看到的必须是运行时真实工具面（能力包解析 + 联网开关收窄/补齐后）
+            tools=tools if tools is not None else _tool_names(agent_config),
             explicit=decision_input.get("explicit") or {},
         )
 

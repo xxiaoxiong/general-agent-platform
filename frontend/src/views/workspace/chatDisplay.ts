@@ -128,7 +128,7 @@ export function groupSummary(g: ToolGroupItem): string {
   const search = ['ls', 'glob', 'grep']
   const exec = ['execute', 'python_exec']
   const write = ['write_file', 'edit_file']
-  const net = ['web_search', 'http_request']
+  const net = ['web_search', 'fetch_webpage', 'http_get', 'http_request']
   const del = ['delete_file', 'delete']
   const count = (names: string[]) => g.items.filter((i) => names.includes(i.name)).length
   const parts: string[] = []

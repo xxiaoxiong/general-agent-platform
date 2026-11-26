@@ -343,6 +343,9 @@ class StreamMixin:
                 from app.services.agent_runtime.decision.orchestrator import resolve_run_decision
 
                 original_context = execution_context
+                # 决策器需要知道本轮真实可用工具（能力包 + 联网开关生效后的工具面），
+                # 否则会把「可联网调研」误判为普通对话
+                decision_tools = [spec["name"] for spec in self._resolve_tool_specs(agent_config)]
                 resolved_context, decision_payload = await resolve_run_decision(
                     run_id=run.run_id,
                     session_id=run.session_id,
@@ -353,6 +356,7 @@ class StreamMixin:
                     provider=provider,
                     model_config=model_config,
                     auto_team=bool(getattr(settings, "AGENT_AUTO_TEAM_ENABLED", False)),
+                    tools=decision_tools,
                 )
                 # 保持与 Worker RunJob / Registry 的同一引用：释放策略需看到最终路线
                 if resolved_context is not original_context:
@@ -382,6 +386,52 @@ class StreamMixin:
                         "clarification_question": decision.get("clarification_question") or "",
                         "deliverable_format": decision.get("deliverable_format") or "none",
                     }
+                    # 关键歧义：服务端直接结束本轮并只输出澄清问题。
+                    # 模型拥有语义判断权，但不能靠"自律"绕过澄清去执行工具（会从错误起点开始检索）。
+                    clarify_question = str(
+                        decision.get("clarification_question") or ""
+                    ).strip()
+                    if decision.get("decision_status") == "ambiguous" and clarify_question:
+                        await bus.publish(RuntimeEvent(
+                            type="task.routed", run_id=run.run_id,
+                            data={
+                                "task_type": execution_context.get("task_type"),
+                                "intent": decision.get("intent"),
+                                "intent_source": "llm",
+                                "decision_status": "ambiguous",
+                                "clarify_question": clarify_question,
+                                "goal_mode": bool(agent_config.get("goal_mode")),
+                                "attachment_count": len(
+                                    execution_context.get("attachment_refs") or []
+                                ),
+                            },
+                        ))
+                        await bus.publish(RuntimeEvent(
+                            type=MODEL_DELTA, run_id=run.run_id,
+                            data={"text": clarify_question},
+                        ))
+                        run.final_text = clarify_question
+                        run.summary = {
+                            "tool_calls": 0, "model_calls": 0, "model_node_runs": 0,
+                            "tokens_generated": 0, "steps": 0, "elapsed_seconds": 0,
+                            "clarify": True,
+                        }
+                        run.transition(STATUS_COMPLETED)
+                        await self._commit(
+                            run, status=STATUS_COMPLETED,
+                            final_text=clarify_question, summary=run.summary,
+                            finished=True,
+                        )
+                        try:
+                            await self._write_back_session(run)
+                        except Exception:
+                            logger.exception("run %s 澄清态会话写回失败", run.run_id)
+                        await bus.publish(RuntimeEvent(
+                            type=RUN_COMPLETED, run_id=run.run_id,
+                            data={"final_text": clarify_question, "summary": run.summary},
+                        ))
+                        telemetry.record_run(log_fields, status="completed")
+                        return
                 # 决策后可能补入历史附件（延续任务）：系统提示显式列出可用文件，
                 # 避免通用 Agent 只看到初始注记而漏读后续解析出的附件
                 attachment_paths = [

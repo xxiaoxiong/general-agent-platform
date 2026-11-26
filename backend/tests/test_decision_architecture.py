@@ -622,13 +622,26 @@ async def test_orchestrator_reuses_persisted_decision_after_restart(monkeypatch)
 
 
 def test_should_defer_semantic_respects_explicit_controls():
-    assert should_defer_semantic("llm", task_mode="auto", has_context=True) is True
-    assert should_defer_semantic("shadow", task_mode="auto", has_context=True) is True
-    assert should_defer_semantic("off", task_mode="auto", has_context=True) is False
-    assert should_defer_semantic("llm", task_mode="auto", has_context=False) is False
-    assert should_defer_semantic("llm", task_mode="document_generate", has_context=True) is False
-    assert should_defer_semantic("llm", task_mode="auto", document_id=7, has_context=True) is False
-    assert should_defer_semantic("llm", task_mode="auto", team_mode=True, has_context=True) is False
+    # 自动模式一律延迟到 Run 内做 LLM 决策（含新会话第一条消息，
+    # 避免关键词规则把“查查最新进展”误判为普通对话）
+    assert should_defer_semantic("llm", task_mode="auto") is True
+    assert should_defer_semantic("shadow", task_mode="auto") is True
+    assert should_defer_semantic("off", task_mode="auto") is False
+    # 显式任务模式 / 显式文档资源 / 显式团队模式是确定性指令，直接执行
+    assert should_defer_semantic("llm", task_mode="document_generate") is False
+    assert should_defer_semantic("llm", task_mode="auto", document_id=7) is False
+    assert should_defer_semantic("llm", task_mode="auto", team_mode=True) is False
+
+
+def test_decision_prompt_carries_current_time():
+    """决策提示必须带当前时间，否则时效性任务无法判断“最新”。"""
+    from app.services.agent_runtime.decision.context import (
+        build_decision_context, render_decision_prompt,
+    )
+
+    text = render_decision_prompt(build_decision_context("查查当前最新进展"))
+    assert "## 当前时间" in text
+    assert "星期" in text
 
 
 # ── TaskContract 与决策解耦 ─────────────────────────────────────────────────

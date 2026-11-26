@@ -270,7 +270,6 @@ async def create_run(
         document_profile_id=body.document_profile_id,
         task_options=body.task_options,
         team_mode=body.team_mode,
-        has_context=bool(history or attachment_refs or preview_hint),
     )
     message_id = uuid.uuid4().hex
     if defer_semantic:

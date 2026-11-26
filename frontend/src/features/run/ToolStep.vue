@@ -101,6 +101,8 @@ const TOOL_VERBS: Record<string, [string, string]> = {
   delete_file: ['已删除', '正在删除'],
   delete: ['已删除', '正在删除'],
   web_search: ['已搜索网络', '正在搜索网络'],
+  fetch_webpage: ['已抓取网页', '正在抓取网页'],
+  http_get: ['已请求网络', '正在请求网络'],
   http_request: ['请求已发送', '请求发送中'],
 }
 const toolLabel = computed(() => {

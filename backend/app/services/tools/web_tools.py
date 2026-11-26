@@ -44,12 +44,14 @@ TOOLS: List[Dict[str, Any]] = [
         "category": "网络增强",
         "description": (
             "实时搜索互联网获取最新信息（多引擎备用，无需 API Key）。"
-            "返回标题、摘要和链接，LLM 可在回答中用 [标题](URL) 格式引用链接。"
+            "返回标题、摘要、发布时间和链接，LLM 可在回答中用 [标题](URL) 格式引用链接。"
+            "先用本工具发现来源，再用 fetch_webpage 精读关键页面。"
         ),
         "parameters": {
             "query":       {"type": "string",  "description": "搜索关键词或问题"},
             "max_results": {"type": "integer", "description": "返回结果数量，默认5，最多10", "default": 5},
             "engine":      {"type": "string",  "description": "搜索引擎: auto/bing/baidu，默认auto", "default": "auto"},
+            "time_range":  {"type": "string",  "description": "发布时间范围: all/day/week/month/year，默认all；查询最新进展时按需收窄", "default": "all"},
         },
         "required": ["query"],
     },
@@ -57,7 +59,10 @@ TOOLS: List[Dict[str, Any]] = [
         "name": "fetch_webpage",
         "display_name": "🌐 抓取网页",
         "category": "网络增强",
-        "description": "抓取指定 URL 的网页正文内容，用于读取文章、文档、新闻详情等",
+        "description": (
+            "抓取指定 URL 的网页正文内容，用于读取已知链接的文章、文档、新闻详情。"
+            "不知道来源 URL 时先用 web_search 搜索，不要用它代替搜索。"
+        ),
         "parameters": {
             "url":      {"type": "string",  "description": "要抓取的网页 URL"},
             "max_len":  {"type": "integer", "description": "返回最大字符数，默认3000", "default": 3000},
@@ -137,10 +142,26 @@ async def _fetch_page_text(client: httpx.AsyncClient, url: str, max_len: int = 1
         return ""
 
 
-def _format_search_results(query: str, results: List[Dict], engine: str) -> str:
+def _format_search_results(
+    query: str,
+    results: List[Dict],
+    engine: str,
+    *,
+    time_range: str = "all",
+    time_filtered: bool = False,
+) -> str:
     if not results:
         return f"搜索 '{query}' 未找到结果"
-    lines = [f"搜索结果（{query}，来源: {engine}）:\n"]
+    from app.core.time_context import current_time_text
+
+    lines = [
+        f"搜索结果（{query}，来源: {engine}）",
+        f"检索时间：{current_time_text()}",
+    ]
+    if time_range != "all":
+        applied = "已应用" if time_filtered else "当前引擎不支持，未应用"
+        lines.append(f"时间范围：{time_range}（{applied}）")
+    lines.append("发布时间以各来源标注为准；请优先采用近期资料，资料明显早于当前时间时须在回答中注明。\n")
     for i, r in enumerate(results, 1):
         lines.append(f"{i}. **{r['title']}**")
         if r.get("published"):
@@ -278,6 +299,9 @@ async def execute_web_search(params: dict) -> Any:
     query       = params.get("query", "")
     max_results = min(int(params.get("max_results", 5)), 10)
     engine      = params.get("engine", "auto").lower()
+    time_range  = (params.get("time_range") or "all").lower()
+    if time_range not in ("all", "day", "week", "month", "year"):
+        time_range = "all"
 
     errors = []  # 记录每个引擎的失败原因
     reachable = False  # 是否至少有一个搜索引擎给出了 HTTP 响应（0 结果 ≠ 网络不可达）
@@ -298,7 +322,11 @@ async def execute_web_search(params: dict) -> Any:
                 ) as searxng_client:
                     resp = await searxng_client.get(
                         f"{searxng_url.rstrip('/')}/search",
-                        params={"q": query, "format": "json", "language": _query_language(query)},
+                        params={
+                            "q": query, "format": "json",
+                            "language": _query_language(query),
+                            **({"time_range": time_range} if time_range != "all" else {}),
+                        },
                         headers=_HEADERS,
                     )
                 reachable = True
@@ -420,7 +448,12 @@ async def execute_web_search(params: dict) -> Any:
                 pass  # 内容拓展失败不影响主流程
             # 文本契约保持不变；结构化来源走 metadata 旁路（SSE 事件/前端引用卡片）
             return ToolResult.succeeded(
-                _format_search_results(query, found_results, found_engine),
+                _format_search_results(
+                    query, found_results, found_engine,
+                    time_range=time_range,
+                    # 只有 SearXNG 支持 time_range；降级引擎必须如实告知未应用
+                    time_filtered=(found_engine == "SearXNG"),
+                ),
                 metadata={"sources": _build_sources(found_results), "engine": found_engine},
             )
 
@@ -432,6 +465,7 @@ async def execute_web_search(params: dict) -> Any:
             f"搜索 '{query}' 未找到可用结果。\n"
             f"引擎状态: {error_detail}\n"
             "请调整查询词后重试（更宽泛的关键词，或去掉 site:、引号等限定符）；"
+            "查询最新信息时可补充年份或调整 time_range。"
             "如果多次检索仍无结果，请如实说明未检索到相关公开资料，不要编造来源。",
             retryable=False,
         )

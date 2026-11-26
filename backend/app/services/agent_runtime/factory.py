@@ -214,10 +214,17 @@ def _subagent_tools(subagent: Dict[str, Any], adapter: ToolAdapterFactory):
 
 def _compose_system_prompt(ctx: RuntimeContext) -> str:
     parts = [ctx.agent_config.get("system_prompt") or "你是一个智能助手。"]
-    # 注入当前日期：模型知识有截止时间，时效判断必须知道"今天"，否则会把旧资料当现状
-    from datetime import date
+    # 注入当前时间：模型知识有截止时间，时效判断必须知道"现在"，否则会把旧资料当现状。
+    # 时区可配置（容器默认 UTC，直接取本地日期会在北京时间凌晨差一天）。
+    from app.core.time_context import current_time_text
 
-    parts.append(f"今天是 {date.today().isoformat()}。涉及「最新/进展/趋势」的问题必须联网检索核实，不得凭记忆断言现状。")
+    parts.append(
+        f"当前时间：{current_time_text()}。\n"
+        "你的训练知识存在截止时间：涉及「现在/当前/最新/进展/现状/价格」等时效性问题时，"
+        "必须先联网检索核实，不得凭记忆断言现状。\n"
+        "引用网络资料时必须注明其发布时间；若检索到的最新资料明显早于当前时间，"
+        "必须在回答中说明资料截止时间，不得把旧资料当作当前状态。"
+    )
     if ctx.db_info and ctx.db_info.get("hint"):
         parts.append(ctx.db_info["hint"])
     if ctx.memory_context:

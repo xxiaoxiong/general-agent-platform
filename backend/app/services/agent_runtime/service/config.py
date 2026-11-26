@@ -130,6 +130,20 @@ class ConfigMixin:
             from app.services.tools import WEB_RETRIEVAL_TOOLS
 
             specs = [s for s in specs if s["name"] not in WEB_RETRIEVAL_TOOLS]
+        elif agent_config.get("web_enabled") is True and settings.AGENT_ALLOW_NETWORK:
+            # 联网开关是用户级显式授权：Agent 未配置网络研究能力时补齐只读检索工具，
+            # 否则开关打开却没有工具可用（前端默认开启，用户会误以为已经联网）。
+            # 只补 web_search / fetch_webpage（只读检索），不补 http_get 等通用请求工具；
+            # Agent 显式 enabled=False 的工具不补（Agent 级收窄优先）。
+            from app.services.tools import get_tool_by_name
+
+            existing = {spec["name"] for spec in specs}
+            for name in ("web_search", "fetch_webpage"):
+                if name in existing or name in disabled:
+                    continue
+                spec = get_tool_by_name(name)
+                if spec:
+                    specs.append(spec)
         # MCP 工具面（装配期写入，见 _load_mcp_runtime）：与内置工具同口径进入
         # 工具面/事件桥接/授权集合
         specs.extend(agent_config.get("mcp_tool_specs") or [])

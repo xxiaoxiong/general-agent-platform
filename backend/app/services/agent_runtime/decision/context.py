@@ -193,6 +193,11 @@ _SYSTEM = """你是通用智能体的任务决策器。你只做一次语义判�
     属于对话或工程输出，不要进入 Word 文档流程。
 17. 没有具体对象或方向的延续请求（如“再来一版 / 继续优化 / 按之前说的做 / 你懂的”）
     属于关键歧义：必须 decision_status=ambiguous 并 clarify，不得自行假定要改哪份文档。
+18. 涉及“现在/当前/最新/现状/进展”等时效性问题时，intent 优先 research（需要真实联网检索），
+    不要因为问题看起来简单就按 general_chat 凭记忆回答。
+19. 用户使用存在多种解释的缩写/简称，且不同解释会落到完全不同的知识领域时，
+    若本轮消息和历史都没有给出领域线索，decision_status=ambiguous 并 clarify 具体领域；
+    历史已明确领域时按历史领域理解，不要重复澄清。
 
 ## 输出
 只输出一个 JSON 对象，不要 Markdown 代码块、不要解释。字段：
@@ -206,7 +211,9 @@ _SYSTEM = """你是通用智能体的任务决策器。你只做一次语义判�
 
 def render_decision_prompt(context: DecisionContext) -> str:
     """渲染决策输入（与系统提示分离，便于测试与审计）。"""
-    lines: list[str] = []
+    from app.core.time_context import current_time_text
+
+    lines: list[str] = [f"## 当前时间\n- {current_time_text()}"]
     if context.history:
         lines.append("## 最近对话（候选引用 message_i）")
         for item in context.history:

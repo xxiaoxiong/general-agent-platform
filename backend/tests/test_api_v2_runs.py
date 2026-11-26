@@ -1045,3 +1045,63 @@ class TestWebRetrievalToggle:
         if isinstance(snapshot, str):
             snapshot = json.loads(snapshot)
         assert snapshot.get("web_enabled") is False
+
+
+class TestDecisionClarifyShortCircuit:
+    def test_ambiguous_decision_ends_run_without_tools(self, client, user_setup, monkeypatch):
+        """关键歧义由服务端直接结束本轮：只输出澄清问题，不执行任何工具。
+
+        模型拥有语义判断权，但不能靠“自律”绕过澄清去检索（否则会从错误起点开始）。
+        """
+        import app.services.tools as tools_pkg
+        from app.core.config import settings
+        from app.services.agent_runtime.decision import orchestrator
+        from app.services.agent_runtime.decision import service as decision_service
+        from app.services.agent_runtime.decision.schemas import RunDecision
+
+        question = "请问这里的 RSI 指哪个领域：金融相对强弱指数，还是 AI 的递归自我改进？"
+
+        async def fake_decide(*_args, **_kwargs):
+            return decision_service.DecisionOutcome(
+                decision=RunDecision(
+                    intent="research", route="clarify", continuity="new_task",
+                    decision_status="ambiguous", clarification_question=question,
+                    goal="确认 RSI 的领域", rationale="缩写存在多义",
+                ),
+                latency_ms=1, fallback=False, model_id="fake",
+            )
+
+        _patch_model(monkeypatch, [])
+        monkeypatch.setattr(orchestrator, "decide", fake_decide)
+        monkeypatch.setattr(settings, "AGENT_DECISION_MODE", "llm")
+        monkeypatch.setattr(settings, "AGENT_ALLOW_NETWORK", True)
+
+        called = []
+
+        async def fake_web_search(params):
+            called.append(params)
+            return "不应执行"
+
+        monkeypatch.setitem(tools_pkg._ASYNC_HANDLERS, "web_search", fake_web_search)
+
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        assistant = client.post("/api/v2/assistants", headers=headers, json={
+            "name": "歧义澄清短路", "capability_ids": ["general"],
+        }).json()
+        started = client.post("/api/v2/runs", headers=headers, json={
+            "message": "你帮我查查当前RSI发展到什么程度了",
+            "assistant_id": assistant["id"],
+            "web_enabled": True, "use_memory": False,
+        }).json()
+
+        info = _wait_run(client, started["run_id"], owner)
+        assert info["status"] == "completed"
+        assert called == [], "澄清轮不得执行检索工具"
+
+        events = _iter_v2_sse(client.get(started["events_url"], headers=headers))
+        decision = [e["data"] for e in events if e["event"] == "task.decision"]
+        assert decision and decision[0]["decision_status"] == "ambiguous"
+        assert decision[0]["clarification_question"] == question
+        assert not [e for e in events if e["event"].startswith("tool.")]
+        assert events[-1]["data"]["final_text"] == question

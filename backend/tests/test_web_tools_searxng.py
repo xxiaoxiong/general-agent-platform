@@ -267,6 +267,58 @@ async def test_all_engines_unreachable_is_retryable_network_failure(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_searxng_time_range_and_retrieval_time(monkeypatch):
+    """时间范围透传给 SearXNG，并在结果中标注检索时刻与过滤是否生效。"""
+    calls = []
+    _patch_client(
+        monkeypatch,
+        {
+            "searxng": _FakeResponse(
+                200,
+                json_data={
+                    "results": [
+                        {"title": "近期文章", "url": "https://example.com/new",
+                         "content": "摘要", "publishedDate": "2026-11-25T00:00:00Z"},
+                    ]
+                },
+            ),
+        },
+        calls,
+    )
+    monkeypatch.setattr(settings, "SEARXNG_URL", "http://searxng:8080")
+
+    ret = await web_tools.execute_web_search({"query": "最新进展", "time_range": "week"})
+
+    assert ret.status == "succeeded"
+    params = next(c for c in calls if "searxng" in c["url"])["kwargs"]["params"]
+    assert params["time_range"] == "week"
+    assert "检索时间" in ret.text
+    assert "时间范围：week（已应用）" in ret.text
+
+
+@pytest.mark.asyncio
+async def test_time_range_not_applied_on_fallback_engine(monkeypatch):
+    """降级引擎不支持时间过滤时必须如实标注，不能让模型误以为已按时间筛选。"""
+    calls = []
+    bing_html = (
+        '<li class="b_algo"><h2><a href="https://example.com/fallback">备用结果</a></h2>'
+        "<p>备用摘要</p></li>"
+    )
+    _patch_client(
+        monkeypatch,
+        {"searxng": httpx.ConnectError("down"), "bing.com": _FakeResponse(200, text=bing_html)},
+        calls,
+    )
+    monkeypatch.setattr(settings, "SEARXNG_URL", "http://searxng:8080")
+    monkeypatch.setattr(settings, "AGENT_EGRESS_PROXY", "")
+
+    ret = await web_tools.execute_web_search({"query": "最新进展", "time_range": "week"})
+
+    assert ret.status == "succeeded"
+    assert "时间范围：week（当前引擎不支持，未应用）" in ret.text
+
+
+@pytest.mark.asyncio
 async def test_fetch_webpage_without_readable_body_is_failed(monkeypatch):
     """空正文/纯脚本页面不是可用来源：按失败上报，不伪装成抓取成功。"""
     calls = []

@@ -101,6 +101,8 @@ class Settings(BaseSettings):
     # ── 搜索引擎配置（内网环境）────────────────────────────────────────────────
     SEARXNG_URL: str = ""                        # SearXNG 实例地址，如 http://localhost:8888
     SEARCH_TIMEOUT: int = 25                     # 搜索超时秒数
+    # 提示词中"当前时间"的时区（容器通常为 UTC，直接取本地日期会在凌晨差一天）
+    AGENT_TIMEZONE: str = "Asia/Shanghai"
 
     # ── 稳定性配置 ────────────────────────────────────────────────────────────
     HOT_RELOAD_TOOLS: bool = True               # 工具热重载
