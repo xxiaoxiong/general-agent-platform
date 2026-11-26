@@ -237,6 +237,7 @@ class Settings(BaseSettings):
     PREVIEW_TOKEN_TTL: int = 3600               # Preview Grant 有效期（秒）
     PREVIEW_MAX_CONNECTIONS: int = 16           # 单 Preview 并发连接上限
     PREVIEW_RATE_LIMIT_PER_MINUTE: int = 600    # 单个 Grant 每分钟请求上限（0=不限）
+    PREVIEW_REQUIRE_LOGIN: bool = False          # true=仅登录用户可访问（禁止外部分享）
     PREVIEW_PROXY_PORT: int = 8081              # Preview Proxy 容器端口
     PREVIEW_PROXY_HOST_PORT: int = 8081         # 浏览器可达端口（compose 映射）
 

@@ -94,7 +94,7 @@
         </div>
         <div v-if="previewUrl" class="sp-foot">
           <span class="sp-muted">{{ fallbackUrl ? '预览地址' : '' }}</span>
-          <code :title="previewUrl">{{ previewUrl }}</code>
+          <code :title="previewDisplayUrl">{{ previewDisplayUrl }}</code>
           <span v-if="expiryText" class="sp-muted">{{ expiryText }}</span>
         </div>
       </template>
@@ -188,6 +188,14 @@ const expiryText = computed(() => {
   if (seconds < 120) return `${seconds}s 后过期`
   return `${Math.round(seconds / 60)} 分钟后过期`
 })
+
+const previewDisplayUrl = computed(() =>
+  previewUrl.value.replace(/([?&])access_token=[^&]*/, '$1access_token=***'))
+
+function withAccess(url: string, accessToken?: string): string {
+  if (!accessToken) return url
+  return `${url}${url.includes('?') ? '&' : '?'}access_token=${encodeURIComponent(accessToken)}`
+}
 
 function serviceTone(service: WorkspaceServiceInfo): string {
   const state = service.observed_state
@@ -368,11 +376,15 @@ async function ensurePreview(service: WorkspaceServiceInfo, force = false) {
     // 后端 expires_at 为无时区 UTC 字符串，前端直接按签发 TTL 计算，
     // 避免被浏览器按本地时区解析导致误判过期。
     const expires = Math.floor(Date.now() / 1000) + ttlSeconds
+    const primaryUrl = withAccess(grant.url, grant.access_token)
+    const fallback = grant.fallback_url
+      ? withAccess(grant.fallback_url, grant.access_token)
+      : ''
     grants.set(service.id, {
-      url: grant.url, fallback: grant.fallback_url || '', expires, id: grant.id,
+      url: primaryUrl, fallback, expires, id: grant.id,
     })
-    previewUrl.value = grant.url
-    fallbackUrl.value = grant.fallback_url || ''
+    previewUrl.value = primaryUrl
+    fallbackUrl.value = fallback
     grantExpiry.value = expires
     usingFallback = false
     reloadFrame()

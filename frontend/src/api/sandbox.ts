@@ -81,6 +81,8 @@ export interface PreviewGrantInfo {
   token?: string
   url?: string
   fallback_url?: string
+  /** PREVIEW_REQUIRE_LOGIN=true 时的短期登录凭证（前端拼到 iframe 地址） */
+  access_token?: string
 }
 
 export interface ProjectWorkspaceDetail {

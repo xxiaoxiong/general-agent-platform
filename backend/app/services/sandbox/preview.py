@@ -1,5 +1,4 @@
 """Preview Grant（任务书 §5.7 / §10.2）。
-
 - Token 只保存 SHA256；绑定 Workspace / Sandbox Generation / Service / Port；
 - 支持过期与撤销；成员移除后撤销该成员签发的 Grant；
 - Preview Token 不能用于命令执行或文件管理（只经 Preview Proxy 使用）。
@@ -42,6 +41,25 @@ def build_preview_urls(token: str) -> dict:
     primary = f"{scheme}://{token}.{domain}:{host_port}/"
     fallback = f"{scheme}://{domain}:{host_port}/p/{token}/"
     return {"url": primary, "fallback_url": fallback}
+
+
+def create_preview_access_token(grant_id: str, user_id: int,
+                                ttl_seconds: int = 3600) -> str:
+    """登录态预览的短期凭证（只在 PREVIEW_REQUIRE_LOGIN=true 时下发）。
+
+    绑定 Grant + User；Preview Proxy 校验签名、过期、Grant 匹配，并再次复核
+    Project ACL。不得用于其他 API。
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from jose import jwt
+
+    expire = datetime.now(timezone.utc) + timedelta(seconds=max(60, ttl_seconds))
+    return jwt.encode(
+        {"exp": expire, "sub": str(user_id), "grant": grant_id, "type": "preview"},
+        settings.SECRET_KEY,
+        algorithm="HS256",
+    )
 
 
 async def create_grant(
@@ -180,7 +198,8 @@ async def resolve_grant(db: AsyncSession, token: str) -> tuple[PreviewGrant, San
     return grant, sandbox, service
 
 
-def grant_to_dict(grant: PreviewGrant, token: Optional[str] = None) -> dict:
+def grant_to_dict(grant: PreviewGrant, token: Optional[str] = None,
+                  access_token: Optional[str] = None) -> dict:
     data = {
         "id": grant.id,
         "service_id": grant.service_id,
@@ -193,4 +212,6 @@ def grant_to_dict(grant: PreviewGrant, token: Optional[str] = None) -> dict:
     if token:
         data.update(build_preview_urls(token))
         data["token"] = token
+    if access_token:
+        data["access_token"] = access_token
     return data

@@ -135,6 +135,81 @@ def _denied_response(exc: PreviewDenied) -> JSONResponse:
     )
 
 
+async def _preview_user_allowed(target: dict, auth_token: str) -> bool:
+    """登录态预览：校验短期 preview token + 实时 Project ACL。"""
+    if not auth_token:
+        return False
+    from app.core.security import decode_token
+
+    payload = decode_token(auth_token)
+    if not payload or payload.get("type") != "preview":
+        return False
+    if str(payload.get("grant") or "") != str(target["grant_id"]):
+        return False
+    try:
+        user_id = int(payload.get("sub") or 0)
+    except (TypeError, ValueError):
+        return False
+    if user_id <= 0:
+        return False
+    from app.models.sandbox import Project, ProjectMember, Workspace
+    from app.models.user import User
+
+    async with AsyncSessionLocal() as db:
+        user = await db.get(User, user_id)
+        if user is None or not bool(user.is_active):
+            return False
+        if bool(getattr(user, "is_superuser", False)):
+            return True
+        workspace = await db.get(Workspace, target["workspace_id"])
+        if workspace is None:
+            return False
+        project = await db.get(Project, workspace.project_id)
+        if project is None or project.deleted_at is not None:
+            return False
+        if project.owner_id == user_id:
+            return True
+        from sqlalchemy import select as _select
+
+        member = (await db.execute(
+            _select(ProjectMember).where(
+                ProjectMember.project_id == project.id,
+                ProjectMember.user_id == user_id,
+            )
+        )).scalar_one_or_none()
+        return member is not None
+
+
+def _request_auth_token(request: Request) -> str:
+    query_token = request.query_params.get("access_token")
+    if query_token:
+        return query_token
+    header = request.headers.get("authorization") or ""
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+    return request.cookies.get("preview_access") or ""
+
+
+def _ws_auth_token(websocket: WebSocket) -> str:
+    query_token = websocket.query_params.get("access_token")
+    if query_token:
+        return query_token
+    header = websocket.headers.get("authorization") or ""
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+    return websocket.cookies.get("preview_access") or ""
+
+
+def _denied_login() -> JSONResponse:
+    metrics.inc_preview_request(denied=True)
+    return JSONResponse(
+        status_code=403,
+        content={"code": "preview_login_required",
+                 "message": "该预览仅允许登录用户访问，请刷新页面重新获取授权"},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "preview-proxy"}
@@ -166,6 +241,11 @@ async def proxy_http(request: Request, path: str):
         metrics.inc_preview_request(denied=True)
         return JSONResponse(status_code=exc.status_code,
                             content={"code": exc.code, "message": exc.message})
+    auth_token = ""
+    if settings.PREVIEW_REQUIRE_LOGIN:
+        auth_token = _request_auth_token(request)
+        if not await _preview_user_allowed(target, auth_token):
+            return _denied_login()
     if not await _rate_allowed(target["grant_id"]):
         metrics.inc_preview_request(denied=True)
         return JSONResponse(status_code=429,
@@ -177,7 +257,14 @@ async def proxy_http(request: Request, path: str):
                             content={"code": "preview_too_many_connections",
                                      "message": "预览并发连接超限"})
     try:
-        return await _forward_http(request, target, rest)
+        response = await _forward_http(request, target, rest)
+        if settings.PREVIEW_REQUIRE_LOGIN and auth_token and response.status_code < 400:
+            # 首次携带 access_token 的文档请求下发同源 Cookie，后续子资源/WS 自动携带
+            response.headers.append(
+                "set-cookie",
+                f"preview_access={auth_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=3600",
+            )
+        return response
     finally:
         await _release(target["grant_id"])
 
@@ -206,7 +293,8 @@ async def _forward_http(request: Request, target: dict, path: str):
         upstream_request = client.build_request(
             request.method, url, headers=headers,
             content=request.stream(),
-            params=list(request.query_params.multi_items()),
+            params=[(key, value) for key, value in request.query_params.multi_items()
+                    if key != "access_token"],
         )
         upstream = await client.send(upstream_request, stream=True)
     except httpx.HTTPError as exc:
@@ -255,6 +343,11 @@ async def proxy_ws(websocket: WebSocket, path: str):
         metrics.inc_preview_request(denied=True)
         await websocket.close(code=1011)
         return
+    if settings.PREVIEW_REQUIRE_LOGIN:
+        if not await _preview_user_allowed(target, _ws_auth_token(websocket)):
+            metrics.inc_preview_request(denied=True)
+            await websocket.close(code=4403)
+            return
     if not await _acquire(target["grant_id"]):
         await websocket.close(code=4429)
         return
@@ -277,6 +370,7 @@ async def _bridge_ws(websocket: WebSocket, target: dict, path: str) -> None:
     )
     query = "&".join(
         f"{key}={value}" for key, value in websocket.query_params.multi_items()
+        if key not in ("access_token", "__token")
     )
     if query:
         upstream_url += f"?{query}"

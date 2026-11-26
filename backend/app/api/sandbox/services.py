@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.core.config import settings
 from app.core.database import get_db
 from app.models.user import User
 from app.services.sandbox import (
@@ -176,9 +177,17 @@ async def create_preview_grant(
         db, workspace, service, current_user,
         ttl_seconds=(body.ttl_seconds or None),
     )
+    access_token = None
+    if settings.PREVIEW_REQUIRE_LOGIN:
+        from app.services.sandbox.preview import create_preview_access_token
+
+        access_token = create_preview_access_token(
+            grant.id, current_user.id,
+            int(body.ttl_seconds or settings.PREVIEW_TOKEN_TTL),
+        )
     await runtime.touch_workspace(db, workspace.id)
     await db.commit()
-    return preview_service.grant_to_dict(grant, token)
+    return preview_service.grant_to_dict(grant, token, access_token)
 
 
 @router.get("/{workspace_id}/preview-grants")

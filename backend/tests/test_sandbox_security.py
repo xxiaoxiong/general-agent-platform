@@ -276,6 +276,23 @@ async def test_preview_rate_limit(monkeypatch):
     assert await _rate_allowed(grant_id) is False
 
 
+async def test_preview_login_token_binds_grant_and_project_acl():
+    from app.preview_proxy.app import _preview_user_allowed
+    from app.services.sandbox.preview import create_preview_access_token
+
+    owner = await _user("preview-owner")
+    outsider = await _user("preview-outsider")
+    _project, workspace = await _project_pair(owner)
+    target = {"grant_id": "grant-login-1", "workspace_id": workspace.id}
+    token = create_preview_access_token(target["grant_id"], owner.id, 600)
+    assert await _preview_user_allowed(target, token) is True
+    outsider_token = create_preview_access_token(target["grant_id"], outsider.id, 600)
+    assert await _preview_user_allowed(target, outsider_token) is False
+    assert await _preview_user_allowed(
+        {"grant_id": "other-grant", "workspace_id": workspace.id}, token) is False
+    assert await _preview_user_allowed(target, "invalid-token") is False
+
+
 async def test_sandbox_files_backend_maps_workspace_and_blocks_host_paths(monkeypatch):
     from app.services.agent_runtime.sandbox_backend import SandboxFilesBackend
 

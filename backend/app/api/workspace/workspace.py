@@ -51,6 +51,7 @@ async def workspace_bootstrap(
             "enabled": _sandbox_enabled(current_user.id),
             "preview_domain": getattr(settings, "PREVIEW_BASE_DOMAIN", "localhost"),
             "default_profile": getattr(settings, "SANDBOX_DEFAULT_PROFILE", "standard"),
+            "preview_require_login": bool(getattr(settings, "PREVIEW_REQUIRE_LOGIN", False)),
         },
     }
 

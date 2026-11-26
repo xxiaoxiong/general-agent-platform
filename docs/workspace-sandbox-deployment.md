@@ -85,6 +85,7 @@ curl -s http://localhost:8081/health      # preview-proxy
 | `PREVIEW_TOKEN_TTL` | 3600 | Preview Grant 有效期（秒） |
 | `PREVIEW_MAX_CONNECTIONS` | 16 | 单 Grant 并发连接上限 |
 | `PREVIEW_RATE_LIMIT_PER_MINUTE` | 600 | 单 Grant 每分钟请求上限（0=不限） |
+| `PREVIEW_REQUIRE_LOGIN` | false | true=仅登录用户可访问预览（`access_token` + 同源 Cookie 校验，403 拒绝匿名） |
 
 ## 4. 使用流程
 
@@ -253,6 +254,6 @@ docker compose -f docker/docker-compose.yml run --rm \
 - Preview 使用 Host 重写为 `localhost:{port}` 兼容 Vite allowedHosts；应用若依赖绝对
   `Host` 生成 URL，请使用 `X-Forwarded-Host`。
 - 未实现完整在线 IDE 与多 Agent 并行修改同一工作树；写租约保证同一 Workspace 串行写。
-- 未实现「管理员关闭外部分享、仅登录用户可看预览」的预览登录态模式；当前授权边界是
-  可过期/可撤销的 Preview Grant（默认 1 小时）。
 - Preview 仅支持 HTTP Web App；WebSocket 已支持（Vite HMR 实测通过）。
+- 登录态预览（`PREVIEW_REQUIRE_LOGIN=true`）使用短期 preview token + 同源 Cookie；
+  token 会出现在 iframe 地址与首屏请求中（HTTPS 下传输，代理不记录原始 Token）。

@@ -92,18 +92,22 @@
   经宿主网关访问平台管理面。
 - **安全回归测试**：Docker Socket 未挂载、平台服务名不可解析、取消命令无孤儿进程
   已加入真实 Docker 集成测试。
+- **登录态预览**：`PREVIEW_REQUIRE_LOGIN=true` 时，Preview Proxy 校验短期 preview token
+  （绑定 Grant + User）并实时复核 Project ACL；首次文档请求下发同源 HttpOnly Cookie，
+  子资源与 WebSocket 复用；匿名/他人 Token 403。
 - **灰度开关**：`SANDBOX_ROLLOUT_USER_IDS` / `SANDBOX_ROLLOUT_PROJECT_IDS` 按用户/项目灰度。
 
 ## 3. 验证记录（真实执行）
 
 | 验证 | 命令 / 方式 | 结果 |
 | --- | --- | --- |
-| 后端全量回归 | `cd backend && python -m pytest -q` | **1064 passed, 13 skipped, 102.99s** |
-| Sandbox 专项（模型/调度/Lease/ACL/预览/工具/文件后端/写租约/自动恢复/限流） | `pytest tests/test_sandbox_runtime.py tests/test_sandbox_security.py tests/test_sandbox_api.py -q` | **27 passed** |
+| 后端全量回归 | `cd backend && python -m pytest -q` | **1065 passed, 13 skipped, 102.31s** |
+| Sandbox 专项（模型/调度/Lease/ACL/预览/工具/文件后端/写租约/自动恢复/限流/登录态） | `pytest tests/test_sandbox_runtime.py tests/test_sandbox_security.py tests/test_sandbox_api.py -q` | **28 passed** |
 | 真实 Docker 集成 | 在 Runner 容器内 `SANDBOX_DOCKER_TEST=1 pytest tests/test_sandbox_docker_integration.py` | **1 passed 39.90s**（容器安全基线、Runner 断网重连、Docker Socket 未挂载、取消命令无孤儿进程、命令、文件一致性、只读 rootfs、网络隔离含平台服务名、Service 健康 + HTTP、删除容器后新 Generation 文件保留、幂等创建） |
 | Vite HMR / WebSocket | 在 Runner 容器内 `SANDBOX_DOCKER_VITE=1 pytest tests/test_sandbox_docker_vite.py -q -s` | **1 passed 13.43s**（Vite 安装、dev server、`vite-hmr` WS、修改源码收到 `full-reload`） |
 | 真实端到端（服务层） | 容器内脚本：项目 → Provision → 命令（uid=10001）→ Service → Preview | `exec succeeded`、`service healthy`、子域预览 200、兜底 200、坏 Token 401 |
-| 浏览器 E2E | `npm run test:e2e:sandbox`（真实 Edge + 已部署栈） | **1 passed 16.0s**：项目创建 → Sandbox Ready → Service healthy → iframe 真实页面 → 刷新后预览 → 切换项目不串显 → Services 面板；截图见 `docs/assets/` |
+| 浏览器 E2E | `npm run test:e2e:sandbox`（真实 Edge + 已部署栈） | **1 passed 22.4s**：项目创建 → Sandbox Ready → Service healthy → iframe 真实页面 → 刷新后预览 → 切换项目不串显 → Services 面板；截图见 `docs/assets/` |
+| 登录态 Preview（`PREVIEW_REQUIRE_LOGIN=true`） | 真实栈脚本：匿名 / 他人 Token / 本人 Token / Cookie | 匿名 403、他人 Token 403、本人 Token 200、首次响应下发 Cookie 且后续仅 Cookie 200 |
 | 性能基准 | `BENCH_ITERATIONS=3 python scripts/sandbox_benchmark.py`（Backend 容器内） | Provision→Ready P50 13.07s / P95 13.07s；命令 P50 0.124s；Service→Healthy P50 1.68s；Preview 首次访问 P50 0.040s（详见性能报告） |
 | 前端类型检查/构建 | `cd frontend && npm run build` | 通过 |
 | Compose 校验 | `docker compose --profile sandbox --profile sandbox-image config -q` | 通过 |
@@ -116,7 +120,7 @@
 - 容器安全：`privileged=false`、`CapDrop=ALL`、`no-new-privileges`、`ReadonlyRootfs=true`、CPU/内存/PID 限制、非 root（uid 10001）均由集成测试 inspect 校验。
 - 网络隔离：Sandbox 无法解析 `backend / mysql / redis / checkpoint_pg`（真实命令测试）；每个 Sandbox 独立 bridge，仅 Runner 加入。
 - 数据面：Backend / Preview Proxy / Sandbox 均未挂载 Docker Socket；Runner 是唯一 Socket 持有者。
-- 访问控制：跨用户项目 404；viewer 不能执行；成员移除后其 Preview Grant 与 Agent 工具/文件访问立即失效；坏 Token 401；过期/撤销/服务停止 401/403/410。
+- 访问控制：跨用户项目 404；viewer 不能执行；成员移除后其 Preview Grant 与 Agent 工具/文件访问立即失效；坏 Token 401；过期/撤销/服务停止 401/403/410；登录态模式匿名/他人 Token 403。
 - 并发：用户上传/删除与 Agent 写入共用写租约；配额创建按用户串行化；Generation 切换中断旧命令。
 - 可靠性：Runner 重启重新接入所有 Sandbox 网络；容器缺失自动 reconcile/恢复；实际 CPU/内存/Volume 用量与预留值分开记录。
 - WebSocket：Preview Proxy → Runner → Vite 的 `vite-hmr` 握手与 `full-reload` 消息实测通过。
@@ -134,8 +138,7 @@
 6. **未实现**：GPU Sandbox、Kubernetes / gVisor / Kata / Firecracker、Warm Pool、Hibernate、跨节点 Volume 迁移、完整在线 IDE、Terminal Tab、多 Agent 并行修改同一工作树。
 7. **Docker Desktop 环境限制**：宿主机 LAN / 云元数据隔离需宿主防火墙；生产建议 Linux + 独立 Runner 主机。
 8. **Playwright 仅覆盖单浏览器（Edge）+ 单项目流程**：未覆盖 Firefox / WebKit 与多用户并行浏览器会话。
-9. **Preview「仅登录用户」模式未实现**：当前访问边界是可过期/可撤销的 Preview Grant；管理员关闭外部分享/登录态校验未做，已在运维手册标注。
-10. **租户级配额并发**：用户级 Provision 已串行化；租户级配额跨用户并发仍为“检查后创建”，极端并发下可能短暂超出，后续可用租户锁/配额表强化。
+9. **租户级配额并发**：用户级 Provision 已串行化；租户级配额跨用户并发仍为“检查后创建”，极端并发下可能短暂超出，后续可用租户锁/配额表强化。
 
 ## 6. 已知风险与规避
 

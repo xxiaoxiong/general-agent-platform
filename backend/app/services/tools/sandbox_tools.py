@@ -645,7 +645,11 @@ async def handle_get_preview_url(ctx: Any, params: dict) -> ToolResult:
         grant, token = await preview_service.create_grant(
             db, workspace, service, user, ttl_seconds=(ttl or None),
         )
-        url = preview_service.grant_to_dict(grant, token)
+        access_token = None
+        if settings.PREVIEW_REQUIRE_LOGIN:
+            access_token = preview_service.create_preview_access_token(
+                grant.id, user.id, ttl or settings.PREVIEW_TOKEN_TTL)
+        url = preview_service.grant_to_dict(grant, token, access_token)
         await runtime.touch_workspace(db, workspace.id)
         await db.commit()
     return ToolResult.succeeded(
