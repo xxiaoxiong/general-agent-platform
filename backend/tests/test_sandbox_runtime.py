@@ -601,6 +601,51 @@ async def test_service_state_sync_emits_events_and_updates_health(monkeypatch):
         assert exited_events[0].payload.get("reason") == "process_missing"
 
 
+async def test_report_sandbox_states_reconciles_and_quarantines_unknown():
+    """Runner 上报：已知 Sandbox 更新 Observed State / OOM；无标签容器只告警不接管。"""
+    user = await _user("u-report")
+    _project, workspace, sandbox = await _ready_for_session(user)
+    async with AsyncSessionLocal() as s:
+        runner = (await s.execute(select(SandboxRunnerNode))).scalars().first()
+        summary = await runtime.report_sandbox_states(s, runner, [
+            {
+                "sandbox_id": sandbox.id, "workspace_id": workspace.id,
+                "observed_state": "failed", "oom_killed": True,
+                "container_id": "c-report",
+            },
+            {"container_id": "unknown-1", "container_name": "gap-sbx-unknown"},
+        ])
+        await s.commit()
+        assert summary == {"updated": 1, "unknown": 1, "oom": 1}
+
+    async with AsyncSessionLocal() as s:
+        row = await s.get(SandboxInstance, sandbox.id)
+        assert row.observed_state == "failed"
+        assert row.failure_code == "oom"
+        oom_events = (await s.execute(
+            select(SandboxEvent).where(SandboxEvent.event_type == "sandbox.oom")
+        )).scalars().all()
+        assert len(oom_events) == 1
+        unknown_events = (await s.execute(
+            select(SandboxEvent).where(
+                SandboxEvent.event_type == "sandbox.unknown_container")
+        )).scalars().all()
+        assert len(unknown_events) == 1
+        assert unknown_events[0].payload.get("container_id") == "unknown-1"
+
+    # 重复上报同一次 OOM 不重复计数
+    async with AsyncSessionLocal() as s:
+        runner = (await s.execute(select(SandboxRunnerNode))).scalars().first()
+        summary = await runtime.report_sandbox_states(s, runner, [
+            {
+                "sandbox_id": sandbox.id, "workspace_id": workspace.id,
+                "observed_state": "failed", "oom_killed": True,
+            },
+        ])
+        await s.commit()
+        assert summary["oom"] == 0
+
+
 async def test_volume_soft_quota_warns_once_and_stops(monkeypatch):
     """软磁盘配额：预警一次；超限停止 Sandbox（Volume 保留，任务书 §6.5）。"""
     monkeypatch.setattr(settings, "SANDBOX_VOLUME_QUOTA_MODE", "soft")

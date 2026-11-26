@@ -114,8 +114,8 @@
 
 | 验证 | 命令 / 方式 | 结果 |
 | --- | --- | --- |
-| 后端全量回归 | `cd backend && python -m pytest -q` | **1069 passed, 13 skipped, 103.46s** |
-| Sandbox 专项（模型/调度/Lease/ACL/预览/工具/文件后端/写租约/自动恢复/限流/登录态/事件/软配额） | `pytest tests/test_sandbox_runtime.py tests/test_sandbox_security.py tests/test_sandbox_api.py -q` | **32 passed** |
+| 后端全量回归 | `cd backend && python -m pytest -q` | **1070 passed, 13 skipped, 102.86s** |
+| Sandbox 专项（模型/调度/Lease/ACL/预览/工具/文件后端/写租约/自动恢复/限流/登录态/事件/软配额/对账） | `pytest tests/test_sandbox_runtime.py tests/test_sandbox_security.py tests/test_sandbox_api.py -q` | **33 passed** |
 | 真实 Docker 集成 | 在 Runner 容器内 `SANDBOX_DOCKER_TEST=1 pytest tests/test_sandbox_docker_integration.py` | **1 passed 39.90s**（容器安全基线、Runner 断网重连、Docker Socket 未挂载、取消命令无孤儿进程、命令、文件一致性、只读 rootfs、网络隔离含平台服务名、Service 健康 + HTTP、删除容器后新 Generation 文件保留、幂等创建） |
 | Vite HMR / WebSocket | 在 Runner 容器内 `SANDBOX_DOCKER_VITE=1 pytest tests/test_sandbox_docker_vite.py -q -s` | **1 passed 13.43s**（Vite 安装、dev server、`vite-hmr` WS、修改源码收到 `full-reload`） |
 | 真实端到端（服务层） | 容器内脚本：项目 → Provision → 命令（uid=10001）→ Service → Preview | `exec succeeded`、`service healthy`、子域预览 200、兜底 200、坏 Token 401 |
