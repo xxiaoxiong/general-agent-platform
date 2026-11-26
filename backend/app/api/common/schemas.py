@@ -91,6 +91,9 @@ class RunCreate(BaseModel):
     ] = "auto"
     document_profile_id: Optional[int] = Field(None, gt=0)
     document_id: Optional[int] = Field(None, gt=0)
+    # 右侧预览文档：仅作为意图分诊的上下文提示，不强制绑定为本轮编辑目标
+    preview_document_id: Optional[int] = Field(None, gt=0)
+    preview_document_version_no: Optional[int] = Field(None, gt=0)
     task_options: Dict[str, Any] = Field(default_factory=dict)
 
 

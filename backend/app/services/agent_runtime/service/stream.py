@@ -316,6 +316,11 @@ class StreamMixin:
             agent_config = dict(agent_config)
             mem_ctx = use_memory_context or agent_config.pop("_memory_context", "")
             extra_db_info = db_info if db_info is not None else agent_config.pop("_db_info", None)
+            # 本轮文件交付要求（非 Word 格式）：由意图分诊写入上下文，系统提示据此
+            # 要求模型真实产出工作区文件后再声明可下载
+            deliverable = (execution_context or {}).get("deliverable")
+            if isinstance(deliverable, dict) and deliverable.get("format"):
+                agent_config["_deliverable"] = deliverable
 
             # 扩展性治理：MCP 工具面装配（fail-closed，未绑定/未启用不注入）
             # 并显式登记风险（未登记工具会被 ToolPolicy 拒绝执行）

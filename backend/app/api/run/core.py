@@ -21,8 +21,10 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.core.config import settings
 from app.core.database import get_db
 from app.models.agent import Agent, AgentRun, AgentRunEvent, AgentSession
+from app.models.document import DocumentAsset
 from app.models.user import User
 
 from app.api.common.schemas import (
@@ -34,6 +36,66 @@ from .common import _attachment_note, _drain_legacy_stream, _get_run_or_404, _lo
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/runs", tags=["runs-v2"])
+
+
+async def _document_hint(db: AsyncSession, document_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+    """校验归属并返回预览文档的轻量上下文（供意图分诊使用）。"""
+    row = (await db.execute(
+        select(DocumentAsset.id, DocumentAsset.title, DocumentAsset.current_version).where(
+            DocumentAsset.id == document_id,
+            DocumentAsset.owner_id == user_id,
+            DocumentAsset.status == "active",
+        )
+    )).first()
+    if row is None:
+        return None
+    return {"document_id": row[0], "title": row[1], "format": "docx", "version_no": row[2]}
+
+
+async def _session_documents(
+    db: AsyncSession, session_id: int, user_id: int, limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """会话最近产生的文档产物（窄列投影，避免排序大字段）。"""
+    rows = (await db.execute(
+        select(DocumentAsset.id, DocumentAsset.title, DocumentAsset.current_version)
+        .where(
+            DocumentAsset.session_id == session_id,
+            DocumentAsset.owner_id == user_id,
+            DocumentAsset.status == "active",
+        )
+        .order_by(DocumentAsset.updated_at.desc())
+        .limit(limit)
+    )).all()
+    return [
+        {"document_id": row[0], "title": row[1], "format": "docx", "version_no": row[2]}
+        for row in rows
+    ]
+
+
+async def _classify_run_intent(
+    db: AsyncSession,
+    message: str,
+    *,
+    agent_config: Dict[str, Any],
+    history: List[Dict[str, Any]],
+    artifacts: List[Dict[str, Any]],
+    preview_document: Optional[Dict[str, Any]],
+    attachments: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """模型分诊：任何失败都返回 None，由规则路由兜底（建 Run 不被阻塞）。"""
+    from app.services.agent_runtime import get_runtime_service
+    from app.services.agent_runtime.intent import classify_intent
+
+    try:
+        provider, model_config = await get_runtime_service()._load_model(agent_config.get("model_config_id"))
+        return await classify_intent(
+            message, provider=provider, model_config=model_config,
+            history=history, artifacts=artifacts,
+            preview_document=preview_document, attachments=attachments,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("意图分诊不可用，回退规则路由: %s", e)
+        return None
 
 
 # ── Run 生命周期 ──────────────────────────────────────────────────────────────
@@ -182,6 +244,42 @@ async def create_run(
         has_document_context=any(message.get("document_run_id") for message in history if isinstance(message, dict)),
         has_word_attachment=bool(previous_word),
     )
+    # 意图分诊：仅在自动模式且用户未显式选择文档/规范时启用。会话历史里有文档
+    # 不代表本轮仍是文档任务，让模型基于本轮消息判断任务形态；显式选择始终优先。
+    preview_hint = (
+        await _document_hint(db, body.preview_document_id, current_user.id)
+        if body.preview_document_id else None
+    )
+    artifacts = (
+        await _session_documents(db, session.id, current_user.id) if session is not None else []
+    )
+    decision = None
+    if (settings.AGENT_INTENT_ROUTER_ENABLED and body.task_mode == "auto"
+            and not body.document_id and not body.document_profile_id
+            and (history or attachment_refs or preview_hint)):
+        decision = await _classify_run_intent(
+            db, body.message, agent_config=agent_config, history=history,
+            artifacts=artifacts, preview_document=preview_hint, attachments=attachment_refs,
+        )
+    if decision is not None:
+        from app.services.agent_runtime.intent import apply_intent
+
+        execution_context = apply_intent(
+            decision, execution_context,
+            has_existing_document=bool(preview_hint or artifacts),
+            has_attachments=bool(attachment_refs),
+        )
+        # 模型判定要针对"当前预览的文档"：此时才把预览文档作为本轮编辑/分析目标
+        if (execution_context["task_type"] in {"document_edit", "document_analyze"}
+                and preview_hint is not None and not body.document_id):
+            body.document_id = preview_hint["document_id"]
+            if preview_hint.get("version_no"):
+                body.task_options = {
+                    **(body.task_options or {}),
+                    "document_version_no": preview_hint["version_no"],
+                }
+            execution_context["document_id"] = body.document_id
+            execution_context["document_version"] = preview_hint.get("version_no")
     # 会话上下文延续：用户指代此前内容（"这份报告/基于上面"）且本轮没有重新上传时，
     # 自动沿用会话内最近上传的 Word，避免文档任务在缺少源资料时凭空生成
     if session is not None:
@@ -209,7 +307,12 @@ async def create_run(
         execution_context["completion_resume"] = continued
         execution_context["reason"] = "继续本会话未完成的文件交付"
     else:
-        execution_context, inherited, anchor_run = document_turn(body.message, history, execution_context)
+        # 模型已明确本轮不是 Word 文档任务时，禁止 document_turn 再用历史把
+        # general_chat 提升成 document_generate（会话文档不得绑架新任务）
+        execution_context, inherited, anchor_run = document_turn(
+            body.message, history, execution_context,
+            allow_upgrade=decision is None or execution_context["task_type"] == "document_generate",
+        )
     if body.team_mode:
         from app.services.agent_runtime.team_project_intent import project_scope
 
@@ -252,7 +355,9 @@ async def create_run(
                 for key, value in response.items()
             }
     execution_context["attachment_refs"] = attachment_refs
-    if execution_context["task_type"] in DOCUMENT_GRAPH_TYPES or body.document_profile_id or body.document_id:
+    if (execution_context["task_type"] in DOCUMENT_GRAPH_TYPES
+            or execution_context["task_type"] == "document_analyze"
+            or body.document_profile_id or body.document_id):
         from app.services.documents.errors import DocumentError
         from app.services.documents.repository import resolve_task_resources
 

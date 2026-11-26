@@ -122,6 +122,11 @@ class Settings(BaseSettings):
     AGENT_CHECKPOINT_DSN: str = "memory"        # memory | sqlite:///./data/agent_checkpoints.db | postgresql+asyncpg://...
     AGENT_STORE_DSN: str = ""                   # 跨线程记忆 Store（空=不启用）
     AGENT_ENABLE_HITL: bool = True              # 人工审批（高危工具 interrupt_on）
+    # 模型驱动的意图识别：会话有历史/附件/预览文档时，用一次轻量模型调用判定
+    # 本轮任务形态（对话/文档生成/编辑/分析），规则路由仅作快速通道与兜底
+    AGENT_INTENT_ROUTER_ENABLED: bool = True
+    AGENT_INTENT_ROUTER_TIMEOUT: float = 8.0    # 秒；超时回退规则路由，不阻塞建 Run
+    AGENT_INTENT_ROUTER_MAX_TOKENS: int = 320
     AGENT_SANDBOX_MODE: str = "restricted"      # restricted / disabled / external（disabled 时禁用高危执行工具）
     AGENT_ALLOW_UNSAFE_PYTHON: bool = False     # 代码执行逃生开关（仅开发）：restricted 不是安全沙箱，生产强制禁用 python_exec/execute
     AGENT_EGRESS_PROXY: str = ""                # 受控 Egress Proxy（HTTP 出口统一收口；DNS Rebinding 防护的等价机制）

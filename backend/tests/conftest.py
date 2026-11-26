@@ -21,6 +21,9 @@ os.environ.setdefault("AGENT_FILES_ROOT", os.path.join(_TEST_DIR, "agent_files")
 os.environ.setdefault("AGENT_NETWORK_ALLOWLIST", "example.com")
 # 自进化评估循环不在测试进程内后台运行（各测试直接调用评估函数）
 os.environ.setdefault("EVOLUTION_ENABLED", "false")
+# 意图分诊默认关闭：测试进程不发起真实模型调用；需要覆盖分诊行为的用例
+# 直接 monkeypatch app.api.run.core._classify_run_intent 或调用纯函数
+os.environ.setdefault("AGENT_INTENT_ROUTER_ENABLED", "false")
 # 测试进程禁用真实 Langfuse 导出：密钥经 .env 注入会让 SDK span 导出/flush/
 # LangChain 回调真实打 HTTP（localhost:3100），扰动租约/并发等时序敏感用例；
 # 需要 Langfuse 行为的测试自行 monkeypatch settings（见 test_observability_langfuse）

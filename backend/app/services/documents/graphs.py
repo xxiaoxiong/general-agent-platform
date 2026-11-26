@@ -537,6 +537,16 @@ class DocumentWorkflow:
             compact_retry="本次只保留 5 至 8 个核心章节与必要输入字段：required_fields 留空，不写章节说明。",
             stage="规划文档结构时遇到问题", progress_label="正在规划文档结构")
         profile = await self._prune_public_inputs(result, config)
+        if _document_context(state).get("autonomous"):
+            # 用户已明确授权自主决策（"不用再问，缺的用假设"）：呈现风格、篇幅等
+            # 由系统决定，不生成任何资料索要字段
+            profile = profile.model_copy(update={
+                "required_inputs": [],
+                "sections": [
+                    section.model_copy(update={"required_fields": []})
+                    for section in profile.sections
+                ],
+            })
         return {"profile": profile.model_dump(mode="json")}
 
     async def _prune_public_inputs(self, profile: ProfileDefinition,
@@ -699,6 +709,10 @@ class DocumentWorkflow:
                 logger.warning("对话前文覆盖核对失败，保留字段索要：%s", exc)
         if _document_context(state).get("example_mode"):
             missing = {key: field for key, field in missing.items() if key.endswith("_facts")}
+        if _document_context(state).get("autonomous"):
+            # 用户已授权按通用假设补全：缺失字段由写作模型自行处理并在正文注明，
+            # 不得再用 waiting_input 表单打断
+            missing = {}
         return {"title": result.title, "values": values,
                 "missing": [field.model_dump(mode="json") for field in missing.values()],
                 "sections": [], "cursor": 0, "rework": 0}
@@ -1052,8 +1066,13 @@ class DocumentWorkflow:
 
     async def decide_edit(self, state: WorkflowState, config: RunnableConfig) -> dict:
         changes = state["edit_changes"]
-        result = request_input(3, "审阅修改前后的内容，选择要应用的改动。", decision_schema(changes))
-        selected = set(result["accepted_change_ids"])
+        if self.context.runtime.enable_hitl:
+            result = request_input(3, "审阅修改前后的内容，选择要应用的改动。", decision_schema(changes))
+            selected = set(result["accepted_change_ids"])
+        else:
+            # 自动审批模式：用户已在对话中明确要求修改，直接应用全部改动，
+            # 不再用审阅表单打断（manual 模式仍保留逐条确认）
+            selected = {item["id"] for item in changes}
         accepted = [item["id"] for item in changes if item["id"] in selected]
         rejected = [item["id"] for item in changes if item["id"] not in selected]
         await self.context.emit("document.edit.reviewed", {

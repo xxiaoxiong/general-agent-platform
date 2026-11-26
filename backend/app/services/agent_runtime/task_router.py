@@ -25,6 +25,23 @@ def references_prior_content(message: str) -> bool:
     return bool(_PRIOR_CONTENT.search(message or ""))
 
 
+# 用户显式授权自主决策（"不用再问我/缺少的用通用假设"）：此时任何表单式追问
+# 都是打断，文档流水线必须按假设直接完成并在正文注明，而不是 waiting_input。
+_AUTONOMY = re.compile(
+    r"(?:不需要|不用|无需|不必|不要).{0,10}(?:再)?(?:向我)?(?:确认|询问|问我|补充|提供|索要)"
+    r"|(?:自行|自己|自动|自主).{0,8}(?:决定|判断|补全|补充|假设|发挥|处理)"
+    r"|(?:缺少|缺失|没有|不足).{0,12}(?:信息|资料|数据|内容).{0,12}(?:用|按|采用|自行).{0,8}(?:假设|通用|合理|补)"
+    r"|(?:通用|合理).{0,6}假设"
+    r"|(?:no need to|don't|do not).{0,24}(?:ask|confirm)",
+    re.I,
+)
+
+
+def user_grants_autonomy(message: str) -> bool:
+    """用户是否明确授权"缺的资料自行假设、不要再来问"。"""
+    return bool(_AUTONOMY.search(message or ""))
+
+
 _PROFILE = re.compile(
     r"(?:提炼|抽取|提取|建立|制作|创建|归纳|总结.{0,10}可复用|整理出).{0,25}(?:规范|模板|profile)"
     r"|(?:需要|想要|设计|定义|写|生成).{0,12}(?:一套|一份|一个).{0,20}(?:规范|模板)(?:$|[。！？，,\s])"
@@ -63,11 +80,13 @@ _EDIT_TARGET = re.compile(
 )
 # 文档对象指代：会话内已有文档时，带编辑动作的"全文/正文/表格"等诉求同样属于文档编辑
 _DOC_OBJECT = re.compile(r"全文|全篇|整篇|整份|文档|正文|章节|小节|段落|表格|图表")
+# 只有点名 Word/DOCX/文档交付物时才进入 Word 流水线；「写一份报告/总结/方案」
+# 这类诉求直接在对话中交付正文（通用能力），不得默认生成 DOCX。
 _GENERATE = re.compile(
     r"(?:生成|制作|输出|导出|撰写|编写|写一[份个篇]|写成|整理成|转[成为]|形成|起草|交付|放到|存到|写到|保存到)"
-    r".{0,28}(?:word|docx|文档|报告|公文|方案|简报|说明书|纪要|总结|手册|指南|文章)"
+    r".{0,28}(?:word|docx|文档|公文)"
     r"|(?:按照|根据|用|套用).{0,22}(?:规范|模板|profile).{0,15}(?:生成|制作|起草|编写|撰写|写|输出)"
-    r"|\b(?:generate|write|draft|create|export)\b.{0,35}\b(?:report|document|word|docx)\b"
+    r"|\b(?:generate|write|draft|create|export)\b.{0,35}\b(?:document|word|docx)\b"
 )
 _ANALYZE = re.compile(r"阅读|解读|解释|摘要|总结|概括|分析|提取|对比|怎么看|说了什么|summari[sz]e|analy[sz]e|explain|read")
 _FILE_REFERENCE = re.compile(r"附件|文件|文档|这份|这篇|word|docx|pdf|attachment|file|document")
@@ -80,6 +99,37 @@ _DELIVERY = re.compile(
     r"|(?:word|docx|文档|报告).{0,14}(?:给(?:到)?我|发(?:给)?我|交付)"
 )
 _MEDIA_TARGET = re.compile(r"第.{0,6}[张幅]图|图\s*[一二三四五六七八九十\d]+|图片|插图|配图")
+
+# ── 交付格式识别 ──────────────────────────────────────────────────────────
+# 文档图只负责 Word（DOCX）的排版/校验/版本；用户点名其他格式时必须交给
+# 通用能力（工作区文件/代码执行）处理，不能一律当成 Word 生成。
+_FORMAT_DOCX = re.compile(r"(?<![a-zA-Z])(?:word|docx?)(?![a-zA-Z])|\.docx?\b", re.I)
+_FORMAT_OTHER = (
+    ("md", re.compile(r"(?<![a-zA-Z])markdown(?![a-zA-Z])|(?<![a-zA-Z])md(?![a-zA-Z])", re.I)),
+    ("txt", re.compile(r"(?<![a-zA-Z])txt(?![a-zA-Z])|纯文本|文本文件", re.I)),
+    ("csv", re.compile(r"(?<![a-zA-Z])csv(?![a-zA-Z])", re.I)),
+    ("xlsx", re.compile(r"(?<![a-zA-Z])(?:xlsx?|excel)(?![a-zA-Z])", re.I)),
+    ("pdf", re.compile(r"(?<![a-zA-Z])pdf(?![a-zA-Z])", re.I)),
+    ("pptx", re.compile(r"(?<![a-zA-Z])(?:pptx?|powerpoint)(?![a-zA-Z])", re.I)),
+    ("html", re.compile(r"(?<![a-zA-Z])(?:html|htm)(?![a-zA-Z])", re.I)),
+    ("json", re.compile(r"(?<![a-zA-Z])json(?![a-zA-Z])", re.I)),
+)
+
+
+def detect_deliverable_format(message: str) -> str | None:
+    """识别用户明确要求的交付文件格式（取最后一次提到的格式）。
+
+    返回 ``docx`` / ``md`` / ``txt`` / ``csv`` / ``xlsx`` / ``pdf`` /
+    ``pptx`` / ``html`` / ``json``；未点名格式返回 ``None``。
+    """
+    hits: list[tuple[int, str]] = [
+        (match.start(), fmt)
+        for fmt, pattern in _FORMAT_OTHER
+        if (match := pattern.search(message or ""))
+    ]
+    if match := _FORMAT_DOCX.search(message or ""):
+        hits.append((match.start(), "docx"))
+    return max(hits)[1] if hits else None
 
 
 def route_task(
@@ -97,11 +147,20 @@ def route_task(
     actionable = not _HOW_TO.match(content)
     attachment_refs = tuple(attachment_refs)
     has_word = has_word_attachment or any(Path(ref["path"]).suffix.casefold() == ".docx" for ref in attachment_refs)
+    # 用户点名非 Word 格式，或附件本身是文本类文件：文档图只处理 DOCX，
+    # 这类请求交给通用能力（工作区读写/代码执行）完成，不能强行生成 Word
+    deliverable_format = detect_deliverable_format(content)
+    text_attachment = any(
+        Path(str(ref.get("path") or "")).suffix.casefold() in {".md", ".markdown", ".txt", ".csv", ".json"}
+        for ref in attachment_refs
+    )
+    non_word = deliverable_format not in (None, "docx") or (text_attachment and not has_word)
     edit = _EDIT.search(content) or _REPLACE.search(content)
     # 只调样式/排版（不含内容改动与结构返工）且会话/附件里已有文档 → 编辑原文档，
     # 绝不能当成新主题生成；同时点名章节/指出不符合要求时必须走真实内容修改流程
     style_edit = bool(actionable and _STYLE.search(content) and _STYLE_ACTION.search(content)
-                      and not _CONTENT_EDIT.search(content) and not _CONTENT_REVISION.search(content))
+                      and not _CONTENT_EDIT.search(content) and not _CONTENT_REVISION.search(content)
+                      and not non_word)
     if task_mode != "auto":
         task_type = "general_chat" if task_mode == "chat" else task_mode
         confidence, reason = 1.0, "用户显式选择任务模式"
@@ -110,7 +169,7 @@ def route_task(
     elif style_edit:
         # 没有任何可优化文档时不得凭空生成"讲排版"的新文档，让对话澄清目标文档
         task_type, confidence, reason = "general_chat", 0.7, "样式/排版优化需要先指明具体文档"
-    elif actionable and edit and (
+    elif actionable and edit and not non_word and (
         document_id or _PREVIOUS_DOCUMENT.search(content)
         or (has_word and (_FILE_REFERENCE.search(content) or _EDIT_TARGET.search(content) or _MEDIA_TARGET.search(content)))
         or (has_document_context and (_EDIT_TARGET.search(content) or _MEDIA_TARGET.search(content)
@@ -120,7 +179,12 @@ def route_task(
     elif actionable and _PROFILE.search(content) and not document_profile_id:
         task_type, confidence, reason = "profile_extract", 0.95, "用户要求创建可复用文档规范"
     elif actionable and (_GENERATE.search(content) or _DELIVERY.search(content)):
-        task_type, confidence, reason = "document_generate", 0.96, "用户明确要求生成文档交付物"
+        if non_word:
+            task_type, confidence, reason = (
+                "general_chat", 0.9, "用户明确要求非 Word 格式文件，交由通用能力生成与交付",
+            )
+        else:
+            task_type, confidence, reason = "document_generate", 0.96, "用户明确要求生成文档交付物"
     elif _ANALYZE.search(content) and (
         document_id or _FILE_REFERENCE.search(content) or any(
             Path(ref["path"]).suffix.casefold() in _DOCUMENT_EXTENSIONS
@@ -138,7 +202,8 @@ def route_task(
         "document_profile_id": document_profile_id,
         "document_id": document_id,
         "style_edit": bool(style_edit and task_type == "document_edit"),
-        "router_version": 1,
+        "deliverable_format": deliverable_format,
+        "router_version": 2,
     }
 
 

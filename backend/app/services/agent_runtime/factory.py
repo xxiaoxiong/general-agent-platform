@@ -235,6 +235,16 @@ def _compose_system_prompt(ctx: RuntimeContext) -> str:
         from .goal import goal_protocol_prompt
 
         parts.append(goal_protocol_prompt(ctx))
+    deliverable = ctx.agent_config.get("_deliverable")
+    if isinstance(deliverable, dict) and deliverable.get("format"):
+        fmt = str(deliverable["format"])
+        parts.append(
+            "## 本轮文件交付\n"
+            f"用户要求交付 {fmt} 格式的文件。完成内容后必须用写入/代码工具把最终文件真实保存到 "
+            f"`/workspace/` 下（扩展名 .{fmt}，文件名贴合主题），确认写入成功后再在最终回答中"
+            "给出文件名、下载位置与关键结论。不得只把内容贴在对话里充当文件交付，"
+            "也不得在文件尚未创建时声称已生成或可下载。"
+        )
     parts.append(
         "## 执行约束\n"
         "- 始终使用用户提问所用的语言回答（用户用中文则用中文）。\n"

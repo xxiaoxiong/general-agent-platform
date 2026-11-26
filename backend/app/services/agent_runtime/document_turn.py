@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from .task_router import recent_word_attachments, references_prior_content, route_task
+from .task_router import recent_word_attachments, references_prior_content, route_task, user_grants_autonomy
 
 _MANUAL = re.compile(r"手册|指南|报告|方案|白皮书|说明书|简报|纪要|总结|文档|word|docx", re.I)
 _FOLLOW_UP = re.compile(
@@ -90,9 +90,17 @@ def is_template_reference(message: str) -> bool:
     return bool(_TEMPLATE.search(message))
 
 
-def document_turn(message: str, history: list[dict], route: dict) -> tuple[dict, list[dict], str | None]:
-    """返回附带上下文的路由、需核验的历史附件和可能有用户补充资料的原 Run。"""
+def document_turn(
+    message: str, history: list[dict], route: dict, *, allow_upgrade: bool = True,
+) -> tuple[dict, list[dict], str | None]:
+    """返回附带上下文的路由、需核验的历史附件和可能有用户补充资料的原 Run。
+
+    ``allow_upgrade=False``：模型分诊已判定本轮不是文档任务时，禁止再把
+    general_chat 提升为 document_generate（会话历史里的文档不能绑架新任务）。
+    """
     if route.get("task_mode") not in ("auto", "document_generate"):
+        return route, [], None
+    if not allow_upgrade and route.get("task_type") != "document_generate":
         return route, [], None
     latest = message.strip()
     followup = bool(_FOLLOW_UP.search(latest))
@@ -149,6 +157,8 @@ def document_turn(message: str, history: list[dict], route: dict) -> tuple[dict,
     context = {
         "request": request, "draft": draft[:_DRAFT_LIMIT], "template_paths": [item["path"] for item in inherited],
         "example_mode": bool(_EXAMPLE.search("\n".join([*users, latest]))),
+        # 用户明确授权自主决策：后续任何缺失资料都按假设补全并在正文注明，不再弹表单
+        "autonomous": user_grants_autonomy("\n".join([*users, latest])),
         # 明确交付意图 + 已有连续正文 = 直接把前文成稿为 Word，不再向用户索要正文资料
         "export_existing": bool(export and draft and len(draft) <= _DRAFT_LIMIT
                                 and not is_template_reference(latest)),

@@ -60,6 +60,9 @@ export const runApi = {
     task_mode?: DocumentMode
     document_profile_id?: number
     document_id?: number
+    /** 右侧预览文档：仅作为意图分诊提示，不强制绑定为本轮编辑目标 */
+    preview_document_id?: number
+    preview_document_version_no?: number
     task_options?: Record<string, unknown>
     /** 会话附件（上传接口返回的项） */
     attachments?: Array<{ name: string; path: string; text_path?: string | null }>

@@ -276,7 +276,9 @@ async def test_failed_document_continues_from_saved_chapter_in_same_run(platform
     monkeypatch.setattr(sys.modules["app.services.documents.graphs"], "build_document_graph", graph_factory)
     first = new_service()
     await first.worker.start()
-    created = await client.post("/api/v2/runs", json={"message": "生成项目报告", "conversation_id": 31})
+    created = await client.post("/api/v2/runs", json={
+        "message": "生成项目报告", "conversation_id": 31, "task_mode": "document_generate",
+    })
     run_id = created.json()["run_id"]
     url = f"/api/v2/runs/{run_id}"
     waiting = (await _events(client, url))[-1]
@@ -359,7 +361,13 @@ def test_document_turn_uses_phm_objective_and_exports_the_existing_draft():
         assert route["document_context"]["draft"] == draft
         assert route["document_context"]["export_existing"] is True
 
-    new_document = "生成一份新的考勤报告"
+    # 未点名 Word 的「报告」直接在对话中交付（通用能力），不进入 Word 流水线
+    new_report = "生成一份新的考勤报告"
+    route, refs, run = document_turn(new_report, history, route_task(new_report))
+    assert route["task_type"] == "general_chat" and "document_context" not in route
+    assert refs == [] and run is None
+    # 明确要求新的 Word 文档时，不继承旧任务的资料与要求
+    new_document = "生成一份新的考勤 Word 报告"
     route, refs, run = document_turn(new_document, history, route_task(new_document))
     assert route["document_context"]["request"] == new_document and refs == [] and run is None
     new_topic = [*history, {"role": "user", "content": "你用的什么模型？"}]

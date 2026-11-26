@@ -410,8 +410,8 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
         attachments: sentFiles,
         ...documentTaskPayload(sentTask),
         ...(sentPreview ? {
-          document_id: sentPreview.document_id,
-          task_options: { document_version_no: sentPreview.version_no },
+          preview_document_id: sentPreview.document_id,
+          preview_document_version_no: sentPreview.version_no,
         } : {}),
       })
       if (entry.stopped) {
