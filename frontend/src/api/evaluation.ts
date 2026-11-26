@@ -20,6 +20,8 @@ export interface EvalDatasetItem {
   complexity: string
   /** 任务类型：direct_qa / multi_step_reasoning / tool_use / instruction_following / multi_turn / adversarial / project_build / long_document / complex_math / deep_research */
   task_type: string
+  /** 能力维度（空=按 task_type 映射） */
+  capability?: string | null
   /** 任务声明的必需工具（客观对照） */
   required_tools: string[]
   /** 期望最少执行步数（客观对照） */
@@ -56,6 +58,12 @@ export interface AggLayer {
   avg_duration_s: number | null
   /** 平均输出字数（长程任务规模） */
   avg_output_chars?: number | null
+  p50_duration_s?: number | null
+  p95_duration_s?: number | null
+  /** 能力维度名称（by_capability 专用） */
+  name?: string
+  /** 样本是否足以形成能力结论（>=3 个有效 Trial） */
+  evidence_sufficient?: boolean
 }
 
 /** 问题用例（纯客观事实，供开发分析） */
@@ -88,10 +96,31 @@ export interface EvalRunAggregate {
   avg_duration_s?: number | null
   total_tokens?: number
   total_tool_calls?: number
+  /** 结果口径分解：pass / fail / inconclusive / infra_error / cancelled / unscored */
+  outcomes?: Record<string, number>
+  /** 执行状态分解 */
+  execution?: Record<string, number>
+  /** 验证覆盖 */
+  verification?: { executed?: number; coverage?: number | null }
+  /** 有效样本（Agent 有明确表现的 Trial） */
+  effective_sample?: number
+  /** 独立 Case 数（重复 Trial 不重复计） */
+  effective_cases?: number
+  /** Case 口径通过率（任一 Trial 通过即算通过） */
+  case_pass_rate?: number | null
+  /** 通过率 95% Wilson 置信区间 */
+  confidence_interval?: number[] | null
+  /** pass@k / pass^k */
+  pass_k?: { k: number; cases: number; pass_at_k: number | null; pass_hat_k: number | null }
+  p50_duration_s?: number | null
+  p95_duration_s?: number | null
+  cost_per_success_tokens?: number | null
   /** 按复杂度分层（L1-L4） */
   by_complexity?: Record<string, AggLayer>
   /** 按任务类型分层 */
   by_task_type?: Record<string, AggLayer>
+  /** 按能力维度分层 */
+  by_capability?: Record<string, AggLayer>
   /** 工具使用统计 */
   tool_usage?: Record<string, { calls: number; failed: number }>
   /** Agent 能力事实 */
@@ -110,6 +139,10 @@ export interface EvalRunAggregate {
     constraint_total?: number
     constraint_passed?: number
     constraint_ratio?: number | null
+    /** 异常恢复：出现工具失败但仍通过的 Trial */
+    tool_failure_trials?: number
+    recovered_trials?: number
+    recovery_rate?: number | null
   }
   problem_items?: ProblemItem[]
 }
@@ -118,12 +151,19 @@ export interface EvalRun {
   id: number
   name: string
   dataset_id: number
+  suite_id?: number | null
+  suite_version_id?: number | null
+  suite_name?: string | null
+  suite_version_no?: number | null
+  trials_per_case?: number
   agent_id: number
   agent_version_id: number | null
   status: string
   config: Record<string, any>
+  environment?: Record<string, any>
   aggregate: EvalRunAggregate
   error: string | null
+  attempt?: number
   started_at: string | null
   finished_at: string | null
   created_at: string | null
@@ -134,21 +174,43 @@ export interface EvalRun {
 export interface EvalRunItemBrief {
   id: number
   dataset_item_id: number | null
+  dataset_id?: number | null
   position: number
+  trial_index?: number
   status: string
+  execution_status?: string
+  verification_status?: string
+  grading_status?: string
+  outcome?: string
   score: number | null
   passed: boolean | null
   run_id: string | null
   error: string | null
   complexity: string
   task_type: string
+  capability?: string | null
   steps?: number | null
   tool_calls?: number | null
   output_chars?: number | null
   used_tools?: string[]
   missing_tools?: string[]
+  artifacts?: Array<{ path: string; size?: number; sha256?: string }>
   input_preview: string
   output_preview: string
+}
+
+export interface EvalGrade {
+  id: number
+  kind: string
+  name: string
+  status: string
+  score: number | null
+  passed: boolean | null
+  detail: Record<string, any>
+  evidence: Record<string, any>
+  model_config_id: number | null
+  prompt_version: string | null
+  created_at: string | null
 }
 
 export interface EvalRunItemDetail extends EvalRunItemBrief {
@@ -162,6 +224,7 @@ export interface EvalRunItemDetail extends EvalRunItemBrief {
   actual_output: string
   score_detail: Record<string, any>
   stats: Record<string, any>
+  grades?: EvalGrade[]
   started_at: string | null
   finished_at: string | null
 }
@@ -171,6 +234,9 @@ export interface EvalRunItemTrace {
   item_id: number
   runs: Array<{
     run_id: string
+    total_events?: number
+    offset?: number
+    limit?: number
     events: Array<{
       sequence: number
       event_type: string
@@ -192,12 +258,68 @@ export interface EvalRunItemTrace {
 
 export interface RunCreatePayload {
   name?: string
-  dataset_id: number
+  dataset_id?: number
+  suite_id?: number
+  suite_version_id?: number
   agent_id: number
+  agent_version_id?: number
   approval_mode?: string
   use_memory?: boolean
   timeout_s?: number
   limit?: number
+  /** Campaign 总耗时上限（秒，0=不限） */
+  campaign_timeout_s?: number
+  /** Campaign 总 Token 上限（0=不限） */
+  campaign_max_tokens?: number
+  trials_per_case?: number
+}
+
+/** 测评套件（多数据集组合 + 不可变版本快照） */
+export interface EvalSuiteVersionBrief {
+  id: number
+  version_no: number
+  digest: string | null
+  total_items: number | null
+  created_at: string | null
+}
+
+export interface EvalSuite {
+  id: number
+  name: string
+  description: string
+  dataset_ids: number[]
+  latest_version: EvalSuiteVersionBrief | null
+  versions?: EvalSuiteVersionBrief[]
+  created_at: string | null
+  updated_at: string | null
+}
+
+/** 版本对比结果（按 Case 聚合多次 Trial） */
+export interface EvalCompareResult {
+  base: Record<string, any>
+  target: Record<string, any>
+  /** 两个任务是否使用同一套件版本（严格可复现对比条件） */
+  same_suite_version?: boolean
+  summary: {
+    cases_paired: number
+    improved: number
+    regressed: number
+    unchanged_pass: number
+    unchanged_fail: number
+    only_base: number
+    only_target: number
+  }
+  deltas: Record<string, number | null>
+  items: Array<{
+    case: string
+    input_preview: string
+    complexity: string
+    task_type: string
+    capability?: string | null
+    base_outcome: string
+    target_outcome: string
+    change: string
+  }>
 }
 
 export const evaluationApi = {
@@ -231,6 +353,47 @@ export const evaluationApi = {
   seedCommunity: () =>
     request.post<any, { created: string[]; updated: string[]; skipped: string[]; available: string[] }>(
       '/evaluation/datasets/seed-community', {}),
+
+  // ── 测评套件 ──
+  listSuites: () =>
+    request.get<any, { items: EvalSuite[] }>('/evaluation/suites'),
+  createSuite: (data: { name: string; description?: string; dataset_ids: number[] }) =>
+    request.post<any, EvalSuite>('/evaluation/suites', data),
+  getSuite: (id: number) =>
+    request.get<any, EvalSuite>(`/evaluation/suites/${id}`),
+  updateSuite: (id: number, data: { name?: string; description?: string; dataset_ids?: number[] }) =>
+    request.put<any, EvalSuite>(`/evaluation/suites/${id}`, data),
+  deleteSuite: (id: number) =>
+    request.delete<any, { deleted: boolean }>(`/evaluation/suites/${id}`),
+  publishSuiteVersion: (id: number) =>
+    request.post<any, EvalSuiteVersionBrief>(`/evaluation/suites/${id}/versions`, {}),
+
+  // ── 版本对比 / 质量审计 / 重新评分 ──
+  compareRuns: (baseRunId: number, targetRunId: number) =>
+    request.get<any, EvalCompareResult>('/evaluation/compare', {
+      params: { base_run_id: baseRunId, target_run_id: targetRunId },
+    }),
+  qualityAudit: () =>
+    request.get<any, {
+      totals: Record<string, any>
+      datasets: Array<Record<string, any>>
+    }>('/evaluation/quality-audit'),
+  regradeItem: (itemId: number, data?: { scoring_method?: string; scoring_config?: Record<string, any> }) =>
+    request.post<any, Record<string, any>>(`/evaluation/run-items/${itemId}/regrade`, data || {}),
+  /** 查看 Trial 工作区最终产物内容（文本预览/二进制下载） */
+  getArtifact: (itemId: number, path: string) =>
+    request.get<any, string>(`/evaluation/run-items/${itemId}/artifact`, {
+      params: { path }, responseType: 'text' as any,
+    }),
+  /** 人工复核 Trial 评分 */
+  reviewItem: (itemId: number, decision: string, note?: string) =>
+    request.post<any, Record<string, any>>(`/evaluation/run-items/${itemId}/review`, {
+      decision, note: note || '',
+    }),
+  /** 把失败/证据不足 Trial 沉淀为回归用例 */
+  trialToRegression: (itemId: number, data?: { dataset_id?: number; dataset_name?: string }) =>
+    request.post<any, { dataset_id: number; item_id: number; created: boolean }>(
+      `/evaluation/run-items/${itemId}/to-regression`, data || {}),
 
   // ── 测评任务 ──
   createRun: (data: RunCreatePayload) =>

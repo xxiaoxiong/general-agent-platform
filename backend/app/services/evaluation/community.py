@@ -11,7 +11,9 @@ from typing import Any, Dict, List
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.evaluation import EvalDataset, EvalDatasetItem, EvalRunItem
+from app.models.evaluation import (
+    EvalDataset, EvalDatasetItem, EvalRunItem, EvalSuite, EvalSuiteDataset,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,7 @@ async def seed_community_datasets(db: AsyncSession,
     """
     defs = load_community_datasets()
     created, updated, skipped = [], [], []
+    seeded_ids: List[int] = []
     for d in defs:
         name = str(d.get("name") or "").strip()
         if not name:
@@ -87,10 +90,53 @@ async def seed_community_datasets(db: AsyncSession,
                 item_metadata=dict(it.get("metadata") or {}),
                 complexity=str(it.get("complexity") or "L2"),
                 task_type=str(it.get("task_type") or "direct_qa"),
+                capability=(it.get("capability") or None),
                 required_tools=list(it.get("required_tools") or []),
                 expected_min_steps=it.get("expected_min_steps"),
                 turns=list(it.get("turns") or []),
             ))
+        seeded_ids.append(dataset.id)
+    suite_info = await _ensure_default_suite(db, seeded_ids)
     await db.commit()
     return {"created": created, "updated": updated, "skipped": skipped,
-            "available": [str(d.get("name")) for d in defs]}
+            "available": [str(d.get("name")) for d in defs],
+            "default_suite": suite_info}
+
+
+async def _ensure_default_suite(db: AsyncSession, dataset_ids: List[int]) -> Dict[str, Any]:
+    """维护默认社区能力套件（组合全部社区数据集，并在内容变化时发布新版本）。"""
+    if not dataset_ids:
+        return {}
+    from app.services.evaluation.suites import (
+        build_suite_snapshot, latest_suite_version, publish_suite_version,
+    )
+
+    name = "社区通用能力基准（默认）"
+    suite = (await db.execute(
+        select(EvalSuite).where(EvalSuite.name == name))).scalar_one_or_none()
+    if suite is None:
+        suite = EvalSuite(
+            name=name, description="内置社区数据集组成的默认能力测评套件",
+        )
+        db.add(suite)
+        await db.flush()
+    await db.execute(delete(EvalSuiteDataset).where(
+        EvalSuiteDataset.suite_id == suite.id))
+    for pos, dataset_id in enumerate(dataset_ids):
+        db.add(EvalSuiteDataset(
+            suite_id=suite.id, dataset_id=dataset_id, position=pos))
+    await db.flush()
+
+    latest = await latest_suite_version(db, suite.id)
+    next_no = (latest.version_no + 1) if latest is not None else 1
+    snapshot = await build_suite_snapshot(db, suite, next_no)
+    changed = latest is None or (latest.snapshot or {}).get("digest") != snapshot.get("digest")
+    if changed:
+        await publish_suite_version(db, suite)
+    latest = await latest_suite_version(db, suite.id)
+    return {
+        "suite_id": suite.id,
+        "name": suite.name,
+        "version_no": latest.version_no if latest is not None else None,
+        "version_changed": changed,
+    }

@@ -16,9 +16,13 @@ from sqlalchemy.orm import Session
 
 from app.core.database import AsyncSessionLocal, engine, init_db
 from app.models.agent import Agent, AgentRun, AgentRunEvent, AgentToolExecution
-from app.models.evaluation import EvalDataset, EvalDatasetItem, EvalRun, EvalRunItem
+from app.models.evaluation import (
+    EvalDataset, EvalDatasetItem, EvalGrade, EvalRun, EvalRunItem,
+    EvalSuite, EvalSuiteDataset, EvalSuiteVersion,
+)
 
-_CLEAN = (EvalRunItem, EvalRun, EvalDatasetItem, EvalDataset,
+_CLEAN = (EvalGrade, EvalRunItem, EvalRun, EvalSuiteDataset, EvalSuiteVersion,
+          EvalSuite, EvalDatasetItem, EvalDataset,
           AgentToolExecution, AgentRunEvent, AgentRun, Agent)
 
 
@@ -1055,6 +1059,10 @@ class TestComplexityAndCapability:
         assert cap["constraint_items"] == 1
         assert cap["constraint_total"] == 8 and cap["constraint_passed"] == 6
         assert cap["constraint_ratio"] == 0.75
+        # 异常恢复：出现工具失败但最终通过
+        assert cap["tool_failure_trials"] == 1
+        assert cap["recovered_trials"] == 1
+        assert cap["recovery_rate"] == 1.0
         # 问题用例：failed+缺工具、error（未持久化行 id 为 None，按问题清单逐条断言）
         problem_lists = [p["problems"] for p in agg["problem_items"]]
         assert len(problem_lists) == 2

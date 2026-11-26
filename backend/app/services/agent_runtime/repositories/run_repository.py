@@ -103,6 +103,7 @@ class RunRepository:
         input_payload: Optional[Dict[str, Any]] = None,
         agent_config_snapshot: Optional[Dict[str, Any]] = None,
         agent_version_id: Optional[int] = None,
+        source: str = "chat",
     ) -> Tuple[AgentRun, bool]:
         """创建 Run。返回 (run, created)。
 
@@ -127,6 +128,7 @@ class RunRepository:
             request_hash=request_hash,
             input_payload=input_payload,
             agent_config_snapshot=agent_config_snapshot,
+            source=source or "chat",
         )
         self.session.add(run)
         try:

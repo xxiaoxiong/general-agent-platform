@@ -574,6 +574,7 @@ class WorkflowEngine:
                 agent_config=agent_config,
                 messages=messages,
                 user_id=scope_user,
+                source="workflow",
             )
             steps = result["steps"]
             final_content = result["content"]

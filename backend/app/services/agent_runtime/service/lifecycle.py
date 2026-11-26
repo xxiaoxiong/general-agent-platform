@@ -33,6 +33,7 @@ class LifecycleMixin:
         db_info: Optional[Dict[str, Any]] = None,
         endpoint: str = "chat",
         user_message: Optional[Dict[str, Any]] = None,
+        source: Optional[str] = None,
     ) -> Tuple[str, AsyncGenerator[Dict[str, Any], None]]:
         """启动运行并返回 (run_id, 事件流)：run_id 可先行写入响应头（X-Run-Id）。"""
         run, _adapter, stream = await self._start(
@@ -45,6 +46,7 @@ class LifecycleMixin:
             db_info=db_info,
             endpoint=endpoint,
             user_message=user_message,
+            source=source,
         )
         return run.run_id, stream
 
@@ -62,6 +64,7 @@ class LifecycleMixin:
         user_message: Optional[Dict[str, Any]] = None,
         execution_context: Optional[Dict[str, Any]] = None,
         request_hash: Optional[str] = None,
+        source: Optional[str] = None,
     ) -> Tuple[str, Optional[int], AsyncGenerator[Dict[str, Any], None]]:
         """启动运行并返回 (run_id, session_id, 事件流)。
 
@@ -80,6 +83,7 @@ class LifecycleMixin:
             user_message=user_message,
             execution_context=execution_context,
             request_hash=request_hash,
+            source=source,
         )
         return run.run_id, run.session_id, stream
 
@@ -132,6 +136,7 @@ class LifecycleMixin:
         db_info: Optional[Dict[str, Any]] = None,
         endpoint: str = "chat",
         user_message: Optional[Dict[str, Any]] = None,
+        source: Optional[str] = None,
     ) -> Dict[str, Any]:
         """非流式执行：返回 {status, content, steps, run_id, session_id}。"""
         run, _adapter, stream = await self._start(
@@ -144,6 +149,7 @@ class LifecycleMixin:
             db_info=db_info,
             endpoint=endpoint,
             user_message=user_message,
+            source=source,
         )
         steps: List[Dict[str, Any]] = []
         content = ""
@@ -402,6 +408,7 @@ class LifecycleMixin:
         user_message: Optional[Dict[str, Any]] = None,
         execution_context: Optional[Dict[str, Any]] = None,
         request_hash: Optional[str] = None,
+        source: Optional[str] = None,
     ) -> Tuple[RunHandle, LegacyEventAdapter, AsyncGenerator[Dict[str, Any], None]]:
         """创建 Run（DB pending）→ Worker CAS Claim → 执行；返回句柄、适配器与旧契约事件流。
 
@@ -439,6 +446,8 @@ class LifecycleMixin:
             input_payload=input_payload,
             snapshot=snapshot,
             user_message=user_message,
+            source=source or ("evaluation" if endpoint in ("eval", "evaluation")
+                              else (endpoint or "chat")),
         )
         run_id = row.id
         thread_id = row.thread_id
@@ -499,6 +508,7 @@ class LifecycleMixin:
         input_payload: Dict[str, Any],
         snapshot: Dict[str, Any],
         user_message: Optional[Dict[str, Any]] = None,
+        source: str = "chat",
     ) -> Tuple[AgentRunRow, bool, Optional[int]]:
         """业务事务（P1-01/P1-02）：幂等预查 + Session 创建 + 用户消息追加
         + Run 创建 + Session 执行权 Claim，单事务原子提交。
@@ -555,10 +565,26 @@ class LifecycleMixin:
 
             # 4) Run 创建（幂等唯一约束兜底并发；thread_id 随解析后的 Session 生成）
             # P2-01：Run 必须绑定不可变发布版本（无版本时自动发布 v1），
-            # 执行期只读该版本快照，不随 Agent 行后续修改变化
+            # 执行期只读该版本快照，不随 Agent 行后续修改变化。
+            # 测评等调用方可在 agent_config 中显式固定 agent_version_id：
+            # 一旦指定就只认该版本，绝不重新解析为最新版本（否则版本会漂移）。
+            from app.models.agent import AgentVersion
             from app.services.assistant.versions import ensure_version
 
-            version = await ensure_version(db, agent_config["id"], created_by=user_id)
+            pinned_version_id = agent_config.get("agent_version_id")
+            version = None
+            if pinned_version_id:
+                version = (await db.execute(
+                    select(AgentVersion).where(
+                        AgentVersion.id == int(pinned_version_id),
+                        AgentVersion.agent_id == int(agent_config["id"]),
+                    )
+                )).scalar_one_or_none()
+                if version is None:
+                    raise ValueError(
+                        f"指定的 AgentVersion 不存在或不属于该 Agent: {pinned_version_id}")
+            if version is None:
+                version = await ensure_version(db, agent_config["id"], created_by=user_id)
             thread_id = f"agent-{agent_config['id']}-document-run-{run_id}" if document_run else make_thread_id(
                 agent_config["id"], resolved_session_id, uuid.uuid4().hex
             )
@@ -573,6 +599,7 @@ class LifecycleMixin:
                 request_hash=request_hash,
                 input_payload=input_payload,
                 agent_config_snapshot=snapshot,
+                source=source,
             )
             if not created:
                 # 并发幂等重试收敛（create_run 冲突路径已 rollback 本事务）：

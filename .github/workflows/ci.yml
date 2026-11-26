@@ -104,6 +104,19 @@ jobs:
           cache-dependency-path: backend/requirements.txt
       - name: 安装锁定依赖
         run: pip install -r backend/requirements.txt
+      - name: PostgreSQL 迁移 upgrade/downgrade（独立测试库）
+        working-directory: backend
+        env:
+          PYTHONPATH: "."
+          PYTHONIOENCODING: utf-8
+          SECRET_KEY: test-secret-key-for-ci
+          DATABASE_URL: "postgresql+psycopg://ai_cp:ci_pg_pw@127.0.0.1:5432/ai_plat_migration_test"
+          DATABASE_SYNC_URL: "postgresql+psycopg2://ai_cp:ci_pg_pw@127.0.0.1:5432/ai_plat_migration_test"
+        run: |
+          PGPASSWORD=ci_pg_pw psql -h 127.0.0.1 -U ai_cp -d agent_checkpoints \
+            -c "CREATE DATABASE ai_plat_migration_test;"
+          python -m alembic upgrade head
+          python -m alembic downgrade base
       - name: PostgreSQL Checkpointer 测试
         working-directory: backend
         env:

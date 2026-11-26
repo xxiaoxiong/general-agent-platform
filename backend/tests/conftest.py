@@ -21,6 +21,8 @@ os.environ.setdefault("AGENT_FILES_ROOT", os.path.join(_TEST_DIR, "agent_files")
 os.environ.setdefault("AGENT_NETWORK_ALLOWLIST", "example.com")
 # 自进化评估循环不在测试进程内后台运行（各测试直接调用评估函数）
 os.environ.setdefault("EVOLUTION_ENABLED", "false")
+# 测评 Campaign Worker 不在测试进程内后台运行（需要时测试直接调用 run_once/execute）
+os.environ.setdefault("EVALUATION_WORKER_ENABLED", "false")
 # 语义决策默认关闭：测试进程不发起真实模型调用；需要覆盖决策行为的用例
 # 直接 monkeypatch decision.service.invoke_decision_model 或调用纯函数
 os.environ.setdefault("AGENT_DECISION_MODE", "off")

@@ -127,9 +127,12 @@ async def trigger_evaluations(
 ) -> Dict[str, Any]:
     """手动触发评估（逐 Run 立即评估，UNIQUE(run_id) 保证幂等）。"""
     from app.models.agent import AgentRun
-    from app.services.evolution.evaluator import TERMINAL_STATUSES, evaluate_run
+    from app.services.evolution.evaluator import (
+        TERMINAL_STATUSES, evaluate_run, production_run_condition,
+    )
 
-    stmt = select(AgentRun).where(AgentRun.status.in_(TERMINAL_STATUSES))
+    stmt = select(AgentRun).where(
+        AgentRun.status.in_(TERMINAL_STATUSES), production_run_condition())
     if body.run_ids:
         stmt = stmt.where(AgentRun.id.in_(body.run_ids))
     elif body.agent_id:

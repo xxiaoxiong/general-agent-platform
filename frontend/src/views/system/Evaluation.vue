@@ -15,10 +15,14 @@
       <!-- ── 测评任务 / 测评结果（面板内含两个 tab-pane 与相关弹层） ── -->
       <EvalRunsPanel ref="runsPanel" v-model:tab="tab" v-model:loading="loading"
         :section-loading="sectionLoading" :section-error="sectionError" />
+      <!-- ── 能力总览 ── -->
+      <EvalCapabilityPanel ref="capabilityPanel" :section-loading="sectionLoading" />
       <!-- ── 数据集 ── -->
       <el-tab-pane label="数据集" name="datasets">
         <EvalDatasetsPanel ref="datasetsPanel" v-model:loading="loading" :section-loading="sectionLoading" />
       </el-tab-pane>
+      <!-- ── 测评套件 ── -->
+      <EvalSuitesPanel ref="suitesPanel" :section-loading="sectionLoading" />
       <!-- ── 运行评估（概览 + 评估记录） ── -->
       <el-tab-pane label="运行评估" name="overview">
         <EvolutionOverviewPanel ref="overviewPanel" v-model:loading="loading" v-model:agent-id="agentId"
@@ -43,7 +47,9 @@ import { Plus, RefreshCw } from '@lucide/vue'
 import PageHeader from '@/components/layout/PageHeader.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import EvalRunsPanel from './evaluation/EvalRunsPanel.vue'
+import EvalCapabilityPanel from './evaluation/EvalCapabilityPanel.vue'
 import EvalDatasetsPanel from './evaluation/EvalDatasetsPanel.vue'
+import EvalSuitesPanel from './evaluation/EvalSuitesPanel.vue'
 import EvolutionOverviewPanel from './evolution/EvolutionOverviewPanel.vue'
 import EvolutionBriefingPanel from './evolution/EvolutionBriefingPanel.vue'
 import EvolutionChangesPanel from './evolution/EvolutionChangesPanel.vue'
@@ -59,7 +65,9 @@ const agentId = ref<number | undefined>(undefined)
 const windowHours = ref(168)
 
 const runsPanel = ref<InstanceType<typeof EvalRunsPanel> | null>(null)
+const capabilityPanel = ref<InstanceType<typeof EvalCapabilityPanel> | null>(null)
 const datasetsPanel = ref<InstanceType<typeof EvalDatasetsPanel> | null>(null)
+const suitesPanel = ref<InstanceType<typeof EvalSuitesPanel> | null>(null)
 const overviewPanel = ref<InstanceType<typeof EvolutionOverviewPanel> | null>(null)
 const changesPanel = ref<InstanceType<typeof EvolutionChangesPanel> | null>(null)
 
@@ -75,7 +83,9 @@ async function loadSection() {
   let requests: Promise<unknown>[]
   switch (tab.value) {
     case 'runs': requests = [runsPanel.value?.loadAll() ?? Promise.resolve()]; break
+    case 'capability': requests = [capabilityPanel.value?.loadAll() ?? Promise.resolve()]; break
     case 'datasets': requests = [datasetsPanel.value?.loadAll() ?? Promise.resolve()]; break
+    case 'suites': requests = [suitesPanel.value?.loadAll() ?? Promise.resolve()]; break
     case 'overview': requests = [overviewPanel.value?.loadAll() ?? Promise.resolve()]; break
     case 'reports': requests = [changesPanel.value?.loadAll() ?? Promise.resolve()]; break
     default:
@@ -97,7 +107,9 @@ async function refreshAll() {
   try {
     const results = await Promise.allSettled([
       runsPanel.value?.loadAll() ?? Promise.resolve(),
+      capabilityPanel.value?.loadAll() ?? Promise.resolve(),
       datasetsPanel.value?.loadAll() ?? Promise.resolve(),
+      suitesPanel.value?.loadAll() ?? Promise.resolve(),
       overviewPanel.value?.loadAll() ?? Promise.resolve(),
       changesPanel.value?.loadAll() ?? Promise.resolve(),
     ])

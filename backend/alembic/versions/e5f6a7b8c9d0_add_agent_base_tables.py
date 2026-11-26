@@ -114,3 +114,9 @@ def downgrade() -> None:
         op.drop_table('prompt_template_versions')
     if _has_table('prompt_templates'):
         op.drop_table('prompt_templates')
+    # agent_sessions 依赖 agents / users；先删子表，避免 initial downgrade
+    # 删除 users 时被遗留外键阻塞（PostgreSQL DependentObjectsStillExist）
+    if _has_table('agent_sessions'):
+        op.drop_table('agent_sessions')
+    if _has_table('agents'):
+        op.drop_table('agents')

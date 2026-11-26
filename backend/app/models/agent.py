@@ -160,6 +160,10 @@ class AgentRun(Base):
     # / limit_exceeded / needs_reconciliation
 
     idempotency_key = Column(String(128), nullable=True, index=True)
+    # Run 来源（P0：隔离 Benchmark 与生产运行）：
+    # chat / workflow / api / evaluation；老数据为空按生产运行对待
+    source = Column(String(32), default="chat", nullable=False, index=True,
+                    server_default="chat")
     error = Column(Text, nullable=True)
     final_text = Column(Text, nullable=True)
     summary = Column(JSON, nullable=True)              # 工具调用数、耗时等

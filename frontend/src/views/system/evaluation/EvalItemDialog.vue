@@ -2,17 +2,47 @@
   <!-- 用例结果详情 -->
   <el-drawer v-model="itemVisible" title="用例结果详情" size="min(870px, 100vw)">
     <el-descriptions v-if="currentItem" :column="2" border size="small">
-      <el-descriptions-item label="状态">{{ itemStatusText(currentItem.status) }}</el-descriptions-item>
+      <el-descriptions-item label="结果">
+        <el-tag :type="outcomeTagType(currentItem.outcome || legacyOutcome(currentItem.status))" size="small">
+          {{ outcomeText[currentItem.outcome || legacyOutcome(currentItem.status)] || currentItem.status }}
+        </el-tag>
+      </el-descriptions-item>
       <el-descriptions-item label="得分">{{ currentItem.score ?? '-' }}</el-descriptions-item>
+      <el-descriptions-item label="执行状态">{{ executionText[currentItem.execution_status || ''] || currentItem.execution_status || '-' }}</el-descriptions-item>
+      <el-descriptions-item label="验证 / 评分">
+        {{ verificationText[currentItem.verification_status || ''] || currentItem.verification_status || '-' }} /
+        {{ gradingText[currentItem.grading_status || ''] || currentItem.grading_status || '-' }}
+      </el-descriptions-item>
       <el-descriptions-item label="复杂度">
         <el-tag :type="complexityTagType(currentItem.complexity)" size="small">
           {{ complexityText[currentItem.complexity] || currentItem.complexity }}
         </el-tag>
       </el-descriptions-item>
-      <el-descriptions-item label="任务类型">{{ taskTypeText[currentItem.task_type] || currentItem.task_type }}</el-descriptions-item>
+      <el-descriptions-item label="任务 / 能力">
+        {{ taskTypeText[currentItem.task_type] || currentItem.task_type }} ·
+        {{ capabilityText[currentItem.capability || ''] || currentItem.capability || '-' }}
+      </el-descriptions-item>
       <el-descriptions-item label="评分方式">{{ currentItem.snap_scoring_method }}</el-descriptions-item>
       <el-descriptions-item label="Run">{{ currentItem.run_id || '-' }}</el-descriptions-item>
     </el-descriptions>
+    <div v-if="currentItem" class="toolbar" style="margin-top:12px;">
+      <UiButton size="sm" :loading="regrading" @click="regrade">重新评分（不重跑 Agent）</UiButton>
+      <UiButton v-if="!isPassed" size="sm" :loading="archiving" @click="archiveRegression">
+        沉淀为回归用例
+      </UiButton>
+      <el-dropdown size="small" @command="review">
+        <el-button size="small">人工复核<el-icon class="el-icon--right"><ArrowDown /></el-icon></el-button>
+        <template #dropdown>
+          <el-dropdown-menu>
+            <el-dropdown-item command="needs_review">标记需复核</el-dropdown-item>
+            <el-dropdown-item command="confirm_pass">人工判通过</el-dropdown-item>
+            <el-dropdown-item command="confirm_fail">人工判失败</el-dropdown-item>
+            <el-dropdown-item command="reject_score">拒绝当前评分</el-dropdown-item>
+          </el-dropdown-menu>
+        </template>
+      </el-dropdown>
+      <span class="hint">重新评分只执行 Verifier / Judge；沉淀会把当前用例快照复制到「回归用例（自动沉淀）」数据集。</span>
+    </div>
     <template v-if="currentItem">
       <h4>执行事实（客观）</h4>
       <div class="fact-grid">
@@ -75,6 +105,34 @@
           </el-table-column>
         </el-table>
       </template>
+      <template v-if="(currentItem.stats?.artifacts || []).length">
+        <h4>最终交付产物（工作区 / 工具调用）</h4>
+        <el-table :data="currentItem.stats.artifacts" size="small" stripe max-height="200">
+          <el-table-column prop="path" label="文件" min-width="240" show-overflow-tooltip />
+          <el-table-column prop="size" label="字节" width="90" />
+          <el-table-column prop="source" label="来源" width="100" />
+          <el-table-column prop="sha256" label="SHA256" min-width="200" show-overflow-tooltip />
+          <el-table-column label="操作" width="76">
+            <template #default="{ row }">
+              <el-button size="small" link type="primary" @click="openArtifact(row.path)">查看</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </template>
+      <template v-if="(currentItem.grades || []).length">
+        <h4>评分记录（Verifier / Judge 历史）</h4>
+        <el-table :data="currentItem.grades" size="small" stripe max-height="220">
+          <el-table-column prop="kind" label="类型" width="90" />
+          <el-table-column prop="name" label="评分器" width="130" />
+          <el-table-column prop="status" label="状态" width="90" />
+          <el-table-column prop="score" label="得分" width="70" />
+          <el-table-column label="证据/理由" min-width="260">
+            <template #default="{ row }">
+              {{ row.detail?.reasoning || row.detail?.error || JSON.stringify(row.evidence || {}) }}
+            </template>
+          </el-table-column>
+        </el-table>
+      </template>
       <template v-if="(currentItem.stats?.turns || []).length > 1">
         <h4>多轮对话（逐轮）</h4>
         <div v-for="t in currentItem.stats.turns" :key="t.turn" class="turn-block">
@@ -132,22 +190,45 @@
       </section>
     </template>
   </el-drawer>
+
+  <!-- 最终产物内容预览 -->
+  <el-dialog v-model="artifactVisible" :title="`产物预览：${artifactPath}`" width="min(900px, 96vw)">
+    <pre class="block" style="max-height:60vh;">{{ artifactText }}</pre>
+  </el-dialog>
 </template>
 
 <script setup lang="ts">
 import { ref, computed } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { ArrowDown } from '@lucide/vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import {
   evaluationApi,
   type EvalRunItemBrief, type EvalRunItemDetail, type EvalRunItemTrace,
 } from '@/api/evaluation'
-import { formatDate, pct, complexityText, complexityTagType, taskTypeText, itemStatusText } from './shared'
+import {
+  formatDate, pct, complexityText, complexityTagType, taskTypeText, itemStatusText,
+  capabilityText, outcomeText, outcomeTagType, executionText, verificationText, gradingText,
+} from './shared'
 
 const itemVisible = ref(false)
 const currentItem = ref<EvalRunItemDetail | null>(null)
 const itemTrace = ref<EvalRunItemTrace | null>(null)
 const traceLoading = ref(false)
 const traceError = ref(false)
+const regrading = ref(false)
+const archiving = ref(false)
+const artifactVisible = ref(false)
+const artifactPath = ref('')
+const artifactText = ref('')
+
+const isPassed = computed(() =>
+  (currentItem.value?.outcome || legacyOutcome(currentItem.value?.status || '')) === 'pass')
+
+function legacyOutcome(status: string) {
+  return ({ passed: 'pass', failed: 'fail', error: 'inconclusive',
+    skipped: 'cancelled', unscored: 'unscored' } as any)[status] || 'pending'
+}
 
 // 客观约束检查清单（constraint 评分明细）
 const constraintChecks = computed(() => {
@@ -174,6 +255,66 @@ async function loadTrace() {
     traceError.value = true
   } finally {
     traceLoading.value = false
+  }
+}
+
+async function regrade() {
+  if (!currentItem.value) return
+  regrading.value = true
+  try {
+    await evaluationApi.regradeItem(currentItem.value.id)
+    currentItem.value = await evaluationApi.getRunItem(currentItem.value.id)
+    ElMessage.success('已重新评分（执行结果未改动）')
+  } catch {
+    // 请求拦截器统一提示
+  } finally {
+    regrading.value = false
+  }
+}
+
+async function archiveRegression() {
+  if (!currentItem.value) return
+  archiving.value = true
+  try {
+    const result = await evaluationApi.trialToRegression(currentItem.value.id)
+    ElMessage.success(result.created ? '已沉淀为回归用例' : '回归用例已存在，未重复创建')
+  } catch {
+    // 请求拦截器统一提示
+  } finally {
+    archiving.value = false
+  }
+}
+
+async function openArtifact(path: string) {
+  if (!currentItem.value) return
+  try {
+    artifactText.value = await evaluationApi.getArtifact(currentItem.value.id, path)
+    artifactPath.value = path
+    artifactVisible.value = true
+  } catch {
+    // 请求拦截器统一提示
+  }
+}
+
+async function review(decision: string) {
+  if (!currentItem.value) return
+  let note = ''
+  try {
+    const result = await ElMessageBox.prompt(
+      '可填写复核说明（留空也可）', '人工复核', {
+        confirmButtonText: '提交', cancelButtonText: '取消',
+        inputPlaceholder: '复核理由/备注',
+      }) as any
+    note = result?.value || ''
+  } catch {
+    return
+  }
+  try {
+    await evaluationApi.reviewItem(currentItem.value.id, decision, note)
+    currentItem.value = await evaluationApi.getRunItem(currentItem.value.id)
+    ElMessage.success('已提交人工复核')
+  } catch {
+    // 请求拦截器统一提示
   }
 }
 

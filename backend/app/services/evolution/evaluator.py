@@ -25,6 +25,17 @@ _LOCK_KEY = "evolution:evaluator:lock"
 _MAX_ATTEMPTS = 3  # 失败评估的最大尝试次数（超过后不再自动重试）
 
 
+def production_run_condition():
+    """Evolution 只处理生产来源 Run（任务书 §6：Benchmark 不混入生产统计）。
+
+    ``agent_runs.source`` 老数据为空，按生产运行对待；``evaluation`` 为
+    标准 Benchmark 测评 Run，由 Evaluation 模块自行评分，Evolution 不得再次计分。
+    """
+    from sqlalchemy import or_
+
+    return or_(AgentRun.source.is_(None), AgentRun.source != "evaluation")
+
+
 async def evaluate_run(db, run: AgentRun) -> Optional[int]:
     """评估单个 Run（调用方需持有 db 会话）。返回 evaluation id；不可评估返回 None。"""
     from app.services.evolution.judge import JudgeError, judge_run
@@ -129,6 +140,7 @@ async def evaluate_pending_runs(limit: Optional[int] = None) -> int:
                 AgentRun.status.in_(TERMINAL_STATUSES),
                 AgentRun.finished_at.isnot(None),
                 AgentRun.finished_at < datetime.utcnow() - timedelta(seconds=30),
+                production_run_condition(),
                 or_(AgentEvaluation.id.is_(None),
                     and_(AgentEvaluation.status == "failed",
                          AgentEvaluation.attempts < _MAX_ATTEMPTS)),

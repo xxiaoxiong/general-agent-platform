@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import AgentRun, AgentRunEvent
@@ -76,6 +76,9 @@ class EventRepository:
 
         仍处于运行/暂停（waiting_approval / needs_reconciliation）的 Run
         事件一律不得清理。返回删除行数。
+
+        Benchmark / 测评 Run（source=evaluation）是历史测评的诊断证据，
+        使用独立保留策略：普通运行日志清理不删除它们（任务书 §4.9）。
         """
         cutoff = datetime.utcnow() - timedelta(days=retention_days)
         stale = await self.session.execute(
@@ -84,6 +87,7 @@ class EventRepository:
                 AgentRun.status.in_(tuple(TERMINAL_STATUSES)),
                 AgentRun.finished_at.isnot(None),
                 AgentRun.finished_at < cutoff,
+                or_(AgentRun.source.is_(None), AgentRun.source != "evaluation"),
             )
             .limit(batch)
         )

@@ -27,7 +27,9 @@ from app.schemas.model_provider import ChatMessage, ChatRequest
 logger = logging.getLogger(__name__)
 
 SCORING_METHODS = ("exact_match", "contains", "keyword", "regex",
-                   "constraint", "llm_judge", "none")
+                   "constraint", "json_schema", "tool_usage", "artifact",
+                   "mock_state", "project_verification", "hybrid",
+                   "llm_judge", "none")
 
 # llm_judge 默认通过线（0~10）
 DEFAULT_PASS_THRESHOLD = 6.0
@@ -117,8 +119,11 @@ def _extract_json(text: str) -> Dict[str, Any]:
 
 
 async def _pick_judge_model(db: AsyncSession) -> Tuple[ModelProvider, ModelConfig, int]:
-    """选择 judge 模型：EVOLUTION_JUDGE_MODEL_CONFIG_ID > 任一 active chat 模型。"""
-    config_id = int(getattr(settings, "EVOLUTION_JUDGE_MODEL_CONFIG_ID", 0) or 0)
+    """选择 judge 模型：EVALUATION_JUDGE_MODEL_CONFIG_ID >
+    EVOLUTION_JUDGE_MODEL_CONFIG_ID > 任一 active chat 模型。"""
+    config_id = int(getattr(settings, "EVALUATION_JUDGE_MODEL_CONFIG_ID", 0) or 0)
+    if not config_id:
+        config_id = int(getattr(settings, "EVOLUTION_JUDGE_MODEL_CONFIG_ID", 0) or 0)
     mc: Optional[ModelConfig] = None
     if config_id:
         mc = (await db.execute(

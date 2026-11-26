@@ -5,6 +5,7 @@
       <el-button type="primary" @click="openDatasetDialog()">新建数据集</el-button>
       <el-button @click="importVisible = true">导入 JSONL</el-button>
       <el-button type="success" :loading="loading" @click="seedCommunity">导入社区通用数据集</el-button>
+      <el-button :loading="auditLoading" @click="openAudit">质量审计</el-button>
       <span class="hint">社区数据集：GSM8K / BBH（多步推理）/ BFCL（函数调用·对抗）/ IFEval（指令遵循）/ 工具链·多轮·对抗鲁棒 + 长程任务（工程构建 / 长文档生成修改 / 复杂数学 / 深度研究），标注复杂度 L1-L4</span>
     </div>
     <el-table :data="datasets" v-loading="sectionLoading || loading" empty-text="暂无数据集" size="small" stripe>
@@ -30,6 +31,29 @@
       </el-table-column>
     </el-table>
   </el-tab-pane>
+
+  <!-- 数据集质量审计（纯客观统计） -->
+  <el-dialog v-model="auditVisible" title="数据集质量审计（客观统计）" width="760px">
+    <div v-if="audit" class="audit-summary">
+      <el-tag>用例 {{ audit.totals.cases }}</el-tag>
+      <el-tag type="success">确定性验证 {{ audit.totals.deterministic }}</el-tag>
+      <el-tag type="warning">仅 Judge {{ audit.totals.judge_only }}</el-tag>
+      <el-tag type="info">无评分 {{ audit.totals.no_scoring }}</el-tag>
+      <el-tag type="danger">缺期望 {{ audit.totals.missing_expected }}</el-tag>
+      <el-tag type="danger">未标能力 {{ audit.totals.missing_capability }}</el-tag>
+      <el-tag type="warning">重复输入 {{ audit.totals.duplicate_inputs }}</el-tag>
+    </div>
+    <el-table v-if="audit" :data="audit.datasets" size="small" stripe max-height="420">
+      <el-table-column prop="name" label="数据集" min-width="180" show-overflow-tooltip />
+      <el-table-column prop="cases" label="用例" width="64" />
+      <el-table-column prop="deterministic_cases" label="确定性" width="76" />
+      <el-table-column prop="judge_only_cases" label="仅Judge" width="76" />
+      <el-table-column prop="no_scoring_cases" label="无评分" width="76" />
+      <el-table-column prop="missing_expected" label="缺期望" width="76" />
+      <el-table-column prop="missing_capability" label="未标能力" width="86" />
+      <el-table-column prop="duplicate_inputs" label="重复输入" width="86" />
+    </el-table>
+  </el-dialog>
 
   <!-- 数据集详情（用例管理） -->
   <el-dialog v-model="datasetVisible" :title="`数据集用例：${currentDataset?.name || ''}`" width="860px" top="5vh">
@@ -89,6 +113,11 @@
           <el-option label="指令遵循" value="instruction_following" />
           <el-option label="多轮任务" value="multi_turn" />
           <el-option label="对抗鲁棒" value="adversarial" />
+        </el-select>
+      </el-form-item>
+      <el-form-item label="能力维度">
+        <el-select v-model="itemForm.capability" clearable placeholder="按任务类型自动归档" style="width:100%;">
+          <el-option v-for="(text, key) in capabilityText" :key="key" :label="text" :value="key" />
         </el-select>
       </el-form-item>
       <el-form-item label="必需工具">
@@ -172,8 +201,7 @@ import {
   evaluationApi,
   type EvalDataset, type EvalDatasetItem,
 } from '@/api/evaluation'
-import { complexityTagType, taskTypeText, confirmAction } from './shared'
-
+import { complexityTagType, taskTypeText, capabilityText, confirmAction } from './shared'
 const props = defineProps<{
   loading: boolean
   sectionLoading: boolean
@@ -194,12 +222,19 @@ const datasetForm = ref({ id: 0, name: '', description: '', category: 'general',
 const itemEditVisible = ref(false)
 const itemForm = ref({
   id: 0, input: '', expected: '', criteria: '', scoring_method: '',
-  complexity: 'L2', task_type: 'direct_qa',
+  complexity: 'L2', task_type: 'direct_qa', capability: '',
   required_tools_text: '', expected_min_steps: 0, turns_text: '',
 })
 const importVisible = ref(false)
 const importForm = ref({ dataset_id: undefined as number | undefined, name: '', content: '' })
-const scoringMethods = ['llm_judge', 'exact_match', 'contains', 'keyword', 'regex', 'none']
+const auditVisible = ref(false)
+const auditLoading = ref(false)
+const audit = ref<{ totals: Record<string, any>; datasets: Array<Record<string, any>> } | null>(null)
+const scoringMethods = [
+  'llm_judge', 'exact_match', 'contains', 'keyword', 'regex',
+  'constraint', 'json_schema', 'tool_usage', 'artifact',
+  'mock_state', 'project_verification', 'hybrid', 'none',
+]
 
 // ── 加载 ──
 async function loadDatasets() {
@@ -251,19 +286,29 @@ async function viewDataset(row: EvalDataset) {
   currentDataset.value = await evaluationApi.getDataset(row.id)
   datasetVisible.value = true
 }
+async function openAudit() {
+  auditLoading.value = true
+  try {
+    audit.value = await evaluationApi.qualityAudit()
+    auditVisible.value = true
+  } finally {
+    auditLoading.value = false
+  }
+}
 function openItemDialog(row?: EvalDatasetItem) {
   itemForm.value = row
     ? {
         id: row.id, input: row.input, expected: row.expected, criteria: row.criteria,
         scoring_method: row.scoring_method || '',
         complexity: row.complexity || 'L2', task_type: row.task_type || 'direct_qa',
+        capability: row.capability || '',
         required_tools_text: (row.required_tools || []).join(','),
         expected_min_steps: row.expected_min_steps ?? 0,
         turns_text: (row.turns || []).join('\n'),
       }
     : {
         id: 0, input: '', expected: '', criteria: '', scoring_method: '',
-        complexity: 'L2', task_type: 'direct_qa',
+        complexity: 'L2', task_type: 'direct_qa', capability: '',
         required_tools_text: '', expected_min_steps: 0, turns_text: '',
       }
   itemEditVisible.value = true
@@ -277,6 +322,7 @@ async function saveItem() {
       input: f.input, expected: f.expected, criteria: f.criteria,
       scoring_method: f.scoring_method || null,
       complexity: f.complexity, task_type: f.task_type,
+      capability: f.capability || null,
       required_tools: f.required_tools_text.split(/[,，]/).map(s => s.trim()).filter(Boolean),
       expected_min_steps: f.expected_min_steps || null,
       turns: f.turns_text.split('\n').map(s => s.trim()).filter(Boolean),
@@ -354,4 +400,5 @@ defineExpose({ loadAll })
 .toolbar { display: flex; gap: var(--ui-space-2); align-items: center; margin-bottom: var(--ui-space-3); flex-wrap: wrap; }
 .toolbar :deep(.el-button + .el-button) { margin-left: 0; }
 .hint { color: var(--ui-muted); font-size: var(--ui-size-sm); }
+.audit-summary { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: var(--ui-space-3); }
 </style>

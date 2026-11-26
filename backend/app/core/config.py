@@ -183,6 +183,17 @@ class Settings(BaseSettings):
     EVOLUTION_EVAL_BATCH_SIZE: int = 10         # 每轮最多评估的 Run 数
     EVOLUTION_JUDGE_MODEL_CONFIG_ID: int = 0    # LLM-as-judge 模型（0=复用 Run 的模型配置）
     EVOLUTION_VALIDATION_MIN_RUNS: int = 5      # 变更验证所需的新评估样本数
+
+    # ── Agent 测评（Evaluation Worker / Campaign）────────────────────────
+    EVALUATION_WORKER_ENABLED: bool = True      # 持久化 Campaign Worker 总开关
+    EVALUATION_WORKER_ID: str = ""              # 显式 Worker ID（缺省自动生成）
+    EVALUATION_POLL_INTERVAL: float = 5.0       # 扫描 pending / 租约过期 Campaign 间隔
+    EVALUATION_WORKER_BATCH: int = 2            # 单轮最多领取的 Campaign 数
+    EVALUATION_LEASE_SECONDS: int = 120         # Campaign 租约时长
+    EVALUATION_HEARTBEAT_INTERVAL: float = 20.0  # 心跳续租间隔
+    EVALUATION_INFRA_RETRY_MAX: int = 1         # 基础设施故障保守重试次数（无成功副作用时）
+    EVALUATION_JUDGE_MODEL_CONFIG_ID: int = 0   # 独立 Judge 模型（0=回退 EVOLUTION_JUDGE_MODEL_CONFIG_ID）
+
     OTEL_ENABLED: bool = False                  # OpenTelemetry 导出（P1-02）
     OTEL_EXPORTER_OTLP_ENDPOINT: str = ""       # 如 http://localhost:4317
     OTEL_SERVICE_NAME: str = "general-agent-platform"

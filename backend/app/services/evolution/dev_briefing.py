@@ -19,6 +19,7 @@ from app.models.agent import (
     AgentApproval, AgentRun, AgentToolExecution, AgentVersion,
 )
 from app.models.evolution import AgentEvaluation, EvolutionChangeLog
+from app.services.evolution.evaluator import production_run_condition
 
 _TRUNC = 300          # 错误/摘要文本截断长度
 _MAX_ROWS = 50        # 各明细列表上限
@@ -57,7 +58,7 @@ async def build_briefing(
         AgentRun.budget_steps, AgentRun.budget_model_calls,
         AgentRun.budget_tool_calls, AgentRun.budget_tokens,
         AgentRun.created_at, AgentRun.started_at, AgentRun.finished_at,
-    ).where(AgentRun.created_at >= window_start)
+    ).where(AgentRun.created_at >= window_start, production_run_condition())
     if agent_id:
         run_stmt = run_stmt.where(AgentRun.agent_id == agent_id)
     runs = sorted(
@@ -138,7 +139,8 @@ def _failed_runs(runs: List[AgentRun]) -> List[Dict[str, Any]]:
 async def _tool_stats(
     db: AsyncSession, window_start: datetime, agent_id: Optional[int],
 ) -> Dict[str, Any]:
-    run_ids = select(AgentRun.id).where(AgentRun.created_at >= window_start)
+    run_ids = select(AgentRun.id).where(
+        AgentRun.created_at >= window_start, production_run_condition())
     if agent_id:
         run_ids = run_ids.where(AgentRun.agent_id == agent_id)
     rows = (await db.execute(
@@ -193,7 +195,8 @@ async def _tool_stats(
 async def _hitl_data(
     db: AsyncSession, window_start: datetime, agent_id: Optional[int],
 ) -> Dict[str, Any]:
-    run_ids = select(AgentRun.id).where(AgentRun.created_at >= window_start)
+    run_ids = select(AgentRun.id).where(
+        AgentRun.created_at >= window_start, production_run_condition())
     if agent_id:
         run_ids = run_ids.where(AgentRun.agent_id == agent_id)
     rows = sorted(

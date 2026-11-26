@@ -63,6 +63,12 @@ async def lifespan(app: FastAPI):
     runtime_worker = get_run_worker()
     await runtime_worker.start()
 
+    # ── 测评 Campaign Worker：持久化领取 / 心跳 / 重启恢复 ──
+    from app.services.evaluation.worker import get_evaluation_worker
+
+    evaluation_worker = get_evaluation_worker()
+    await evaluation_worker.start()
+
     # ── 自进化闭环：周期评估（确定性指标 + LLM-as-judge）────────────────
     evolution_task = None
     if getattr(settings, "EVOLUTION_ENABLED", True):
@@ -84,6 +90,10 @@ async def lifespan(app: FastAPI):
             await evolution_task
         except Exception:  # noqa: BLE001
             pass
+    from app.services.evaluation.worker import get_evaluation_worker
+
+    # 先停测评调度，再停 Run Worker：避免 Campaign 在 Runtime 关闭后继续发起新 Run
+    await get_evaluation_worker().stop()
     if runtime_worker is not None:
         await runtime_worker.stop()
     from app.services.agent_runtime.persistence import CheckpointerFactory

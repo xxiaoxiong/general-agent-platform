@@ -20,7 +20,7 @@ def upgrade() -> None:
     with op.batch_alter_table("agents") as batch_op:
         batch_op.add_column(sa.Column("capability_ids", sa.JSON(), nullable=True))
         batch_op.add_column(
-            sa.Column("is_default", sa.Boolean(), nullable=False, server_default=sa.text("0"))
+            sa.Column("is_default", sa.Boolean(), nullable=False, server_default=sa.false())
         )
 
 
