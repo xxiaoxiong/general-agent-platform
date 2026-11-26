@@ -62,8 +62,9 @@ def _payload(suffix: str, generation: int, volume: str) -> dict:
     }
 
 
-async def _agent(ip: str, token: str, method: str, path: str, **kwargs) -> dict:
-    async with httpx.AsyncClient(timeout=60) as client:
+async def _agent(ip: str, token: str, method: str, path: str,
+                 *, timeout: float = 60.0, **kwargs) -> dict:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.request(
             method, f"http://{ip}:{_AGENT_PORT}{path}",
             headers={"Authorization": f"Bearer {token}"}, **kwargs,
@@ -114,6 +115,19 @@ async def test_real_docker_sandbox_lifecycle_and_isolation():
         assert any("no-new-privileges" in item for item in host["SecurityOpt"])
         assert info["Config"]["User"] in ("", None) or not info["Config"]["User"].startswith("0")
         assert info["Config"]["Labels"].get("platform.managed") == "true"
+
+        # ── Runner 重启恢复：断开自身网络后重新接入，Gateway 恢复 ─────────
+        from app.sandbox_runner.executor import _self_container_id
+
+        network = f"gap-net-{sandbox_id}-g1"
+        await engine.disconnect_network(network, _self_container_id())
+        await asyncio.sleep(2)
+        with pytest.raises(httpx.HTTPError):
+            await _agent(ip, token, "GET", "/health", timeout=4.0)
+        attached = await executor.attach_managed_networks()
+        assert attached >= 1
+        recovered = await _agent(ip, token, "GET", "/health", timeout=10.0)
+        assert recovered["status"] == "ok"
 
         # ── 命令执行 ────────────────────────────────────────────────────
         echo = await _agent(ip, token, "POST", "/exec", json={

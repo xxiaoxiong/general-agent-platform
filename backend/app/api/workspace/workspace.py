@@ -48,8 +48,14 @@ async def workspace_bootstrap(
         },
         # Workspace Sandbox：前端据此显示 Preview / Services Tab 与项目选择
         "sandbox": {
-            "enabled": bool(getattr(settings, "SANDBOX_ENABLED", False)),
+            "enabled": _sandbox_enabled(current_user.id),
             "preview_domain": getattr(settings, "PREVIEW_BASE_DOMAIN", "localhost"),
             "default_profile": getattr(settings, "SANDBOX_DEFAULT_PROFILE", "standard"),
         },
     }
+
+
+def _sandbox_enabled(user_id: int) -> bool:
+    from app.services.sandbox.common import sandbox_enabled_for
+
+    return sandbox_enabled_for(user_id)

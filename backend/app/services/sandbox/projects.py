@@ -67,6 +67,10 @@ async def default_project(db: AsyncSession, user: User) -> Project:
 
 
 async def list_projects(db: AsyncSession, user: User) -> list[dict]:
+    from .common import sandbox_enabled_for
+
+    if not sandbox_enabled_for(user.id):
+        return []
     owned = (await db.execute(
         select(Project).where(
             Project.deleted_at.is_(None),

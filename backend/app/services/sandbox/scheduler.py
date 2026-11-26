@@ -196,6 +196,7 @@ async def reserve_compute_for_sandbox(db: AsyncSession, sandbox: SandboxInstance
     """停止后重新启动：按 Sandbox 记录重新预留 CPU/RAM（磁盘预留仍保留）。
 
     资源不足时抛 SandboxResourceUnavailable（启动请求被拒绝），不超卖。
+    已持有计算预留时只补差额，重复调用不会重复计数。
     """
     if not sandbox.runner_id:
         raise SandboxResourceUnavailable("Sandbox 未绑定 Runner，无法重新启动")
@@ -206,13 +207,6 @@ async def reserve_compute_for_sandbox(db: AsyncSession, sandbox: SandboxInstance
     )).scalar_one_or_none()
     if runner is None:
         raise SandboxResourceUnavailable("Sandbox 所属 Runner 不存在")
-    cpu = int(sandbox.cpu_request_millis or 0)
-    memory = int(sandbox.memory_request_bytes or 0)
-    cpu_available, memory_available, _disk = _available(runner)
-    if cpu_available < cpu or memory_available < memory:
-        raise SandboxResourceUnavailable(
-            "Runner CPU/内存资源不足，Sandbox 启动请求已拒绝，请稍后重试"
-        )
     reservation = (await db.execute(
         select(SandboxResourceReservation)
         .where(
@@ -221,24 +215,44 @@ async def reserve_compute_for_sandbox(db: AsyncSession, sandbox: SandboxInstance
         )
         .with_for_update()
     )).scalars().first()
+    target_cpu = int(sandbox.cpu_request_millis or 0)
+    target_memory = int(sandbox.memory_request_bytes or 0)
+    current_cpu = int(reservation.cpu_reserved_millis) if reservation else 0
+    current_memory = int(reservation.memory_reserved_bytes) if reservation else 0
+    delta_cpu = max(0, target_cpu - current_cpu)
+    delta_memory = max(0, target_memory - current_memory)
+    cpu_available, memory_available, _disk = _available(runner)
+    if cpu_available < delta_cpu or memory_available < delta_memory:
+        raise SandboxResourceUnavailable(
+            "Runner CPU/内存资源不足，Sandbox 启动请求已拒绝，请稍后重试"
+        )
     if reservation is None:
         reservation = SandboxResourceReservation(
             runner_id=runner.id,
             workspace_id=sandbox.workspace_id,
             sandbox_id=sandbox.id,
-            cpu_reserved_millis=cpu,
-            memory_reserved_bytes=memory,
+            cpu_reserved_millis=target_cpu,
+            memory_reserved_bytes=target_memory,
             disk_reserved_bytes=0,
             status="reserved",
             reservation_token=new_token(16),
         )
         db.add(reservation)
     else:
-        reservation.cpu_reserved_millis = cpu
-        reservation.memory_reserved_bytes = memory
-    runner.cpu_reserved_millis = int(runner.cpu_reserved_millis) + cpu
-    runner.memory_reserved_bytes = int(runner.memory_reserved_bytes) + memory
+        reservation.cpu_reserved_millis = target_cpu
+        reservation.memory_reserved_bytes = target_memory
+    runner.cpu_reserved_millis = int(runner.cpu_reserved_millis) + delta_cpu
+    runner.memory_reserved_bytes = int(runner.memory_reserved_bytes) + delta_memory
     await db.flush()
+
+
+async def lock_owner_for_quota(db: AsyncSession, user_id: int) -> None:
+    """串行化同一用户的并发 Provision（锁定用户行，避免配额竞态突破上限）。"""
+    from app.models.user import User
+
+    await db.execute(
+        select(User).where(User.id == user_id).with_for_update()
+    )
 
 
 async def release_all(db: AsyncSession, sandbox_id: int,

@@ -199,6 +199,9 @@ class Settings(BaseSettings):
     SANDBOX_PROVIDER: str = "docker"            # 第一阶段仅 docker
     SANDBOX_RUNNER_ID: str = ""                 # Runner 节点标识（缺省 hostname）
     SANDBOX_RUNNER_TOKEN: str = ""              # Runner 内部服务令牌（启用时必填，fail-closed）
+    # 灰度白名单：为空=全部；非空=仅列出的用户/项目启用（任务书 §18 Feature Flag）
+    SANDBOX_ROLLOUT_USER_IDS: str = ""          # 逗号分隔 user_id
+    SANDBOX_ROLLOUT_PROJECT_IDS: str = ""       # 逗号分隔 project_id
     SANDBOX_RUNNER_CONTROL_URL: str = "http://sandbox-runner:9100"
     SANDBOX_RUNNER_PORT: int = 9100             # Runner 内部 API / Gateway 监听端口
     SANDBOX_BACKEND_URL: str = "http://backend:8000"  # Runner 回调 Backend 内部 API

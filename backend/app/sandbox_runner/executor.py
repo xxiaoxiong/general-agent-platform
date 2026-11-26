@@ -88,10 +88,12 @@ class RunnerExecutor:
                     "/tmp": "rw,noexec,nosuid,nodev,size=256m,mode=1777",
                     "/run": "rw,noexec,nosuid,nodev,size=64m,mode=755",
                     "/var/tmp": "rw,nosuid,nodev,size=128m,mode=1777",
-                    "/home/sandbox/.npm": "rw,size=256m,mode=700",
-                    "/home/sandbox/.npm-global": "rw,size=128m,mode=700",
-                    "/home/sandbox/.cache": "rw,size=256m,mode=700",
-                    "/home/sandbox/.local": "rw,size=256m,mode=700",
+                    # 用户目录挂载为 tmpfs：必须显式 uid/gid，否则 Docker 以 root
+                    # 创建挂载点，非 root sandbox 用户无法写 npm/pip 缓存（EACCES）
+                    "/home/sandbox/.npm": "rw,exec,size=256m,mode=700,uid=10001,gid=10001",
+                    "/home/sandbox/.npm-global": "rw,exec,size=128m,mode=700,uid=10001,gid=10001",
+                    "/home/sandbox/.cache": "rw,exec,size=256m,mode=700,uid=10001,gid=10001",
+                    "/home/sandbox/.local": "rw,exec,size=256m,mode=700,uid=10001,gid=10001",
                 },
                 "CapDrop": ["ALL"],
                 "SecurityOpt": ["no-new-privileges:true"],
@@ -379,6 +381,69 @@ class RunnerExecutor:
             })
         return items
 
+    async def attach_managed_networks(self) -> int:
+        """Runner 重启后重新加入所有已管理 Sandbox 的独立网络。
+
+        Runner 容器重建后不会保留动态接入的网络；不重新接入会导致 Gateway
+        无法访问仍在运行的 workspace-agent / Service（HTTP 502）。
+        """
+        runner_container = settings.SANDBOX_RUNNER_CONTAINER or _self_container_id()
+        if not runner_container:
+            return 0
+        attached = 0
+        try:
+            containers = await self.engine.list_containers({"platform.managed": "true"})
+        except DockerEngineError:
+            return 0
+        for container in containers:
+            labels = container.get("Labels") or {}
+            network = labels.get("platform.network")
+            if not network:
+                continue
+            try:
+                await self.engine.connect_network(network, runner_container)
+                attached += 1
+            except DockerEngineError as exc:
+                logger.warning("Runner 重新接入网络失败 %s: %s", network, exc)
+        return attached
+
+    async def sample_usage(self) -> dict:
+        """采样实际资源使用（container stats + workspace volume du）。
+
+        仅用于监控指标（预留量在数据库），采样失败不影响对账与业务。
+        """
+        items = await self.list_managed()
+        running = [item for item in items if item.get("observed_state") == "ready"]
+        cpu_cores = 0.0
+        memory_bytes = 0
+        volume_bytes = 0
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for index, item in enumerate(running[:10]):
+                try:
+                    stats = await self.engine.stats_one_shot(item["container_id"])
+                    cpu, memory = _stats_values(stats)
+                    cpu_cores += cpu
+                    memory_bytes += memory
+                except DockerEngineError:
+                    continue
+                # Volume 实际占用（限前 5 个，du 有成本）
+                if index < 5 and item.get("container_ip"):
+                    token = agent_token(int(item["sandbox_id"]), int(item["generation"]))
+                    try:
+                        response = await client.get(
+                            f"http://{item['container_ip']}:{settings.SANDBOX_AGENT_PORT}/files/usage",
+                            headers={"Authorization": f"Bearer {token}"},
+                        )
+                        if response.status_code == 200:
+                            volume_bytes += int(response.json().get("bytes") or 0)
+                    except (httpx.HTTPError, ValueError):
+                        pass
+        return {
+            "cpu_cores": round(cpu_cores, 3),
+            "memory_bytes": int(memory_bytes),
+            "volume_bytes": int(volume_bytes),
+        }
+
     async def usage(self) -> dict:
         """Runner 资源总量（CPU 核 / 内存 / 磁盘）与已用容器统计。"""
         try:
@@ -410,6 +475,28 @@ class RunnerExecutor:
             "active_sandbox_count": active,
             "runtime_version": version,
         }
+
+
+def _stats_values(stats: dict) -> tuple[float, int]:
+    """解析 Docker stats（one-shot）：返回 (CPU 核, 内存字节)。"""
+    try:
+        cpu_stats = stats.get("cpu_stats") or {}
+        pre_stats = stats.get("precpu_stats") or {}
+        cpu_total = int((cpu_stats.get("cpu_usage") or {}).get("total_usage") or 0)
+        pre_total = int((pre_stats.get("cpu_usage") or {}).get("total_usage") or 0)
+        system = int(cpu_stats.get("system_cpu_usage") or 0)
+        pre_system = int(pre_stats.get("system_cpu_usage") or 0)
+        online = int(cpu_stats.get("online_cpus") or len(
+            (cpu_stats.get("cpu_usage") or {}).get("percpu_usage") or []) or 1)
+        cpu_delta = cpu_total - pre_total
+        system_delta = system - pre_system
+        cores = (cpu_delta / system_delta) * online if system_delta > 0 and cpu_delta > 0 else 0.0
+        memory_stats = stats.get("memory_stats") or {}
+        usage = int(memory_stats.get("usage") or 0)
+        cache = int((memory_stats.get("stats") or {}).get("cache") or 0)
+        return max(0.0, cores), max(0, usage - cache)
+    except (TypeError, ValueError):
+        return 0.0, 0
 
 
 def _self_container_id() -> str:

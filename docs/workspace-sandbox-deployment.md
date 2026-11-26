@@ -63,6 +63,7 @@ curl -s http://localhost:8081/health      # preview-proxy
 | --- | --- | --- |
 | `SANDBOX_ENABLED` | false | 总开关 |
 | `SANDBOX_RUNNER_TOKEN` | 空 | 启用时必填（≥16 位），Backend/Runner/Preview Proxy 共用 |
+| `SANDBOX_ROLLOUT_USER_IDS` / `_PROJECT_IDS` | 空 | 灰度白名单（逗号分隔）；空=全部。不在名单内返回 503/404，工具与文件 API 同步拒绝 |
 | `SANDBOX_RUNNER_CONTROL_URL` | `http://sandbox-runner:9100` | Backend → Runner Gateway |
 | `SANDBOX_IMAGE` | `general-agent-platform/workspace-sandbox:1.0.0` | 固定镜像标签 |
 | `SANDBOX_DEFAULT_PROFILE` | standard | 资源档位 |
@@ -95,6 +96,39 @@ curl -s http://localhost:8081/health      # preview-proxy
   `read_file / write_file / edit_file / ls / glob / grep` 与 `execute_command` 看到同一份文件。
 - 附件上传写入 `uploads/`（Sandbox 内），文件面板、预览、ZIP 下载均从 Sandbox 读取。
 - 未归属项目的存量会话继续使用旧宿主机文件后端，互不影响。
+- **写租约覆盖所有写路径**：Agent 工具、文件后端、用户上传/删除附件都先获取
+  Workspace 写租约（owner=`run:{run_id}` 或 `user:{id}:{purpose}:{uuid}`），
+  同一 Workspace 串行写；租约被占用时上传返回 `409 workspace_write_busy`。
+- 每次工具/文件 API 调用都会重新校验 Project ACL；成员被移除后，
+  已在运行的会话也不能继续读写该 Workspace。
+
+### 4.2 Sandbox 内 workspace-agent 协议
+
+workspace-agent 只监听 Sandbox 网络内的 `:19999`，使用 Runner 派生 Token
+（`Authorization: Bearer <sha256(runner_token:sandbox_id:generation)>`），
+由 Runner Gateway 转发，不对外暴露。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/health` | 进程 / 工作区可写 / 服务数 |
+| POST | `/exec` | 启动命令，返回 operation（`wait_seconds` 内同步返回输出） |
+| GET | `/exec/{id}` | 查询状态 / 输出 / 退出码 |
+| POST | `/exec/{id}/cancel` | 杀死整个进程组 |
+| GET | `/files/list` | 目录列表（仅 `/workspace`） |
+| POST | `/files/read` | 按行窗口读取（文本/base64） |
+| POST | `/files/write` | 写入（支持 `encoding=base64`） |
+| POST | `/files/edit` | 精确字符串替换 |
+| POST | `/files/delete` | 删除文件/目录 |
+| POST | `/files/grep` | 字面量搜索 |
+| POST | `/files/glob` | glob 匹配 |
+| POST | `/files/raw` | 原始字节（base64，≤8MB） |
+| GET | `/files/usage` | Volume 实际占用（du） |
+| POST | `/services` | 启动长期服务 |
+| GET | `/services` | 列出服务与状态 |
+| GET | `/services/{name}` | 单服务状态 |
+| POST | `/services/{name}/stop` | 停止服务（进程组） |
+| POST | `/services/{name}/restart` | 重启服务 |
+| GET | `/services/{name}/logs` | 日志尾部（后端脱敏） |
 
 ## 5. 存储、配额与清理
 
@@ -154,6 +188,10 @@ Sandbox 容器本身是可丢弃的，恢复后由 Runner 按 Desired State 重�
 | 容器 OOM | `docker inspect` 查看 `OOMKilled`；调大 profile 内存上限或优化依赖 |
 | 磁盘写满 | 检查 Volume 使用量（Dashboard）；清理依赖缓存或扩容；`soft` 模式不会自动阻断 |
 | Runner 崩溃后 Job 卡住 | 默认 90s 租约过期后自动重新入队；超过 `max_attempts` 标记 failed，可重新点启动 |
+| Runner 重启后预览/命令 502 | Runner 启动与对账周期会自动重新接入所有既有 Sandbox 网络（`platform.network` 标签）；确认日志出现「Runner 已重新接入 N 个 Sandbox 网络」 |
+| 容器被外部删除 | Reconciler 检测 `container_missing` 后自动入队 start（10 分钟冷却），并记录 `sandbox.auto_recover_queued`；连续失败会保持 degraded 并留事件 |
+| npm/pip 安装报 EACCES | Runner 为 `/home/sandbox/.npm`、`.npm-global`、`.cache`、`.local` 挂载 tmpfs 时必须带 `uid=10001,gid=10001` 且 `exec`（否则非 root 无法写缓存 / 执行 npx 二进制） |
+| Vite HMR WebSocket 失败 | Preview Proxy 必须转发 `?token=` 查询参数与 `Sec-WebSocket-Protocol: vite-hmr`；Runner 转发时只保留自定义 Origin，避免重复 Host/Origin/Protocol 头 |
 | 服务在 Sandbox 重启后未恢复 | 服务需 `auto_start_on_sandbox_start=true` 且 `desired_state=running`；查看 `sandbox.ready` 事件中的 services |
 
 日志关联字段：`tenant_id / user_id / project_id / workspace_id / sandbox_id / generation /
@@ -169,6 +207,22 @@ run_id / job_id`。禁止把 Token、密码、API Key 写入日志。
   `sandbox_job_retry_total`、`sandbox_reconcile_mismatch_total`、`sandbox_oom_total`、
   `workspace_service_restart_total`、`workspace_service_health`、`preview_request_total`。
 - Grafana 导入 `docker/grafana/workspace-sandbox-runtime.json`（与现有 Runtime 看板同目录）。
+- **预留值与实际值可区分**：`*_reserved` 来自数据库预留账本；`sandbox_cpu_usage` /
+  `sandbox_memory_usage_bytes` / `sandbox_volume_usage_bytes` 由 Runner 在每轮对账中
+  采样（Docker stats + workspace `du -sb`，限流采样，失败不影响业务）。
+
+### 7.1 Vite HMR / WebSocket 验证
+
+```bash
+docker compose -f docker/docker-compose.yml run --rm \
+  -e SANDBOX_DOCKER_VITE=1 \
+  -e DATABASE_URL=sqlite+aiosqlite:////tmp/sandbox_vite.db \
+  -e DATABASE_SYNC_URL=sqlite:////tmp/sandbox_vite.db \
+  sandbox-runner python -m pytest tests/test_sandbox_docker_vite.py -q -s
+```
+
+测试会在 Sandbox 内安装并启动 Vite，连接 `vite-hmr` WebSocket，修改源码后断言
+收到 `update` / `full-reload` 消息。Preview Proxy 链路验证见交付报告。
 
 ## 8. 安全清单
 
@@ -192,3 +246,6 @@ run_id / job_id`。禁止把 Token、密码、API Key 写入日志。
 - Preview 使用 Host 重写为 `localhost:{port}` 兼容 Vite allowedHosts；应用若依赖绝对
   `Host` 生成 URL，请使用 `X-Forwarded-Host`。
 - 未实现完整在线 IDE 与多 Agent 并行修改同一工作树；写租约保证同一 Workspace 串行写。
+- 未实现「管理员关闭外部分享、仅登录用户可看预览」的预览登录态模式；当前授权边界是
+  可过期/可撤销的 Preview Grant（默认 1 小时）。
+- Preview 仅支持 HTTP Web App；WebSocket 已支持（Vite HMR 实测通过）。

@@ -213,7 +213,7 @@ async def _forward_http(request: Request, target: dict, path: str):
 
 @app.websocket("/{path:path}")
 async def proxy_ws(websocket: WebSocket, path: str):
-    token, _rest = _extract_token(websocket.headers.get("host") or "", websocket.url.path)
+    token, rest = _extract_token(websocket.headers.get("host") or "", websocket.url.path)
     if not token:
         await websocket.close(code=4404)
         return
@@ -231,7 +231,8 @@ async def proxy_ws(websocket: WebSocket, path: str):
         await websocket.close(code=4429)
         return
     try:
-        await _bridge_ws(websocket, target, path)
+        # 使用去掉 /p/{token} 前缀后的真实路径（Vite HMR 默认在 /）
+        await _bridge_ws(websocket, target, rest)
     finally:
         await _release(target["grant_id"])
 

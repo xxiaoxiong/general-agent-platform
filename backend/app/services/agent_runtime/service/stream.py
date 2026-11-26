@@ -319,9 +319,15 @@ class StreamMixin:
             # 模型无法通过工具参数指定其他项目/沙箱（任务书 §9.2）
             if settings.SANDBOX_ENABLED:
                 project_id = await self._load_session_project_id(run.session_id)
-                if project_id:
+                from app.services.sandbox.common import sandbox_enabled_for
+
+                if project_id and sandbox_enabled_for(
+                    user_id or run.user_id, project_id,
+                ):
                     agent_config["sandbox_enabled"] = True
                     agent_config["_project_id"] = project_id
+                else:
+                    project_id = None
             mem_ctx = use_memory_context or agent_config.pop("_memory_context", "")
             extra_db_info = db_info if db_info is not None else agent_config.pop("_db_info", None)
             # 运行开始事件先于语义决策发布：决策模型调用期间前端也能看到运行已启动

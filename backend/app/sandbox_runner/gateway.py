@@ -224,11 +224,13 @@ async def proxy_port_ws(websocket: WebSocket, sandbox_id: int, port: int, path: 
     for key, value in websocket.headers.items():
         if key.lower() in {
             "host", "connection", "upgrade", "sec-websocket-key",
-            "sec-websocket-version", "sec-websocket-extensions", "x-runner-token",
+            "sec-websocket-version", "sec-websocket-extensions",
+            "sec-websocket-protocol", "origin", "x-runner-token",
         }:
             continue
-        incoming_headers[key] = value
-    incoming_headers["Origin"] = f"http://localhost:{int(port)}"
+        incoming_headers[key.lower()] = value
+    # 统一小写键，避免与显式 Origin 形成重复头（Vite WS 会拒绝/挂起）
+    incoming_headers["origin"] = f"http://localhost:{int(port)}"
     subprotocols = [
         item.strip()
         for item in (websocket.headers.get("sec-websocket-protocol") or "").split(",")

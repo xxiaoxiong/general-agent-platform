@@ -68,6 +68,13 @@ class SandboxNotReadyError(SandboxError):
     code = "sandbox_not_ready"
 
 
+class SandboxWriteBusy(SandboxError):
+    """Workspace 写租约被其他 Agent Run / 用户写入占用。"""
+
+    status_code = 409
+    code = "workspace_write_busy"
+
+
 class SandboxOperationError(SandboxError):
     status_code = 502
     code = "sandbox_operation_failed"
@@ -142,6 +149,41 @@ def ensure_enabled() -> None:
         raise SandboxDisabledError(
             "Workspace Sandbox 未启用（SANDBOX_ENABLED=false）。"
             "请先在部署配置中启用 Sandbox Runtime 并启动 sandbox-runner。"
+        )
+
+
+def _csv_ints(raw: str) -> set[int]:
+    values: set[int] = set()
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            values.add(int(item))
+        except ValueError:
+            continue
+    return values
+
+
+def sandbox_enabled_for(user_id: Optional[int] = None,
+                        project_id: Optional[int] = None) -> bool:
+    """灰度 Feature Flag：全局开关 + 用户/项目白名单（空=全部）。"""
+    if not settings.SANDBOX_ENABLED:
+        return False
+    users = _csv_ints(getattr(settings, "SANDBOX_ROLLOUT_USER_IDS", ""))
+    if users and (user_id is None or int(user_id) not in users):
+        return False
+    projects = _csv_ints(getattr(settings, "SANDBOX_ROLLOUT_PROJECT_IDS", ""))
+    if projects and (project_id is None or int(project_id) not in projects):
+        return False
+    return True
+
+
+def ensure_enabled_for(user_id: Optional[int] = None,
+                       project_id: Optional[int] = None) -> None:
+    if not sandbox_enabled_for(user_id, project_id):
+        raise SandboxDisabledError(
+            "Workspace Sandbox 未对当前用户/项目开放（灰度白名单）。"
         )
 
 

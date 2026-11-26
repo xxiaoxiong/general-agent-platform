@@ -48,6 +48,9 @@ async def create_project(
     current_user: User = Depends(get_current_user),
 ):
     ensure_enabled()
+    from app.services.sandbox.common import ensure_enabled_for
+
+    ensure_enabled_for(current_user.id)
     project, workspace = await project_service.create_project(
         db, current_user, body.name, body.description,
     )

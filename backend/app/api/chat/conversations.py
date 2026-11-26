@@ -109,15 +109,21 @@ async def create_conversation(
     # 挂接用户默认项目，保证文件工具 / 命令工具 / 文件面板共享同一 Workspace。
     if getattr(settings, "SANDBOX_ENABLED", False):
         from app.services.sandbox import acl as sandbox_acl
+        from app.services.sandbox.common import sandbox_enabled_for
         from app.services.sandbox.projects import default_project
 
-        if body.project_id is not None:
+        if not sandbox_enabled_for(current_user.id, body.project_id):
+            if body.project_id is not None:
+                raise HTTPException(status_code=400, detail="项目未对当前用户开放")
+            session.project_id = None
+        elif body.project_id is not None:
             project, _role = await sandbox_acl.require_project_access(
                 db, body.project_id, current_user, "operator",
             )
+            session.project_id = project.id
         else:
             project = await default_project(db, current_user)
-        session.project_id = project.id
+            session.project_id = project.id
     elif body.project_id is not None:
         raise HTTPException(status_code=400, detail="Sandbox 未启用，不能指定项目")
     db.add(session)

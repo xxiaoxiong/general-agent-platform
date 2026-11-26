@@ -31,7 +31,10 @@ _CLEAN = (
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _db():
+async def _db(monkeypatch):
+    monkeypatch.setattr(settings, "SANDBOX_ENABLED", True)
+    monkeypatch.setattr(settings, "SANDBOX_ROLLOUT_USER_IDS", "")
+    monkeypatch.setattr(settings, "SANDBOX_ROLLOUT_PROJECT_IDS", "")
     await init_db()
     async with AsyncSessionLocal() as s:
         for model in _CLEAN:
@@ -217,7 +220,8 @@ async def test_execute_command_tool_persists_operation(monkeypatch):
     user = await _user("tool")
     project, workspace, sandbox = await _ready_sandbox(user)
 
-    async def fake_resolve(project_id, wait_seconds=25.0):
+    async def fake_resolve(project_id, *, user_id=None, min_role="operator",
+                           wait_seconds=25.0):
         return sandbox_tools.SandboxRef(sandbox.id, sandbox.generation, workspace.id, project.id)
 
     async def fake_exec(sandbox_id, command, **kwargs):
@@ -267,7 +271,7 @@ async def test_sandbox_files_backend_maps_workspace_and_blocks_host_paths(monkey
 
     backend = SandboxFilesBackend(project_id=1, run_id="run-1", user_id=1)
 
-    async def fake_sandbox():
+    async def fake_sandbox(min_role="viewer"):
         return type("Ref", (), {"sandbox_id": 9, "generation": 1,
                                 "workspace_id": 3, "project_id": 1})()
 

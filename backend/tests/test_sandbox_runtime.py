@@ -17,9 +17,11 @@ from app.models.sandbox import (
     SandboxRunnerNode, Workspace, WorkspaceService,
 )
 from app.models.user import User
-from app.services.sandbox import jobs, projects, runtime, scheduler
+from app.models.agent import AgentSession
+from app.services.sandbox import jobs, projects, runtime, scheduler, session_files
 from app.services.sandbox.common import (
-    SandboxNotFoundError, SandboxQuotaError, SandboxResourceUnavailable,
+    SandboxAccessDenied, SandboxNotFoundError, SandboxQuotaError,
+    SandboxResourceUnavailable, SandboxWriteBusy, sandbox_enabled_for,
 )
 from app.services.sandbox.common import utcnow
 from app.services.sandbox.profiles import ensure_default_profiles
@@ -35,6 +37,9 @@ _CLEAN = (
 
 @pytest_asyncio.fixture(autouse=True)
 async def _db(monkeypatch):
+    monkeypatch.setattr(settings, "SANDBOX_ENABLED", True)
+    monkeypatch.setattr(settings, "SANDBOX_ROLLOUT_USER_IDS", "")
+    monkeypatch.setattr(settings, "SANDBOX_ROLLOUT_PROJECT_IDS", "")
     await init_db()
     async with AsyncSessionLocal() as s:
         for model in _CLEAN:
@@ -391,3 +396,147 @@ async def test_runner_offline_detection():
         assert count == 1
         await s.refresh(row)
         assert row.status == "offline"
+
+async def test_generation_change_interrupts_running_operations():
+    user = await _user("u10")
+    project, workspace = await _project_with_workspace(user)
+    await _runner()
+    async with AsyncSessionLocal() as s:
+        sandbox = await runtime.provision_workspace(s, workspace)
+        s.add(SandboxCommandOperation(
+            id="op-old-generation", workspace_id=workspace.id, sandbox_id=sandbox.id,
+            sandbox_generation=sandbox.generation, run_id="run-old",
+            command="sleep 100", status="running",
+        ))
+        await s.commit()
+        sandbox.observed_state = "failed"
+        sandbox.failure_message = "container lost"
+        await s.commit()
+        renewed = await runtime.provision_workspace(s, workspace)
+        await s.commit()
+        operation = await s.get(SandboxCommandOperation, "op-old-generation")
+        assert renewed.generation == sandbox.generation + 1
+        assert operation.status == "interrupted"
+
+
+async def test_user_file_write_respects_agent_write_lease():
+    user = await _user("u11")
+    project, workspace, sandbox = await _ready_for_session(user)
+    async with AsyncSessionLocal() as s:
+        session = AgentSession(
+            agent_id=1, user_id=user.id, project_id=project.id,
+            title="lease", messages=[],
+        )
+        s.add(session)
+        await s.commit()
+        await s.refresh(session)
+        from app.services.sandbox.write_lease import acquire_write_lease
+
+        token = await acquire_write_lease(s, workspace.id, "run:busy-run", user_id=user.id)
+        await s.commit()
+        assert token is not None
+        with pytest.raises(SandboxWriteBusy):
+            await session_files.acquire_user_write_lease(
+                s, session, user.id, purpose="upload")
+        await s.rollback()
+
+
+async def test_member_removal_revokes_agent_tool_access():
+    owner = await _user("u12")
+    member = await _user("u13")
+    project, workspace, sandbox = await _ready_for_session(owner)
+    async with AsyncSessionLocal() as s:
+        await projects.add_member(s, project.id, owner, member.id, "operator")
+        await s.commit()
+        from app.services.tools.sandbox_tools import resolve_sandbox
+
+        ref = await resolve_sandbox(
+            project.id, user_id=member.id, min_role="operator", wait_seconds=0)
+        assert ref.sandbox_id == sandbox.id
+        await projects.remove_member(s, project.id, owner, member.id)
+        await s.commit()
+        with pytest.raises(SandboxAccessDenied):
+            await resolve_sandbox(
+                project.id, user_id=member.id, min_role="operator", wait_seconds=0)
+
+
+async def test_rollout_whitelist_blocks_other_users(monkeypatch):
+    user = await _user("u14")
+    project, workspace = await _project_with_workspace(user)
+    monkeypatch.setattr(settings, "SANDBOX_ROLLOUT_USER_IDS", "999999")
+    assert sandbox_enabled_for(user.id) is False
+    async with AsyncSessionLocal() as s:
+        with pytest.raises(SandboxNotFoundError):
+            from app.services.sandbox.acl import require_project_access
+
+            await require_project_access(s, project.id, user)
+        monkeypatch.setattr(settings, "SANDBOX_ROLLOUT_USER_IDS", str(user.id))
+        assert sandbox_enabled_for(user.id) is True
+
+
+async def test_missing_container_auto_recovery_enqueues_start():
+    user = await _user("u15")
+    project, workspace, sandbox = await _ready_for_session(user)
+    async with AsyncSessionLocal() as s:
+        sandbox = await s.get(SandboxInstance, sandbox.id)
+        sandbox.observed_state = "failed"
+        sandbox.failure_code = "container_missing"
+        sandbox.failure_message = "container missing"
+        sandbox.last_observed_at = utcnow() - timedelta(minutes=5)
+        await s.commit()
+        from app.services.sandbox.reconciler import get_reconciler
+
+        summary = await get_reconciler().run_once()
+        assert summary["auto_recover"] >= 1
+        start_jobs = (await s.execute(
+            select(SandboxJob).where(SandboxJob.job_type == "start")
+        )).scalars().all()
+        assert start_jobs and start_jobs[-1].status == "queued"
+
+
+async def test_stats_values_parsing_and_usage_metrics():
+    from app.sandbox_runner.executor import _stats_values
+    from app.observability import metrics
+
+    cpu, memory = _stats_values({
+        "cpu_stats": {
+            "cpu_usage": {"total_usage": 2_000_000},
+            "system_cpu_usage": 10_000_000,
+            "online_cpus": 2,
+        },
+        "precpu_stats": {
+            "cpu_usage": {"total_usage": 1_000_000},
+            "system_cpu_usage": 8_000_000,
+        },
+        "memory_stats": {"usage": 300 * 1024 * 1024, "stats": {"cache": 100 * 1024 * 1024}},
+    })
+    assert cpu == 1.0
+    assert memory == 200 * 1024 * 1024
+    metrics.set_sandbox_usage(cpu_cores=1.5, memory_bytes=1234, volume_bytes=5678)
+    body, _content_type = metrics.render()
+    text = body.decode("utf-8")
+    assert "sandbox_cpu_usage 1.5" in text
+    assert "sandbox_memory_usage_bytes 1234.0" in text
+    assert "sandbox_volume_usage_bytes 5678.0" in text
+
+
+async def _ready_for_session(user: User):
+    project, workspace = await _project_with_workspace(user)
+    await _runner(name=f"runner-{user.id}")
+    async with AsyncSessionLocal() as s:
+        workspace = await s.get(Workspace, workspace.id)
+        sandbox = await runtime.provision_workspace(s, workspace)
+        await s.commit()
+        runner = (await s.execute(select(SandboxRunnerNode))).scalar_one()
+        claimed = await jobs.claim_jobs(s, runner)
+        await s.commit()
+        job = claimed[0]
+        done = await jobs.complete_job(s, job.id, runner, job.lease_token, {
+            "container_id": f"c-{sandbox.id}", "container_ip": "10.0.0.9",
+            "observed_state": "ready",
+        })
+        await runtime.apply_job_complete(s, done, done.result_json or {})
+        await s.commit()
+        await s.refresh(workspace)
+        await s.refresh(sandbox)
+        return project, workspace, sandbox

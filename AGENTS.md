@@ -79,6 +79,10 @@ docker compose -f docker/docker-compose.yml --profile sandbox up -d
 docker compose -f docker/docker-compose.yml run --rm -e SANDBOX_DOCKER_TEST=1 \
   -e DATABASE_URL=sqlite+aiosqlite:////tmp/it.db -e DATABASE_SYNC_URL=sqlite:////tmp/it.db \
   sandbox-runner python -m pytest tests/test_sandbox_docker_integration.py -q
+# 真实 Vite HMR / WebSocket（需 npm 网络，可设 SANDBOX_NPM_REGISTRY）
+docker compose -f docker/docker-compose.yml run --rm -e SANDBOX_DOCKER_VITE=1 \
+  -e DATABASE_URL=sqlite+aiosqlite:////tmp/vite.db -e DATABASE_SYNC_URL=sqlite:////tmp/vite.db \
+  sandbox-runner python -m pytest tests/test_sandbox_docker_vite.py -q
 
 # 数据库迁移
 cd backend && python -m alembic upgrade head
@@ -121,6 +125,11 @@ cd backend && python -m alembic upgrade head
 15. **Sandbox 工具需要 Run 上下文**：`execute_command` / `*_service` 等走 `ToolExecutor` 的 `_CONTEXT_HANDLERS(ctx, params)`；Run 的 `project_id` 只能由 `session.project_id` 推导（`RuntimeContext.project_id`），不得从模型参数读取。写操作先获取 Workspace 写租约（`write_lease.py`，owner=`run:{run_id}`），Run 结束在 `_drive` finally 释放。
 16. **本地 Preview 地址是 `{token}.localhost:8081`**：`*.localhost` 由浏览器解析到回环；生产必须 `PREVIEW_PUBLIC_BASE_URL=https://preview.example.com`（启动校验要求 https）。Preview Proxy 只代理 Grant 中登记的 Sandbox + Port，禁止任意 upstream URL；本地若浏览器不解析子域，用 `/p/{token}/` 兜底地址。
 17. **Sandbox 集成测试必须真实 Docker**：`test_sandbox_docker_integration.py` 只在 `SANDBOX_DOCKER_TEST=1` 时运行，且必须在挂载 Docker Socket 的容器内执行（DockerEngine 只支持 unix socket，Windows 宿主直跑不可用）；测试会创建/删除真实容器、网络与 Volume，名称带随机后缀。
+18. **Sandbox 用户目录 tmpfs 必须 `uid/gid=10001` 且 `exec`**：Docker tmpfs 默认 root 所有并 `noexec`，否则 npm/pip 缓存 EACCES、`npx`/`vite` 二进制 Permission denied。修改 `executor._container_spec` 的 Tmpfs 时不要丢掉这组参数。
+19. **Runner 重启后必须重新接入既有 Sandbox 网络**：Runner 容器重建不会保留动态加入的 `gap-net-*` 网络；`RunnerExecutor.attach_managed_networks()` 在启动与每轮对账执行，否则 Gateway 访问既有 Sandbox 全部 502。改 Runner 生命周期时保留该调用。
+20. **Preview WebSocket 路径要去掉 `/p/{token}` 前缀**：Preview Proxy 的 `_bridge_ws` 必须使用 `_extract_token` 返回的 rest（否则 Vite 收到错误路径）；Runner 转发 WS 时不要重复发送 Host/Origin/Sec-WebSocket-Protocol（Vite 会挂起/400）。Vite 8+ 还需原样透传页面客户端自动附加的 `?token=`。
+21. **Sandbox 写路径全部要 ACL + 写租约**：工具/文件后端/附件上传删除每次调用都复核 Project 角色（成员移除立即失效），并走 Workspace 写租约；新增写入口不要绕过 `session_files.acquire_user_write_lease` / `write_lease.acquire_write_lease`。
+22. **灰度开关**：`SANDBOX_ROLLOUT_USER_IDS` / `SANDBOX_ROLLOUT_PROJECT_IDS` 非空时仅名单内启用；bootstrap、会话挂项目、工具、ACL 必须统一走 `sandbox_enabled_for()`，不要只判断 `SANDBOX_ENABLED`。
 
 ## 修改范围原则
 

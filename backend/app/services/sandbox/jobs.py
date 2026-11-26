@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Optional
 
 from sqlalchemy import select, update
@@ -225,6 +225,34 @@ async def fail_job(
                  "error": job.error_message[:500]},
     )
     return job, retry
+
+
+async def has_active_job(db: AsyncSession, sandbox_id: int) -> bool:
+    """该 Sandbox 是否已有排队/执行中的 Job（避免 Reconciler 重复入队）。"""
+    from sqlalchemy import func
+
+    count = (await db.execute(
+        select(func.count(SandboxJob.id)).where(
+            SandboxJob.sandbox_id == sandbox_id,
+            SandboxJob.status.in_(("queued", "leased", "running")),
+        )
+    )).scalar() or 0
+    return count > 0
+
+
+async def last_job_created_at(
+    db: AsyncSession, sandbox_id: int, job_types: tuple[str, ...],
+) -> Optional[datetime]:
+    rows = (await db.execute(
+        select(SandboxJob.created_at)
+        .where(
+            SandboxJob.sandbox_id == sandbox_id,
+            SandboxJob.job_type.in_(job_types),
+        )
+        .order_by(SandboxJob.created_at.desc())
+        .limit(1)
+    )).scalars().first()
+    return rows
 
 
 async def recover_expired_jobs(db: AsyncSession) -> int:

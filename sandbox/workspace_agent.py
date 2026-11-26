@@ -492,6 +492,20 @@ def raw_file(payload: dict) -> dict:
     }
 
 
+def workspace_usage() -> dict:
+    """Workspace Volume 实际占用（du -sb），用于容量监控（软配额）。"""
+    try:
+        result = subprocess.run(  # noqa: S603 固定命令
+            ["du", "-sb", WORKSPACE_ROOT],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return {"bytes": int(result.stdout.split()[0])}
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return {"bytes": 0}
+
+
 # ── Service ──────────────────────────────────────────────────────────────
 
 class Service:
@@ -816,6 +830,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, glob_files(payload))
             elif path == "/files/raw" and method == "POST":
                 self._send(200, raw_file(payload))
+            elif path == "/files/usage" and method == "GET":
+                self._send(200, workspace_usage())
             elif path == "/services" and method == "GET":
                 self._send(200, list_services())
             elif path == "/services" and method == "POST":

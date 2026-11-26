@@ -1,4 +1,4 @@
-"""Sandbox Agent 工具集（任务书 §9.1）。
+﻿"""Sandbox Agent 工具集（任务书 §9.1）。
 
 - 命令：execute_command / get_command_status / get_command_output / cancel_command
 - 服务：start_service / list_services / get_service_status / get_service_logs /
@@ -27,8 +27,12 @@ from app.models.sandbox import (
     Project, SandboxCommandOperation, SandboxInstance, Workspace, WorkspaceService,
 )
 from app.models.user import User
-from app.services.sandbox import agent_client, preview as preview_service, runtime, service_manager
-from app.services.sandbox.common import SandboxError
+from app.services.sandbox import (
+    agent_client, preview as preview_service, runtime, service_manager,
+)
+from app.services.sandbox.common import (
+    SandboxAccessDenied, SandboxDisabledError, SandboxError,
+)
 from app.services.sandbox.write_lease import acquire_write_lease
 
 from .result import ToolResult
@@ -187,9 +191,14 @@ class SandboxRef:
 
 
 async def resolve_sandbox(
-    project_id: Optional[int], *, wait_seconds: float = 25.0,
+    project_id: Optional[int], *, user_id: Optional[int] = None,
+    min_role: str = "operator", wait_seconds: float = 25.0,
 ) -> SandboxRef:
-    """取（必要时启动）项目 Sandbox；启动中最多等待 wait_seconds。"""
+    """取（必要时启动）项目 Sandbox；启动中最多等待 wait_seconds。
+
+    ``user_id`` 非空时每次调用都重新校验 Project ACL（成员移除后立即失效），
+    不信任任何缓存或模型参数。
+    """
     if not project_id:
         raise SandboxError(
             "当前会话未绑定项目工作空间（旧会话使用平台文件区），"
@@ -202,6 +211,20 @@ async def resolve_sandbox(
         )).scalar_one_or_none()
         if project is None:
             raise SandboxError("项目不存在或已删除", code="sandbox_project_missing")
+        if user_id is not None:
+            from app.services.sandbox import acl
+            from app.services.sandbox.common import sandbox_enabled_for
+
+            if not sandbox_enabled_for(int(user_id), project.id):
+                raise SandboxDisabledError("Workspace Sandbox 未对当前用户/项目开放")
+            user = await db.get(User, int(user_id))
+            if user is None:
+                raise SandboxAccessDenied("用户不存在")
+            role = await acl.project_role(db, project, user)
+            if not acl.role_satisfies(role, min_role):
+                raise SandboxAccessDenied(
+                    f"当前项目角色 {role or '无'} 无 {min_role} 权限"
+                )
         workspace = (await db.execute(
             select(Workspace).where(
                 Workspace.project_id == project.id, Workspace.deleted_at.is_(None))
@@ -364,6 +387,12 @@ async def _operation_ctx(operation_id: str, ctx: Any) -> SandboxRef:
         )).scalar_one_or_none()
         if sandbox is None:
             raise SandboxError("命令所属 Sandbox 不存在", code="sandbox_not_found")
+        workspace = await db.get(Workspace, sandbox.workspace_id)
+        if workspace is not None and ctx.scope.user_id is not None:
+            from app.services.sandbox import acl
+
+            await acl.require_project_role(
+                db, workspace.project_id, ctx.scope.user_id, "operator")
         return SandboxRef(sandbox.id, sandbox.generation, sandbox.workspace_id, 0)
 
 
@@ -380,13 +409,22 @@ async def _service_by_name(workspace_id: int, name: str) -> WorkspaceService:
         return service
 
 
+async def _resolve(ctx: Any, min_role: str = "operator") -> SandboxRef:
+    """工具入口统一 ACL 复核：project_id 来自 Run 上下文，user_id 来自认证身份。"""
+    return await resolve_sandbox(
+        getattr(ctx, "project_id", None),
+        user_id=getattr(ctx.scope, "user_id", None),
+        min_role=min_role,
+    )
+
+
 # ── Handlers（ToolExecutor 以 (ctx, params) 调用）──────────────────────────
 
 async def handle_execute_command(ctx: Any, params: dict) -> ToolResult:
     command = str(params.get("command") or "").strip()
     if not command:
         return ToolResult.failed("command 不能为空")
-    ref = await resolve_sandbox(getattr(ctx, "project_id", None))
+    ref = await _resolve(ctx)
     lease_error = await ensure_write_lease(ctx, ref)
     if lease_error:
         return ToolResult.failed(lease_error)
@@ -447,7 +485,7 @@ async def handle_cancel_command(ctx: Any, params: dict) -> ToolResult:
 
 
 async def handle_start_service(ctx: Any, params: dict) -> ToolResult:
-    ref = await resolve_sandbox(getattr(ctx, "project_id", None))
+    ref = await _resolve(ctx)
     lease_error = await ensure_write_lease(ctx, ref)
     if lease_error:
         return ToolResult.failed(lease_error)
@@ -490,7 +528,7 @@ async def handle_start_service(ctx: Any, params: dict) -> ToolResult:
 
 
 async def handle_list_services(ctx: Any, params: dict) -> ToolResult:
-    ref = await resolve_sandbox(getattr(ctx, "project_id", None))
+    ref = await _resolve(ctx, "viewer")
     async with AsyncSessionLocal() as db:
         workspace = (await db.execute(
             select(Workspace).where(Workspace.id == ref.workspace_id)
@@ -513,7 +551,7 @@ async def handle_list_services(ctx: Any, params: dict) -> ToolResult:
 
 
 async def handle_get_service_status(ctx: Any, params: dict) -> ToolResult:
-    ref = await resolve_sandbox(getattr(ctx, "project_id", None))
+    ref = await _resolve(ctx, "viewer")
     name = str(params.get("name") or "")
     service = await _service_by_name(ref.workspace_id, name)
     async with AsyncSessionLocal() as db:
@@ -535,7 +573,7 @@ async def handle_get_service_status(ctx: Any, params: dict) -> ToolResult:
 
 
 async def handle_get_service_logs(ctx: Any, params: dict) -> ToolResult:
-    ref = await resolve_sandbox(getattr(ctx, "project_id", None))
+    ref = await _resolve(ctx, "viewer")
     name = str(params.get("name") or "")
     tail = max(1, min(2000, int(params.get("tail") or 200)))
     service = await _service_by_name(ref.workspace_id, name)
@@ -547,7 +585,7 @@ async def handle_get_service_logs(ctx: Any, params: dict) -> ToolResult:
 
 
 async def handle_stop_service(ctx: Any, params: dict) -> ToolResult:
-    ref = await resolve_sandbox(getattr(ctx, "project_id", None))
+    ref = await _resolve(ctx)
     lease_error = await ensure_write_lease(ctx, ref)
     if lease_error:
         return ToolResult.failed(lease_error)
@@ -570,7 +608,7 @@ async def handle_stop_service(ctx: Any, params: dict) -> ToolResult:
 
 
 async def handle_restart_service(ctx: Any, params: dict) -> ToolResult:
-    ref = await resolve_sandbox(getattr(ctx, "project_id", None))
+    ref = await _resolve(ctx)
     lease_error = await ensure_write_lease(ctx, ref)
     if lease_error:
         return ToolResult.failed(lease_error)
@@ -593,7 +631,7 @@ async def handle_restart_service(ctx: Any, params: dict) -> ToolResult:
 
 
 async def handle_get_preview_url(ctx: Any, params: dict) -> ToolResult:
-    ref = await resolve_sandbox(getattr(ctx, "project_id", None))
+    ref = await _resolve(ctx, "viewer")
     name = str(params.get("name") or "")
     ttl = max(0, min(86400, int(params.get("ttl_seconds") or settings.PREVIEW_TOKEN_TTL)))
     async with AsyncSessionLocal() as db:

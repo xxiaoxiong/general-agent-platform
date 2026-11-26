@@ -176,5 +176,15 @@ async def report_sandboxes(
 ):
     runner = await _get_runner(db, runner_id)
     result = await runtime.report_sandbox_states(db, runner, payload.get("items") or [])
+    usage = payload.get("usage") or {}
+    if usage:
+        metrics.set_sandbox_usage(
+            cpu_cores=float(usage.get("cpu_cores") or 0),
+            memory_bytes=int(usage.get("memory_bytes") or 0),
+            volume_bytes=int(usage.get("volume_bytes") or 0),
+        )
+    if result.get("oom"):
+        for _ in range(int(result["oom"])):
+            metrics.inc_sandbox_oom()
     await db.commit()
     return result

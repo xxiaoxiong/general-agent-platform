@@ -69,8 +69,12 @@ class SandboxReconciler:
                 continue
 
     async def run_once(self) -> dict:
-        summary = {"offline": 0, "recovered": 0, "idle": 0, "services": 0, "mismatch": 0}
+        summary = {
+            "offline": 0, "recovered": 0, "idle": 0, "services": 0,
+            "mismatch": 0, "reconcile_queued": 0, "auto_recover": 0,
+        }
         async with AsyncSessionLocal() as db:
+            now = utcnow()
             summary["offline"] = await runtime.mark_stale_runners_offline(db)
             summary["recovered"] = await jobs.recover_expired_jobs(db)
             if summary["recovered"]:
@@ -92,7 +96,45 @@ class SandboxReconciler:
                 changed = await sync_service_states(db, workspace, sandbox)
                 summary["services"] += changed
 
-            # Desired / Observed 不一致（不自动接管，只告警 + 指标）
+            # 长时间无 Runner 上报的 Ready Sandbox：入队 reconcile 探查真实容器
+            stale_threshold = now - timedelta(
+                seconds=max(90.0, float(settings.SANDBOX_RECONCILE_INTERVAL) * 3))
+            stale_rows = (await db.execute(
+                select(SandboxInstance).where(
+                    SandboxInstance.observed_state == "ready",
+                    SandboxInstance.desired_state == "running",
+                    (SandboxInstance.last_observed_at.is_(None))
+                    | (SandboxInstance.last_observed_at < stale_threshold),
+                ).limit(10)
+            )).scalars().all()
+            for sandbox in stale_rows:
+                if await jobs.has_active_job(db, sandbox.id):
+                    continue
+                job, created = await jobs.enqueue_job(
+                    db, job_type="reconcile", workspace_id=sandbox.workspace_id,
+                    sandbox_id=sandbox.id, runner_id=sandbox.runner_id,
+                    payload={
+                        "workspace_id": sandbox.workspace_id,
+                        "sandbox_id": sandbox.id,
+                        "generation": sandbox.generation,
+                    },
+                    idempotency_key=(
+                        f"reconcile:{sandbox.id}:{sandbox.generation}:"
+                        f"{int(now.timestamp() // 600)}"
+                    ),
+                    priority=110,
+                )
+                if created:
+                    summary["reconcile_queued"] += 1
+                    await emit_event(
+                        db, "sandbox.reconcile_queued",
+                        workspace_id=sandbox.workspace_id, sandbox_id=sandbox.id,
+                        generation=sandbox.generation, job_id=job.id,
+                        payload={"reason": "stale_observed_state",
+                                 "last_observed_at": sandbox.last_observed_at},
+                    )
+
+            # Desired / Observed 不一致：告警 + 指标；容器缺失自动恢复（10 分钟冷却）
             mismatched = (await db.execute(
                 select(SandboxInstance).where(
                     SandboxInstance.desired_state == "running",
@@ -101,7 +143,7 @@ class SandboxReconciler:
             )).scalars().all()
             for sandbox in mismatched:
                 last = sandbox.last_observed_at or sandbox.created_at
-                if last is not None and utcnow() - last < timedelta(seconds=60):
+                if last is not None and now - last < timedelta(seconds=60):
                     continue
                 summary["mismatch"] += 1
                 metrics.inc_sandbox_reconcile_mismatch()
@@ -110,8 +152,40 @@ class SandboxReconciler:
                     workspace_id=sandbox.workspace_id, sandbox_id=sandbox.id,
                     generation=sandbox.generation,
                     payload={"desired_state": sandbox.desired_state,
-                             "observed_state": sandbox.observed_state},
+                             "observed_state": sandbox.observed_state,
+                             "failure_code": sandbox.failure_code},
                 )
+                if sandbox.failure_code != "container_missing":
+                    continue
+                workspace = await db.get(Workspace, sandbox.workspace_id)
+                if workspace is None or workspace.deleted_at is not None:
+                    continue
+                if await jobs.has_active_job(db, sandbox.id):
+                    continue
+                last_start = await jobs.last_job_created_at(
+                    db, sandbox.id, ("start",))
+                if last_start is not None and (now - last_start).total_seconds() < 600:
+                    continue
+                try:
+                    await runtime.request_lifecycle(
+                        db, workspace, sandbox, "start",
+                        workspace.owner_user_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 资源不足等：记录，下轮再试
+                    await emit_event(
+                        db, "sandbox.auto_recover_failed",
+                        workspace_id=sandbox.workspace_id, sandbox_id=sandbox.id,
+                        generation=sandbox.generation,
+                        payload={"error": str(exc)[:500]},
+                    )
+                else:
+                    summary["auto_recover"] += 1
+                    await emit_event(
+                        db, "sandbox.auto_recover_queued",
+                        workspace_id=workspace.id, sandbox_id=sandbox.id,
+                        generation=sandbox.generation,
+                        payload={"reason": "container_missing"},
+                    )
 
             await self._refresh_metrics(db)
             await db.commit()

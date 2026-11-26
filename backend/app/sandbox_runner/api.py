@@ -94,6 +94,13 @@ class SandboxRunnerAgent:
             return
         await self._register_with_retry()
         gateway.set_engine(self.engine)
+        # 重启后重新接入所有既有 Sandbox 网络，恢复 Gateway 连通性
+        try:
+            attached = await self.executor.attach_managed_networks()
+            if attached:
+                logger.info("Runner 已重新接入 %s 个 Sandbox 网络", attached)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Runner 重新接入 Sandbox 网络失败：%s", exc)
         self._loops = [
             asyncio.create_task(self._control_loop(), name="sandbox-runner-control"),
             asyncio.create_task(self._reconcile_loop(), name="sandbox-runner-reconcile"),
@@ -162,10 +169,15 @@ class SandboxRunnerAgent:
             try:
                 if self.runner_id is None:
                     continue
+                try:
+                    await self.executor.attach_managed_networks()
+                except Exception:  # noqa: BLE001 网络接入失败不阻断对账
+                    pass
                 items = await self.executor.list_managed()
+                usage = await self.executor.sample_usage()
                 result = await self._post(
                     f"/internal/runners/{self.runner_id}/sandboxes/report",
-                    {"items": items},
+                    {"items": items, "usage": usage},
                 )
                 if result.get("unknown"):
                     metrics.inc_sandbox_reconcile_mismatch()

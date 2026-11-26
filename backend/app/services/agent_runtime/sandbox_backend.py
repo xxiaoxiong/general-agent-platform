@@ -54,10 +54,13 @@ class SandboxFilesBackend(BackendProtocol):
         self.run_id = run_id
         self.user_id = int(user_id)
 
-    async def _sandbox(self):
+    async def _sandbox(self, min_role: str = "viewer"):
         from app.services.tools.sandbox_tools import resolve_sandbox
 
-        return await resolve_sandbox(self.project_id, wait_seconds=25.0)
+        return await resolve_sandbox(
+            self.project_id, user_id=self.user_id, min_role=min_role,
+            wait_seconds=25.0,
+        )
 
     async def _lease_error(self, ref) -> Optional[str]:
         from app.core.database import AsyncSessionLocal
@@ -121,7 +124,7 @@ class SandboxFilesBackend(BackendProtocol):
 
     async def awrite(self, file_path: str, content: str) -> WriteResult:
         try:
-            ref = await self._sandbox()
+            ref = await self._sandbox("operator")
             error = await self._lease_error(ref)
             if error:
                 return WriteResult(error=error)
@@ -135,7 +138,7 @@ class SandboxFilesBackend(BackendProtocol):
     async def aedit(self, file_path: str, old_string: str, new_string: str,
                     replace_all: bool = False) -> EditResult:
         try:
-            ref = await self._sandbox()
+            ref = await self._sandbox("operator")
             error = await self._lease_error(ref)
             if error:
                 return EditResult(error=error)
@@ -151,7 +154,7 @@ class SandboxFilesBackend(BackendProtocol):
 
     async def adelete(self, file_path: str) -> DeleteResult:
         try:
-            ref = await self._sandbox()
+            ref = await self._sandbox("operator")
             error = await self._lease_error(ref)
             if error:
                 return DeleteResult(error=error)
@@ -210,7 +213,7 @@ class SandboxFilesBackend(BackendProtocol):
         ref = None
         lease_error = None
         try:
-            ref = await self._sandbox()
+            ref = await self._sandbox("operator")
             lease_error = await self._lease_error(ref)
         except SandboxError as exc:
             return [FileUploadResponse(path=path, error=exc.message) for path, _ in files]

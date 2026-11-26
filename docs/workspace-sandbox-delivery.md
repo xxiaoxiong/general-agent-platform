@@ -64,15 +64,40 @@
 - Prometheus 指标 18 项；Grafana 看板；审计事件 `sandbox_events`（生命周期 / Job / ACL / Preview / 资源）。
 - 多 Runner 注册、容量记账、目标 Runner 路由已具备（未做跨节点 Volume 迁移）。
 
+## 2.1 完成度审计补强（第二轮）
+
+对照任务书逐条审计后补齐的缺口：
+
+- **ACL 全链路**：Agent 工具、`SandboxFilesBackend`、附件上传/删除/list/preview 每次调用都
+  重新校验 Project 角色；成员移除后正在运行的会话立即失去读写权限（新增测试）。
+- **用户写入租约**：用户上传/删除附件与 Agent 写操作共用 Workspace 写租约，
+  并发写入返回 `409 workspace_write_busy`，避免用户编辑与 Agent 互相覆盖。
+- **配额并发**：Provision 前锁定用户行，串行化同一用户的并发创建，避免突破活动 Sandbox 上限。
+- **Generation 隔离**：新 Generation、stop/restart/delete 时旧 `SandboxCommandOperation`
+  标记 `interrupted`，不假设命令自动继续。
+- **自动恢复**：Reconciler 对 `container_missing` 自动入队 start（10 分钟冷却）；
+  长时间无 Runner 上报的 Ready Sandbox 入队 reconcile 探查真实容器。
+- **实际资源用量**：Runner 周期采样 Docker stats 与 `du -sb /workspace`，
+  回传 Backend 写入 `sandbox_cpu_usage` / `sandbox_memory_usage_bytes` /
+  `sandbox_volume_usage_bytes`（与预留值分离）；OOM 转换只计数一次并记审计事件。
+- **Runner 重启恢复**：Runner 启动与每轮对账重新接入所有 `platform.network`，
+  修复 Runner 重建后既有 Sandbox 的 Gateway 502（集成测试覆盖断网→重连）。
+- **依赖安装修复**：Sandbox 用户目录 tmpfs 显式 `uid/gid=10001` 且 `exec`，
+  修复 npm/pip 缓存 EACCES 与 npx 二进制 Permission denied。
+- **Vite HMR**：Preview Proxy WebSocket 使用去掉 `/p/{token}` 前缀后的真实路径，
+  Runner 去重 Host/Origin/Sec-WebSocket-Protocol 头；Vite 8 `?token=` 由页面客户端自动附加并透传。
+- **灰度开关**：`SANDBOX_ROLLOUT_USER_IDS` / `SANDBOX_ROLLOUT_PROJECT_IDS` 按用户/项目灰度。
+
 ## 3. 验证记录（真实执行）
 
 | 验证 | 命令 / 方式 | 结果 |
 | --- | --- | --- |
-| 后端全量回归 | `cd backend && python -m pytest -q` | **1057 passed, 12 skipped, 102.01s** |
-| Sandbox 专项（模型/调度/Lease/ACL/预览/工具/文件后端） | `pytest tests/test_sandbox_runtime.py tests/test_sandbox_security.py tests/test_sandbox_api.py -q` | **20 passed** |
-| 真实 Docker 集成 | 在 Runner 容器内 `SANDBOX_DOCKER_TEST=1 pytest tests/test_sandbox_docker_integration.py` | **1 passed**（创建容器/网络/Volume、命令、文件一致性、只读 rootfs、网络隔离、Service 健康 + HTTP、删除容器后新 Generation 文件保留、幂等创建） |
+| 后端全量回归 | `cd backend && python -m pytest -q` | **1063 passed, 13 skipped, 111.45s** |
+| Sandbox 专项（模型/调度/Lease/ACL/预览/工具/文件后端/写租约/自动恢复） | `pytest tests/test_sandbox_runtime.py tests/test_sandbox_security.py tests/test_sandbox_api.py -q` | **26 passed** |
+| 真实 Docker 集成 | 在 Runner 容器内 `SANDBOX_DOCKER_TEST=1 pytest tests/test_sandbox_docker_integration.py` | **1 passed**（容器安全基线、Runner 断网后重新接入恢复 Gateway、命令、文件一致性、只读 rootfs、网络隔离、Service 健康 + HTTP、删除容器后新 Generation 文件保留、幂等创建） |
+| Vite HMR / WebSocket | 在 Runner 容器内 `SANDBOX_DOCKER_VITE=1 pytest tests/test_sandbox_docker_vite.py -q -s` | **1 passed 13.43s**（Vite 安装、dev server、`vite-hmr` WS、修改源码收到 `full-reload`） |
 | 真实端到端（服务层） | 容器内脚本：项目 → Provision → 命令（uid=10001）→ Service → Preview | `exec succeeded`、`service healthy`、子域预览 200、兜底 200、坏 Token 401 |
-| 浏览器 E2E | `npm run test:e2e:sandbox`（真实 Edge + 已部署栈） | **1 passed 10.8s**：项目创建 → Sandbox Ready → Service healthy → iframe 真实页面 → 刷新后预览 → 切换项目不串显 → Services 面板；截图见 `docs/assets/` |
+| 浏览器 E2E | `npm run test:e2e:sandbox`（真实 Edge + 已部署栈） | **1 passed 16.0s**：项目创建 → Sandbox Ready → Service healthy → iframe 真实页面 → 刷新后预览 → 切换项目不串显 → Services 面板；截图见 `docs/assets/` |
 | 前端类型检查/构建 | `cd frontend && npm run build` | 通过 |
 | Compose 校验 | `docker compose --profile sandbox --profile sandbox-image config -q` | 通过 |
 | SQLite 迁移 | `alembic upgrade head` + `downgrade base` | 通过 |
@@ -84,7 +109,10 @@
 - 容器安全：`privileged=false`、`CapDrop=ALL`、`no-new-privileges`、`ReadonlyRootfs=true`、CPU/内存/PID 限制、非 root（uid 10001）均由集成测试 inspect 校验。
 - 网络隔离：Sandbox 无法解析 `backend / mysql / redis / checkpoint_pg`（真实命令测试）；每个 Sandbox 独立 bridge，仅 Runner 加入。
 - 数据面：Backend / Preview Proxy / Sandbox 均未挂载 Docker Socket；Runner 是唯一 Socket 持有者。
-- 访问控制：跨用户项目 404；viewer 不能执行；成员移除后其 Preview Grant 立即撤销；坏 Token 401；过期/撤销/服务停止 401/403/410。
+- 访问控制：跨用户项目 404；viewer 不能执行；成员移除后其 Preview Grant 与 Agent 工具/文件访问立即失效；坏 Token 401；过期/撤销/服务停止 401/403/410。
+- 并发：用户上传/删除与 Agent 写入共用写租约；配额创建按用户串行化；Generation 切换中断旧命令。
+- 可靠性：Runner 重启重新接入所有 Sandbox 网络；容器缺失自动 reconcile/恢复；实际 CPU/内存/Volume 用量与预留值分开记录。
+- WebSocket：Preview Proxy → Runner → Vite 的 `vite-hmr` 握手与 `full-reload` 消息实测通过。
 - 工具：未登记风险工具 fail-closed；restricted 模式拒绝执行类工具；命令/服务启动 HITL。
 - 路径：文件工具仅允许 `/workspace`，拒绝宿主机风格路径与符号链接逃逸。
 - 凭据：workspace-agent Token 由 Runner 派生注入；子进程环境移除该 Token；服务日志与命令输出脱敏。
@@ -99,6 +127,8 @@
 6. **未实现**：GPU Sandbox、Kubernetes / gVisor / Kata / Firecracker、Warm Pool、Hibernate、跨节点 Volume 迁移、完整在线 IDE、Terminal Tab、多 Agent 并行修改同一工作树。
 7. **Docker Desktop 环境限制**：宿主机 LAN / 云元数据隔离需宿主防火墙；生产建议 Linux + 独立 Runner 主机。
 8. **Playwright 仅覆盖单浏览器（Edge）+ 单项目流程**：未覆盖 Firefox / WebKit 与多用户并行浏览器会话。
+9. **Preview「仅登录用户」模式未实现**：当前访问边界是可过期/可撤销的 Preview Grant；管理员关闭外部分享/登录态校验未做，已在运维手册标注。
+10. **租户级配额并发**：用户级 Provision 已串行化；租户级配额跨用户并发仍为“检查后创建”，极端并发下可能短暂超出，后续可用租户锁/配额表强化。
 
 ## 6. 已知风险与规避
 
@@ -111,6 +141,9 @@
 | 大请求体/上传 | Runner Gateway 缓冲上限 20MB；Preview 单连接限制 |
 | 多 Uvicorn Worker 并发播种档位 | 唯一键/死锁重试，失败不阻断启动 |
 | 空闲回收误停 | 有活动 Agent Run 时跳过；只停计算资源，Volume 保留 |
+| Runner 重启后 Gateway 失联 | 启动/对账周期重新接入 `platform.network`；集成测试覆盖 |
+| 容器被外部删除 | Reconciler 入队 reconcile，`container_missing` 自动 start（10 分钟冷却） |
+| 用户与 Agent 同时写文件 | 统一 Workspace 写租约，串行化并返回 409 |
 
 ## 7. 使用入口
 

@@ -13,14 +13,14 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any, Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.agent import AgentRun, AgentSession
 from app.models.sandbox import (
-    SandboxInstance, SandboxJob, SandboxResourceProfile, SandboxRunnerNode,
-    Workspace, WorkspaceService,
+    SandboxCommandOperation, SandboxInstance, SandboxJob, SandboxResourceProfile,
+    SandboxRunnerNode, Workspace, WorkspaceService,
 )
 
 from . import jobs, scheduler
@@ -147,6 +147,23 @@ async def _workspace_services(db: AsyncSession, workspace_id: int) -> list[Works
     )).scalars().all())
 
 
+async def _interrupt_operations(db: AsyncSession, workspace_id: int,
+                                sandbox_id: Optional[int]) -> int:
+    """Generation 变化 / 容器停止或重启：旧命令标记 interrupted，不假设自动继续。"""
+    conditions = [
+        SandboxCommandOperation.workspace_id == workspace_id,
+        SandboxCommandOperation.status == "running",
+    ]
+    if sandbox_id is not None:
+        conditions.append(SandboxCommandOperation.sandbox_id != int(sandbox_id))
+    result = await db.execute(
+        update(SandboxCommandOperation)
+        .where(*conditions)
+        .values(status="interrupted", finished_at=utcnow())
+    )
+    return result.rowcount or 0
+
+
 async def provision_workspace(
     db: AsyncSession, workspace: Workspace, *, profile_name: Optional[str] = None,
     requested_by: Optional[int] = None,
@@ -166,6 +183,7 @@ async def provision_workspace(
         await request_lifecycle(db, workspace, sandbox, "start", requested_by)
         return sandbox
 
+    await scheduler.lock_owner_for_quota(db, workspace.owner_user_id)
     await scheduler.check_quota(db, workspace.owner_user_id, workspace.tenant_id)
     profile = await get_profile(db, profile_name)
     if workspace.resource_profile_id != profile.id:
@@ -190,6 +208,8 @@ async def provision_workspace(
     )
     db.add(sandbox)
     await db.flush()
+    # 新 Generation 不继承旧容器的命令：旧 Operation 标记 interrupted
+    await _interrupt_operations(db, workspace.id, sandbox.id)
 
     await scheduler.reserve(db, runner, workspace, profile, sandbox_id=sandbox.id)
     services = await _workspace_services(db, workspace.id)
@@ -237,8 +257,8 @@ async def request_lifecycle(
             if existing is None:
                 raise SandboxNotReadyError("Sandbox 已在运行")
         sandbox.desired_state = "running"
-        if sandbox.observed_state in ("stopped",) and sandbox.runner_id:
-            # 停止时释放了 CPU/RAM，启动前必须重新原子预留（不超卖）
+        if sandbox.observed_state in ("stopped", "failed") and sandbox.runner_id:
+            # 停止/失败时可能已释放 CPU/RAM，启动前必须重新原子预留（不超卖）
             await scheduler.reserve_compute_for_sandbox(db, sandbox)
     elif action == "stop":
         if sandbox.observed_state in ("stopped", "queued") and sandbox.desired_state == "stopped":
@@ -250,6 +270,8 @@ async def request_lifecycle(
         sandbox.desired_state = "deleted"
 
     sandbox.lifecycle_version = int(sandbox.lifecycle_version or 0) + 1
+    if action in ("stop", "restart", "delete"):
+        await _interrupt_operations(db, workspace.id, sandbox.id)
     profile = await get_profile(db, None)
     if workspace.resource_profile_id:
         profile = (await db.execute(
@@ -333,6 +355,7 @@ async def report_sandbox_states(
     """对账上报：更新真实 Observed State；未知容器只隔离告警，不自动接管。"""
     updated = 0
     unknown = 0
+    oom = 0
     for item in items or []:
         sandbox_id = item.get("sandbox_id")
         if not sandbox_id:
@@ -368,8 +391,17 @@ async def report_sandbox_states(
             "stopped", "failed", "recovering",
         ):
             sandbox.observed_state = observed
+        if observed == "failed" and item.get("oom_killed") and sandbox.failure_code != "oom":
+            sandbox.failure_code = "oom"
+            sandbox.failure_message = "容器因内存超限被 OOM Kill"
+            oom += 1
+            await emit_event(
+                db, "sandbox.oom", workspace_id=sandbox.workspace_id,
+                sandbox_id=sandbox.id, generation=sandbox.generation,
+                payload={"container_id": sandbox.container_id},
+            )
         updated += 1
-    return {"updated": updated, "unknown": unknown}
+    return {"updated": updated, "unknown": unknown, "oom": oom}
 
 
 # ── Job 结果落库 ───────────────────────────────────────────────────────────
@@ -425,6 +457,7 @@ async def apply_job_complete(
         sandbox.observed_state = "stopped"
         sandbox.desired_state = "stopped"
         await scheduler.release_compute(db, sandbox.id)
+        await _interrupt_operations(db, workspace.id, sandbox.id)
         services = await _workspace_services(db, workspace.id)
         for service in services:
             if service.observed_state not in ("stopped", "exited"):
@@ -439,6 +472,7 @@ async def apply_job_complete(
         sandbox.observed_state = "stopped"
         sandbox.desired_state = "deleted"
         await scheduler.release_all(db, sandbox.id)
+        await _interrupt_operations(db, workspace.id, sandbox.id)
         services = await _workspace_services(db, workspace.id)
         for service in services:
             service.observed_state = "stopped"
@@ -452,9 +486,27 @@ async def apply_job_complete(
             sandbox_id=sandbox.id, generation=sandbox.generation, job_id=job.id,
             payload={"volume_retained": not bool(job.payload_json.get("purge_volume"))},
         )
+    elif job.job_type == "restart":
+        await _interrupt_operations(db, workspace.id, sandbox.id)
     elif job.job_type == "reconcile":
         if result.get("observed_state"):
             sandbox.observed_state = result["observed_state"]
+        if result.get("observed_state") == "failed":
+            sandbox.failure_code = str(result.get("reason") or "container_missing")[:64]
+            sandbox.failure_message = "Sandbox 容器不存在或不可用，等待自动恢复"
+            workspace.status = "degraded"
+            await scheduler.release_compute(db, sandbox.id)
+            await emit_event(
+                db, "sandbox.reconcile_failed",
+                tenant_id=workspace.tenant_id, user_id=workspace.owner_user_id,
+                project_id=workspace.project_id, workspace_id=workspace.id,
+                sandbox_id=sandbox.id, generation=sandbox.generation, job_id=job.id,
+                payload={"reason": sandbox.failure_code},
+            )
+        elif result.get("observed_state") == "ready":
+            sandbox.failure_code = None
+            sandbox.failure_message = None
+            workspace.status = "ready"
 
 
 async def apply_job_failure(

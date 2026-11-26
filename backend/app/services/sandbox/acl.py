@@ -27,6 +27,29 @@ def _satisfies(role: Optional[str], min_role: str) -> bool:
     return bool(role) and _ROLE_RANK.get(role, 0) >= _ROLE_RANK.get(min_role, 1)
 
 
+def role_satisfies(role: Optional[str], min_role: str = "viewer") -> bool:
+    """公开的角色判定（Agent 工具 / 文件后端的每轮 ACL 复核使用）。"""
+    return _satisfies(role, min_role)
+
+
+async def require_project_role(
+    db: AsyncSession, project_id: int, user_id: int, min_role: str = "viewer",
+) -> Project:
+    """按 user_id 复核项目角色（工具/文件后端每轮调用，成员移除立即失效）。"""
+    project = (await db.execute(
+        select(Project).where(Project.id == project_id, Project.deleted_at.is_(None))
+    )).scalar_one_or_none()
+    if project is None:
+        raise SandboxNotFoundError("项目不存在")
+    user = (await db.execute(select(User).where(User.id == int(user_id)))).scalar_one_or_none()
+    if user is None:
+        raise SandboxAccessDenied("用户不存在")
+    role = await project_role(db, project, user)
+    if not _satisfies(role, min_role):
+        raise SandboxAccessDenied(f"当前项目角色 {role or '无'} 无 {min_role} 权限")
+    return project
+
+
 async def project_role(db: AsyncSession, project: Project, user: User) -> Optional[str]:
     if project.owner_id == user.id or bool(getattr(user, "is_superuser", False)):
         return "admin"
@@ -46,6 +69,10 @@ async def require_project_access(
         select(Project).where(Project.id == project_id, Project.deleted_at.is_(None))
     )).scalar_one_or_none()
     if project is None:
+        raise SandboxNotFoundError("项目不存在")
+    from .common import sandbox_enabled_for
+
+    if not sandbox_enabled_for(user.id, project.id):
         raise SandboxNotFoundError("项目不存在")
     role = await project_role(db, project, user)
     if role is None:
@@ -71,6 +98,10 @@ async def require_workspace_access(
     )).scalar_one_or_none()
     if project is None:
         raise SandboxNotFoundError("项目不存在")
+    from .common import sandbox_enabled_for
+
+    if not sandbox_enabled_for(user.id, project.id):
+        raise SandboxNotFoundError("工作空间不存在")
     role = await project_role(db, project, user)
     if role is None:
         raise SandboxNotFoundError("工作空间不存在")

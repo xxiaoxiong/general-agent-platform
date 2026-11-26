@@ -221,45 +221,53 @@ async def upload_conversation_file(
             data.extend(chunk)
             if len(data) > max_bytes:
                 raise HTTPException(status_code=413, detail="文件超过大小限制")
-        upload_name = await session_files.unique_upload_name(
-            db, session, name, reserve_sidecar=reserve_sidecar)
-        raw = bytes(data)
-        await session_files.write_bytes(db, session, f"uploads/{upload_name}", raw)
+        # 用户侧写入同样遵守 Workspace 写租约（避免与 Agent Run 并发覆盖）
+        lease_workspace, lease_owner, lease_token = await session_files.acquire_user_write_lease(
+            db, session, current_user.id, purpose="upload",
+        )
+        try:
+            upload_name = await session_files.unique_upload_name(
+                db, session, name, reserve_sidecar=reserve_sidecar)
+            raw = bytes(data)
+            await session_files.write_bytes(db, session, f"uploads/{upload_name}", raw)
 
-        text = ""
-        if ext_l in _EXTRACT_EXTS:
-            tmp_path = None
-            try:
-                import tempfile
+            text = ""
+            if ext_l in _EXTRACT_EXTS:
+                tmp_path = None
+                try:
+                    import tempfile
 
-                handle = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-                handle.write(raw)
-                handle.close()
-                tmp_path = handle.name
-                if ext_l in _DOCUMENT_EXTS:
-                    try:
-                        text = await asyncio.to_thread(_document_text, tmp_path, file.content_type)
-                    except DocumentParseError as exc:
-                        raise HTTPException(status_code=422, detail=str(exc)) from exc
-                else:
-                    text = await _extract_office_text(tmp_path, ext)
-            finally:
-                if tmp_path:
-                    with suppress(OSError):
-                        os.unlink(tmp_path)
-        text_path = None
-        if reserve_sidecar:
-            has_text = bool(text) and not text.startswith(("[文档解析失败", "[音频转写"))
-            if has_text:
-                await session_files.write_text(
-                    db, session, f"uploads/{upload_name}.extracted.txt", text)
-                text_path = f"uploads/{upload_name}.extracted.txt"
-        record_attachment_change(session.id, after={"name": upload_name, "size": len(raw)})
-        await db.commit()
-        return {
-            "name": upload_name, "path": f"uploads/{upload_name}",
-            "text_path": text_path, "size": len(raw),
-        }
+                    handle = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+                    handle.write(raw)
+                    handle.close()
+                    tmp_path = handle.name
+                    if ext_l in _DOCUMENT_EXTS:
+                        try:
+                            text = await asyncio.to_thread(_document_text, tmp_path, file.content_type)
+                        except DocumentParseError as exc:
+                            raise HTTPException(status_code=422, detail=str(exc)) from exc
+                    else:
+                        text = await _extract_office_text(tmp_path, ext)
+                finally:
+                    if tmp_path:
+                        with suppress(OSError):
+                            os.unlink(tmp_path)
+            text_path = None
+            if reserve_sidecar:
+                has_text = bool(text) and not text.startswith(("[文档解析失败", "[音频转写"))
+                if has_text:
+                    await session_files.write_text(
+                        db, session, f"uploads/{upload_name}.extracted.txt", text)
+                    text_path = f"uploads/{upload_name}.extracted.txt"
+            record_attachment_change(session.id, after={"name": upload_name, "size": len(raw)})
+            await db.commit()
+            return {
+                "name": upload_name, "path": f"uploads/{upload_name}",
+                "text_path": text_path, "size": len(raw),
+            }
+        finally:
+            await session_files.release_user_write_lease(
+                db, lease_workspace, lease_owner, lease_token)
 
     root = workspace_root(current_user.id, session.agent_id, session.id)
     upload_dir = Path(_resolve_workspace_path(root, "uploads"))
@@ -374,11 +382,18 @@ async def delete_conversation_file(
     if os.path.splitext(name)[1].lstrip(".").lower() in _EXTRACT_EXTS:
         names.append(f"{name}.extracted.txt")
     if session_files.uses_sandbox(session):
-        for fname in names:
-            await session_files.delete_path(db, session, f"uploads/{fname}")
-        record_attachment_change(session.id, before={"name": name})
-        await db.commit()
-        return {"message": "已删除"}
+        lease_workspace, lease_owner, lease_token = await session_files.acquire_user_write_lease(
+            db, session, current_user.id, purpose="delete",
+        )
+        try:
+            for fname in names:
+                await session_files.delete_path(db, session, f"uploads/{fname}")
+            record_attachment_change(session.id, before={"name": name})
+            await db.commit()
+            return {"message": "已删除"}
+        finally:
+            await session_files.release_user_write_lease(
+                db, lease_workspace, lease_owner, lease_token)
     root = workspace_root(current_user.id, session.agent_id, session.id)
     upload_dir = _resolve_workspace_path(root, "uploads")
     for fname in names:
