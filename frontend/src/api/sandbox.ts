@@ -85,6 +85,22 @@ export interface PreviewGrantInfo {
   access_token?: string
 }
 
+/** 内置浏览器会话：画面帧与输入经平台 Backend WebSocket 中转 */
+export interface BrowserSessionInfo {
+  session_id: string
+  /** 短期会话令牌（仅用于 WebSocket 鉴权） */
+  token: string
+  ws_url: string
+  expires_at?: string | null
+  /** 本次签发 TTL（秒） */
+  ttl_seconds?: number
+  /** 外部预览地址（“新窗口打开 / 复制地址”仍可用） */
+  preview_url?: string
+  fallback_url?: string
+  access_token?: string | null
+  viewport?: { width: number; height: number }
+}
+
 export interface ProjectWorkspaceDetail {
   project: { id: number; name: string; owner_id: number; status: string }
   role: string
@@ -233,4 +249,13 @@ export const sandboxApi = {
     ),
   revokePreviewGrant: (workspaceId: number, grantId: string) =>
     request.delete(`/workspaces/${workspaceId}/preview-grants/${grantId}`),
+  createBrowserSession: (
+    workspaceId: number,
+    serviceId: number,
+    data: { viewport_width?: number; viewport_height?: number; ttl_seconds?: number } = {},
+  ) => request.post<any, BrowserSessionInfo>(
+    `/workspaces/${workspaceId}/services/${serviceId}/browser-sessions`, data,
+  ),
+  closeBrowserSession: (sessionId: string, token: string) =>
+    request.delete(`/workspaces/browser-sessions/${sessionId}`, { params: { token } }),
 }

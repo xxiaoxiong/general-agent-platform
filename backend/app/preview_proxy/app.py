@@ -66,14 +66,28 @@ def _runner_base() -> str:
     return (settings.SANDBOX_RUNNER_CONTROL_URL or "").rstrip("/")
 
 
+def _accepted_base_domains() -> list[str]:
+    """外部访问域名 + 内置浏览器内部域名（两者都只接受 Grant Token 子域）。"""
+    domains: list[str] = []
+    for value in (
+        settings.PREVIEW_BASE_DOMAIN,
+        getattr(settings, "PREVIEW_INTERNAL_BASE_DOMAIN", ""),
+    ):
+        base = (value or "").strip().lower().lstrip(".")
+        if base and base not in domains:
+            domains.append(base)
+    return domains
+
+
 def _extract_token(request_host: str, path: str) -> tuple[Optional[str], str]:
     match = _PATH_TOKEN_RE.match(path or "/")
     if match:
         return match.group(1), match.group(2) or "/"
     raw_hostname = (request_host or "").split(":")[0]
     hostname = raw_hostname.lower()
-    base = (settings.PREVIEW_BASE_DOMAIN or "").lower()
-    if base and hostname.endswith("." + base):
+    for base in _accepted_base_domains():
+        if not hostname.endswith("." + base):
+            continue
         # Host 域名大小写不敏感，但 Token 大小写敏感：保留原始大小写
         prefix = raw_hostname[: -(len(base) + 1)]
         if prefix and "." not in prefix and _TOKEN_RE.match(prefix):
@@ -269,10 +283,30 @@ async def proxy_http(request: Request, path: str):
         await _release(target["grant_id"])
 
 
+def _forward_query(request: Request, *, drop: tuple[str, ...] = ()) -> str:
+    """保留原始查询串（包括 Vite 的空值标记，如 ?vue&type=style&lang.css）。
+
+    用 query_params 重新编码会把空值参数写成 ``key=``，Vite 会因此把样式模块
+    当作直接 CSS 请求，导致浏览器执行 CSS 报 ``Unexpected token '*'``。
+    """
+    raw = request.scope.get("query_string", b"").decode("latin-1")
+    parts = []
+    for part in raw.split("&"):
+        if not part:
+            continue
+        if part.split("=", 1)[0] in drop:
+            continue
+        parts.append(part)
+    return "&".join(parts)
+
+
 async def _forward_http(request: Request, target: dict, path: str):
     upstream_path = path.lstrip("/")
     url = (f"{_runner_base()}/gateway/sandboxes/{target['sandbox_id']}"
            f"/ports/{target['port']}/{upstream_path}")
+    query = _forward_query(request, drop=("access_token",))
+    if query:
+        url += f"?{query}"
     headers = {}
     for key, value in request.headers.items():
         if key.lower() in _HOP_BY_HOP or key.lower() == "x-runner-token":
@@ -291,10 +325,7 @@ async def _forward_http(request: Request, target: dict, path: str):
     )
     try:
         upstream_request = client.build_request(
-            request.method, url, headers=headers,
-            content=request.stream(),
-            params=[(key, value) for key, value in request.query_params.multi_items()
-                    if key != "access_token"],
+            request.method, url, headers=headers, content=request.stream(),
         )
         upstream = await client.send(upstream_request, stream=True)
     except httpx.HTTPError as exc:
@@ -368,9 +399,10 @@ async def _bridge_ws(websocket: WebSocket, target: dict, path: str) -> None:
         f"{runner_ws_base}/gateway/sandboxes/{target['sandbox_id']}"
         f"/ports/{target['port']}/ws/{path.lstrip('/')}"
     )
+    raw_query = websocket.scope.get("query_string", b"").decode("latin-1")
     query = "&".join(
-        f"{key}={value}" for key, value in websocket.query_params.multi_items()
-        if key not in ("access_token", "__token")
+        part for part in raw_query.split("&")
+        if part and part.split("=", 1)[0] not in ("access_token", "__token")
     )
     if query:
         upstream_url += f"?{query}"

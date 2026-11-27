@@ -245,6 +245,18 @@ class Settings(BaseSettings):
     PREVIEW_REQUIRE_LOGIN: bool = False          # true=仅登录用户可访问（禁止外部分享）
     PREVIEW_PROXY_PORT: int = 8081              # Preview Proxy 容器端口
     PREVIEW_PROXY_HOST_PORT: int = 8081         # 浏览器可达端口（compose 映射）
+    # 内置浏览器（服务端 Chromium）：预览面板不依赖客户机访问 Preview 子域/端口。
+    # 浏览器经内部域名访问 Preview Proxy，仍走 Grant 校验，不直连 Sandbox 网络。
+    PREVIEW_INTERNAL_BASE_DOMAIN: str = "preview.internal"
+    BROWSER_SERVICE_URL: str = "http://browser-service:9300"
+    BROWSER_SERVICE_TOKEN: str = ""             # 为空=内置浏览器关闭（fail-closed）
+    BROWSER_SESSION_TTL: int = 1800             # 浏览器会话最长生命周期（秒）
+    BROWSER_SESSION_IDLE_TIMEOUT: int = 120     # 无客户端连接后的回收时间（秒）
+    BROWSER_MAX_SESSIONS: int = 4               # 单浏览器服务并发会话上限
+    BROWSER_VIEWPORT_WIDTH: int = 1280          # 默认页面视口（前端连接后按面板尺寸调整）
+    BROWSER_VIEWPORT_HEIGHT: int = 800
+    BROWSER_FRAME_QUALITY: int = 60             # 帧 JPEG 质量
+    BROWSER_FRAME_INTERVAL_MS: int = 70         # 帧最小间隔（≈14fps）
 
     OTEL_ENABLED: bool = False                  # OpenTelemetry 导出（P1-02）
     OTEL_EXPORTER_OTLP_ENDPOINT: str = ""       # 如 http://localhost:4317
@@ -316,6 +328,12 @@ class Settings(BaseSettings):
                 raise RuntimeError(
                     "配置非法：SANDBOX_NETWORK_SUBNET_PREFIX 必须大于等于子网池前缀且不超过地址位宽。"
                 )
+        browser_token = (self.BROWSER_SERVICE_TOKEN or "").strip()
+        if browser_token and len(browser_token) < 16:
+            raise RuntimeError(
+                "配置非法：BROWSER_SERVICE_TOKEN 必须为至少 16 位的内部服务令牌"
+                "（Backend 与 browser-service 共用；留空表示不启用内置浏览器）。"
+            )
         if not self.SANDBOX_ENABLED:
             return
         if len((self.SANDBOX_RUNNER_TOKEN or "").strip()) < 16:

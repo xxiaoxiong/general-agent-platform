@@ -129,13 +129,25 @@
 - **服务监听地址校验**：workspace-agent 健康检查同时探测 IPv4/IPv6 回环并校验
   容器非回环 IP 可达；只监听 localhost 的服务标记 unhealthy 并写入明确提示，
   避免“服务显示正常但预览打不开”。
+- **内置浏览器（服务端 Chromium）**：新增独立 `browser-service`（FastAPI +
+  Playwright headless shell），预览面板默认用「内置」模式渲染；页面经
+  `{token}.preview.internal` → Preview Proxy（Grant 校验）→ Runner Gateway 访问，
+  客户机无需解析 Preview 子域或访问 8081。Backend 新增
+  `POST /api/v2/workspaces/{id}/services/{sid}/browser-sessions` 与
+  `WS /api/v2/workspaces/browser-sessions/{sid}/stream`（JWT 绑定用户/项目/服务，
+  每次连接复核 ACL）；前端 `SandboxBrowserView` 负责 JPEG 帧画布渲染、鼠标/滚轮/
+  键盘/中文输入法与面板尺寸同步，保留「直连」iframe 模式可切换。
+- **Vite 样式模块查询串修复**：Preview Proxy 与 Runner Gateway 改为原样转发查询串。
+  原实现用 `query_params` 重新编码，把 `?vue&type=style&lang.css` 写成 `key=`，
+  Vite 会把样式模块当直接 CSS 返回，浏览器执行 CSS 报 `Unexpected token '*'`
+  导致预览白屏；修复后示例项目页面正常渲染。
 
 ## 3. 验证记录（真实执行）
 
 | 验证 | 命令 / 方式 | 结果 |
 | --- | --- | --- |
-| 后端全量回归 | `cd backend && python -m pytest -q` | **1078 passed, 13 skipped, 104.46s** |
-| Sandbox 专项（模型/调度/Lease/ACL/预览/工具/文件后端/写租约/自动恢复/限流/登录态/事件/软配额/对账/服务配额/验收读取/网络清理/文件树/服务更新） | `pytest tests/test_sandbox_runtime.py tests/test_sandbox_security.py tests/test_sandbox_api.py -q` | **40 passed** |
+| 后端全量回归 | `cd backend && python -m pytest -q` | **1084 passed, 13 skipped, 101.43s** |
+| Sandbox 专项（模型/调度/Lease/ACL/预览/工具/文件后端/写租约/自动恢复/限流/登录态/事件/软配额/对账/服务配额/验收读取/网络清理/文件树/服务更新/内置浏览器/查询串保留） | `pytest tests/test_sandbox_runtime.py tests/test_sandbox_security.py tests/test_sandbox_api.py -q` | **46 passed, 5.00s** |
 | 真实 Docker 集成 | 在 Runner 容器内 `SANDBOX_DOCKER_TEST=1 pytest tests/test_sandbox_docker_integration.py` | **1 passed 40.03s**（容器安全基线、Runner 断网重连、Docker Socket 未挂载、取消命令无孤儿进程、命令、文件一致性、只读 rootfs、网络隔离含平台服务名、Service 健康 + HTTP、删除容器后新 Generation 文件保留、幂等创建） |
 | Vite HMR / WebSocket | 在 Runner 容器内 `SANDBOX_DOCKER_VITE=1 pytest tests/test_sandbox_docker_vite.py -q -s` | **1 passed 10.81s**（Vite 安装、dev server、`vite-hmr` WS、修改源码收到 `full-reload`）；启动→Healthy + 首页 200 = **2.018s** |
 | 真实端到端（服务层） | 容器内脚本：项目 → Provision → 命令（uid=10001）→ Service → Preview | `exec succeeded`、`service healthy`、子域预览 200、兜底 200、坏 Token 401 |
@@ -145,6 +157,9 @@
 | 事件流（部署栈） | `GET /api/v2/workspaces/{id}/events`（Bearer） | `workspace.provisioning` / `workspace.created` 帧带 project/workspace 标识；非成员 404；keepalive 正常 |
 | 文件树懒加载（部署栈） | `GET /api/v2/conversations/203/file-tree`、`?path=frontend/src` | 根目录 7 项、子目录 2 项；目录/文件结构正确，不再返回 500 条截断 |
 | 服务恢复（部署栈） | 清理无托管进程 → 停服务 → 用 `npm run dev -- --host 0.0.0.0` 重新启动 | frontend / backend 均 healthy；经 Preview Proxy 访问前端页面 200、后端 `/api/health` 200 |
+| 内置浏览器服务 | 部署栈 `browser-service` 健康检查 + 创建会话 + WebSocket 收帧 | `/health` 200、`enabled=true`；会话 `1000x700`；首帧 JPEG 4441 字节（PIL 校验 1000×700）；meta 标题「前后端分离示例项目」 |
+| 内置浏览器 UI（Playwright/Chromium） | 登录态打开会话 203 → 文件面板「预览」→ 画面就绪 → 点击输入框输入 `Tester` → 点击「发送问候」 | 模式「内置」、canvas 619×707；远程页面输入框显示 `Tester`，问候结果为「你好，Tester！欢迎访问前后端分离示例项目。」；截图确认非白屏 |
+| 预览样式模块修复 | 内部预览地址直接加载示例项目 | 修复前 `Unexpected token '*'`、body 为空；修复后 `STATUS 200`、body 含标题/问候/项目列表/新增项目 |
 | 性能基准 | `BENCH_ITERATIONS=3 python scripts/sandbox_benchmark.py`（Backend 容器内） | Provision→Ready P50 13.07s / P95 13.07s；命令 P50 0.124s；Service→Healthy P50 1.68s；Preview 首次访问 P50 0.040s（详见性能报告） |
 | 前端类型检查/构建 | `cd frontend && npm run build` | 通过 |
 | Compose 校验 | `docker compose --profile sandbox --profile sandbox-image config -q` | 通过 |
@@ -187,6 +202,9 @@
 11. **资源压力矩阵未做极限破坏性压测**：PID fork bomb、磁盘写满、100+ 并发创建、
     大型 `npm install` 期间的生命周期操作未逐条真实压测；PID/CPU/内存限制已由容器
     inspect 与单测校验，预留/队列/配额并发已有单测覆盖。
+12. **内置浏览器为第一阶段实现**：无头 Chromium 暂不支持原生文件选择/上传、文件
+    下载、扩展与跨站弹窗新窗口；复杂拖拽与全局快捷键未逐一覆盖；默认约 14fps /
+    JPEG 60，未做高并发多用户浏览器压测；尚未在 Firefox/WebKit 或移动端验证。
 
 ## 6. 已知风险与规避
 

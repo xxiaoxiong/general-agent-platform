@@ -187,6 +187,17 @@ services:
       PREVIEW_REQUIRE_LOGIN: ${PREVIEW_REQUIRE_LOGIN:-false}
       PREVIEW_PROXY_PORT: ${PREVIEW_PROXY_PORT:-8081}
       PREVIEW_PROXY_HOST_PORT: ${PREVIEW_PROXY_HOST_PORT:-8081}
+      # 内置浏览器（服务端 Chromium）：预览面板不依赖客户机访问 Preview 端口
+      PREVIEW_INTERNAL_BASE_DOMAIN: ${PREVIEW_INTERNAL_BASE_DOMAIN:-preview.internal}
+      BROWSER_SERVICE_URL: ${BROWSER_SERVICE_URL:-http://browser-service:9300}
+      BROWSER_SERVICE_TOKEN: ${BROWSER_SERVICE_TOKEN:-}
+      BROWSER_SESSION_TTL: ${BROWSER_SESSION_TTL:-1800}
+      BROWSER_SESSION_IDLE_TIMEOUT: ${BROWSER_SESSION_IDLE_TIMEOUT:-120}
+      BROWSER_MAX_SESSIONS: ${BROWSER_MAX_SESSIONS:-4}
+      BROWSER_VIEWPORT_WIDTH: ${BROWSER_VIEWPORT_WIDTH:-1280}
+      BROWSER_VIEWPORT_HEIGHT: ${BROWSER_VIEWPORT_HEIGHT:-800}
+      BROWSER_FRAME_QUALITY: ${BROWSER_FRAME_QUALITY:-60}
+      BROWSER_FRAME_INTERVAL_MS: ${BROWSER_FRAME_INTERVAL_MS:-70}
       UVICORN_WORKERS: "2"
       # Langfuse 可观测（对接宿主机 langfuse-deploy 栈；未配密钥时整条链路 no-op）
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
@@ -292,10 +303,51 @@ services:
       PREVIEW_REQUIRE_LOGIN: ${PREVIEW_REQUIRE_LOGIN:-false}
       PREVIEW_PROXY_PORT: "8081"
       PREVIEW_PROXY_HOST_PORT: ${PREVIEW_PROXY_HOST_PORT:-8081}
+      PREVIEW_INTERNAL_BASE_DOMAIN: ${PREVIEW_INTERNAL_BASE_DOMAIN:-preview.internal}
     networks:
       - default
     depends_on:
       backend:
+        condition: service_started
+
+  # ── 内置浏览器：服务端 Chromium（预览面板不依赖客户机访问 Preview 端口）──
+  # 浏览器经内部域名 {token}.preview.internal 访问 Preview Proxy，仍走 Grant 校验；
+  # 不映射宿主机端口、不挂载 Docker Socket。未配置 BROWSER_SERVICE_TOKEN 时拒绝服务。
+  browser-service:
+    build:
+      context: ..
+      dockerfile: docker/browser-service.Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+    container_name: ai_plat_browser_service
+    restart: unless-stopped
+    environment:
+      BROWSER_SERVICE_TOKEN: ${BROWSER_SERVICE_TOKEN:-}
+      BROWSER_SERVICE_PORT: "9300"
+      BROWSER_PREVIEW_HOST: preview-proxy
+      BROWSER_PREVIEW_DOMAIN: ${PREVIEW_INTERNAL_BASE_DOMAIN:-preview.internal}
+      BROWSER_MAX_SESSIONS: ${BROWSER_MAX_SESSIONS:-4}
+      BROWSER_SESSION_TTL: ${BROWSER_SESSION_TTL:-1800}
+      BROWSER_SESSION_IDLE_TIMEOUT: ${BROWSER_SESSION_IDLE_TIMEOUT:-120}
+      BROWSER_VIEWPORT_WIDTH: ${BROWSER_VIEWPORT_WIDTH:-1280}
+      BROWSER_VIEWPORT_HEIGHT: ${BROWSER_VIEWPORT_HEIGHT:-800}
+      BROWSER_FRAME_QUALITY: ${BROWSER_FRAME_QUALITY:-60}
+      BROWSER_FRAME_INTERVAL_MS: ${BROWSER_FRAME_INTERVAL_MS:-70}
+    shm_size: 256m
+    mem_limit: 1g
+    pids_limit: 512
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:9300/health', timeout=3)\""]
+      interval: 20s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+    networks:
+      - default
+    depends_on:
+      preview-proxy:
         condition: service_started
 
   # ── Sandbox 基础镜像（只构建不常驻）：docker compose --profile sandbox-image build

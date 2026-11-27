@@ -276,6 +276,73 @@ async def test_preview_rate_limit(monkeypatch):
     assert await _rate_allowed(grant_id) is False
 
 
+async def test_preview_proxy_internal_browser_domain(monkeypatch):
+    """内置浏览器内部域名与外部域名都只接受 Grant Token 子域。"""
+    from app.preview_proxy.app import _extract_token
+
+    monkeypatch.setattr(settings, "PREVIEW_BASE_DOMAIN", "localhost")
+    monkeypatch.setattr(settings, "PREVIEW_INTERNAL_BASE_DOMAIN", "preview.internal")
+    token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    assert _extract_token(f"{token}.preview.internal:8081", "/") == (token, "/")
+    assert _extract_token(f"{token}.localhost:8081", "/app.js") == (token, "/app.js")
+    assert _extract_token("evil.preview.internal:8081", "/")[0] is None
+    assert _extract_token(f"x.{token}.preview.internal:8081", "/")[0] is None
+
+
+async def test_browser_session_token_and_internal_url(monkeypatch):
+    """浏览器会话 JWT 绑定 sid / user / workspace，内部 URL 只指向 Preview Proxy。"""
+    from app.services.sandbox import browser
+
+    monkeypatch.setattr(settings, "BROWSER_SERVICE_TOKEN", "browser-token-1234567890")
+    monkeypatch.setattr(settings, "PREVIEW_INTERNAL_BASE_DOMAIN", "preview.internal")
+    monkeypatch.setattr(settings, "PREVIEW_PROXY_PORT", 8081)
+    assert browser.browser_available() is True
+    assert browser.build_internal_preview_url("tokentoken", "access-token") == (
+        "http://tokentoken.preview.internal:8081/?access_token=access-token"
+    )
+    token = browser.create_browser_session_token("bs1", 3, 7, 9, 120)
+    payload = browser.decode_browser_session_token(token)
+    assert payload["sid"] == "bs1" and payload["type"] == "browser"
+    assert payload["wid"] == 7 and payload["svc"] == 9 and payload["sub"] == "3"
+    assert browser.decode_browser_session_token("not-a-jwt") is None
+
+
+async def test_preview_query_keeps_vite_flag_params():
+    """Preview Proxy / Runner Gateway 必须保留 Vite 的空值查询标记。
+
+    重新编码成 ``key=`` 会让 Vite 把 ``?vue&type=style&lang.css`` 当成直接 CSS
+    请求，浏览器执行 CSS 时报 ``Unexpected token '*'``（页面白屏）。
+    """
+    from starlette.requests import Request
+
+    from app.preview_proxy.app import _forward_query
+    from app.sandbox_runner.gateway import _raw_query
+
+    request = Request({
+        "type": "http",
+        "query_string": b"vue&type=style&index=0&lang.css&access_token=secret",
+        "headers": [],
+    })
+    assert _forward_query(request, drop=("access_token",)) == (
+        "vue&type=style&index=0&lang.css"
+    )
+    assert _raw_query(
+        {"query_string": b"token=abc&__token=x&flag"}, drop=("__token",),
+    ) == "token=abc&flag"
+
+
+async def test_browser_service_only_allows_preview_domain(monkeypatch):
+    """browser-service 只允许打开内部 Preview 域名，防止被当作任意 URL 代理。"""
+    monkeypatch.setenv("BROWSER_PREVIEW_DOMAIN", "preview.internal")
+    from app.browser_service.manager import BrowserManager
+
+    manager = BrowserManager()
+    assert manager._allowed_url("http://abc.preview.internal:8081/")
+    assert not manager._allowed_url("http://example.com/")
+    assert not manager._allowed_url("http://preview.internal.evil.dev/")
+    assert not manager._allowed_url("file:///etc/passwd")
+
+
 async def test_preview_login_token_binds_grant_and_project_acl():
     from app.preview_proxy.app import _preview_user_allowed
     from app.services.sandbox.preview import create_preview_access_token

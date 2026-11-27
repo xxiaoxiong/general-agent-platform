@@ -31,6 +31,7 @@ export const workspaceApi = {
         preview_domain: string
         default_profile: string
         preview_require_login?: boolean
+        browser_enabled?: boolean
       }
     }>('/workspace/bootstrap'),
   capabilities: () => request.get<any, { items: any[] }>('/capabilities'),

@@ -102,6 +102,15 @@ def _error(status: int, code: str) -> JSONResponse:
     return JSONResponse(status_code=status, content={"code": code, "message": code})
 
 
+def _raw_query(scope: dict, *, drop: tuple[str, ...] = ()) -> str:
+    """原样保留查询串（含 Vite 空值标记，如 ?vue&type=style&lang.css）。"""
+    raw = scope.get("query_string", b"").decode("latin-1")
+    return "&".join(
+        part for part in raw.split("&")
+        if part and part.split("=", 1)[0] not in drop
+    )
+
+
 def _forward_headers(request: Request, *, target_port: int) -> dict:
     headers = {}
     for key, value in request.headers.items():
@@ -169,6 +178,11 @@ async def _http_proxy(request: Request, url: str, headers: dict, *, timeout: flo
         body = b""
     if len(body) > 20 * 1024 * 1024:
         return _error(413, "request_body_too_large")
+    # 原样保留查询串：用 query_params 重新编码会把 Vite 的空值标记
+    # （?vue&type=style&lang.css）写成 key=，导致样式模块被当作直接 CSS 返回。
+    raw_query = _raw_query(request.scope)
+    if raw_query:
+        url = f"{url}?{raw_query}"
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10.0, read=timeout, write=timeout, pool=10.0),
         follow_redirects=False,
@@ -178,7 +192,6 @@ async def _http_proxy(request: Request, url: str, headers: dict, *, timeout: flo
             request.method, url,
             headers=headers,
             content=body if body else None,
-            params=list(request.query_params.multi_items()),
         )
         upstream = await client.send(upstream_request, stream=True)
     except httpx.HTTPError as exc:
@@ -237,13 +250,9 @@ async def proxy_port_ws(websocket: WebSocket, sandbox_id: int, port: int, path: 
         if item.strip()
     ] or None
     upstream_url = f"ws://{ip}:{int(port)}/{path}"
-    if websocket.query_params:
-        query = "&".join(
-            f"{key}={value}" for key, value in websocket.query_params.multi_items()
-            if key != "__token"
-        )
-        if query:
-            upstream_url += f"?{query}"
+    query = _raw_query(websocket.scope, drop=("__token",))
+    if query:
+        upstream_url += f"?{query}"
     try:
         upstream = await websockets.connect(
             upstream_url,

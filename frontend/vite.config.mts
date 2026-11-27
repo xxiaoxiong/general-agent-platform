@@ -33,6 +33,8 @@ export default defineConfig({
       '/api': {
         target: 'http://127.0.0.1:8002',
         changeOrigin: true,
+        // 内置浏览器帧/输入走 WebSocket（/api/v2/workspaces/browser-sessions/*）
+        ws: true,
       },
     },
   },

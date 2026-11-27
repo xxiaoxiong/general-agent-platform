@@ -12,6 +12,7 @@
 | backend | 现有 Compose 服务 | 否 | Project / Workspace / Job / 调度 / Service Registry / Preview Grant |
 | sandbox-runner | 独立 Compose 服务（profile `sandbox`） | **是（唯一）** | 注册 / 心跳 / 领取 Job / Docker Provider / 对账 / Gateway |
 | preview-proxy | 独立 Compose 服务 | 否 | Preview Grant 校验、子域路由、HTTP/WebSocket 转发 |
+| browser-service | 独立 Compose 服务 | 否 | 内置浏览器（无头 Chromium、JPEG 帧、键鼠输入转发） |
 | workspace-sandbox 镜像 | Runner 动态创建容器 | 否 | workspace-agent（命令 / 文件 / Service） |
 | project_verifier | 既有服务 | 否 | 短时离线工程验收（与 Sandbox 完全独立） |
 
@@ -43,15 +44,17 @@ docker build -t general-agent-platform/workspace-sandbox:1.0.0 sandbox
 #   SANDBOX_ENABLED=true
 #   AGENT_SANDBOX_MODE=external          # 向模型开放执行类工具
 #   SANDBOX_RUNNER_TOKEN=<openssl rand -hex 32>
+#   BROWSER_SERVICE_TOKEN=<openssl rand -hex 32>   # 内置浏览器内部令牌（与 Backend 共用）
 
-# 3) 构建并启动（sandbox profile 会拉起 Runner）
-docker compose -f docker/docker-compose.yml build backend frontend
+# 3) 构建并启动（sandbox profile 会拉起 Runner；browser-service 默认随栈启动）
+docker compose -f docker/docker-compose.yml build backend frontend preview-proxy browser-service
 docker compose -f docker/docker-compose.yml --profile sandbox up -d
 
 # 4) 校验
 curl -s http://localhost:8000/api/health
 docker logs -f ai_plat_sandbox_runner     # 应看到 “Sandbox Runner 注册成功”
 curl -s http://localhost:8081/health      # preview-proxy
+docker exec ai_plat_backend python -c "import urllib.request;print(urllib.request.urlopen('http://browser-service:9300/health').read().decode())"
 ```
 
 - `SANDBOX_ENABLED=false` 是总回滚开关：Sandbox API 返回 503、前端隐藏 Preview/Services、
@@ -89,6 +92,13 @@ curl -s http://localhost:8081/health      # preview-proxy
 | `PREVIEW_MAX_CONNECTIONS` | 16 | 单 Grant 并发连接上限 |
 | `PREVIEW_RATE_LIMIT_PER_MINUTE` | 600 | 单 Grant 每分钟请求上限（0=不限） |
 | `PREVIEW_REQUIRE_LOGIN` | false | true=仅登录用户可访问预览（`access_token` + 同源 Cookie 校验，403 拒绝匿名） |
+| `PREVIEW_INTERNAL_BASE_DOMAIN` | preview.internal | 内置浏览器访问 Preview Proxy 的内部域名（仅容器网络，仍校验 Grant） |
+| `BROWSER_SERVICE_URL` | `http://browser-service:9300` | Backend → 内置浏览器服务地址 |
+| `BROWSER_SERVICE_TOKEN` | 空 | 内部服务令牌（≥16 位）；空=内置浏览器关闭（fail-closed） |
+| `BROWSER_SESSION_TTL` | 1800 | 浏览器会话最长生命周期（秒） |
+| `BROWSER_SESSION_IDLE_TIMEOUT` | 120 | 无客户端连接后的回收时间（秒） |
+| `BROWSER_MAX_SESSIONS` | 4 | 单浏览器服务并发会话上限 |
+| `BROWSER_FRAME_QUALITY` / `BROWSER_FRAME_INTERVAL_MS` | 60 / 70 | JPEG 质量与帧最小间隔（≈14fps） |
 
 ## 4. 使用流程
 
@@ -150,6 +160,30 @@ workspace-agent 只监听 Sandbox 网络内的 `:19999`，使用 Runner 派生 T
 | POST | `/services/{name}/stop` | 停止服务（进程组） |
 | POST | `/services/{name}/restart` | 重启服务 |
 | GET | `/services/{name}/logs` | 日志尾部（后端脱敏） |
+
+### 4.4 内置浏览器（服务端 Chromium）
+
+预览面板默认使用「内置」模式：页面由平台侧 `browser-service` 中的无头 Chromium
+渲染，JPEG 帧与键鼠输入经 Backend WebSocket 中转，**客户机无需解析 Preview 子域
+或访问 8081 端口**，只要能登录控制台即可浏览 Sandbox 内服务。
+
+- 访问链路：`browser-service` → `{token}.preview.internal:8081`（Preview Proxy，
+  Grant 校验）→ Runner Gateway → Sandbox 容器端口。浏览器不加入 Sandbox 网络，
+  也不挂载 Docker Socket。
+- 域名解析：browser-service 启动 Chromium 时通过 `--host-resolver-rules` 把
+  `*.preview.internal` 映射到 `preview-proxy` 容器 IP；Preview Proxy 同时接受
+  `PREVIEW_BASE_DOMAIN` 与 `PREVIEW_INTERNAL_BASE_DOMAIN` 的 Token 子域。
+- 会话与资源：每个会话独立 BrowserContext；无客户端连接 120s 回收，最长 1800s；
+  并发上限默认 4；全部会话结束后 5 分钟释放 Chromium 进程。
+- 交互能力：鼠标移动/点击/滚轮、常用按键、文本与中文输入法（隐藏 textarea
+  承接 composition）、前进/后退/刷新、面板尺寸变化自动 resize。
+- 模式切换：「内置 / 直连」按钮可切回 iframe 直连模式；`browser-service` 未启用
+  时后端返回 `browser_unavailable`，前端自动回退直连并提示。
+- WebSocket 入口：`/api/v2/workspaces/browser-sessions/{id}/stream`，Nginx 已为该
+  前缀配置 `Upgrade`/`Connection` 与关闭缓冲；Vite dev 代理已设置 `ws: true`。
+- 安全：`BROWSER_SERVICE_TOKEN` 为空时 fail-closed；browser-service 不映射宿主
+  端口；会话 JWT 绑定用户/Workspace/Service，WebSocket 每次连接复核用户与项目 ACL；
+  Chromium 只允许打开 `*.preview.internal` 地址，不能作为任意 URL 代理。
 
 ## 5. 存储、配额与清理
 
@@ -227,6 +261,11 @@ docker network rm gap-net-<id>-g<gen>
 | Preview 打开 404/empty | Preview Proxy 未启动 / `PREVIEW_PROXY_HOST_PORT` 未映射；`*.localhost` 是否被浏览器解析 |
 | Preview 401/410 | Grant 过期/撤销、Sandbox 停止、Service 停止；点「钥匙」重新获取 |
 | Preview 白屏但服务 healthy | 检查 Service 是否监听 `0.0.0.0`；Vite 需 `--host 0.0.0.0`；应用是否强制 HTTPS |
+| 内置浏览器提示「未启用」/ `browser_unavailable` | `docker/.env` 是否设置 `BROWSER_SERVICE_TOKEN`（≥16 位）并重启 backend；`docker ps` 查看 `ai_plat_browser_service` |
+| 内置浏览器连接失败 / 1011 / 403 | 先看 `docker logs ai_plat_browser_service`：`POST /sessions` 是否 200；确认 `BROWSER_SERVICE_TOKEN`、`PREVIEW_INTERNAL_BASE_DOMAIN`、`browser-service` 与 `preview-proxy` 在同一 Compose 网络 |
+| 内置浏览器 502「预览上游返回 HTTP 404」 | Preview Proxy 镜像未更新（旧镜像不识别 `*.preview.internal`）或 Service 已停止；重建 `preview-proxy` 并确认服务 healthy |
+| 页面白屏、控制台 `Unexpected token '*'` | Preview Proxy / Runner Gateway 把 Vite 的空值查询（`?vue&type=style&lang.css`）重编码成 `key=`，样式模块被当 CSS 返回；确认使用当前版本（原样转发查询串） |
+| 内置浏览器占用内存偏高 | 默认单 Chromium 进程 + 最多 4 个 Context，无会话 120s 回收、5 分钟释放进程；可调低 `BROWSER_MAX_SESSIONS` / `BROWSER_FRAME_QUALITY` |
 | start_service 报端口被占用 | 常见于之前用 execute_command `&` 启动的 dev server；先 `stop_service`/结束占用进程，再用 `start_service` 启动。新版本已自动清理命令结束后的残留后台进程 |
 | 服务只监听 localhost | workspace-agent 健康检查会标记 unhealthy 并写入日志提示；用 `stop_service` 后以 `npm run dev -- --host 0.0.0.0` 重新 start_service |
 | 需要修改服务启动命令 | 先 `stop_service`，再用同名同端口 `start_service` 提交新命令（会更新原记录并重启）；运行中的服务不允许直接改命令 |
@@ -282,6 +321,8 @@ docker compose -f docker/docker-compose.yml run --rm \
 - [ ] 宿主机防火墙阻断 Sandbox 网段访问 LAN 管理地址与云元数据（`169.254.169.254`）。
 - [ ] 普通用户不能修改资源档位、配额、镜像、Runner。
 - [ ] Backend / Frontend / Preview Proxy 端口默认只绑定 `127.0.0.1`；对外访问经受控反向代理。
+- [ ] `browser-service` 不映射宿主端口、不挂载 Docker Socket、不加入 Sandbox 网络；`BROWSER_SERVICE_TOKEN` 经 Secret 注入且 ≥16 位。
+- [ ] 内置浏览器 WebSocket 入口经受控反向代理暴露，并保留 Upgrade 头与长读超时。
 - [ ] Project 成员移除后 Preview Grant 立即失效（后端 `revoke_grants_for_user`）。
 
 ## 9. 已知限制（第一阶段）
@@ -297,3 +338,9 @@ docker compose -f docker/docker-compose.yml run --rm \
 - Preview 仅支持 HTTP Web App；WebSocket 已支持（Vite HMR 实测通过）。
 - 登录态预览（`PREVIEW_REQUIRE_LOGIN=true`）使用短期 preview token + 同源 Cookie；
   token 会出现在 iframe 地址与首屏请求中（HTTPS 下传输，代理不记录原始 Token）。
+- 内置浏览器基于无头 Chromium + CDP screencast：暂不支持原生文件选择/上传、
+  文件下载、浏览器扩展、跨站弹窗新窗口；复杂拖拽手势与全局快捷键未逐一覆盖。
+- 内置浏览器帧率默认约 14fps（`BROWSER_FRAME_INTERVAL_MS=70`）、JPEG 质量 60；
+  高动态页面会增加 CPU/带宽，可通过配置降低帧率/质量。
+- browser-service 以容器内 `--no-sandbox` 运行 Chromium（容器自身无特权、
+  无 Docker Socket、无宿主端口）；生产如需更强隔离，可为本服务配置独立 seccomp/AppArmor。

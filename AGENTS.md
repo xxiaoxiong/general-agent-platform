@@ -43,6 +43,7 @@ backend/
     tools/            # 工具注册表与执行器（含 sandbox_tools.py）
   app/sandbox_runner/ # 独立 Sandbox Runner 进程（Docker Provider / Job 执行 / Gateway）
   app/preview_proxy/  # 独立 Preview Proxy（Preview Grant 校验 + HTTP/WS 转发）
+  app/browser_service/ # 独立内置浏览器（无头 Chromium + CDP 帧流 + 输入转发）
   app/observability/  # langfuse_tracing.py、otel_tracing.py、metrics.py
   alembic/            # 数据库迁移
   tests/              # pytest 测试套件
@@ -127,7 +128,7 @@ cd backend && python -m alembic upgrade head
 13. **启用 Sandbox 需两个开关同时打开**：`SANDBOX_ENABLED=true` 且 `AGENT_SANDBOX_MODE=external`；只开第一个时执行类工具会被 `ToolPolicy` 以 restricted 拒绝（fail-closed）。Runner/Preview Proxy 是独立 Compose 服务，需 `--profile sandbox` 启动（`preview-proxy` 默认启动，Runner 在 profile 内）。
 14. **项目会话的文件与命令必须同一份 `/workspace`**：项目会话由 `SandboxFilesBackend` 把 DeepAgents 文件工具路由到 Sandbox；未归属项目的存量会话继续使用 `data/agent_files/{user}/{agent}/{session}`。改文件工具时不要只改一边，附件上传 / file-list / file-preview / file-bytes / files.zip 都有 sandbox 分支（`app/services/sandbox/session_files.py`）。
 15. **Sandbox 工具需要 Run 上下文**：`execute_command` / `*_service` 等走 `ToolExecutor` 的 `_CONTEXT_HANDLERS(ctx, params)`；Run 的 `project_id` 只能由 `session.project_id` 推导（`RuntimeContext.project_id`），不得从模型参数读取。写操作先获取 Workspace 写租约（`write_lease.py`，owner=`run:{run_id}`），Run 结束在 `_drive` finally 释放。
-16. **本地 Preview 地址是 `{token}.localhost:8081`**：`*.localhost` 由浏览器解析到回环；生产必须 `PREVIEW_PUBLIC_BASE_URL=https://preview.example.com`（启动校验要求 https）。Preview Proxy 只代理 Grant 中登记的 Sandbox + Port，禁止任意 upstream URL；本地若浏览器不解析子域，用 `/p/{token}/` 兜底地址。
+16. **本地 Preview 地址是 `{token}.localhost:8081`**：`*.localhost` 由浏览器解析到回环；生产必须 `PREVIEW_PUBLIC_BASE_URL=https://preview.example.com`（启动校验要求 https）。Preview Proxy 只代理 Grant 中登记的 Sandbox + Port，禁止任意 upstream URL；本地若浏览器不解析子域，用 `/p/{token}/` 兜底地址。预览面板默认改用内置浏览器（服务端 Chromium），客户机无需访问该端口；「直连」模式才使用上述地址。
 17. **Sandbox 集成测试必须真实 Docker**：`test_sandbox_docker_integration.py` 只在 `SANDBOX_DOCKER_TEST=1` 时运行，且必须在挂载 Docker Socket 的容器内执行（DockerEngine 只支持 unix socket，Windows 宿主直跑不可用）；测试会创建/删除真实容器、网络与 Volume，名称带随机后缀。
 18. **Sandbox 用户目录 tmpfs 必须 `uid/gid=10001` 且 `exec`**：Docker tmpfs 默认 root 所有并 `noexec`，否则 npm/pip 缓存 EACCES、`npx`/`vite` 二进制 Permission denied。修改 `executor._container_spec` 的 Tmpfs 时不要丢掉这组参数。
 19. **Runner 重启后必须重新接入既有 Sandbox 网络**：Runner 容器重建不会保留动态加入的 `gap-net-*` 网络；`RunnerExecutor.attach_managed_networks()` 在启动与每轮对账执行，否则 Gateway 访问既有 Sandbox 全部 502。改 Runner 生命周期时保留该调用。
@@ -138,6 +139,8 @@ cd backend && python -m alembic upgrade head
 23. **项目会话的验收/续做/冻结/附件指纹必须读 Sandbox**：`completion._collect_evidence`、`prepare_completion_continuation`、`freeze_artifacts_async`、新产物 ZIP、`resolve_attachment_refs_async` 都按会话后端分流（项目会话 → `/workspace`，存量会话 → `data/agent_files/...`）。只改宿主机会话目录会出现“用户看得见文件、验收却报没有写入记录”的假失败。
 24. **每个 Sandbox 一个 bridge 网络，必须管理好生命周期**：删除时先断开 Runner 再删网络；Runner 启动/对账周期清理无容器的孤儿网络（仅清理创建超过 10 分钟的网络，防误删 Provision 中的网络）；并发多时配置 `SANDBOX_NETWORK_SUBNET_POOL`，否则 Docker 默认地址池耗尽会报 `all predefined address pools have been fully subnetted`（新环境创建 400）。
 25. **Sandbox 长期服务必须监听 `0.0.0.0` 且由 `start_service` 管理**：`execute_command` 结束后 workspace-agent 会清理残留后台进程（`&`/nohup 启动的 dev server 不可用）；健康检查同时探测 IPv4/IPv6 回环与容器非回环 IP，仅监听 localhost 会标记 unhealthy 并写提示；`start_service` 启动前检测端口占用；同名同端口服务停止后可用新命令重新启动（更新原记录）。
+26. **内置浏览器是独立 `browser-service` 进程**：`app/browser_service` 用无头 Chromium + CDP screencast，经 `{token}.preview.internal`（Preview Proxy，Grant 校验）访问 Sandbox；不挂 Docker Socket、不映射端口、不加入 Sandbox 网络。`BROWSER_SERVICE_TOKEN` 为空时 fail-closed；镜像必须安装 `uvicorn[standard]`（否则 WebSocket 升级 404）；Nginx `/api/v2/workspaces/browser-sessions/` 必须转发 `Upgrade`，Vite dev 代理需 `ws: true`。会话 JWT 绑定用户/项目/服务，WS 连接每次复核 ACL。
+27. **Preview Proxy / Runner Gateway 必须原样转发查询串**：不要用 `request.query_params` 重新编码（空值标记会变成 `key=`）。Vite 的 `?vue&type=style&index=0&lang.css` 被改写后会把样式模块当直接 CSS 返回，浏览器执行 CSS 报 `Unexpected token '*'`、页面白屏。使用 `_forward_query` / `_raw_query` 保留原始 query string。
 
 ## 修改范围原则
 

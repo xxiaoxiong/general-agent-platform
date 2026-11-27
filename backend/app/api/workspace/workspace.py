@@ -52,6 +52,8 @@ async def workspace_bootstrap(
             "preview_domain": getattr(settings, "PREVIEW_BASE_DOMAIN", "localhost"),
             "default_profile": getattr(settings, "SANDBOX_DEFAULT_PROFILE", "standard"),
             "preview_require_login": bool(getattr(settings, "PREVIEW_REQUIRE_LOGIN", False)),
+            # 内置浏览器（服务端 Chromium）：前端默认用内置浏览器渲染预览
+            "browser_enabled": _browser_enabled(),
         },
     }
 
@@ -60,3 +62,9 @@ def _sandbox_enabled(user_id: int) -> bool:
     from app.services.sandbox.common import sandbox_enabled_for
 
     return sandbox_enabled_for(user_id)
+
+
+def _browser_enabled() -> bool:
+    from app.services.sandbox.browser import browser_available
+
+    return browser_available()

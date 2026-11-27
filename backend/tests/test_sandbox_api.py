@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
+from starlette.websockets import WebSocketDisconnect
 
 from app.core.config import settings
 from app.core.security import create_access_token
@@ -220,6 +221,135 @@ def test_file_tree_lazy_directory_listing(client, sandbox_enabled, monkeypatch):
     bad = client.get(
         f"/api/v2/conversations/{session_id}/file-tree?path=../secret", headers=headers)
     assert bad.status_code == 400
+
+
+def _ready_workspace(client, headers: dict, username: str) -> int:
+    """创建一个 ready Sandbox 的 Workspace（注册 Runner → provision → 完成 Job）。"""
+    from app.models.sandbox import SandboxRunnerNode
+
+    # 历史用例留下的 Runner 可能仍在调度池：先排空，确保 Job 落到当前测试节点
+    engine = create_engine(os.environ["DATABASE_SYNC_URL"])
+    with Session(engine) as session:
+        session.query(SandboxRunnerNode).update({"status": "draining"})
+        session.commit()
+    created = client.post(
+        "/api/v2/projects", json={"name": f"浏览器项目-{username}"}, headers=headers,
+    )
+    assert created.status_code == 200, created.text
+    project_id = created.json()["id"]
+    workspace_id = created.json()["workspace"]["id"]
+    runner_headers = {"X-Runner-Token": settings.SANDBOX_RUNNER_TOKEN}
+    registered = client.post("/internal/runners/register", json={
+        "node_name": f"browser-runner-{username}",
+        "cpu_total_millis": 8000, "cpu_allocatable_millis": 8000,
+        "memory_total_bytes": 16 * 1024 ** 3,
+        "memory_allocatable_bytes": 16 * 1024 ** 3,
+        "disk_total_bytes": 100 * 1024 ** 3,
+        "disk_allocatable_bytes": 100 * 1024 ** 3,
+    }, headers=runner_headers)
+    assert registered.status_code == 200, registered.text
+    runner_id = registered.json()["runner_id"]
+    client.post(f"/internal/runners/{runner_id}/heartbeat",
+                json={"status": "online"}, headers=runner_headers)
+    provisioned = client.post(
+        f"/api/v2/projects/{project_id}/workspace/provision", json={}, headers=headers,
+    )
+    assert provisioned.status_code == 200, provisioned.text
+    sandbox_id = provisioned.json()["sandbox"]["id"]
+    job = None
+    # 模块级 client 会保留其他用例的排队 Job：领到属于当前 Sandbox 的 provision 为止
+    for _ in range(5):
+        claimed = client.post(f"/internal/runners/{runner_id}/jobs/claim",
+                              json={"limit": 8}, headers=runner_headers)
+        assert claimed.status_code == 200, claimed.text
+        job = next(
+            (item for item in claimed.json()["jobs"]
+             if item["sandbox_id"] == sandbox_id and item["job_type"] == "provision"),
+            None,
+        )
+        if job is not None:
+            break
+    assert job is not None, "未领取到当前 Workspace 的 provision Job"
+    completed = client.post(f"/internal/jobs/{job['id']}/complete", json={
+        "runner_id": runner_id, "lease_token": job["lease_token"],
+        "result": {
+            "container_id": f"cid-{username}", "container_name": f"gap-sbx-{username}-g1",
+            "container_ip": "10.20.0.2", "image_digest": "sha256:test",
+            "observed_state": "ready", "services": [],
+        },
+    }, headers=runner_headers)
+    assert completed.status_code == 200, completed.text
+    return workspace_id
+
+
+def test_browser_session_uses_internal_preview_and_checks_acl(
+    client, sandbox_enabled, monkeypatch,
+):
+    """内置浏览器会话：内部 Preview 域名 + 服务/项目权限；未启用时 503。"""
+    from app.services.sandbox import agent_client, browser as browser_service
+
+    monkeypatch.setattr(settings, "BROWSER_SERVICE_TOKEN", "test-browser-token-123456")
+    monkeypatch.setattr(settings, "PREVIEW_INTERNAL_BASE_DOMAIN", "preview.internal")
+    monkeypatch.setattr(settings, "PREVIEW_REQUIRE_LOGIN", False)
+    captured: dict = {}
+
+    async def fake_create(session_id, url, *, width, height):
+        captured.update(session_id=session_id, url=url, width=width, height=height)
+
+    async def fake_start(_sandbox_id, _config):
+        return {"observed_state": "healthy", "process_id": "1"}
+
+    monkeypatch.setattr(browser_service, "create_remote_session", fake_create)
+    monkeypatch.setattr(agent_client, "start_service", fake_start)
+
+    owner_id = _user("sbxapi-browser")
+    headers = _auth(owner_id)
+    workspace_id = _ready_workspace(client, headers, "sbxapi-browser")
+    service = client.post(f"/api/v2/workspaces/{workspace_id}/services", json={
+        "name": "frontend", "command": "npm run dev -- --host 0.0.0.0", "port": 5173,
+    }, headers=headers)
+    assert service.status_code == 200, service.text
+    service_id = service.json()["id"]
+
+    created = client.post(
+        f"/api/v2/workspaces/{workspace_id}/services/{service_id}/browser-sessions",
+        json={"viewport_width": 1000, "viewport_height": 700}, headers=headers,
+    )
+    assert created.status_code == 200, created.text
+    data = created.json()
+    assert data["session_id"].startswith("bs")
+    assert data["session_id"] in data["ws_url"] and "token=" in data["ws_url"]
+    assert data["token"] and data["ttl_seconds"] == settings.BROWSER_SESSION_TTL
+    assert data["viewport"] == {"width": 1000, "height": 700}
+    assert data["preview_url"]
+    assert captured["session_id"] == data["session_id"]
+    assert captured["width"] == 1000 and captured["height"] == 700
+    assert ".preview.internal:8081" in captured["url"]
+    assert "access_token" not in captured["url"]
+
+    outsider_id = _user("sbxapi-browser-out")
+    denied = client.post(
+        f"/api/v2/workspaces/{workspace_id}/services/{service_id}/browser-sessions",
+        json={}, headers=_auth(outsider_id),
+    )
+    assert denied.status_code == 404
+
+    monkeypatch.setattr(settings, "BROWSER_SERVICE_TOKEN", "")
+    disabled = client.post(
+        f"/api/v2/workspaces/{workspace_id}/services/{service_id}/browser-sessions",
+        json={}, headers=headers,
+    )
+    assert disabled.status_code == 503
+    assert disabled.json()["code"] == "browser_unavailable"
+
+
+def test_browser_stream_rejects_invalid_token(client, sandbox_enabled):
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(
+            "/api/v2/workspaces/browser-sessions/bs-x/stream?token=invalid",
+        ):
+            pass
+    assert exc_info.value.code == 4403
 
 
 def test_sandbox_disabled_returns_503(client, monkeypatch):

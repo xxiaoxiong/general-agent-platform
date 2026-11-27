@@ -55,7 +55,36 @@
             <span class="sp-dot" :data-tone="selectedService ? serviceTone(selectedService) : 'muted'"></span>
             {{ selectedService?.name || '未选择服务' }}
             <span v-if="selectedService" class="sp-muted">· {{ serviceStateLabel(selectedService) }} · {{ selectedService.port }}</span>
+            <span v-if="mode === 'browser' && browserMeta.title" class="sp-muted sp-page-title" :title="browserMeta.title">· {{ browserMeta.title }}</span>
           </span>
+          <div class="sp-modes" role="group" aria-label="预览模式">
+            <button
+              type="button" class="sp-mode" :class="{ active: mode === 'browser' }"
+              title="内置浏览器：由平台侧浏览器渲染，客户机无需访问预览端口"
+              @click="switchMode('browser')"
+            >
+              <Monitor :size="13" /> 内置
+            </button>
+            <button
+              type="button" class="sp-mode" :class="{ active: mode === 'iframe' }"
+              title="直连预览：需要客户机能访问预览域名/端口"
+              @click="switchMode('iframe')"
+            >
+              <Globe :size="13" /> 直连
+            </button>
+          </div>
+          <button
+            v-if="mode === 'browser'" type="button" class="sp-icon-btn"
+            title="后退" aria-label="后退" @click="browserRef?.goBack()"
+          >
+            <ArrowLeft :size="14" />
+          </button>
+          <button
+            v-if="mode === 'browser'" type="button" class="sp-icon-btn"
+            title="前进" aria-label="前进" @click="browserRef?.goForward()"
+          >
+            <ArrowRight :size="14" />
+          </button>
           <button type="button" class="sp-icon-btn" title="刷新页面" aria-label="刷新页面" @click="reloadFrame">
             <RefreshCw :size="14" />
           </button>
@@ -70,9 +99,25 @@
           </button>
         </div>
 
+        <div v-if="browserNotice" class="sp-notice" role="status">
+          <CircleAlert :size="13" />
+          <span>{{ browserNotice }}</span>
+          <button type="button" class="sp-notice-close" aria-label="关闭提示" @click="browserNotice = ''">×</button>
+        </div>
+
         <div class="sp-frame">
+          <SandboxBrowserView
+            v-if="mode === 'browser' && browserWsUrl"
+            :key="browserKey"
+            ref="browserRef"
+            :ws-url="browserWsUrl"
+            :viewport-width="browserViewport.width"
+            :viewport-height="browserViewport.height"
+            @error="onBrowserError"
+            @meta="onBrowserMeta"
+          />
           <iframe
-            v-if="previewUrl" :key="iframeKey" :src="previewUrl" class="sp-iframe"
+            v-else-if="mode === 'iframe' && previewUrl" :key="iframeKey" :src="previewUrl" class="sp-iframe"
             title="项目预览" referrerpolicy="no-referrer"
             sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads"
             allow="clipboard-read; clipboard-write"
@@ -80,20 +125,21 @@
           ></iframe>
           <div v-else class="sp-empty">
             <LoaderCircle v-if="grantLoading" class="sp-spin" :size="18" />
+            <Monitor v-else-if="mode === 'browser'" :size="20" />
             <Globe v-else :size="20" />
-            <p>{{ grantLoading ? '正在获取预览授权…' : '选择服务以加载预览' }}</p>
+            <p>{{ grantLoading ? (mode === 'browser' ? '正在启动内置浏览器…' : '正在获取预览授权…') : '选择服务以加载预览' }}</p>
           </div>
-          <div v-if="previewUrl && iframeLoading" class="sp-overlay" role="status">
+          <div v-if="mode === 'iframe' && previewUrl && iframeLoading" class="sp-overlay" role="status">
             <LoaderCircle class="sp-spin" :size="16" /> 页面加载中…
           </div>
-          <div v-else-if="previewUrl && iframeTimedOut" class="sp-overlay sp-overlay-error" role="alert">
+          <div v-else-if="mode === 'iframe' && previewUrl && iframeTimedOut" class="sp-overlay sp-overlay-error" role="alert">
             <CircleAlert :size="16" />
             <span>页面加载超时，服务可能仍在启动</span>
             <button type="button" class="sp-btn" @click="reloadFrame">重试</button>
           </div>
         </div>
         <div v-if="previewUrl" class="sp-foot">
-          <span class="sp-muted">{{ fallbackUrl ? '预览地址' : '' }}</span>
+          <span class="sp-muted">{{ mode === 'browser' ? '外部预览地址' : fallbackUrl ? '预览地址' : '' }}</span>
           <code :title="previewDisplayUrl">{{ previewDisplayUrl }}</code>
           <span v-if="expiryText" class="sp-muted">{{ expiryText }}</span>
         </div>
@@ -104,23 +150,26 @@
 
 <script setup lang="ts">
 /**
- * Sandbox Preview 面板：真实 iframe 预览项目 Service 页面。
+ * Sandbox Preview 面板：内置浏览器（服务端 Chromium）+ 直连 iframe 两种模式。
  *
+ * - 默认内置浏览器：画面由平台侧浏览器渲染，客户机无需访问 Preview 域名/端口；
+ * - 直连模式保留原有 Preview Grant + iframe 路径（适合可访问预览端口的环境）；
  * - 打开时自动初始化/启动项目 Sandbox（任务书 §8.6「重新打开项目时排队启动」）；
  * - 预览地址由后端 Preview Grant 签发（绑定 Sandbox Generation + Port，可过期/撤销）；
- * - 页面刷新时重新获取 Grant，不要求重启 Service；
  * - 前端不拼接容器 IP / 端口，只使用后端返回的地址。
  */
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
-  CircleAlert, Copy, ExternalLink, Globe, KeyRound, LoaderCircle, Play,
-  RefreshCw, RotateCcw, Server,
+  ArrowLeft, ArrowRight, CircleAlert, Copy, ExternalLink, Globe, KeyRound,
+  LoaderCircle, Monitor, Play, RefreshCw, RotateCcw, Server,
 } from '@lucide/vue'
 import { ElMessage } from 'element-plus'
 import {
   consumeSandboxEvents, sandboxApi,
-  type PreviewGrantInfo, type SandboxInfo, type WorkspaceInfo, type WorkspaceServiceInfo,
+  type BrowserSessionInfo, type PreviewGrantInfo, type SandboxInfo,
+  type WorkspaceInfo, type WorkspaceServiceInfo,
 } from '@/api/sandbox'
+import SandboxBrowserView from './SandboxBrowserView.vue'
 
 const props = defineProps<{
   projectId: number | null
@@ -141,6 +190,22 @@ const grantExpiry = ref(0)
 const iframeKey = ref(0)
 const iframeLoading = ref(false)
 const iframeTimedOut = ref(false)
+
+// ── 内置浏览器（服务端 Chromium）────────────────────────────────────────────
+const MODE_KEY = 'sandbox-preview-mode'
+const mode = ref<'browser' | 'iframe'>(
+  (localStorage.getItem(MODE_KEY) as 'browser' | 'iframe') || 'browser',
+)
+const browserWsUrl = ref('')
+const browserKey = ref(0)
+const browserNotice = ref('')
+const browserMeta = ref({ url: '', title: '' })
+const browserViewport = ref({ width: 1280, height: 800 })
+const browserRef = ref<InstanceType<typeof SandboxBrowserView> | null>(null)
+const browserSessions = new Map<number, {
+  id: string; token: string; wsUrl: string; expires: number
+  previewUrl: string; fallback: string
+}>()
 
 const grants = new Map<number, { url: string; fallback: string; expires: number; id: string }>()
 let pollTimer: number | undefined
@@ -233,6 +298,10 @@ function onFrameLoad() {
 }
 
 function reloadFrame() {
+  if (mode.value === 'browser') {
+    browserRef.value?.reload()
+    return
+  }
   if (!previewUrl.value) return
   iframeLoading.value = true
   iframeTimedOut.value = false
@@ -295,11 +364,65 @@ function reset() {
   fallbackUrl.value = ''
   grantExpiry.value = 0
   grants.clear()
+  closeBrowserSessions()
+  browserWsUrl.value = ''
+  browserNotice.value = ''
+  browserMeta.value = { url: '', title: '' }
   autoStartAttempted = false
   usingFallback = false
   iframeLoading.value = false
   iframeTimedOut.value = false
   stopFrameTimer()
+}
+
+function closeBrowserSessions() {
+  for (const record of browserSessions.values()) {
+    void sandboxApi.closeBrowserSession(record.id, record.token).catch(() => {})
+  }
+  browserSessions.clear()
+}
+
+function activateBrowserSession(record: {
+  id: string; token: string; wsUrl: string; expires: number
+  previewUrl: string; fallback: string
+}) {
+  previewUrl.value = record.previewUrl
+  fallbackUrl.value = record.fallback
+  grantExpiry.value = record.expires
+  browserWsUrl.value = record.wsUrl
+  browserKey.value += 1
+  usingFallback = false
+  browserMeta.value = { url: '', title: '' }
+  browserNotice.value = ''
+  iframeLoading.value = false
+  iframeTimedOut.value = false
+  stopFrameTimer()
+}
+
+async function switchMode(next: 'browser' | 'iframe') {
+  if (mode.value === next) return
+  mode.value = next
+  localStorage.setItem(MODE_KEY, next)
+  previewUrl.value = ''
+  fallbackUrl.value = ''
+  browserWsUrl.value = ''
+  browserMeta.value = { url: '', title: '' }
+  if (next === 'iframe') {
+    closeBrowserSessions()
+    browserNotice.value = ''
+  } else {
+    browserNotice.value = '正在启动内置浏览器…'
+  }
+  const service = selectedService.value
+  if (service) await ensurePreview(service, true)
+}
+
+function onBrowserError(message: string) {
+  browserNotice.value = message
+}
+
+function onBrowserMeta(payload: { url: string; title: string }) {
+  browserMeta.value = payload
 }
 
 async function startEnvironment(auto = false) {
@@ -348,6 +471,8 @@ async function restartEnvironment() {
   starting.value = true
   try {
     grants.clear()
+    closeBrowserSessions()
+    browserWsUrl.value = ''
     await sandboxApi.restartSandbox(workspace.value.id)
     await waitUntilReady()
   } catch (exc: any) {
@@ -359,6 +484,56 @@ async function restartEnvironment() {
 
 async function ensurePreview(service: WorkspaceServiceInfo, force = false) {
   if (!workspace.value || sandbox.value?.observed_state !== 'ready') return
+  if (mode.value === 'browser') {
+    const browserCached = browserSessions.get(service.id)
+    if (!force && browserCached && browserCached.expires > Date.now() / 1000 + 30) {
+      if (browserWsUrl.value !== browserCached.wsUrl) activateBrowserSession(browserCached)
+      return
+    }
+    grantLoading.value = true
+    try {
+      const session: BrowserSessionInfo = await sandboxApi.createBrowserSession(
+        workspace.value.id, service.id, {
+          viewport_width: browserViewport.value.width,
+          viewport_height: browserViewport.value.height,
+        },
+      )
+      const ttl = Number(session.ttl_seconds) || 1800
+      // 后端 expires_at 为无时区 UTC 字符串；这里按签发 TTL 计算，避免时区误判
+      const expires = Math.floor(Date.now() / 1000) + ttl
+      const record = {
+        id: session.session_id,
+        token: session.token,
+        wsUrl: session.ws_url,
+        expires,
+        previewUrl: session.preview_url
+          ? withAccess(session.preview_url, session.access_token || undefined)
+          : '',
+        fallback: session.fallback_url
+          ? withAccess(session.fallback_url, session.access_token || undefined)
+          : '',
+      }
+      browserSessions.set(service.id, record)
+      activateBrowserSession(record)
+    } catch (exc: any) {
+      const code = exc?.response?.data?.code
+      if (code === 'browser_unavailable') {
+        browserNotice.value = '服务端内置浏览器未启用，已切换为直连预览'
+        mode.value = 'iframe'
+        localStorage.setItem(MODE_KEY, 'iframe')
+        browserWsUrl.value = ''
+        grantLoading.value = false
+        await ensurePreview(service, force)
+        return
+      }
+      previewUrl.value = ''
+      browserWsUrl.value = ''
+      error.value = exc?.response?.data?.message || exc?.message || '无法启动内置浏览器'
+    } finally {
+      grantLoading.value = false
+    }
+    return
+  }
   const cached = grants.get(service.id)
   if (!force && cached && cached.expires > Date.now() / 1000 + 30) {
     if (previewUrl.value !== cached.url) {
@@ -407,7 +582,12 @@ async function selectService(serviceId: number) {
 
 async function refreshGrant() {
   const service = selectedService.value
-  if (service) await ensurePreview(service, true)
+  if (!service) return
+  if (mode.value === 'browser') {
+    closeBrowserSessions()
+    browserWsUrl.value = ''
+  }
+  await ensurePreview(service, true)
 }
 
 function openExternal() {
@@ -493,6 +673,7 @@ onUnmounted(() => {
   stopPolling()
   stopEvents()
   stopFrameTimer()
+  closeBrowserSessions()
 })
 
 watch(() => props.projectId, () => {
@@ -557,6 +738,27 @@ watch(() => props.active, (active) => {
   border-bottom: 1px solid var(--ui-border); background: var(--ui-surface);
 }
 .sp-current { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ui-text); }
+.sp-page-title { max-width: 15rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-modes {
+  flex: none; display: inline-flex; margin-right: 4px;
+  border: 1px solid var(--ui-border); border-radius: 999px; overflow: hidden;
+}
+.sp-mode {
+  display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px;
+  border: 0; background: transparent; color: var(--ui-secondary);
+  font-size: 11.5px; cursor: pointer;
+}
+.sp-mode:hover { color: var(--ui-accent); }
+.sp-mode.active { background: var(--ui-accent-soft); color: var(--ui-accent); }
+.sp-notice {
+  flex: none; display: flex; align-items: center; gap: 6px; padding: 5px 9px;
+  font-size: 11.5px; color: var(--ui-warning);
+  background: var(--ui-warning-soft); border-bottom: 1px solid var(--ui-border);
+}
+.sp-notice-close {
+  margin-left: auto; border: 0; background: transparent; color: inherit;
+  font-size: 14px; line-height: 1; cursor: pointer;
+}
 .sp-icon-btn {
   width: 28px; height: 28px; flex: none; display: inline-flex; align-items: center; justify-content: center;
   border: 0; border-radius: var(--ui-radius-sm); background: transparent;
