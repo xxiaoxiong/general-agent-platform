@@ -3,7 +3,9 @@
 运行：
     cd backend && python -m pytest tests/test_sandbox_runtime.py -q
 """
-from datetime import timedelta
+import base64
+import hashlib
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import pytest_asyncio
@@ -17,7 +19,7 @@ from app.models.sandbox import (
     SandboxRunnerNode, Workspace, WorkspaceService,
 )
 from app.models.user import User
-from app.models.agent import AgentSession
+from app.models.agent import AgentRunEvent, AgentSession
 from app.services.sandbox import (
     jobs, projects, runtime, scheduler, service_manager, session_files,
 )
@@ -745,3 +747,140 @@ async def test_quota_denied_emits_resource_event(monkeypatch):
         assert len(events) == 1
         assert events[0].project_id == _p2.id
         assert events[0].payload.get("reason") == "quota"
+
+
+async def test_completion_evidence_reads_sandbox_workspace(monkeypatch):
+    """项目会话验收证据必须从 Sandbox /workspace 读取，避免误报“没有写入记录”。"""
+    from app.services.agent_runtime import completion
+    from app.services.agent_runtime.context import RunScope, RuntimeContext
+    from app.services.agent_runtime.events import TOOL_COMPLETED, TOOL_STARTED
+    from app.services.sandbox import agent_client
+
+    user = await _user("u-evidence")
+    project, _workspace, sandbox = await _ready_for_session(user)
+    run_id = "run-sbx-evidence"
+    raw = "# 调研报告\n\n正文内容\n".encode()
+    digest = hashlib.sha256(raw).hexdigest()
+
+    async def _read_raw(sandbox_id, path):
+        assert sandbox_id == sandbox.id
+        assert path == "/workspace/software_report.md"
+        return {"path": path, "size": len(raw),
+                "content_b64": base64.b64encode(raw).decode()}
+
+    monkeypatch.setattr(agent_client, "read_raw", _read_raw)
+    monkeypatch.setattr(settings, "SANDBOX_ENABLED", True)
+    async with AsyncSessionLocal() as s:
+        s.add_all([
+            AgentRunEvent(run_id=run_id, sequence=1, event_type=TOOL_STARTED, payload={
+                "tool": "write_file", "tool_call_id": "call-w1", "internal": True,
+                "input": {"file_path": "/workspace/software_report.md"}}),
+            AgentRunEvent(run_id=run_id, sequence=2, event_type=TOOL_COMPLETED, payload={
+                "tool": "write_file", "tool_call_id": "call-w1", "internal": True,
+                "output": "written"}),
+        ])
+        await s.commit()
+    try:
+        ctx = RuntimeContext(
+            RunScope(user.id), run_id, "thread-evidence", 1,
+            session_id=1, project_id=project.id,
+        )
+        evidence, artifacts, external = await completion._collect_evidence(ctx)
+        assert external is False
+        assert any(item.tool_name == "write_file" and item.path == "software_report.md"
+                   for item in evidence)
+        assert {"path": "software_report.md", "name": "software_report.md",
+                "size": len(raw), "sha256": digest} in artifacts
+        assert completion.delivery_path_checks(
+            "报告已保存 /workspace/software_report.md，全文如下……", evidence, artifacts) == []
+    finally:
+        async with AsyncSessionLocal() as s:
+            await s.execute(delete(AgentRunEvent).where(AgentRunEvent.run_id == run_id))
+            await s.commit()
+
+
+async def test_attachment_refs_read_from_sandbox_workspace(monkeypatch):
+    """项目会话附件指纹从 Sandbox 读取（否则 run 创建会误报附件不存在）。"""
+    from app.services.agent_runtime.task_router import resolve_attachment_refs_async
+    from app.services.sandbox import agent_client
+
+    user = await _user("u-attach")
+    project, _workspace, _sandbox = await _ready_for_session(user)
+    note = "附件正文\n".encode()
+    extracted = "附件正文\n".encode()
+
+    async def _read_raw(_sandbox_id, path):
+        payload = extracted if path.endswith(".extracted.txt") else note
+        return {"path": path, "size": len(payload),
+                "content_b64": base64.b64encode(payload).decode()}
+
+    monkeypatch.setattr(agent_client, "read_raw", _read_raw)
+    async with AsyncSessionLocal() as s:
+        session = AgentSession(
+            agent_id=1, user_id=user.id, title="附件会话",
+            messages=[], project_id=project.id,
+        )
+        s.add(session)
+        await s.commit()
+        await s.refresh(session)
+    refs = await resolve_attachment_refs_async(
+        [{"path": "uploads/note.txt",
+          "text_path": "uploads/note.txt.extracted.txt"}],
+        user_id=user.id, agent_id=1, session_id=session.id,
+    )
+    assert refs[0]["path"] == "uploads/note.txt"
+    assert refs[0]["size"] == len(note)
+    assert refs[0]["sha256"] == hashlib.sha256(note).hexdigest()
+    assert refs[0]["text_path"] == "uploads/note.txt.extracted.txt"
+    assert refs[0]["text_sha256"] == hashlib.sha256(extracted).hexdigest()
+
+
+async def test_cleanup_orphan_networks_and_subnet_allocation(monkeypatch):
+    """孤儿 Sandbox 网络自动清理；配置子网池时按块分配，避免地址池耗尽。"""
+    from app.sandbox_runner.executor import RunnerExecutor
+
+    def _created(seconds_ago: float) -> str:
+        stamp = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+        return stamp.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+    class FakeEngine:
+        def __init__(self):
+            self.removed: list[str] = []
+            self.disconnected: list[tuple[str, str]] = []
+
+        async def list_containers(self, _labels):
+            return [{"Labels": {"platform.network": "gap-net-1-g1"}}]
+
+        async def list_networks(self, _labels):
+            return [
+                {"Name": "gap-net-1-g1", "Created": _created(3600)},
+                {"Name": "gap-net-2-g1", "Created": _created(3600)},
+                {"Name": "gap-net-3-g1", "Created": _created(3600)},
+                {"Name": "gap-net-4-g1", "Created": _created(5)},
+                {"Name": "gap-net-5-g1", "Created": _created(3600),
+                 "IPAM": {"Config": [{"Subnet": "10.210.0.0/24"}]}},
+            ]
+
+        async def inspect_network(self, name):
+            if name == "gap-net-2-g1":
+                return {"Containers": {"runner-1": {"Name": "runner"}}}
+            if name == "gap-net-3-g1":
+                return {"Containers": {"other": {"Name": "other"}}}
+            return {"Containers": {}}
+
+        async def disconnect_network(self, network, container):
+            self.disconnected.append((network, container))
+
+        async def remove_network(self, name):
+            self.removed.append(name)
+
+    monkeypatch.setattr(settings, "SANDBOX_RUNNER_CONTAINER", "runner-1")
+    monkeypatch.setattr(settings, "SANDBOX_NETWORK_SUBNET_POOL", "10.210.0.0/16")
+    monkeypatch.setattr(settings, "SANDBOX_NETWORK_SUBNET_PREFIX", 24)
+    engine = FakeEngine()
+    executor = RunnerExecutor(engine)
+    removed = await executor.cleanup_orphan_networks()
+    assert removed == 2
+    assert engine.removed == ["gap-net-2-g1", "gap-net-5-g1"]
+    assert engine.disconnected == [("gap-net-2-g1", "runner-1")]
+    assert await executor._allocate_subnet() == "10.210.1.0/24"

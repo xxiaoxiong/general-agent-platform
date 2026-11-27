@@ -109,13 +109,23 @@
   `SANDBOX_VOLUME_QUOTA_WARN_PERCENT` 发布 `sandbox.volume_quota_warning`，
   达到配额上限发布 `sandbox.volume_quota_exceeded` 并停止 Sandbox
   （只释放计算资源，Volume 保留；同一 Generation 不重复告警/停止）。
+- **项目会话验收读取 Sandbox 文件**：完成验收 / 续做摘要 / 产物冻结 / 附件指纹
+  均按会话后端读取——项目会话读 Sandbox `/workspace`，存量会话读宿主机会话目录；
+  工程验收先把源码同步到宿主隔离目录，生成的 ZIP / OpenAPI 再回写 Sandbox。
+  修复“文件已写入但验收提示没有写入记录”。
+- **超长工具输出同源卸载**：项目会话的 `tool-outputs/*` 写入 Sandbox `/workspace`，
+  `read_file` 与 `execute_command` 看到同一份文件。
+- **Sandbox 网络生命周期**：删除 Sandbox 时先断开 Runner 再删网络；Runner 启动与
+  每轮对账清理无容器的孤儿网络（仅清理创建超过 10 分钟的网络，避免误删 Provision
+  中的网络）；并发 Sandbox 较多时可配置 `SANDBOX_NETWORK_SUBNET_POOL` 专用子网池，
+  避免 Docker 默认地址池耗尽（`all predefined address pools have been fully subnetted`）。
 
 ## 3. 验证记录（真实执行）
 
 | 验证 | 命令 / 方式 | 结果 |
 | --- | --- | --- |
-| 后端全量回归 | `cd backend && python -m pytest -q` | **1071 passed, 13 skipped, 102.48s** |
-| Sandbox 专项（模型/调度/Lease/ACL/预览/工具/文件后端/写租约/自动恢复/限流/登录态/事件/软配额/对账/服务配额） | `pytest tests/test_sandbox_runtime.py tests/test_sandbox_security.py tests/test_sandbox_api.py -q` | **34 passed** |
+| 后端全量回归 | `cd backend && python -m pytest -q` | **1075 passed, 13 skipped, 100.67s** |
+| Sandbox 专项（模型/调度/Lease/ACL/预览/工具/文件后端/写租约/自动恢复/限流/登录态/事件/软配额/对账/服务配额/验收读取/网络清理） | `pytest tests/test_sandbox_runtime.py tests/test_sandbox_security.py tests/test_sandbox_api.py -q` | **37 passed** |
 | 真实 Docker 集成 | 在 Runner 容器内 `SANDBOX_DOCKER_TEST=1 pytest tests/test_sandbox_docker_integration.py` | **1 passed 40.03s**（容器安全基线、Runner 断网重连、Docker Socket 未挂载、取消命令无孤儿进程、命令、文件一致性、只读 rootfs、网络隔离含平台服务名、Service 健康 + HTTP、删除容器后新 Generation 文件保留、幂等创建） |
 | Vite HMR / WebSocket | 在 Runner 容器内 `SANDBOX_DOCKER_VITE=1 pytest tests/test_sandbox_docker_vite.py -q -s` | **1 passed 10.81s**（Vite 安装、dev server、`vite-hmr` WS、修改源码收到 `full-reload`）；启动→Healthy + 首页 200 = **2.018s** |
 | 真实端到端（服务层） | 容器内脚本：项目 → Provision → 命令（uid=10001）→ Service → Preview | `exec succeeded`、`service healthy`、子域预览 200、兜底 200、坏 Token 401 |

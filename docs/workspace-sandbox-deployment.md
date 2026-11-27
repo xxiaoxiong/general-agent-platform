@@ -73,6 +73,8 @@ curl -s http://localhost:8081/health      # preview-proxy
 | `SANDBOX_MAX_ACTIVE_PER_USER / _TENANT` | 2 / 20 | 活动 Sandbox 配额（0=不限） |
 | `SANDBOX_IDLE_TIMEOUT` | 1800 | 空闲自动停止秒数（0=不回收） |
 | `SANDBOX_NETWORK_POLICY` | egress | `none` 创建 internal 网络（完全断网） |
+| `SANDBOX_NETWORK_SUBNET_POOL` | 空 | 每个 Sandbox 独立 bridge 的子网池（如 `10.210.0.0/16`）；空=Docker 自动分配 |
+| `SANDBOX_NETWORK_SUBNET_PREFIX` | 24 | 从子网池切分的网络前缀（/16 池按 /24 可支持 256 个并发网络） |
 | `SANDBOX_VOLUME_QUOTA_MODE` | soft | 硬配额需宿主文件系统支持（见 §5） |
 | `SANDBOX_VOLUME_QUOTA_WARN_PERCENT` | 85 | 软配额预警阈值；超配额自动停止 Sandbox（Volume 保留） |
 | `SANDBOX_CPU_RESERVE / MEMORY_RESERVE / DISK_RESERVE` | 2 核 / 2048MB / 20GB | Runner 可分配 = 总量 - 保留 |
@@ -181,6 +183,25 @@ docker exec ai_plat_mysql mysqldump -u root -p"$MYSQL_ROOT_PASSWORD" ai_plat \
 恢复顺序：数据库元数据 → Volume → 启动 backend → 在 Preview/Services 面板重新启动环境。
 Sandbox 容器本身是可丢弃的，恢复后由 Runner 按 Desired State 重建并自动拉起 Service。
 
+### 5.2 清理孤儿 Sandbox 网络
+
+每个 Sandbox 使用独立 bridge 网络；删除失败或测试中断可能残留无容器网络，
+最终耗尽 Docker 默认地址池（创建环境报
+`all predefined address pools have been fully subnetted`）。Runner 会周期自动清理，
+也可手工执行（先确认网络确实没有 Sandbox 容器）：
+
+```bash
+# 列出所有平台网络及其容器数
+docker network ls --filter name=gap-net- --format '{{.Name}}'
+docker network inspect gap-net-<id>-g<gen> --format '{{len .Containers}}'
+
+# 对 containers=0 的网络：先断开 Runner，再删除
+docker network disconnect -f gap-net-<id>-g<gen> ai_plat_sandbox_runner
+docker network rm gap-net-<id>-g<gen>
+```
+
+长期并发较多的部署请配置 `SANDBOX_NETWORK_SUBNET_POOL`，不要依赖 Docker 默认池。
+
 ## 6. 故障排查
 
 | 现象 | 排查 |
@@ -201,6 +222,7 @@ Sandbox 容器本身是可丢弃的，恢复后由 Runner 按 Desired State 重�
 | Runner 崩溃后 Job 卡住 | 默认 90s 租约过期后自动重新入队；超过 `max_attempts` 标记 failed，可重新点启动 |
 | Runner 重启后预览/命令 502 | Runner 启动与对账周期会自动重新接入所有既有 Sandbox 网络（`platform.network` 标签）；确认日志出现「Runner 已重新接入 N 个 Sandbox 网络」 |
 | 容器被外部删除 | Reconciler 检测 `container_missing` 后自动入队 start（10 分钟冷却），并记录 `sandbox.auto_recover_queued`；连续失败会保持 degraded 并留事件 |
+| 创建环境报 `all predefined address pools have been fully subnetted` | Docker 默认地址池被历史网络耗尽：Runner 每轮会清理无容器的孤儿网络（仅当 Sandbox 正常运行且网络创建超过 10 分钟）；仍不足时配置 `SANDBOX_NETWORK_SUBNET_POOL=10.210.0.0/16` 并重启 Runner。手工清理见 §5.2 |
 | npm/pip 安装报 EACCES | Runner 为 `/home/sandbox/.npm`、`.npm-global`、`.cache`、`.local` 挂载 tmpfs 时必须带 `uid=10001,gid=10001` 且 `exec`（否则非 root 无法写缓存 / 执行 npx 二进制） |
 | Vite HMR WebSocket 失败 | Preview Proxy 必须转发 `?token=` 查询参数与 `Sec-WebSocket-Protocol: vite-hmr`；Runner 转发时只保留自定义 Origin，避免重复 Host/Origin/Protocol 头 |
 | 服务在 Sandbox 重启后未恢复 | 服务需 `auto_start_on_sandbox_start=true` 且 `desired_state=running`；查看 `sandbox.ready` 事件中的 services |

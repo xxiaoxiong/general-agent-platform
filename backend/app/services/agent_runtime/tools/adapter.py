@@ -30,6 +30,7 @@ Phase 5（P0-05）统一 ToolResult（§7.2）：
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -153,6 +154,41 @@ def limit_for_context(
             f"{preview}\n\n...[输出过长已卸载：共 {len(text)} 字符。"
             f"完整内容见工作区文件 {rel}，可用 read_file 读取]"
         )
+    except Exception:  # noqa: BLE001 卸载失败不得阻断工具结果交付
+        return text[:_TOOL_CONTEXT_LIMIT] + f"...[输出已截断，共 {len(text)} 字符]"
+
+
+async def limit_for_context_async(
+    text: str,
+    *,
+    ctx: "RuntimeContext",
+    tool_name: str,
+) -> str:
+    """项目会话把超长工具输出卸载到 Sandbox /workspace，保证 read_file 能读到。"""
+    if len(text) <= _TOOL_CONTEXT_LIMIT:
+        return text
+    if not (ctx.project_id and settings.SANDBOX_ENABLED):
+        return await asyncio.to_thread(limit_for_context, text, ctx=ctx, tool_name=tool_name)
+    try:
+        from app.services.sandbox import agent_client
+        from app.services.sandbox.common import SandboxError
+        from app.services.tools.sandbox_tools import resolve_sandbox
+
+        ref = await resolve_sandbox(
+            int(ctx.project_id), user_id=ctx.scope.user_id,
+            min_role="viewer", wait_seconds=15.0,
+        )
+        digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+        name = f"tool-outputs/{tool_name}-{digest}.txt"
+        await agent_client.write_file(ref.sandbox_id, f"/workspace/{name}", text)
+        preview = text[:_TOOL_PREVIEW_CHARS]
+        return (
+            f"{preview}\n\n...[输出过长已卸载：共 {len(text)} 字符。"
+            f"完整内容见工作区文件 {name}，可用 read_file 读取]"
+        )
+    except SandboxError:
+        # Sandbox 不可用时不把内容写到宿主机会话目录（文件工具读不到），直接截断
+        return text[:_TOOL_CONTEXT_LIMIT] + f"...[输出已截断，共 {len(text)} 字符]"
     except Exception:  # noqa: BLE001 卸载失败不得阻断工具结果交付
         return text[:_TOOL_CONTEXT_LIMIT] + f"...[输出已截断，共 {len(text)} 字符]"
 
@@ -534,7 +570,7 @@ class ToolAdapterFactory:
                     duration_ms=float(duration_ms),
                 )
                 # P4-04（AG-06）：大输出卸载，上下文只留预览 + 路径
-                return limit_for_context(text, ctx=self.ctx, tool_name=name)
+                return await limit_for_context_async(text, ctx=self.ctx, tool_name=name)
 
             if tr.status == STATUS_FAILED:
                 self._consecutive_failures[name] = self._consecutive_failures.get(name, 0) + 1

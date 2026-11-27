@@ -135,6 +135,8 @@ cd backend && python -m alembic upgrade head
 21. **登录态预览依赖首屏 Set-Cookie**：`PREVIEW_REQUIRE_LOGIN=true` 时前端把短期 `access_token` 拼到 iframe URL；Preview Proxy 校验 Grant+User+Project ACL 后必须给文档响应追加 `preview_access` HttpOnly Cookie，子资源与 WebSocket 才能继续访问。修改 `_forward_http` 返回/头过滤时不要丢掉 Set-Cookie。
 21. **Sandbox 写路径全部要 ACL + 写租约**：工具/文件后端/附件上传删除每次调用都复核 Project 角色（成员移除立即失效），并走 Workspace 写租约；新增写入口不要绕过 `session_files.acquire_user_write_lease` / `write_lease.acquire_write_lease`。
 22. **灰度开关**：`SANDBOX_ROLLOUT_USER_IDS` / `SANDBOX_ROLLOUT_PROJECT_IDS` 非空时仅名单内启用；bootstrap、会话挂项目、工具、ACL 必须统一走 `sandbox_enabled_for()`，不要只判断 `SANDBOX_ENABLED`。
+23. **项目会话的验收/续做/冻结/附件指纹必须读 Sandbox**：`completion._collect_evidence`、`prepare_completion_continuation`、`freeze_artifacts_async`、新产物 ZIP、`resolve_attachment_refs_async` 都按会话后端分流（项目会话 → `/workspace`，存量会话 → `data/agent_files/...`）。只改宿主机会话目录会出现“用户看得见文件、验收却报没有写入记录”的假失败。
+24. **每个 Sandbox 一个 bridge 网络，必须管理好生命周期**：删除时先断开 Runner 再删网络；Runner 启动/对账周期清理无容器的孤儿网络（仅清理创建超过 10 分钟的网络，防误删 Provision 中的网络）；并发多时配置 `SANDBOX_NETWORK_SUBNET_POOL`，否则 Docker 默认地址池耗尽会报 `all predefined address pools have been fully subnetted`（新环境创建 400）。
 
 ## 修改范围原则
 

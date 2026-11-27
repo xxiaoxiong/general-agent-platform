@@ -1,6 +1,7 @@
 """依据用户意图及已有文档上下文确定 Run 路线。"""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 from pathlib import Path
@@ -336,3 +337,74 @@ def resolve_attachment_refs(
                     del ref["text_path"]
         refs.append(ref)
     return refs
+
+
+def _attachment_name(value: Any) -> str:
+    relative = str(value or "").replace("\\", "/")
+    parts = relative.split("/")
+    if (
+        len(parts) != 2 or parts[0] != "uploads" or not parts[1]
+        or parts[1] in (".", "..") or ":" in parts[1]
+        or any(ord(char) < 32 for char in parts[1])
+    ):
+        raise ValueError("附件路径无效")
+    return parts[1]
+
+
+async def resolve_attachment_refs_async(
+    attachments: list[dict[str, Any]],
+    *,
+    user_id: int,
+    agent_id: int,
+    session_id: int | None,
+) -> list[dict[str, Any]]:
+    """按会话后端读取附件指纹：项目会话读 Sandbox /workspace，存量会话读本地工作区。"""
+    if not attachments:
+        return []
+    if len(attachments) > 30:
+        raise ValueError("单次请求最多支持 30 个附件")
+    if session_id is None:
+        raise ValueError("请先将附件上传至当前会话")
+    from app.core.database import AsyncSessionLocal
+    from app.models.agent import AgentSession
+    from app.services.sandbox import session_files
+
+    async with AsyncSessionLocal() as db:
+        session = await db.get(AgentSession, session_id)
+        if session is None or session.user_id != user_id:
+            raise ValueError("会话不存在")
+        if session_files.uses_sandbox(session):
+            refs = []
+            max_bytes = int(settings.AGENT_MAX_FILE_SIZE_MB * 1024 * 1024)
+            for attachment in attachments:
+                name = _attachment_name(attachment.get("path"))
+                relative = f"uploads/{name}"
+                try:
+                    raw, _mime = await session_files.read_bytes(db, session, relative)
+                except Exception as exc:  # noqa: BLE001 Sandbox 不可达按附件缺失处理
+                    raise FileNotFoundError("会话附件不存在") from exc
+                if len(raw) > max_bytes:
+                    raise ValueError("附件超过大小限制")
+                ref: dict[str, Any] = {
+                    "path": relative, "name": name, "size": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
+                text_path = attachment.get("text_path")
+                if text_path:
+                    expected = f"{relative}.extracted.txt"
+                    if str(text_path).replace("\\", "/") != expected:
+                        raise ValueError("附件文本副本路径无效")
+                    try:
+                        text_raw, _mime = await session_files.read_bytes(db, session, expected)
+                    except Exception:  # noqa: BLE001 文本副本缺失不阻断
+                        pass
+                    else:
+                        if len(text_raw) <= max_bytes:
+                            ref["text_path"] = expected
+                            ref["text_sha256"] = hashlib.sha256(text_raw).hexdigest()
+                refs.append(ref)
+            return refs
+    return await asyncio.to_thread(
+        resolve_attachment_refs, attachments, user_id=user_id,
+        agent_id=agent_id, session_id=session_id,
+    )

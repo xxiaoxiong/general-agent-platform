@@ -216,6 +216,10 @@ class Settings(BaseSettings):
     SANDBOX_IDLE_TIMEOUT: int = 1800            # 空闲回收秒数（0=不自动回收）
     SANDBOX_IMAGE: str = "general-agent-platform/workspace-sandbox:1.0.0"
     SANDBOX_NETWORK_POLICY: str = "egress"      # egress=允许公网出站；none=完全断网
+    # 每个 Sandbox 独立 bridge 网络；默认由 Docker 自动分配子网（受 daemon default-address-pools 限制）。
+    # 并发 Sandbox 较多时配置专用子网池（如 10.210.0.0/16），按 /24 逐块分配，避免地址池耗尽。
+    SANDBOX_NETWORK_SUBNET_POOL: str = ""
+    SANDBOX_NETWORK_SUBNET_PREFIX: int = 24
     SANDBOX_VOLUME_QUOTA_MODE: str = "soft"     # soft=监控预警（超限停止）；hard=宿主支持时硬配额
     SANDBOX_VOLUME_QUOTA_WARN_PERCENT: int = 85  # 软配额预警阈值（%），达到后发布事件
     SANDBOX_CPU_RESERVE: float = 2.0            # 宿主机为 OS/平台保留的 CPU 核数
@@ -297,6 +301,21 @@ class Settings(BaseSettings):
             raise RuntimeError("配置非法：SANDBOX_NETWORK_POLICY 只能为 egress / none。")
         if self.SANDBOX_VOLUME_QUOTA_MODE not in {"soft", "hard"}:
             raise RuntimeError("配置非法：SANDBOX_VOLUME_QUOTA_MODE 只能为 soft / hard。")
+        pool = (self.SANDBOX_NETWORK_SUBNET_POOL or "").strip()
+        if pool:
+            import ipaddress
+
+            try:
+                network = ipaddress.ip_network(pool, strict=False)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"配置非法：SANDBOX_NETWORK_SUBNET_POOL 不是合法 CIDR（{pool}）。"
+                ) from exc
+            prefix = int(self.SANDBOX_NETWORK_SUBNET_PREFIX or 24)
+            if not 8 <= prefix <= network.max_prefixlen or prefix < network.prefixlen:
+                raise RuntimeError(
+                    "配置非法：SANDBOX_NETWORK_SUBNET_PREFIX 必须大于等于子网池前缀且不超过地址位宽。"
+                )
         if not self.SANDBOX_ENABLED:
             return
         if len((self.SANDBOX_RUNNER_TOKEN or "").strip()) < 16:

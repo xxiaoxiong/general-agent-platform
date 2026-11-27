@@ -1286,13 +1286,13 @@ class StreamMixin:
 
     async def _publish_completion_artifacts(self, ctx, run, verification: dict) -> None:
         from app.api.workspace.artifacts import make_artifact_id
-        from app.services.agent_runtime.completion import freeze_artifacts
+        from app.services.agent_runtime.completion import freeze_artifacts_async
 
         artifacts = verification.get("artifacts") or []
         if not artifacts:
             return
         if run.session_id:
-            frozen = await asyncio.to_thread(freeze_artifacts, ctx, artifacts)
+            frozen = await freeze_artifacts_async(ctx, artifacts)
             # 旧版 checkpoint 里的产物仍可通过原有会话链接下载。
             paths = {**{item["path"]: item["path"] for item in artifacts if not item.get("sha256")}, **frozen}
             verification["artifacts"] = [

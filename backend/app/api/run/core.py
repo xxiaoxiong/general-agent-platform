@@ -119,7 +119,7 @@ async def create_run(
     from app.services.agent_runtime.repositories import IdempotencyConflict, SessionBusy
     from app.services.agent_runtime.source_bindings import SourceBindingError, check_source_bindings
     from app.services.agent_runtime.task_router import (
-        DOCUMENT_GRAPH_TYPES, recent_word_attachments, resolve_attachment_refs,
+        DOCUMENT_GRAPH_TYPES, recent_word_attachments, resolve_attachment_refs_async,
         route_task, word_candidates,
     )
 
@@ -186,8 +186,8 @@ async def create_run(
     ):
         raise HTTPException(status_code=422, detail="任务选项仅支持正整数的规范或文档版本号")
     try:
-        attachment_refs = await asyncio.to_thread(
-            resolve_attachment_refs, body.attachments, user_id=current_user.id,
+        attachment_refs = await resolve_attachment_refs_async(
+            body.attachments, user_id=current_user.id,
             agent_id=agent_id, session_id=body.conversation_id,
         ) if body.attachments else []
     except ValueError as e:

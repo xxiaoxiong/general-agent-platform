@@ -19,7 +19,7 @@ from app.models.document import RunInputRequest
 from ..document_turn import document_turn, is_template_reference
 from ..task_router import (
     DOCUMENT_GRAPH_TYPES, choose_word_attachment, continuation_attachments,
-    recent_word_attachments, resolve_attachment_refs, word_candidates,
+    recent_word_attachments, resolve_attachment_refs_async, word_candidates,
 )
 
 
@@ -35,9 +35,8 @@ async def _resolve_inherited(
     ref: dict[str, Any], *, user_id: int, agent_id: int, session_id: int | None,
 ) -> dict[str, Any] | None:
     try:
-        return (await asyncio.to_thread(
-            resolve_attachment_refs, [ref], user_id=user_id,
-            agent_id=agent_id, session_id=session_id,
+        return (await resolve_attachment_refs_async(
+            [ref], user_id=user_id, agent_id=agent_id, session_id=session_id,
         ))[0]
     except (ValueError, OSError):
         return None

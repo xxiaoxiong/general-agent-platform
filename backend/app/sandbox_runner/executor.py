@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, Optional
 
 import httpx
@@ -36,6 +38,26 @@ def container_name(sandbox_id: int, generation: int) -> str:
 
 def network_name(sandbox_id: int, generation: int) -> str:
     return f"gap-net-{sandbox_id}-g{generation}"
+
+
+def _network_age_seconds(item: dict) -> float:
+    """Docker 网络创建时间到现在的秒数（解析失败按「很旧」处理，允许清理）。"""
+    raw = str(item.get("Created") or "")
+    if not raw:
+        return 1e9
+    text = raw.replace("Z", "+00:00")
+    if "." in text:
+        head, tail = text.split(".", 1)
+        digits = "".join(char for char in tail[:9] if char.isdigit())
+        zone = "+00:00" if tail.endswith("+00:00") else ""
+        text = f"{head}.{digits[:6]}{zone}"
+    try:
+        created = datetime.fromisoformat(text)
+    except ValueError:
+        return 1e9
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - created).total_seconds())
 
 
 class RunnerExecutor:
@@ -109,6 +131,43 @@ class RunnerExecutor:
             },
         }
 
+    async def _allocate_subnet(self) -> str:
+        """从配置的子网池分配未占用网段（默认空 = Docker 自动分配）。
+
+        Docker 默认 address pool 只支持约十几个 bridge 网络；并发 Sandbox 较多时
+        必须配置 SANDBOX_NETWORK_SUBNET_POOL，否则创建网络会报
+        ``all predefined address pools have been fully subnetted``。
+        """
+        pool = (settings.SANDBOX_NETWORK_SUBNET_POOL or "").strip()
+        if not pool:
+            return ""
+        try:
+            network = ipaddress.ip_network(pool, strict=False)
+            prefix = int(settings.SANDBOX_NETWORK_SUBNET_PREFIX or 24)
+            candidates = network.subnets(new_prefix=prefix)
+        except ValueError:
+            logger.warning("SANDBOX_NETWORK_SUBNET_POOL 配置无效：%s", pool)
+            return ""
+        try:
+            networks = await self.engine.list_networks({})
+        except DockerEngineError:
+            return ""
+        used = set()
+        for item in networks:
+            for config in ((item.get("IPAM") or {}).get("Config") or []):
+                subnet = config.get("Subnet")
+                if not subnet:
+                    continue
+                try:
+                    used.add(ipaddress.ip_network(subnet, strict=False))
+                except ValueError:
+                    continue
+        for candidate in candidates:
+            if not any(candidate.overlaps(block) for block in used):
+                return str(candidate)
+        logger.warning("Sandbox 子网池 %s 已用尽（prefix=/%s）", pool, prefix)
+        return ""
+
     async def _ensure_network(self, payload: dict) -> str:
         name = network_name(int(payload["sandbox_id"]), int(payload["generation"]))
         internal = str(payload.get("network_policy") or "egress") == "none"
@@ -118,6 +177,7 @@ class RunnerExecutor:
                 int(payload["workspace_id"]), int(payload["sandbox_id"]),
                 int(payload["generation"]),
             ),
+            subnet=await self._allocate_subnet(),
         )
         runner_container = settings.SANDBOX_RUNNER_CONTAINER or _self_container_id()
         if runner_container:
@@ -315,10 +375,17 @@ class RunnerExecutor:
             await self.engine.stop_container(container_id, timeout=5)
             await self.engine.remove_container(container_id, force=True)
         network = network_name(int(payload["sandbox_id"]), int(payload["generation"]))
+        runner_container = settings.SANDBOX_RUNNER_CONTAINER or _self_container_id()
+        if runner_container:
+            # Runner 是该网络的端点；不先断开会导致 DELETE 失败并留下孤儿网络
+            try:
+                await self.engine.disconnect_network(network, runner_container)
+            except DockerEngineError:
+                pass
         try:
             await self.engine.remove_network(network)
-        except DockerEngineError:
-            pass
+        except DockerEngineError as exc:
+            logger.warning("删除 Sandbox 网络失败（留待对账清理）%s: %s", network, exc)
         if payload.get("purge_volume"):
             await self.engine.remove_volume(str(payload["volume_id"]))
         return {"observed_state": "stopped", "volume_retained": not bool(payload.get("purge_volume"))}
@@ -381,6 +448,67 @@ class RunnerExecutor:
             })
         return items
 
+    async def cleanup_orphan_networks(self) -> int:
+        """清理没有对应 Sandbox 容器的平台网络（删除失败/测试残留）。
+
+        每个 Sandbox 一个 bridge 网络，Docker 默认地址池容量有限；孤儿网络会
+        逐步耗尽地址池，导致新 Sandbox 创建时报 400
+        ``all predefined address pools have been fully subnetted``。
+        """
+        runner_container = settings.SANDBOX_RUNNER_CONTAINER or _self_container_id()
+        try:
+            containers = await self.engine.list_containers({"platform.managed": "true"})
+        except DockerEngineError:
+            return 0
+        active = {str((item.get("Labels") or {}).get("platform.network") or "")
+                  for item in containers}
+        active.discard("")
+        try:
+            networks = await self.engine.list_networks({"platform.managed": "true"})
+        except DockerEngineError:
+            return 0
+        min_age = max(600.0, float(settings.SANDBOX_RECONCILE_INTERVAL) * 3)
+        removed = 0
+        for network in networks:
+            name = str(network.get("Name") or "")
+            if not name.startswith("gap-net-") or name in active:
+                continue
+            # 新建网络可能正处于 Provision 中（网络已建、容器未建），不清理
+            if _network_age_seconds(network) < min_age:
+                continue
+            try:
+                detail = await self.engine.inspect_network(name)
+            except DockerEngineError:
+                continue
+            endpoints = detail.get("Containers") or {}
+            foreign = [
+                container_id for container_id, info in endpoints.items()
+                if container_id != runner_container
+                and str((info or {}).get("Name") or "").lstrip("/") != runner_container
+            ]
+            # 存在非 Runner 端点时不自动删除（可能是未知容器网络，只告警）
+            if foreign:
+                logger.warning("孤儿网络存在未知容器端点，跳过清理：%s", name)
+                continue
+            runner_attached = runner_container and (
+                runner_container in endpoints
+                or any(str((info or {}).get("Name") or "").lstrip("/") == runner_container
+                       for info in endpoints.values())
+            )
+            if runner_attached:
+                try:
+                    await self.engine.disconnect_network(name, runner_container)
+                except DockerEngineError:
+                    pass
+            try:
+                await self.engine.remove_network(name)
+                removed += 1
+            except DockerEngineError as exc:
+                logger.warning("清理孤儿 Sandbox 网络失败 %s: %s", name, exc)
+        if removed:
+            logger.info("已清理孤儿 Sandbox 网络 %d 个", removed)
+        return removed
+
     async def attach_managed_networks(self) -> int:
         """Runner 重启后重新加入所有已管理 Sandbox 的独立网络。
 
@@ -390,6 +518,10 @@ class RunnerExecutor:
         runner_container = settings.SANDBOX_RUNNER_CONTAINER or _self_container_id()
         if not runner_container:
             return 0
+        try:
+            await self.cleanup_orphan_networks()
+        except Exception as exc:  # noqa: BLE001 清理失败不阻断重新接入
+            logger.warning("清理孤儿 Sandbox 网络失败：%s", exc)
         attached = 0
         try:
             containers = await self.engine.list_containers({"platform.managed": "true"})

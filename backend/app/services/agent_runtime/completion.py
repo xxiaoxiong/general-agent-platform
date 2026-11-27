@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import tempfile
@@ -33,6 +35,11 @@ from .persistence import CheckpointerFactory, make_run_config
 from .tools.classification import CLASS_EXTERNAL_IDEMPOTENT, CLASS_NON_IDEMPOTENT, get_side_effect_contract
 from .tools.policy import BudgetExceededError
 from .workspace_delivery import ProjectReview, review_workspace_project, workspace_project_digest
+
+logger = logging.getLogger("ai_plat.agent_runtime.completion")
+
+_TEXT_SUFFIXES = {".txt", ".md", ".csv", ".tsv", ".py", ".js", ".html", ".css", ".sql"}
+_ARCHIVE_SUFFIXES = {".zip", ".xlsx", ".docx", ".pptx"}
 
 
 class CompletionState(AgentState):
@@ -260,6 +267,32 @@ def _artifact_root(ctx: RuntimeContext) -> Path | None:
     return expected if path.resolve() == expected else None
 
 
+def _sandbox_workspace(ctx: RuntimeContext) -> bool:
+    """项目会话：文件在 Sandbox /workspace，不在宿主机会话目录。"""
+    return bool(ctx.project_id and settings.SANDBOX_ENABLED)
+
+
+def _artifact_content(relative: str, raw: bytes, ctx: RuntimeContext) -> Any:
+    """按文件类型解析内容；空文件 / 空归档 / 非法 JSON 视为无效产物。"""
+    suffix = PurePosixPath(relative).suffix.casefold()
+    content = None
+    if suffix == ".json":
+        parsed = json.loads(raw.decode("utf-8-sig"))
+        if ctx.task_contract and ctx.task_contract.table_facts:
+            content = parsed
+    elif suffix in _ARCHIVE_SUFFIXES:
+        with ZipFile(io.BytesIO(raw)) as archive:
+            if not archive.namelist():
+                raise ValueError("空归档")
+    elif suffix in _TEXT_SUFFIXES:
+        text = raw.decode("utf-8-sig")
+        if not text.strip():
+            raise ValueError("空文本")
+        if suffix in {".txt", ".md"} and ctx.task_contract and ctx.task_contract.table_facts:
+            content = text
+    return content
+
+
 def _read_artifacts(ctx: RuntimeContext, paths: set[str]) -> dict[str, tuple[int, str, Any]]:
     if (root := _artifact_root(ctx)) is None:
         return {}
@@ -274,32 +307,155 @@ def _read_artifacts(ctx: RuntimeContext, paths: set[str]) -> dict[str, tuple[int
                 raw = stream.read(max_size + 1)
             if not 0 < len(raw) <= max_size:
                 continue
-            suffix = target.suffix.casefold()
-            content = None
-            if suffix == ".json":
-                parsed = json.loads(raw.decode("utf-8-sig"))
-                if ctx.task_contract and ctx.task_contract.table_facts:
-                    content = parsed
-            elif suffix in {".zip", ".xlsx", ".docx", ".pptx"}:
-                with ZipFile(io.BytesIO(raw)) as archive:
-                    if not archive.namelist():
-                        continue
-            elif suffix in {".txt", ".md", ".csv", ".tsv", ".py", ".js", ".html", ".css", ".sql"}:
-                text = raw.decode("utf-8-sig")
-                if not text.strip():
-                    continue
-                if suffix in {".txt", ".md"} and ctx.task_contract and ctx.task_contract.table_facts:
-                    content = text
-        except (OSError, ValueError, RuntimeError, BadZipFile):
+            content = _artifact_content(relative, raw, ctx)
+        except (OSError, ValueError, TypeError, RuntimeError, BadZipFile):
             continue
         valid[relative] = (len(raw), hashlib.sha256(raw).hexdigest(), content)
     return valid
 
 
+async def _resolve_sandbox_ref(ctx: RuntimeContext):
+    """解析项目 Sandbox（含实时 ACL）；不可用时返回 None，验收按缺口处理。"""
+    from app.services.sandbox.common import SandboxError
+    from app.services.tools.sandbox_tools import resolve_sandbox
+
+    try:
+        return await resolve_sandbox(
+            int(ctx.project_id), user_id=ctx.scope.user_id,
+            min_role="viewer", wait_seconds=15.0,
+        )
+    except SandboxError as exc:
+        logger.warning("验收读取 Sandbox 失败（project=%s）：%s", ctx.project_id, exc)
+        return None
+
+
+async def _read_sandbox_artifacts(ctx: RuntimeContext, paths: set[str]) -> dict[str, tuple[int, str, Any]]:
+    """项目会话从 Sandbox /workspace 读取产物（与文件工具同一份文件）。"""
+    from app.services.sandbox import agent_client
+    from app.services.sandbox.common import SandboxError
+
+    ref = await _resolve_sandbox_ref(ctx)
+    if ref is None:
+        return {}
+    max_size = int(settings.AGENT_MAX_FILE_SIZE_MB * 1024 * 1024)
+    valid = {}
+    for relative in sorted(paths)[:100]:
+        if _workspace_path(f"/workspace/{relative}") != relative:
+            continue
+        try:
+            data = await agent_client.read_raw(ref.sandbox_id, f"/workspace/{relative}")
+            raw = base64.b64decode(data.get("content_b64") or "")
+            if not 0 < len(raw) <= max_size:
+                continue
+            content = _artifact_content(relative, raw, ctx)
+        except (SandboxError, ValueError, TypeError, BadZipFile):
+            continue
+        valid[relative] = (len(raw), hashlib.sha256(raw).hexdigest(), content)
+    return valid
+
+
+async def _read_artifacts_any(ctx: RuntimeContext, paths: set[str]) -> dict[str, tuple[int, str, Any]]:
+    """统一产物读取入口：项目会话读 Sandbox，普通会话读宿主机会话目录。"""
+    if not paths:
+        return {}
+    if _sandbox_workspace(ctx):
+        return await _read_sandbox_artifacts(ctx, paths)
+    return await asyncio.to_thread(_read_artifacts, ctx, paths)
+
+
+def _write_workspace_file(target: Path, raw: bytes) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+            stream.close()
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+async def _materialize_project_sources(ctx: RuntimeContext, artifacts: list[dict]) -> bool:
+    """项目会话：把 Sandbox 工程源码同步到宿主机会话目录，供隔离工程验收读取。"""
+    if not _sandbox_workspace(ctx):
+        return True
+    root = _artifact_root(ctx)
+    if root is None:
+        return False
+    from app.services.sandbox import agent_client
+    from app.services.sandbox.common import SandboxError
+
+    ref = await _resolve_sandbox_ref(ctx)
+    if ref is None:
+        return False
+    for item in artifacts:
+        path = str(item.get("path") or "")
+        digest = str(item.get("sha256") or "")
+        size = int(item.get("size") or 0)
+        if not path or not _workspace_path(f"/workspace/{path}"):
+            continue
+        if not re.fullmatch(r"[a-f0-9]{64}", digest) or size <= 0:
+            return False
+        target = root / path
+        try:
+            if target.is_file() and target.stat().st_size == size:
+                with target.open("rb") as stream:
+                    if hashlib.file_digest(stream, "sha256").hexdigest() == digest:
+                        continue
+            data = await agent_client.read_raw(ref.sandbox_id, f"/workspace/{path}")
+            raw = base64.b64decode(data.get("content_b64") or "")
+        except (SandboxError, OSError, ValueError, TypeError):
+            return False
+        if len(raw) != size or hashlib.sha256(raw).hexdigest() != digest:
+            return False
+        try:
+            await asyncio.to_thread(_write_workspace_file, target, raw)
+        except OSError:
+            return False
+    return True
+
+
+async def _sync_generated_to_sandbox(ctx: RuntimeContext, artifacts: list[dict]) -> None:
+    """隔离验收生成的文件（源码 ZIP / OpenAPI）回写 Sandbox，用户可见且可冻结。"""
+    if not _sandbox_workspace(ctx) or not artifacts:
+        return
+    root = _artifact_root(ctx)
+    if root is None:
+        return
+    from app.services.sandbox import agent_client
+    from app.services.sandbox.common import SandboxError
+
+    ref = await _resolve_sandbox_ref(ctx)
+    if ref is None:
+        return
+    for item in artifacts:
+        path = str(item.get("path") or "")
+        digest = str(item.get("sha256") or "")
+        size = int(item.get("size") or 0)
+        if not path or not _workspace_path(f"/workspace/{path}"):
+            continue
+        source = root / path
+        try:
+            if not source.is_file() or source.stat().st_size != size:
+                continue
+            with source.open("rb") as stream:
+                raw = stream.read(size + 1)
+            if len(raw) != size or hashlib.sha256(raw).hexdigest() != digest:
+                continue
+            await agent_client.write_file(
+                ref.sandbox_id, f"/workspace/{path}",
+                base64.b64encode(raw).decode("ascii"), encoding="base64",
+            )
+        except (SandboxError, OSError, ValueError, TypeError) as exc:
+            logger.warning("同步工程验收产物到 Sandbox 失败 %s: %s", path, exc)
+
+
 async def prepare_completion_continuation(ctx: RuntimeContext, continuation: dict) -> None:
     """快照确认的路径由服务端复核摘要，无需模型逐个重读。"""
     recorded = continuation.get("artifacts") or {}
-    files = await asyncio.to_thread(_read_artifacts, ctx, set(recorded)) if recorded else {}
+    files = await _read_artifacts_any(ctx, set(recorded)) if recorded else {}
     ctx.carried_artifacts = {path: digest for path, digest in recorded.items()
                              if path in files and files[path][1] == digest}
     ctx.completion_continuation = {
@@ -346,6 +502,28 @@ def _continuation_project_todos(continuation: dict, checks: list[CheckResult] | 
     return [*history[-(64 - len(actions)):], *({"content": item, "status": "pending"} for item in actions)]
 
 
+def _freeze_bytes(root: Path, run_id: str, relative: str,
+                  raw: bytes, digest: str) -> str | None:
+    """把产物字节写入冻结目录（幂等：同摘要已存在直接复用）。"""
+    destination = root / RUN_ARTIFACT_FOLDER / run_id / digest / relative
+    if destination.is_file():
+        with destination.open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() == digest:
+                return destination.relative_to(root).as_posix()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+            stream.close()
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return destination.relative_to(root).as_posix()
+
+
 def freeze_artifacts(ctx: RuntimeContext, artifacts: list[dict]) -> dict[str, str]:
     """保存验收时的字节，后续会话内的编辑不会改变已发布的下载记录。"""
     root = _artifact_root(ctx)
@@ -357,34 +535,57 @@ def freeze_artifacts(ctx: RuntimeContext, artifacts: list[dict]) -> dict[str, st
         if not _workspace_path(f"/workspace/{path}") or not re.fullmatch(r"[a-f0-9]{64}", digest):
             continue
         source = root / path
-        destination = root / RUN_ARTIFACT_FOLDER / ctx.run_id / digest / path
         try:
-            if source.resolve() != source or destination.resolve() != destination:
+            if source.resolve() != source:
                 continue
-            if destination.is_file():
-                with destination.open("rb") as stream:
-                    if hashlib.file_digest(stream, "sha256").hexdigest() == digest:
-                        published[path] = destination.relative_to(root).as_posix()
-                        continue
             if not source.is_file():
                 continue
             with source.open("rb") as stream:
                 raw = stream.read(size + 1)
             if len(raw) != size or hashlib.sha256(raw).hexdigest() != digest:
                 continue
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as stream:
-                temporary = Path(stream.name)
-                try:
-                    stream.write(raw)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                    stream.close()
-                    os.replace(temporary, destination)
-                finally:
-                    temporary.unlink(missing_ok=True)
-            published[path] = destination.relative_to(root).as_posix()
+            frozen = _freeze_bytes(root, ctx.run_id, path, raw, digest)
+            if frozen:
+                published[path] = frozen
         except (OSError, ValueError, RuntimeError):
+            continue
+    return published
+
+
+async def freeze_artifacts_async(ctx: RuntimeContext, artifacts: list[dict]) -> dict[str, str]:
+    """项目会话从 Sandbox 下载产物字节后冻结；普通会话仍读宿主机会话目录。"""
+    if not _sandbox_workspace(ctx):
+        return await asyncio.to_thread(freeze_artifacts, ctx, artifacts)
+    root = _artifact_root(ctx)
+    if not root or not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", ctx.run_id):
+        return {}
+    from app.services.sandbox import agent_client
+    from app.services.sandbox.common import SandboxError
+    from app.services.tools.sandbox_tools import resolve_sandbox
+
+    try:
+        ref = await resolve_sandbox(
+            int(ctx.project_id), user_id=ctx.scope.user_id,
+            min_role="viewer", wait_seconds=15.0,
+        )
+    except SandboxError as exc:
+        logger.warning("冻结 Sandbox 产物失败（project=%s）：%s", ctx.project_id, exc)
+        return {}
+    published: dict[str, str] = {}
+    for artifact in artifacts:
+        path, digest, size = artifact["path"], artifact.get("sha256", ""), artifact["size"]
+        if not _workspace_path(f"/workspace/{path}") or not re.fullmatch(r"[a-f0-9]{64}", digest):
+            continue
+        try:
+            data = await agent_client.read_raw(ref.sandbox_id, f"/workspace/{path}")
+            raw = base64.b64decode(data.get("content_b64") or "")
+            if len(raw) != size or hashlib.sha256(raw).hexdigest() != digest:
+                continue
+            frozen = await asyncio.to_thread(
+                _freeze_bytes, root, ctx.run_id, path, raw, digest)
+            if frozen:
+                published[path] = frozen
+        except (SandboxError, OSError, ValueError, TypeError):
             continue
     return published
 
@@ -434,7 +635,7 @@ async def _collect_evidence(ctx: RuntimeContext) -> tuple[list[ToolEvidence], li
         elif event_type == TOOL_COMPLETED and call_id in writes:
             finished_paths.add(writes[call_id])
     paths = finished_paths | ctx.carried_artifacts.keys()
-    available = await asyncio.to_thread(_read_artifacts, ctx, paths) if paths else {}
+    available = await _read_artifacts_any(ctx, paths)
     available = {path: result for path, result in available.items()
                  if path in finished_paths or result[1] == ctx.carried_artifacts.get(path)}
     for relative, (_, _, content) in available.items():
@@ -483,6 +684,8 @@ async def _restore_project_review(ctx: RuntimeContext, artifacts: list[dict]) ->
             .order_by(AgentRunEvent.sequence.desc()).limit(1)
         )
     if not receipt:
+        return None
+    if not await _materialize_project_sources(ctx, artifacts):
         return None
     digest = await workspace_project_digest(root, artifacts, ctx.task_contract.project_openapi_path)
     if not digest or digest != receipt["source_digest"]:
@@ -569,8 +772,13 @@ class CompletionMiddleware(AgentMiddleware[CompletionState]):
         root = _artifact_root(self.ctx) if self.ctx.session_id else None
         if root is None:
             return ProjectReview("", [CheckResult("project_environment", False, "工程验收需要可持久化的会话工作区")], [], True)
+        if not await _materialize_project_sources(self.ctx, artifacts):
+            return ProjectReview("", [CheckResult(
+                "project_environment", False, "无法从 Sandbox 读取本轮工程源码")], [], True)
         previous = self._project_review
         review = await review_workspace_project(root, self.ctx.run_id, self.contract, artifacts, previous)
+        if review.artifacts:
+            await _sync_generated_to_sandbox(self.ctx, review.artifacts)
         if self.bus and review.digest and review is not previous:
             # 先保存服务端验收回执，再让工具返回或让模型进入下一轮。
             await self.bus.publish(RuntimeEvent(type=WORKSPACE_PROJECT_REVIEWED, run_id=self.ctx.run_id, data={

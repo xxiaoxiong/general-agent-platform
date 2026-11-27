@@ -139,23 +139,36 @@ class DockerEngine:
 
     # ── Networks ───────────────────────────────────────────────────────
 
-    async def ensure_network(self, name: str, *, internal: bool, labels: dict) -> dict:
+    async def ensure_network(self, name: str, *, internal: bool,
+                             labels: dict, subnet: str = "") -> dict:
         try:
             return (await self._request(
                 "GET", f"/networks/{quote(name, safe='')}")).json()
         except DockerEngineError as exc:
             if exc.status_code != 404:
                 raise
+        body = {
+            "Name": name,
+            "Driver": "bridge",
+            "Internal": bool(internal),
+            "CheckDuplicate": True,
+            "Labels": labels,
+        }
+        if subnet:
+            body["IPAM"] = {"Driver": "default", "Config": [{"Subnet": subnet}]}
         return (await self._request(
-            "POST", "/networks/create",
-            json_body={
-                "Name": name,
-                "Driver": "bridge",
-                "Internal": bool(internal),
-                "CheckDuplicate": True,
-                "Labels": labels,
-            },
+            "POST", "/networks/create", json_body=body,
         )).json()
+
+    async def list_networks(self, labels: dict) -> list[dict]:
+        params = None
+        if labels:
+            params = {"filters": json.dumps(
+                {"label": [f"{key}={value}" for key, value in labels.items()]})}
+        return (await self._request("GET", "/networks", params=params)).json()
+
+    async def inspect_network(self, name: str) -> dict:
+        return (await self._request("GET", f"/networks/{quote(name, safe='')}")).json()
 
     async def connect_network(self, network: str, container: str) -> None:
         try:

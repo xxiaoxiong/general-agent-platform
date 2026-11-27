@@ -5,19 +5,24 @@
 """
 import os
 
+import pytest
+
+from app.core.config import settings
 from app.services.agent_runtime.context import RuntimeContext, RunScope
 from app.services.agent_runtime.tools.adapter import (
     _TOOL_CONTEXT_LIMIT,
     limit_for_context,
+    limit_for_context_async,
 )
 
 
-def _ctx(user_id=501, agent_id=601, session_id=701):
+def _ctx(user_id=501, agent_id=601, session_id=701, project_id=None):
     return RuntimeContext(
         scope=RunScope(user_id=user_id),
         run_id="run-ctx", thread_id="agent-601-run-ctx",
         agent_id=agent_id, session_id=session_id,
         trace_id="run-ctx", model_id="fake", agent_config={},
+        project_id=project_id,
     )
 
 
@@ -70,3 +75,41 @@ class TestLimitForContext:
         out = limit_for_context(big, ctx=_ctx(), tool_name="t")
         assert len(out) <= _TOOL_CONTEXT_LIMIT + 60
         assert "已截断" in out
+
+
+@pytest.mark.asyncio
+async def test_async_offload_writes_to_sandbox_workspace(monkeypatch):
+    """项目会话的大输出卸载到 Sandbox /workspace，文件工具与命令工具同源。"""
+    from app.services.sandbox import agent_client
+    from app.services.sandbox.common import SandboxError
+    from app.services.tools import sandbox_tools
+
+    written = {}
+
+    async def _resolve(project_id, **_kwargs):
+        return sandbox_tools.SandboxRef(
+            sandbox_id=7, generation=1, workspace_id=8, project_id=int(project_id))
+
+    async def _write(sandbox_id, path, content, **_kwargs):
+        written["sandbox_id"] = sandbox_id
+        written["path"] = path
+        written["content"] = content
+        return {"path": path}
+
+    monkeypatch.setattr(settings, "SANDBOX_ENABLED", True)
+    monkeypatch.setattr(sandbox_tools, "resolve_sandbox", _resolve)
+    monkeypatch.setattr(agent_client, "write_file", _write)
+    big = "x" * (_TOOL_CONTEXT_LIMIT + 100)
+    out = await limit_for_context_async(big, ctx=_ctx(project_id=9), tool_name="web_search")
+    assert "已卸载" in out and "tool-outputs/" in out and big not in out
+    assert written["sandbox_id"] == 7
+    assert written["path"].startswith("/workspace/tool-outputs/web_search-")
+    assert written["content"] == big
+
+    async def _unavailable(_project_id, **_kwargs):
+        raise SandboxError("sandbox not ready")
+
+    monkeypatch.setattr(sandbox_tools, "resolve_sandbox", _unavailable)
+    out = await limit_for_context_async(big, ctx=_ctx(project_id=9), tool_name="web_search")
+    assert "已截断" in out
+    assert len(written) == 3  # 不写宿主机、不再新增写入
