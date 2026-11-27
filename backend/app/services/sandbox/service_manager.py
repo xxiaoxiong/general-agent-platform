@@ -106,32 +106,56 @@ async def create_service(
         )
     )).scalar_one_or_none()
     if existing is not None:
-        if existing.name == name:
-            raise SandboxQuotaError(f"服务名 '{name}' 已被占用（同一项目内名称唯一）")
-        raise SandboxQuotaError(f"端口 {port} 已被服务 '{existing.name}' 占用")
-    service = WorkspaceService(
-        workspace_id=workspace.id,
-        sandbox_id=sandbox.id,
-        name=name,
-        command=command,
-        working_directory=working_directory or "/workspace",
-        port=int(port),
-        protocol=protocol or "http",
-        health_check_type=health_check_type or "http",
-        health_check_path=health_check_path or "/",
-        health_check_timeout=int(health_check_timeout),
-        desired_state="running",
-        observed_state="starting",
-        auto_restart=bool(auto_restart),
-        auto_start_on_sandbox_start=bool(auto_start_on_sandbox_start),
-        last_started_at=utcnow(),
-    )
-    try:
-        async with db.begin_nested():
-            db.add(service)
-            await db.flush()
-    except IntegrityError as exc:
-        raise SandboxQuotaError("服务名或端口冲突，请更换后重试") from exc
+        if existing.name != name:
+            raise SandboxQuotaError(f"端口 {port} 已被服务 '{existing.name}' 占用")
+        if int(existing.port) != int(port):
+            raise SandboxQuotaError(
+                f"服务 '{name}' 已存在且端口为 {existing.port}，不能直接改端口；"
+                "请先停止后由管理员清理旧服务记录"
+            )
+        if existing.desired_state == "running" and existing.observed_state in (
+            "starting", "healthy", "unhealthy",
+        ):
+            raise SandboxQuotaError(
+                f"服务 '{name}' 正在运行；请先 stop_service，再以新命令重新启动")
+        # 已停止/失败的同名同端口服务：更新启动命令后重试（例如补上 --host 0.0.0.0）
+        existing.command = command
+        existing.working_directory = working_directory or "/workspace"
+        existing.protocol = protocol or "http"
+        existing.health_check_type = health_check_type or "http"
+        existing.health_check_path = health_check_path or "/"
+        existing.health_check_timeout = int(health_check_timeout)
+        existing.auto_restart = bool(auto_restart)
+        existing.auto_start_on_sandbox_start = bool(auto_start_on_sandbox_start)
+        existing.sandbox_id = sandbox.id
+        existing.desired_state = "running"
+        existing.observed_state = "starting"
+        existing.last_started_at = utcnow()
+        service = existing
+    else:
+        service = WorkspaceService(
+            workspace_id=workspace.id,
+            sandbox_id=sandbox.id,
+            name=name,
+            command=command,
+            working_directory=working_directory or "/workspace",
+            port=int(port),
+            protocol=protocol or "http",
+            health_check_type=health_check_type or "http",
+            health_check_path=health_check_path or "/",
+            health_check_timeout=int(health_check_timeout),
+            desired_state="running",
+            observed_state="starting",
+            auto_restart=bool(auto_restart),
+            auto_start_on_sandbox_start=bool(auto_start_on_sandbox_start),
+            last_started_at=utcnow(),
+        )
+        try:
+            async with db.begin_nested():
+                db.add(service)
+                await db.flush()
+        except IntegrityError as exc:
+            raise SandboxQuotaError("服务名或端口冲突，请更换后重试") from exc
 
     await emit_event(
         db, "service.starting", user_id=user.id, tenant_id=workspace.tenant_id,

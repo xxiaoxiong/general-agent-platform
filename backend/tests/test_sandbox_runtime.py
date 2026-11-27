@@ -799,6 +799,75 @@ async def test_completion_evidence_reads_sandbox_workspace(monkeypatch):
             await s.commit()
 
 
+async def test_stopped_service_can_restart_with_updated_command(monkeypatch):
+    """同名同端口服务停止后可用新命令重启（修正 --host 等启动参数）。"""
+    from app.services.sandbox import agent_client
+
+    user = await _user("u-svc-update")
+    _project, workspace, _sandbox = await _ready_for_session(user)
+    calls: list[str] = []
+
+    async def _start(_sandbox_id, config):
+        calls.append(config["command"])
+        return {"observed_state": "starting", "process_id": "111"}
+
+    monkeypatch.setattr(agent_client, "start_service", _start)
+    async with AsyncSessionLocal() as s:
+        workspace_row = await s.get(Workspace, workspace.id)
+        sandbox_row = await runtime.active_sandbox(s, workspace.id)
+        service = await service_manager.create_service(
+            s, workspace_row, sandbox_row, user,
+            name="frontend", command="npm run dev", port=5173,
+        )
+        await s.commit()
+        assert service.observed_state == "starting"
+        service.desired_state = "stopped"
+        service.observed_state = "stopped"
+        await s.commit()
+        updated = await service_manager.create_service(
+            s, workspace_row, sandbox_row, user,
+            name="frontend", command="npm run dev -- --host 0.0.0.0", port=5173,
+        )
+        await s.commit()
+    assert updated.id == service.id
+    assert updated.command.endswith("--host 0.0.0.0")
+    assert calls == ["npm run dev", "npm run dev -- --host 0.0.0.0"]
+
+
+async def test_directory_listing_for_lazy_tree(monkeypatch):
+    """按目录懒加载：返回直接子项（目录+文件），排除平台内部目录，不按总数截断。"""
+    from app.services.sandbox import agent_client
+
+    user = await _user("u-tree")
+    project, _workspace, _sandbox = await _ready_for_session(user)
+    async with AsyncSessionLocal() as s:
+        session = AgentSession(
+            agent_id=1, user_id=user.id, title="树", messages=[], project_id=project.id,
+        )
+        s.add(session)
+        await s.commit()
+        await s.refresh(session)
+
+    async def _list_dir(_sandbox_id, path):
+        assert path == "/workspace"
+        return {"entries": [
+            {"name": "frontend", "path": "/workspace/frontend", "is_dir": True},
+            {"name": "node_modules", "path": "/workspace/node_modules", "is_dir": True},
+            {"name": "report.md", "path": "/workspace/report.md", "is_dir": False,
+             "size": 12, "modified_at": "2026-11-27T00:00:00+00:00"},
+            {"name": ".sandbox", "path": "/workspace/.sandbox", "is_dir": True},
+            {"name": "tool-outputs", "path": "/workspace/tool-outputs", "is_dir": True},
+        ]}
+
+    monkeypatch.setattr(agent_client, "list_dir", _list_dir)
+    async with AsyncSessionLocal() as s:
+        entries = await session_files.list_directory(s, session, "")
+        await s.commit()
+    assert [entry["name"] for entry in entries] == ["frontend", "node_modules", "report.md"]
+    assert entries[-1]["size"] == 12
+    assert entries[-1]["mtime"] > 0
+
+
 async def test_attachment_refs_read_from_sandbox_workspace(monkeypatch):
     """项目会话附件指纹从 Sandbox 读取（否则 run 创建会误报附件不存在）。"""
     from app.services.agent_runtime.task_router import resolve_attachment_refs_async

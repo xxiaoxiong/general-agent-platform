@@ -119,13 +119,23 @@
   每轮对账清理无容器的孤儿网络（仅清理创建超过 10 分钟的网络，避免误删 Provision
   中的网络）；并发 Sandbox 较多时可配置 `SANDBOX_NETWORK_SUBNET_POOL` 专用子网池，
   避免 Docker 默认地址池耗尽（`all predefined address pools have been fully subnetted`）。
+- **文件树完整浏览（按需加载）**：右侧文件面板改为按目录懒加载
+  （`GET /api/v2/conversations/{id}/file-tree?path=`），不再按 500 条截断；
+  目录展开时才请求子项，node_modules 等大目录也能逐层查看。
+- **服务进程治理**：`execute_command` 结束后自动清理残留后台进程（`&`/nohup 启的
+  dev server 不再变成无法管理的野生进程）；`start_service` 启动前检测端口占用并
+  返回占用进程；同一服务停止后可用新命令（如补 `--host 0.0.0.0`）重新启动；
+  `get_service_status` 返回健康检查失败提示。
+- **服务监听地址校验**：workspace-agent 健康检查同时探测 IPv4/IPv6 回环并校验
+  容器非回环 IP 可达；只监听 localhost 的服务标记 unhealthy 并写入明确提示，
+  避免“服务显示正常但预览打不开”。
 
 ## 3. 验证记录（真实执行）
 
 | 验证 | 命令 / 方式 | 结果 |
 | --- | --- | --- |
-| 后端全量回归 | `cd backend && python -m pytest -q` | **1075 passed, 13 skipped, 100.67s** |
-| Sandbox 专项（模型/调度/Lease/ACL/预览/工具/文件后端/写租约/自动恢复/限流/登录态/事件/软配额/对账/服务配额/验收读取/网络清理） | `pytest tests/test_sandbox_runtime.py tests/test_sandbox_security.py tests/test_sandbox_api.py -q` | **37 passed** |
+| 后端全量回归 | `cd backend && python -m pytest -q` | **1078 passed, 13 skipped, 104.46s** |
+| Sandbox 专项（模型/调度/Lease/ACL/预览/工具/文件后端/写租约/自动恢复/限流/登录态/事件/软配额/对账/服务配额/验收读取/网络清理/文件树/服务更新） | `pytest tests/test_sandbox_runtime.py tests/test_sandbox_security.py tests/test_sandbox_api.py -q` | **40 passed** |
 | 真实 Docker 集成 | 在 Runner 容器内 `SANDBOX_DOCKER_TEST=1 pytest tests/test_sandbox_docker_integration.py` | **1 passed 40.03s**（容器安全基线、Runner 断网重连、Docker Socket 未挂载、取消命令无孤儿进程、命令、文件一致性、只读 rootfs、网络隔离含平台服务名、Service 健康 + HTTP、删除容器后新 Generation 文件保留、幂等创建） |
 | Vite HMR / WebSocket | 在 Runner 容器内 `SANDBOX_DOCKER_VITE=1 pytest tests/test_sandbox_docker_vite.py -q -s` | **1 passed 10.81s**（Vite 安装、dev server、`vite-hmr` WS、修改源码收到 `full-reload`）；启动→Healthy + 首页 200 = **2.018s** |
 | 真实端到端（服务层） | 容器内脚本：项目 → Provision → 命令（uid=10001）→ Service → Preview | `exec succeeded`、`service healthy`、子域预览 200、兜底 200、坏 Token 401 |
@@ -133,6 +143,8 @@
 | 登录态 Preview（`PREVIEW_REQUIRE_LOGIN=true`） | 真实栈脚本：匿名 / 他人 Token / 本人 Token / Cookie | 匿名 403、他人 Token 403、本人 Token 200、首次响应下发 Cookie 且后续仅 Cookie 200 |
 | 重启恢复（真实栈故障注入） | 项目 → Sandbox Ready → Service healthy → 预览 200；`docker restart backend` / `docker restart sandbox-runner`；Sandbox stop → start；删除项目 | 后端重启后 Sandbox 继续运行、Service healthy、预览 200；Runner 重启后 Gateway 重新接入、预览 200；stop→start 同 Generation 文件保留、Service 按 Desired State 自动恢复 healthy、预览 200；删除项目后容器与 Volume 均清理 |
 | 事件流（部署栈） | `GET /api/v2/workspaces/{id}/events`（Bearer） | `workspace.provisioning` / `workspace.created` 帧带 project/workspace 标识；非成员 404；keepalive 正常 |
+| 文件树懒加载（部署栈） | `GET /api/v2/conversations/203/file-tree`、`?path=frontend/src` | 根目录 7 项、子目录 2 项；目录/文件结构正确，不再返回 500 条截断 |
+| 服务恢复（部署栈） | 清理无托管进程 → 停服务 → 用 `npm run dev -- --host 0.0.0.0` 重新启动 | frontend / backend 均 healthy；经 Preview Proxy 访问前端页面 200、后端 `/api/health` 200 |
 | 性能基准 | `BENCH_ITERATIONS=3 python scripts/sandbox_benchmark.py`（Backend 容器内） | Provision→Ready P50 13.07s / P95 13.07s；命令 P50 0.124s；Service→Healthy P50 1.68s；Preview 首次访问 P50 0.040s（详见性能报告） |
 | 前端类型检查/构建 | `cd frontend && npm run build` | 通过 |
 | Compose 校验 | `docker compose --profile sandbox --profile sandbox-image config -q` | 通过 |

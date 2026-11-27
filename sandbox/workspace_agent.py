@@ -53,6 +53,101 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _non_loopback_ip() -> Optional[str]:
+    """容器自身非回环 IP（UDP connect 只选路不发送数据）。"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("192.0.2.1", 80))  # TEST-NET-1，仅用于确定出口地址
+            address = probe.getsockname()[0]
+            return None if address.startswith("127.") or address == "0.0.0.0" else address
+    except OSError:
+        return None
+
+
+def _probe_tcp(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, int(port)), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def _probe_http(host: str, port: int, path: str) -> bool:
+    url = (f"http://[{host}]:{int(port)}{path}" if ":" in host
+           else f"http://{host}:{int(port)}{path}")
+    try:
+        with urllib.request.urlopen(url, timeout=3) as response:  # noqa: S310 内网自检
+            return response.status < 500
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def _listening_inodes(port: int) -> set[str]:
+    inodes: set[str] = set()
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table, "r", encoding="utf-8") as handle:
+                next(handle, None)
+                for line in handle:
+                    parts = line.split()
+                    if len(parts) < 10 or parts[3] != "0A":  # 0A = LISTEN
+                        continue
+                    try:
+                        local_port = int(parts[1].rsplit(":", 1)[1], 16)
+                    except (IndexError, ValueError):
+                        continue
+                    if local_port == int(port):
+                        inodes.add(parts[9])
+        except OSError:
+            continue
+    return inodes
+
+
+def _port_owner(port: int) -> Optional[str]:
+    """占用端口的进程描述（PID + 命令行），无法识别时返回空描述。"""
+    inodes = _listening_inodes(port)
+    if not inodes:
+        return None
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            for fd in os.listdir(fd_dir):
+                try:
+                    target = os.readlink(f"{fd_dir}/{fd}")
+                except OSError:
+                    continue
+                if target.startswith("socket:[") and target[8:-1] in inodes:
+                    try:
+                        with open(f"/proc/{pid}/cmdline", "rb") as cmd:
+                            argv = [part.decode("utf-8", "replace")
+                                    for part in cmd.read().split(b"\0") if part]
+                    except OSError:
+                        argv = []
+                    return f"PID {pid}: {' '.join(argv)[:180] or '未知进程'}"
+        except OSError:
+            continue
+    return "未能识别占用进程"
+
+
+def _port_conflict(port: int) -> Optional[str]:
+    """启动长期服务前检查端口；返回占用描述，未占用返回 None。"""
+    owner = _port_owner(port)
+    if owner:
+        return owner
+    for family, address in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
+        try:
+            probe = socket.socket(family, socket.SOCK_STREAM)
+            try:
+                probe.bind((address, int(port)))
+            finally:
+                probe.close()
+        except OSError:
+            return "未能识别占用进程"
+    return None
+
+
 # ── 路径守卫 ─────────────────────────────────────────────────────────────
 
 class PathError(Exception):
@@ -111,6 +206,7 @@ class Operation:
         self.started_at = _now_iso()
         self.finished_at: Optional[str] = None
         self.process: Optional[subprocess.Popen] = None
+        self.pgid: Optional[int] = None
         self._lock = threading.RLock()
         self._cancelled = False
 
@@ -163,6 +259,30 @@ class Operation:
                 self.status = "succeeded" if process.returncode == 0 else "failed"
                 self.exit_code = process.returncode
                 self.finished_at = _now_iso()
+        self._cleanup_group()
+
+    def _cleanup_group(self) -> None:
+        """命令结束后清理残留后台子进程：长期服务必须用 Service Manager。
+
+        否则 ``npm run dev &`` 这类命令会留下无法停止/重启/自动恢复的进程，
+        并占用端口导致后续 start_service 失败（EADDRINUSE）。
+        """
+        pgid = self.pgid
+        if not pgid:
+            return
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+        self._append(
+            self.stderr,
+            "\n[平台] 命令结束后已清理残留的后台进程；长期运行的服务请使用 start_service"
+            "（可被停止/重启/自动恢复，并生成预览地址）。\n".encode(),
+        )
 
     def _terminate_group(self, *, force: bool = False) -> None:
         process = self.process
@@ -195,6 +315,7 @@ class Operation:
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
+        self.pgid = self.process.pid  # start_new_session=True：进程组 ID = 子进程 PID
         threading.Thread(target=self._pump, args=(self.process.stdout, self.stdout),
                          daemon=True).start()
         threading.Thread(target=self._pump, args=(self.process.stderr, self.stderr),
@@ -524,6 +645,7 @@ class Service:
         self.exit_code: Optional[int] = None
         self.last_started_at: Optional[str] = None
         self.last_exited_at: Optional[str] = None
+        self.last_error: Optional[str] = None
         self.restart_count = 0
         self.stopped_by_user = False
         self.log_path = os.path.join(SERVICE_LOG_DIR, f"{self.name}.log")
@@ -544,6 +666,11 @@ class Service:
                 raise ValueError("command 不能为空")
             if not os.path.isdir(self.cwd):
                 raise ValueError(f"工作目录不存在: {self.cwd}")
+            if conflict := _port_conflict(self.port):
+                raise ValueError(
+                    f"端口 {self.port} 已被占用（{conflict}）。"
+                    "长期运行的服务请通过 start_service 管理；先停止占用进程或更换端口再启动。"
+                )
             os.makedirs(SERVICE_LOG_DIR, exist_ok=True)
             self._rotate_log()
             env = {key: value for key, value in os.environ.items()
@@ -569,6 +696,7 @@ class Service:
             self.stopped_by_user = False
             self.last_started_at = _now_iso()
             self.exit_code = None
+            self.last_error = None
             threading.Thread(target=self._monitor, daemon=True).start()
             threading.Thread(target=self._health_check, daemon=True).start()
 
@@ -597,6 +725,22 @@ class Service:
             except Exception:  # noqa: BLE001
                 pass
 
+    def _probe(self, host: str) -> bool:
+        if self.health_type == "tcp":
+            return _probe_tcp(host, self.port)
+        return _probe_http(host, self.port, self.health_path)
+
+    def _set_health_error(self, detail: str) -> None:
+        with self._lock:
+            if self.last_error == detail:
+                return
+            self.last_error = detail
+        try:
+            with open(self.log_path, "ab", buffering=0) as handle:
+                handle.write(f"[平台] {detail}\n".encode("utf-8", "replace"))
+        except OSError:
+            pass
+
     def _health_check(self) -> None:
         if self.health_type == "none":
             with self._lock:
@@ -611,27 +755,31 @@ class Service:
                     if self.status in ("starting", "healthy", "unhealthy"):
                         self.status = "exited" if (process and process.returncode == 0) else "failed"
                 return
-            try:
-                if self.health_type == "tcp":
-                    with socket.create_connection(("127.0.0.1", self.port), timeout=2):
-                        with self._lock:
-                            if self.status in ("starting", "unhealthy"):
-                                self.status = "healthy"
-                        return
+            # 回环地址可能解析为 IPv4 / IPv6，两种都探测
+            loopback_ok = self._probe("127.0.0.1") or self._probe("::1")
+            if loopback_ok:
+                external_ip = _non_loopback_ip()
+                if external_ip and not self._probe(external_ip):
+                    detail = (
+                        f"服务仅监听回环地址（端口 {self.port}），Preview/其他服务无法访问。"
+                        "请改用监听 0.0.0.0 的启动命令（如 npm run dev -- --host 0.0.0.0、"
+                        "uvicorn app:app --host 0.0.0.0），再 restart_service。"
+                    )
+                    self._set_health_error(detail)
+                    with self._lock:
+                        if self.status == "starting":
+                            self.status = "unhealthy"
                 else:
-                    url = f"http://127.0.0.1:{self.port}{self.health_path}"
-                    with urllib.request.urlopen(url, timeout=3) as response:  # noqa: S310 内网自检
-                        if response.status < 500:
-                            with self._lock:
-                                if self.status in ("starting", "unhealthy"):
-                                    self.status = "healthy"
-                            return
-            except (urllib.error.URLError, OSError, ValueError):
-                pass
+                    with self._lock:
+                        if self.status in ("starting", "unhealthy"):
+                            self.status = "healthy"
+                    return
             time.sleep(1.5)
         with self._lock:
             if self.status == "starting":
                 self.status = "unhealthy"
+        self._set_health_error(
+            f"健康检查超时：{self.health_timeout}s 内端口 {self.port} 未通过检查")
 
     def stop(self) -> None:
         with self._lock:
@@ -691,6 +839,7 @@ class Service:
                 "observed_state": self.status,
                 "process_id": str(process.pid) if process and process.poll() is None else None,
                 "exit_code": self.exit_code,
+                "detail": self.last_error,
                 "last_started_at": self.last_started_at,
                 "last_exited_at": self.last_exited_at,
                 "auto_restart": self.auto_restart,

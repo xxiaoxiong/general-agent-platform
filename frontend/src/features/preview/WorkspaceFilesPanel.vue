@@ -18,7 +18,7 @@
     <header class="wf-head">
       <component :is="tab === 'preview' ? Globe : tab === 'services' ? Server : FolderOpen" :size="16" aria-hidden="true" />
       <strong>{{ tabTitle }}</strong>
-      <span v-if="tab === 'files' && files.length" class="wf-count">{{ files.length }} 个文件</span>
+      <span v-if="tab === 'files' && displayCount" class="wf-count">{{ displayCount }} 个文件</span>
       <div class="wf-actions">
         <button v-if="tab === 'files'" type="button" class="wf-icon-btn" title="刷新" aria-label="刷新文件列表" :disabled="loading" @click="$emit('refresh')">
           <LoaderCircle v-if="loading" class="mini-spin" :size="15" />
@@ -58,16 +58,16 @@
     <div v-show="tab === 'files'" class="wf-body">
       <!-- 左：项目文件树（层级索引） -->
       <ul class="wf-tree" aria-label="工作目录文件树">
-        <li v-if="loading && !files.length" class="wf-state" role="status">
+        <li v-if="treeLoadingView && !rows.length" class="wf-state" role="status">
           <LoaderCircle class="mini-spin" :size="16" />
           <span>正在加载文件列表…</span>
         </li>
-        <li v-else-if="error" class="wf-state wf-error" role="alert">
+        <li v-else-if="treeErrorView" class="wf-state wf-error" role="alert">
           <CircleAlert :size="16" />
-          <span>{{ error }}</span>
-          <button type="button" class="wf-link-btn" @click="$emit('refresh')">重试</button>
+          <span>{{ treeErrorView }}</span>
+          <button type="button" class="wf-link-btn" @click="retryTree">重试</button>
         </li>
-        <li v-else-if="!files.length" class="wf-state">
+        <li v-else-if="!rows.length" class="wf-state">
           <FolderOpen :size="16" />
           <span>工作目录暂无文件，任务产出的文件会显示在这里</span>
         </li>
@@ -81,6 +81,7 @@
               <ChevronRight class="wf-chevron" :class="{ open: row.expanded }" :size="13" />
               <component :is="row.expanded ? FolderOpen : Folder" class="wf-folder" :size="15" />
               <span class="wf-name">{{ row.name }}</span>
+              <LoaderCircle v-if="loadingDirs.has(row.path)" class="mini-spin wf-dir-loading" :size="12" />
             </button>
             <button
               v-else
@@ -96,7 +97,7 @@
             </button>
           </li>
         </template>
-        <li v-if="truncated" class="wf-truncated">文件较多，仅显示前 {{ files.length }} 个</li>
+        <li v-if="!lazy && truncated" class="wf-truncated">文件较多，仅显示前 {{ files.length }} 个</li>
       </ul>
 
       <!-- 右：文件内容（点文件名原位预览，树保持可见） -->
@@ -143,21 +144,27 @@
  * 左侧项目文件树作层级索引（目录在前、可展开折叠），点文件名 → 右侧原位预览内容；
  * 支持手动刷新、打包下载（ZIP）、拖动调宽与放大。
  */
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import {
   ChevronRight, CircleAlert, Download, FileSearch, Folder, FolderOpen, Globe,
   LoaderCircle, Maximize, Minimize, RefreshCw, Server, X,
 } from '@lucide/vue'
-import type { PreviewContent, WorkspaceFile } from '@/api/conversations'
+import {
+  conversationApi, type PreviewContent, type WorkspaceFile,
+} from '@/api/conversations'
 import FilePreviewBody from './FilePreviewBody.vue'
 import SandboxPreviewPane from './SandboxPreviewPane.vue'
 import SandboxServicesPane from './SandboxServicesPane.vue'
 import { fileKindMeta } from './fileKinds'
-import { buildFileTree, flattenFileTree, type FileTreeRowView } from './fileTree'
+import {
+  buildFileTree, flattenFileTree, type FileTreeNode, type FileTreeRowView,
+} from './fileTree'
 import { useResizablePanel } from './useResizablePanel'
 
 const props = defineProps<{
   files: WorkspaceFile[]
+  /** 当前会话（提供后文件树按目录懒加载，完整浏览不截断） */
+  conversationId?: number | null
   loading?: boolean
   error?: string
   truncated?: boolean
@@ -205,25 +212,132 @@ watch(() => props.sandboxEnabled, (enabled) => {
   if (!enabled) tab.value = 'files'
 })
 
-// ── 文件树（默认全部展开，折叠状态记在 collapsed 集合）──────────────────────
+// ── 文件树 ────────────────────────────────────────────────────────────────
+// 会话可用时按目录懒加载（任意数量文件均可展开查看）；旧数据回退到扁平清单。
+const lazy = computed(() => props.conversationId != null)
 const collapsed = reactive(new Set<string>())
-const tree = computed(() => buildFileTree(props.files))
-const rows = computed<FileTreeRowView[]>(() =>
-  flattenFileTree(tree.value, (path) => !collapsed.has(path)).map(({ node, depth }) => ({
-    key: node.path,
-    name: node.name,
-    path: node.path,
-    depth,
-    kind: node.dir ? 'dir' : 'file',
-    expanded: node.dir && !collapsed.has(node.path),
-    file: node.file,
-  })),
-)
+const expanded = reactive(new Set<string>())
+const loadingDirs = reactive(new Set<string>())
+const childrenMap = reactive<Record<string, FileTreeNode[]>>({})
+const treeLoading = ref(false)
+const treeError = ref('')
 
-function toggleDir(path: string) {
-  if (collapsed.has(path)) collapsed.delete(path)
-  else collapsed.add(path)
+const treeLoadingView = computed(() => (lazy.value ? treeLoading.value : !!props.loading))
+const treeErrorView = computed(() => (lazy.value ? treeError.value : props.error || ''))
+const loadedFileCount = computed(() => Object.values(childrenMap)
+  .reduce((total, nodes) => total + nodes.filter((node) => !node.dir).length, 0))
+const displayCount = computed(() => (lazy.value ? loadedFileCount.value : props.files.length))
+
+const rows = computed<FileTreeRowView[]>(() => {
+  if (!lazy.value) {
+    return flattenFileTree(
+      buildFileTree(props.files), (path) => !collapsed.has(path),
+    ).map(({ node, depth }) => ({
+      key: node.path,
+      name: node.name,
+      path: node.path,
+      depth,
+      kind: node.dir ? 'dir' : 'file',
+      expanded: node.dir && !collapsed.has(node.path),
+      file: node.file,
+    }))
+  }
+  const visible: FileTreeRowView[] = []
+  const walk = (nodes: FileTreeNode[], depth: number) => {
+    for (const node of nodes) {
+      const isExpanded = node.dir && expanded.has(node.path)
+      visible.push({
+        key: node.path,
+        name: node.name,
+        path: node.path,
+        depth,
+        kind: node.dir ? 'dir' : 'file',
+        expanded: isExpanded,
+        file: node.file,
+      })
+      if (isExpanded) walk(childrenMap[node.path] || [], depth + 1)
+    }
+  }
+  walk(childrenMap[''] || [], 0)
+  return visible
+})
+
+async function loadDir(path: string) {
+  const conversationId = props.conversationId
+  if (!conversationId || loadingDirs.has(path)) return
+  loadingDirs.add(path)
+  if (!path) treeLoading.value = true
+  treeError.value = ''
+  try {
+    const response = await conversationApi.fileTree(conversationId, path)
+    childrenMap[path] = (response.entries || []).map((entry): FileTreeNode => ({
+      path: entry.path,
+      name: entry.name,
+      dir: entry.is_dir,
+      file: entry.is_dir ? undefined : {
+        path: entry.path,
+        name: entry.name,
+        size: entry.size,
+        mtime: entry.mtime,
+        kind: entry.kind || '',
+      },
+      children: [],
+    }))
+  } catch {
+    if (!path) treeError.value = '无法加载文件列表'
+    else if (childrenMap[path] == null) childrenMap[path] = []
+  } finally {
+    loadingDirs.delete(path)
+    if (!path) treeLoading.value = false
+  }
 }
+
+function resetLazyTree() {
+  for (const key of Object.keys(childrenMap)) delete childrenMap[key]
+  expanded.clear()
+  loadingDirs.clear()
+  treeError.value = ''
+}
+
+async function reloadLoadedDirs() {
+  if (!lazy.value) return
+  const dirs = ['', ...Array.from(expanded)]
+  await Promise.all(dirs.map((path) => loadDir(path)))
+}
+
+async function toggleDir(path: string) {
+  if (!lazy.value) {
+    if (collapsed.has(path)) collapsed.delete(path)
+    else collapsed.add(path)
+    return
+  }
+  if (expanded.has(path)) {
+    expanded.delete(path)
+    return
+  }
+  if (!childrenMap[path]) await loadDir(path)
+  expanded.add(path)
+}
+
+function retryTree() {
+  if (lazy.value) void reloadLoadedDirs()
+  else emit('refresh')
+}
+
+onMounted(() => {
+  if (lazy.value) void loadDir('')
+})
+
+watch(() => props.conversationId, (current, previous) => {
+  if (current === previous) return
+  resetLazyTree()
+  if (current != null) void loadDir('')
+})
+
+// Agent 写入文件后父组件刷新清单：同步刷新根目录与所有已展开目录
+watch(() => props.files, () => {
+  if (lazy.value) void reloadLoadedDirs()
+})
 
 function openFile(row: FileTreeRowView) {
   if (row.file) emit('open', row.file.path, row.file.name)
@@ -346,6 +460,7 @@ function closeOverlay() {
 }
 .wf-chevron.open { transform: rotate(90deg); }
 .wf-folder { flex: none; color: var(--ui-warning); }
+.wf-dir-loading { flex: none; margin-inline-start: auto; color: var(--ui-muted); }
 .wf-dir .wf-name { font-weight: 550; }
 .wf-kind-icon {
   width: 22px; height: 22px; flex: none; display: inline-flex; align-items: center; justify-content: center;

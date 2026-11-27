@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 import re
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -445,6 +445,68 @@ def _iter_workspace_files(root: str) -> tuple[list[tuple[str, str]], bool]:
         truncated = True
         found = found[:_MAX_LIST_FILES]
     return found, truncated
+
+
+_EXCLUDED_TREE_DIRS = {"tool-outputs", "tool_results", ".sandbox", ".run-artifacts"}
+_EXCLUDED_TREE_SUFFIX = ".extracted.txt"
+
+
+def _host_directory_entries(root: str, rel: str) -> list[dict]:
+    """本地会话工作区：列出单个目录的直接子项（懒加载文件树）。"""
+    base = _resolve_workspace_path(root, rel)
+    if not os.path.isdir(base):
+        raise HTTPException(status_code=404, detail="目录不存在")
+    entries: list[dict] = []
+    with os.scandir(base) as rows:
+        for item in rows:
+            name = item.name
+            if name.startswith("."):
+                continue
+            virtual = f"{rel}/{name}" if rel else name
+            try:
+                if item.is_dir(follow_symlinks=False):
+                    if name.casefold() in _EXCLUDED_TREE_DIRS:
+                        continue
+                    entries.append({
+                        "path": virtual, "name": name, "is_dir": True,
+                        "size": 0, "mtime": item.stat().st_mtime,
+                    })
+                elif item.is_file(follow_symlinks=False) and not name.endswith(_EXCLUDED_TREE_SUFFIX):
+                    stat = item.stat()
+                    entries.append({
+                        "path": virtual, "name": name, "is_dir": False,
+                        "size": stat.st_size, "mtime": stat.st_mtime,
+                    })
+            except OSError:
+                continue
+    entries.sort(key=lambda entry: (not entry["is_dir"], entry["name"].lower()))
+    return entries
+
+
+@router.get("/{session_id}/file-tree")
+async def list_conversation_file_tree(
+    session_id: int,
+    path: str = Query("", description="目录相对路径（空=工作区根目录）"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """按目录懒加载工作区文件树（完整浏览，不再按总条目数截断）。"""
+    session = await _get_owned_session(db, session_id, current_user)
+    parts = [part for part in (path or "").replace("\\", "/").split("/") if part]
+    if any(part in (".", "..") or ":" in part or any(ord(ch) < 32 for ch in part)
+           for part in parts):
+        raise HTTPException(status_code=400, detail="非法路径")
+    rel = "/".join(parts)
+    if session_files.uses_sandbox(session):
+        entries = await session_files.list_directory(db, session, rel)
+        await db.commit()
+    else:
+        root = workspace_root(current_user.id, session.agent_id, session.id)
+        entries = await asyncio.to_thread(_host_directory_entries, root, rel)
+    for entry in entries:
+        if not entry["is_dir"]:
+            entry["kind"] = _classify(os.path.splitext(entry["name"])[1])[0]
+    return {"path": rel, "entries": entries}
 
 
 @router.get("/{session_id}/file-list")

@@ -132,6 +132,47 @@ async def list_files(db: AsyncSession, session: AgentSession) -> tuple[list[dict
     return entries, truncated
 
 
+async def list_directory(db: AsyncSession, session: AgentSession,
+                         rel_path: str = "") -> list[dict]:
+    """列出 Sandbox 中单个目录的直接子项（按需加载完整文件树，不做总数截断）。"""
+    relative = (rel_path or "").replace("\\", "/").strip("/")
+    parts = [part for part in relative.split("/") if part]
+    if any(part in (".", "..") or ":" in part or any(ord(ch) < 32 for ch in part)
+           for part in parts):
+        raise ValueError("目录路径无效")
+    relative = "/".join(parts)
+    sandbox = await _sandbox(db, session)
+    base = "/workspace" + (f"/{relative}" if relative else "")
+    data = await agent_client.list_dir(sandbox.id, base)
+    entries: list[dict] = []
+    for entry in (data.get("entries") or []):
+        name = str(entry.get("name") or "")
+        virtual = str(entry.get("path") or "")
+        if not name or name.startswith("."):
+            continue
+        is_dir = bool(entry.get("is_dir"))
+        if is_dir and name.casefold() in _EXCLUDED_DIRS:
+            continue
+        if not is_dir and name.endswith(_EXCLUDED_SUFFIX):
+            continue
+        rel = virtual[len("/workspace/"):] if virtual.startswith("/workspace/") else virtual
+        modified = entry.get("modified_at")
+        try:
+            mtime = datetime.fromisoformat(modified).timestamp() if modified else 0.0
+        except ValueError:
+            mtime = 0.0
+        entries.append({
+            "path": rel,
+            "name": name,
+            "is_dir": is_dir,
+            "size": 0 if is_dir else int(entry.get("size") or 0),
+            "mtime": mtime,
+            "modified_at": modified,
+        })
+    entries.sort(key=lambda item: (not item["is_dir"], item["name"].lower()))
+    return entries
+
+
 async def read_bytes(db: AsyncSession, session: AgentSession, rel_path: str) -> tuple[bytes, str]:
     sandbox = await _sandbox(db, session)
     data = await agent_client.read_raw(sandbox.id, _virtual(rel_path))

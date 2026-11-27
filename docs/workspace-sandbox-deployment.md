@@ -100,7 +100,18 @@ curl -s http://localhost:8081/health      # preview-proxy
 4. 服务健康后 Preview 区域展示真实页面；刷新页面会重新签发 Preview Grant。
 5. Agent Run 结束不会停止 Sandbox / Service；空闲超时才停止（只释放 CPU/内存）。
 
-### 4.1 文件一致性
+### 4.1 Service 启动规范
+
+- 长期服务（Vite / FastAPI / Express 等）必须用 `start_service` 启动，禁止用
+  `execute_command` 的 `&` / `nohup` / `setsid` 后台启动；命令结束后平台会清理
+  残留后台进程，避免出现无法停止/重启且占用端口的野生进程。
+- 启动命令必须监听 `0.0.0.0`（如 `npm run dev -- --host 0.0.0.0`、
+  `uvicorn app:app --host 0.0.0.0 --port 8000`）；只监听 localhost 的服务会被
+  标记 unhealthy 并写入提示，Preview 无法访问。
+- `start_service` 启动前检查端口占用；被占用时返回占用进程信息，先停止旧进程
+  或改用其他端口。已停止的同名同端口服务可用新命令重新启动（例如补上 `--host`）。
+
+### 4.2 文件一致性
 
 - 项目会话的 `/workspace/` 由 `SandboxFilesBackend` 路由到 Sandbox 内的同一份文件；
   `read_file / write_file / edit_file / ls / glob / grep` 与 `execute_command` 看到同一份文件。
@@ -112,7 +123,7 @@ curl -s http://localhost:8081/health      # preview-proxy
 - 每次工具/文件 API 调用都会重新校验 Project ACL；成员被移除后，
   已在运行的会话也不能继续读写该 Workspace。
 
-### 4.2 Sandbox 内 workspace-agent 协议
+### 4.3 Sandbox 内 workspace-agent 协议
 
 workspace-agent 只监听 Sandbox 网络内的 `:19999`，使用 Runner 派生 Token
 （`Authorization: Bearer <sha256(runner_token:sandbox_id:generation)>`），
@@ -216,6 +227,9 @@ docker network rm gap-net-<id>-g<gen>
 | Preview 打开 404/empty | Preview Proxy 未启动 / `PREVIEW_PROXY_HOST_PORT` 未映射；`*.localhost` 是否被浏览器解析 |
 | Preview 401/410 | Grant 过期/撤销、Sandbox 停止、Service 停止；点「钥匙」重新获取 |
 | Preview 白屏但服务 healthy | 检查 Service 是否监听 `0.0.0.0`；Vite 需 `--host 0.0.0.0`；应用是否强制 HTTPS |
+| start_service 报端口被占用 | 常见于之前用 execute_command `&` 启动的 dev server；先 `stop_service`/结束占用进程，再用 `start_service` 启动。新版本已自动清理命令结束后的残留后台进程 |
+| 服务只监听 localhost | workspace-agent 健康检查会标记 unhealthy 并写入日志提示；用 `stop_service` 后以 `npm run dev -- --host 0.0.0.0` 重新 start_service |
+| 需要修改服务启动命令 | 先 `stop_service`，再用同名同端口 `start_service` 提交新命令（会更新原记录并重启）；运行中的服务不允许直接改命令 |
 | Vite HMR 断连 | 确认 Preview Proxy 与 Runner WebSocket 转发未被反向代理截断；Nginx 需 `proxy_read_timeout 3600s` |
 | 容器 OOM | `docker inspect` 查看 `OOMKilled`；调大 profile 内存上限或优化依赖 |
 | 磁盘写满 | 检查 Volume 使用量（Dashboard）；`soft` 模式超配额会停止 Sandbox（Volume 保留），清理依赖缓存后手动启动；持续不足需扩容或调大资源档位 |

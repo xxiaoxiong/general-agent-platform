@@ -57,6 +57,8 @@ TOOLS: List[Dict[str, Any]] = [
             "在项目 Docker Sandbox 中执行 shell 命令（工作目录 /workspace，与文件工具同一文件系统）。"
             "适合作业：安装依赖、运行测试/构建、脚本执行、查看目录。"
             "长时间命令会返回 running 状态与 operation_id，用 get_command_status/get_command_output 查询，cancel_command 取消。"
+            "不要用 `&` / `nohup` / `setsid` 启动长期服务（命令结束后残留后台进程会被平台清理）；"
+            "Vite / FastAPI / Express 等长期服务必须使用 start_service。"
             "命令在非 root、只读 rootfs、受限 CPU/内存的隔离容器中执行。"
         ),
         "parameters": {
@@ -564,12 +566,24 @@ async def handle_get_service_status(ctx: Any, params: dict) -> ToolResult:
         await service_manager.sync_service_states(db, workspace, sandbox)
         await db.refresh(service)
         await db.commit()
-    return ToolResult.succeeded(
+    detail = ""
+    try:
+        from app.services.sandbox import agent_client
+        from app.services.sandbox.common import SandboxError
+
+        status = await agent_client.service_status(ref.sandbox_id, name)
+        detail = str(status.get("detail") or "")
+    except SandboxError:
+        detail = ""
+    text = (
         f"服务 {service.name}: {service.observed_state}\n"
         f"desired={service.desired_state}，端口 {service.port}，PID {service.process_id or '-'}，"
         f"最近启动 {service.last_started_at}，最近退出 {service.last_exited_at or '-'}，"
         f"退出码 {service.exit_code if service.exit_code is not None else '-'}"
     )
+    if detail:
+        text += f"\n提示：{detail}"
+    return ToolResult.succeeded(text)
 
 
 async def handle_get_service_logs(ctx: Any, params: dict) -> ToolResult:

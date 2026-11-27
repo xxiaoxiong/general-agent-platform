@@ -138,6 +138,20 @@ async def test_real_docker_sandbox_lifecycle_and_isolation():
         assert "hello-sandbox" in echo["stdout"]
         assert "/workspace" in echo["stdout"]
 
+        # ── 命令结束后清理残留后台进程（否则会占用端口导致 Service 启动失败）──
+        background = await _agent(ip, token, "POST", "/exec", json={
+            "command": "sleep 300 & echo spawned", "working_directory": "/workspace",
+            "timeout_seconds": 30, "wait_seconds": 10,
+        })
+        assert background["status"] == "succeeded", background
+        await asyncio.sleep(1)
+        probe = await _agent(ip, token, "POST", "/exec", json={
+            "command": "pgrep -f 'sleep 300' || true", "working_directory": "/workspace",
+            "timeout_seconds": 15, "wait_seconds": 10,
+        })
+        assert "sleep 300" not in probe["stdout"]
+        assert "清理残留的后台进程" in background["stderr"]
+
         # ── 文件工具与命令工具同一份文件 ────────────────────────────────
         await _agent(ip, token, "POST", "/files/write", json={
             "path": "/workspace/demo.txt", "content": "persisted-data",

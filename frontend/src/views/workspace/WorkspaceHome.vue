@@ -299,7 +299,8 @@
     <!-- 文件面板打开时由面板承载预览（左侧文件树保持可见）；关闭后点文件名走独立预览 -->
     <WorkspaceFilesPanel
       v-else-if="filesPanelOpen"
-      :files="fileList" :loading="filesLoading" :error="filesError" :truncated="filesTruncated"
+      :files="fileList" :conversation-id="currentConversation?.id ?? null"
+      :loading="filesLoading" :error="filesError" :truncated="filesTruncated"
       :downloading="workspaceZipBusy" :preview="preview"
       :sandbox-enabled="sandboxEnabled" :project-id="currentConversation?.project_id ?? null"
       @open="openPreview" @refresh="refreshFileList(true)" @close="closeFilesPanel"

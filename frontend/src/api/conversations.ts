@@ -54,6 +54,17 @@ export interface WorkspaceFile {
   kind: string
 }
 
+/** 懒加载文件树条目（目录 / 文件） */
+export interface WorkspaceTreeEntry {
+  path: string
+  name: string
+  is_dir: boolean
+  size: number
+  mtime: number
+  /** 文件渲染分支 */
+  kind?: string
+}
+
 export const conversationApi = {
   list: (params?: any) =>
     request.get<any, { items: Conversation[]; total: number }>('/conversations', { params }),
@@ -100,6 +111,11 @@ export const conversationApi = {
   /** 列出会话工作区文件（右侧文件面板；排除平台内部目录） */
   fileList: (id: number) =>
     request.get<any, { files: WorkspaceFile[]; truncated: boolean }>(`/conversations/${id}/file-list`),
+  /** 按目录懒加载文件树（path 为空=工作区根目录；不按总数截断） */
+  fileTree: (id: number, path = '') =>
+    request.get<any, { path: string; entries: WorkspaceTreeEntry[] }>(
+      `/conversations/${id}/file-tree`, { params: { path } },
+    ),
   /** 打包下载会话工作区文件（与 fileList 同一范围） */
   downloadWorkspaceZip: (id: number) =>
     request.get<any, Blob>(`/conversations/${id}/files.zip`, { responseType: 'blob' }),

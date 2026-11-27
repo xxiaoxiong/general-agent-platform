@@ -137,6 +137,7 @@ cd backend && python -m alembic upgrade head
 22. **灰度开关**：`SANDBOX_ROLLOUT_USER_IDS` / `SANDBOX_ROLLOUT_PROJECT_IDS` 非空时仅名单内启用；bootstrap、会话挂项目、工具、ACL 必须统一走 `sandbox_enabled_for()`，不要只判断 `SANDBOX_ENABLED`。
 23. **项目会话的验收/续做/冻结/附件指纹必须读 Sandbox**：`completion._collect_evidence`、`prepare_completion_continuation`、`freeze_artifacts_async`、新产物 ZIP、`resolve_attachment_refs_async` 都按会话后端分流（项目会话 → `/workspace`，存量会话 → `data/agent_files/...`）。只改宿主机会话目录会出现“用户看得见文件、验收却报没有写入记录”的假失败。
 24. **每个 Sandbox 一个 bridge 网络，必须管理好生命周期**：删除时先断开 Runner 再删网络；Runner 启动/对账周期清理无容器的孤儿网络（仅清理创建超过 10 分钟的网络，防误删 Provision 中的网络）；并发多时配置 `SANDBOX_NETWORK_SUBNET_POOL`，否则 Docker 默认地址池耗尽会报 `all predefined address pools have been fully subnetted`（新环境创建 400）。
+25. **Sandbox 长期服务必须监听 `0.0.0.0` 且由 `start_service` 管理**：`execute_command` 结束后 workspace-agent 会清理残留后台进程（`&`/nohup 启动的 dev server 不可用）；健康检查同时探测 IPv4/IPv6 回环与容器非回环 IP，仅监听 localhost 会标记 unhealthy 并写提示；`start_service` 启动前检测端口占用；同名同端口服务停止后可用新命令重新启动（更新原记录）。
 
 ## 修改范围原则
 

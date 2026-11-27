@@ -186,6 +186,42 @@ def test_workspace_events_sse_auth_and_incremental(client, sandbox_enabled):
     assert event["id"] >= 1
 
 
+def test_file_tree_lazy_directory_listing(client, sandbox_enabled, monkeypatch):
+    """文件树按目录懒加载（支持完整浏览），路径穿越被拒绝。"""
+    from app.services.sandbox import session_files
+
+    owner_id = _user("sbxapi-tree")
+    headers = _auth(owner_id)
+    created = client.post("/api/v2/projects", json={"name": "树项目"}, headers=headers)
+    assert created.status_code == 200, created.text
+    project_id = created.json()["id"]
+    conversation = client.post("/api/v2/conversations", json={
+        "title": "树会话", "project_id": project_id,
+    }, headers=headers)
+    assert conversation.status_code == 200, conversation.text
+    session_id = conversation.json()["id"]
+
+    async def fake_list(_db, _session, rel_path=""):
+        assert rel_path == ""
+        return [
+            {"path": "frontend", "name": "frontend", "is_dir": True, "size": 0, "mtime": 0.0},
+            {"path": "report.md", "name": "report.md", "is_dir": False, "size": 3, "mtime": 1.0},
+        ]
+
+    monkeypatch.setattr(session_files, "list_directory", fake_list)
+    response = client.get(
+        f"/api/v2/conversations/{session_id}/file-tree", headers=headers)
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["path"] == ""
+    assert [item["name"] for item in data["entries"]] == ["frontend", "report.md"]
+    assert data["entries"][1]["kind"]
+
+    bad = client.get(
+        f"/api/v2/conversations/{session_id}/file-tree?path=../secret", headers=headers)
+    assert bad.status_code == 400
+
+
 def test_sandbox_disabled_returns_503(client, monkeypatch):
     monkeypatch.setattr(settings, "SANDBOX_ENABLED", False)
     user_id = _user("sbxapi-off")
