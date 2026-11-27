@@ -299,6 +299,8 @@ class StreamMixin:
         project_id: Optional[int] = None
         verification: Optional[Dict[str, Any]] = None  # P4-02：验证结果（异常路径保持 None）
         planning_input: Dict[str, Any] = {}
+        decision_ambiguous = False
+        clarify_question = ""
         team_stats: dict[str, Any] = {}
         team_incomplete: str | None = None
         log_fields: Dict[str, Any] = {
@@ -316,6 +318,10 @@ class StreamMixin:
             if agent_config is None:
                 agent_config = await self._load_agent_config(run.agent_id)
             agent_config = dict(agent_config)
+            # 历史会话检索工具面：仅真实执行上下文开启（纯配置解析不隐式扩面）
+            agent_config.setdefault(
+                "history_tools_enabled", bool(getattr(settings, "CONVERSATION_MEMORY_ENABLED", True))
+            )
             # Workspace Sandbox：会话 → 项目 → 持久化 Workspace；仅服务端推导，
             # 模型无法通过工具参数指定其他项目/沙箱（任务书 §9.2）
             if settings.SANDBOX_ENABLED:
@@ -404,52 +410,15 @@ class StreamMixin:
                         "clarification_question": decision.get("clarification_question") or "",
                         "deliverable_format": decision.get("deliverable_format") or "none",
                     }
-                    # 关键歧义：服务端直接结束本轮并只输出澄清问题。
-                    # 模型拥有语义判断权，但不能靠"自律"绕过澄清去执行工具（会从错误起点开始检索）。
+                    # 关键歧义：默认由服务端直接结束本轮并只输出澄清问题。
+                    # 但如果历史检索能提供足够背景（下方 prepare_history_context），
+                    # 则先检索再决定是否仍需澄清（延续既有任务是典型场景）。
                     clarify_question = str(
                         decision.get("clarification_question") or ""
                     ).strip()
-                    if decision.get("decision_status") == "ambiguous" and clarify_question:
-                        await bus.publish(RuntimeEvent(
-                            type="task.routed", run_id=run.run_id,
-                            data={
-                                "task_type": execution_context.get("task_type"),
-                                "intent": decision.get("intent"),
-                                "intent_source": "llm",
-                                "decision_status": "ambiguous",
-                                "clarify_question": clarify_question,
-                                "goal_mode": bool(agent_config.get("goal_mode")),
-                                "attachment_count": len(
-                                    execution_context.get("attachment_refs") or []
-                                ),
-                            },
-                        ))
-                        await bus.publish(RuntimeEvent(
-                            type=MODEL_DELTA, run_id=run.run_id,
-                            data={"text": clarify_question},
-                        ))
-                        run.final_text = clarify_question
-                        run.summary = {
-                            "tool_calls": 0, "model_calls": 0, "model_node_runs": 0,
-                            "tokens_generated": 0, "steps": 0, "elapsed_seconds": 0,
-                            "clarify": True,
-                        }
-                        run.transition(STATUS_COMPLETED)
-                        await self._commit(
-                            run, status=STATUS_COMPLETED,
-                            final_text=clarify_question, summary=run.summary,
-                            finished=True,
-                        )
-                        try:
-                            await self._write_back_session(run)
-                        except Exception:
-                            logger.exception("run %s 澄清态会话写回失败", run.run_id)
-                        await bus.publish(RuntimeEvent(
-                            type=RUN_COMPLETED, run_id=run.run_id,
-                            data={"final_text": clarify_question, "summary": run.summary},
-                        ))
-                        telemetry.record_run(log_fields, status="completed")
-                        return
+                    decision_ambiguous = (
+                        decision.get("decision_status") == "ambiguous" and bool(clarify_question)
+                    )
                 # 决策后可能补入历史附件（延续任务）：系统提示显式列出可用文件，
                 # 避免通用 Agent 只看到初始注记而漏读后续解析出的附件
                 attachment_paths = [
@@ -461,6 +430,87 @@ class StreamMixin:
                     agent_config["_attachments"] = attachment_paths[:30]
 
             scope = RunScope(user_id=user_id or run.user_id)
+            # 历史会话检索（Conversation Memory）：普通 Agent 首次执行前自动预取。
+            # 失败/超时/无结果只降级为“无历史上下文”，绝不阻塞 Run；团队/文档
+            # 执行器保持原有语义（阶段一先接入普通 Agent）。
+            history_context = ""
+            history_sources: List[Dict[str, Any]] = []
+            if (
+                bool(getattr(settings, "CONVERSATION_MEMORY_ENABLED", True))
+                and messages and not resume and not is_team_run and not is_document_run
+                and int(run.attempt or 0) <= 1
+            ):
+                from app.services.conversation_memory.service import prepare_history_context
+
+                prepared = await prepare_history_context(
+                    run_id=run.run_id,
+                    user_id=user_id or run.user_id,
+                    project_id=project_id,
+                    messages=messages,
+                    provider=provider,
+                    model_config=model_config,
+                    agent_config=agent_config,
+                )
+                if prepared.enabled:
+                    history_context = prepared.context
+                    history_sources = prepared.sources
+                    agent_config["_history_context"] = history_context
+                    try:
+                        await bus.publish(RuntimeEvent(
+                            type="history_sources", run_id=run.run_id,
+                            data=prepared.event_payload(),
+                        ))
+                    except Exception:  # noqa: BLE001 来源事件失败不影响执行
+                        logger.warning("run %s history.sources 事件发布失败", run.run_id)
+            if decision_ambiguous:
+                if history_context:
+                    # 历史上下文已消解关键歧义：移除强制澄清提示，继续正常执行
+                    _decision_cfg = agent_config.get("_decision")
+                    if isinstance(_decision_cfg, dict):
+                        _decision_cfg["clarification_question"] = ""
+                else:
+                    await bus.publish(RuntimeEvent(
+                        type="task.routed", run_id=run.run_id,
+                        data={
+                            "task_type": (execution_context or {}).get("task_type"),
+                            "intent": (
+                                ((execution_context or {}).get("decision") or {}).get("intent")
+                            ),
+                            "intent_source": "llm",
+                            "decision_status": "ambiguous",
+                            "clarify_question": clarify_question,
+                            "goal_mode": bool(agent_config.get("goal_mode")),
+                            "attachment_count": len(
+                                (execution_context or {}).get("attachment_refs") or []
+                            ),
+                        },
+                    ))
+                    await bus.publish(RuntimeEvent(
+                        type=MODEL_DELTA, run_id=run.run_id,
+                        data={"text": clarify_question},
+                    ))
+                    run.final_text = clarify_question
+                    run.summary = {
+                        "tool_calls": 0, "model_calls": 0, "model_node_runs": 0,
+                        "tokens_generated": 0, "steps": 0, "elapsed_seconds": 0,
+                        "clarify": True,
+                    }
+                    run.transition(STATUS_COMPLETED)
+                    await self._commit(
+                        run, status=STATUS_COMPLETED,
+                        final_text=clarify_question, summary=run.summary,
+                        finished=True,
+                    )
+                    try:
+                        await self._write_back_session(run)
+                    except Exception:
+                        logger.exception("run %s 澄清态会话写回失败", run.run_id)
+                    await bus.publish(RuntimeEvent(
+                        type=RUN_COMPLETED, run_id=run.run_id,
+                        data={"final_text": clarify_question, "summary": run.summary},
+                    ))
+                    telemetry.record_run(log_fields, status="completed")
+                    return
             # 权限模块（审批模式）：Run 级 manual/auto 优先（创建时写入配置并
             # 随 agent_config_snapshot 保留到恢复/续跑），auto = 高危工具自动放行
             # 不触发 HITL 中断；缺省 manual（安全默认），且全局开关可强制关闭
@@ -505,6 +555,8 @@ class StreamMixin:
                 model_id=log_fields["model_id"],
                 agent_config=agent_config,
                 memory_context=mem_ctx,
+                history_context=history_context,
+                history_sources=history_sources,
                 budget=budget,
                 enable_hitl=enable_hitl,
                 sandbox_mode=getattr(settings, "AGENT_SANDBOX_MODE", "restricted"),

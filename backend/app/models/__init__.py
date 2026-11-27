@@ -8,6 +8,10 @@ from app.models.workflow import Workflow, WorkflowExecution
 from app.models.app_market import AppTemplate, AppInstance
 from app.models.audit import AuditLog
 from app.models.agent import Agent, AgentSession, AgentRun, AgentApproval
+from app.models.conversation_memory import (
+    ConversationIndexEntry, ConversationIndexJob, ConversationMemoryExclusion,
+    ConversationMemorySetting, ConversationMemoryShare,
+)
 from app.models.database_connection import DatabaseConnection
 from app.models.evolution import AgentEvaluation, EvolutionReport, EvolutionChangeLog
 from app.models.skill import Skill
@@ -35,6 +39,8 @@ __all__ = [
     "AppTemplate", "AppInstance",
     "AuditLog",
     "Agent", "AgentSession",
+    "ConversationIndexEntry", "ConversationIndexJob", "ConversationMemorySetting",
+    "ConversationMemoryExclusion", "ConversationMemoryShare",
     "DatabaseConnection",
     "AgentEvaluation", "EvolutionReport", "EvolutionChangeLog",
     "Skill", "MCPServer",

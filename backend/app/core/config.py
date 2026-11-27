@@ -323,6 +323,35 @@ class Settings(BaseSettings):
     KNOWLEDGE_RERANK_TOP_K: int = 20
     KNOWLEDGE_LEGACY_FALLBACK: bool = True        # 新索引不可用时回退旧词法检索
 
+    # ── Conversation Memory（历史会话检索 MVP）────────────────────────────
+    CONVERSATION_MEMORY_ENABLED: bool = True
+    # 自动预取判定：llm=每次有索引历史时做一次低温结构化判断；off=仅保留主动检索工具
+    CONVERSATION_MEMORY_PLANNER_MODE: str = "llm"
+    CONVERSATION_MEMORY_PLANNER_TIMEOUT: float = 25.0
+    CONVERSATION_MEMORY_PLANNER_MAX_TOKENS: int = 400
+    CONVERSATION_MEMORY_TOP_K: int = 5
+    CONVERSATION_MEMORY_CONTEXT_TOKEN_BUDGET: int = 1200
+    CONVERSATION_MEMORY_DENSE_TOP_K: int = 24
+    CONVERSATION_MEMORY_LEXICAL_TOP_K: int = 24
+    # 绝对余弦下限（低于此值直接丢弃）；短会话语料的无关相似度常见 0.42~0.55，
+    # 因此还需要「强相关阈值 + 相对优势」共同判定（按 32 条评测集校准）。
+    CONVERSATION_MEMORY_MIN_DENSE_SCORE: float = 0.5
+    CONVERSATION_MEMORY_DENSE_STRONG_SCORE: float = 0.62
+    CONVERSATION_MEMORY_DENSE_MARGIN: float = 0.04
+    # BM25 候选扫描上限（按消息时间倒序）；防止单用户历史无限膨胀拖慢检索
+    CONVERSATION_MEMORY_MAX_SCAN_ENTRIES: int = 4000
+    CONVERSATION_MEMORY_LOOKBACK_DAYS: int = 730
+    # 索引 Worker：独立于 RunWorker 轮询，避免 Embedding 阻塞 Run 领取
+    CONVERSATION_MEMORY_INDEX_ENABLED: bool = True
+    CONVERSATION_MEMORY_INDEX_INTERVAL: float = 2.0
+    CONVERSATION_MEMORY_INDEX_BATCH: int = 20
+    CONVERSATION_MEMORY_INDEX_MAX_ATTEMPTS: int = 3
+    CONVERSATION_MEMORY_TURN_MAX_CHARS: int = 4000
+    CONVERSATION_MEMORY_SEGMENT_TURNS: int = 3
+    CONVERSATION_MEMORY_SEGMENT_MAX_CHARS: int = 3000
+    CONVERSATION_MEMORY_QDRANT_COLLECTION_PREFIX: str = "gap_memory"
+    CONVERSATION_MEMORY_INDEX_VERSION: str = "cvm1"
+
     OTEL_ENABLED: bool = False                  # OpenTelemetry 导出（P1-02）
     OTEL_EXPORTER_OTLP_ENDPOINT: str = ""       # 如 http://localhost:4317
     OTEL_SERVICE_NAME: str = "general-agent-platform"
@@ -367,6 +396,20 @@ class Settings(BaseSettings):
             )
         if float(self.AGENT_WORK_PLAN_TIMEOUT) <= 0:
             raise RuntimeError("配置非法：AGENT_WORK_PLAN_TIMEOUT 必须大于 0。")
+        if self.CONVERSATION_MEMORY_PLANNER_MODE not in {"llm", "off"}:
+            raise RuntimeError(
+                "配置非法：CONVERSATION_MEMORY_PLANNER_MODE 只能为 llm / off。"
+            )
+        if float(self.CONVERSATION_MEMORY_PLANNER_TIMEOUT) <= 0:
+            raise RuntimeError("配置非法：CONVERSATION_MEMORY_PLANNER_TIMEOUT 必须大于 0。")
+        if not 1 <= int(self.CONVERSATION_MEMORY_TOP_K) <= 20:
+            raise RuntimeError("配置非法：CONVERSATION_MEMORY_TOP_K 必须在 1~20 之间。")
+        if int(self.CONVERSATION_MEMORY_CONTEXT_TOKEN_BUDGET) < 200:
+            raise RuntimeError(
+                "配置非法：CONVERSATION_MEMORY_CONTEXT_TOKEN_BUDGET 不得小于 200。"
+            )
+        if float(self.CONVERSATION_MEMORY_INDEX_INTERVAL) <= 0:
+            raise RuntimeError("配置非法：CONVERSATION_MEMORY_INDEX_INTERVAL 必须大于 0。")
         if self.asr_enabled:
             self._validate_asr_settings()
         self._validate_sandbox_settings()

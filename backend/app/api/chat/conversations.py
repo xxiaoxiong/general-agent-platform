@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -179,6 +180,13 @@ async def set_conversation_project(
         raise HTTPException(status_code=409, detail="任务执行中，暂不能切换项目")
     if not getattr(settings, "SANDBOX_ENABLED", False):
         raise HTTPException(status_code=400, detail="Sandbox 未启用")
+    # 切换项目后旧的写租约/预览不属于当前项目，前端会重新获取；
+    # 历史会话索引同步：撤销项目共享（避免把会话历史带到新项目），并更新条目项目归属。
+    from sqlalchemy import update as _update
+    from app.models.conversation_memory import ConversationIndexEntry
+    from app.services.conversation_memory.repository import revoke_shares_for_session
+
+    previous_project_id = session.project_id
     if body.project_id is not None:
         from app.services.sandbox import acl as sandbox_acl
 
@@ -186,6 +194,22 @@ async def set_conversation_project(
             db, body.project_id, current_user, "operator",
         )
         session.project_id = project.id
+        new_project_id = project.id
+    else:
+        session.project_id = None
+        new_project_id = None
+    if previous_project_id != new_project_id:
+        await revoke_shares_for_session(db, session_id)
+        await db.execute(
+            _update(ConversationIndexEntry)
+            .where(ConversationIndexEntry.session_id == session_id)
+            .values(
+                project_id=new_project_id, visibility_scope="user",
+                updated_at=datetime.utcnow(),
+            ),
+            execution_options={"synchronize_session": False},
+        )
+    if body.project_id is not None:
         # 切换项目后旧的写租约/预览不属于当前项目，前端会重新获取
         from app.models.sandbox import Workspace
         from app.services.sandbox import runtime
@@ -198,8 +222,6 @@ async def set_conversation_project(
             workspace = await runtime.ensure_workspace(
                 db, project.id, project.owner_id, project.tenant_id)
         await runtime.touch_workspace(db, workspace.id)
-    else:
-        session.project_id = None
     await db.commit()
     await db.refresh(session)
     return conversation_to_dict(session)
@@ -254,6 +276,27 @@ async def delete_conversation(
         busy = claimed_status not in TERMINAL_STATUSES
     if busy:
         raise HTTPException(status_code=409, detail="会话仍有未完成的任务，请取消或等待任务结束后再删除")
+
+    # 历史会话索引：先置删除标记（检索立即不可见），Qdrant 清理走异步 Job；
+    # 排除/共享记录一并清理，避免撤销授权后残留。
+    from app.models.conversation_memory import (
+        ConversationMemoryExclusion, ConversationMemoryShare,
+    )
+    from app.services.conversation_memory.indexer import mark_session_deleted
+    from app.services.conversation_memory.repository import enqueue_delete_job
+
+    await mark_session_deleted(db, session_id)
+    await enqueue_delete_job(db, session_id=session_id, user_id=current_user.id)
+    await db.execute(
+        delete(ConversationMemoryExclusion).where(
+            ConversationMemoryExclusion.conversation_id == session_id
+        )
+    )
+    await db.execute(
+        delete(ConversationMemoryShare).where(
+            ConversationMemoryShare.conversation_id == session_id
+        )
+    )
 
     # Run、事件、Trace 和评测仍可按 Run 查询。仅解除已删除会话的可空外键引用。
     await db.execute(

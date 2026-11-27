@@ -120,3 +120,39 @@ export const conversationApi = {
   downloadWorkspaceZip: (id: number) =>
     request.get<any, Blob>(`/conversations/${id}/files.zip`, { responseType: 'blob' }),
 }
+
+/** 历史会话记忆（Conversation Memory）：用户开关 / 索引状态 / 排除 / 项目共享 */
+export const memoryApi = {
+  settings: () => request.get<any, {
+    settings: {
+      history_enabled: boolean
+      auto_retrieval_enabled: boolean
+      project_memory_enabled: boolean
+      global_enabled: boolean
+      planner_mode: string
+      index_version: string
+    }
+    index: {
+      indexed_entries: number
+      pending_jobs: number
+      failed_jobs: number
+      last_job: Record<string, any> | null
+    }
+  }>('/memory/settings'),
+  updateSettings: (data: {
+    history_enabled?: boolean
+    auto_retrieval_enabled?: boolean
+    project_memory_enabled?: boolean
+  }) => inlineRequest.patch<unknown, any>('/memory/settings', data),
+  status: () => request.get<any, any>('/memory/status'),
+  /** 异步重建当前用户的历史索引（Job 入队，立即返回） */
+  reindex: () => request.post<any, any>('/memory/reindex'),
+  /** 排除/恢复某次会话参与后续检索 */
+  excludeConversation: (id: number, excluded: boolean, reason?: string) =>
+    inlineRequest.put<unknown, any>(`/memory/conversations/${id}/exclusion`, { excluded, reason }),
+  /** 显式共享会话到项目（缺省=会话当前项目） */
+  shareConversation: (id: number, projectId?: number) =>
+    inlineRequest.post<unknown, any>(`/memory/conversations/${id}/share`, { project_id: projectId }),
+  revokeShare: (id: number) =>
+    inlineRequest.delete<unknown, any>(`/memory/conversations/${id}/share`),
+}

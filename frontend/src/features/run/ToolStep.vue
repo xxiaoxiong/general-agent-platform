@@ -49,6 +49,11 @@
               <span class="source-title">{{ s.title }}</span>
               <span class="source-host">知识库</span>
             </span>
+            <span v-else-if="s.kind === 'history'" class="source-link source-link-static" :title="s.snippet || s.title">
+              <span class="source-id">{{ s.id }}</span>
+              <span class="source-title">{{ s.title }}</span>
+              <span class="source-host">历史会话</span>
+            </span>
             <a v-else class="source-link" :href="s.url" target="_blank" rel="noopener noreferrer" :title="s.url">
               <span class="source-id">{{ s.id }}</span>
               <span class="source-title">{{ s.title || s.url }}</span>

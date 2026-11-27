@@ -86,6 +86,8 @@ class RunCreate(BaseModel):
     # 联网检索开关：true=强制保留网络检索工具；false=本次 Run 禁用（收窄）；
     # None=跟随助手能力包默认。随 Run 创建写入 agent_config 快照，续跑保持原值
     web_enabled: Optional[bool] = None
+    # 历史会话检索开关：false=本次 Run 禁用自动预取与历史工具；None=跟随用户设置
+    history_enabled: Optional[bool] = None
     # 会话内手动选模型：仅本次 Run 覆盖助手默认模型（None=助手默认）
     model_config_id: Optional[int] = None
     # 每次运行须由调用方显式开启团队，省略时继续使用现有单助手路线。

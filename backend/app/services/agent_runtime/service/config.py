@@ -151,6 +151,20 @@ class ConfigMixin:
                 spec = get_tool_by_name(name)
                 if spec:
                     specs.append(spec)
+        # 历史会话检索工具（Conversation Memory）：只读、受 ToolPolicy 约束。
+        # 显式 history_memory_enabled=false 或 Agent enabled=false 时不注入。
+        if (
+            bool(getattr(settings, "CONVERSATION_MEMORY_ENABLED", True))
+            and agent_config.get("history_tools_enabled") is True
+            and agent_config.get("history_memory_enabled") is not False
+        ):
+            from app.services.conversation_memory.tools import TOOLS as MEMORY_TOOL_SPECS
+
+            existing = {spec["name"] for spec in specs}
+            for spec in MEMORY_TOOL_SPECS:
+                if spec["name"] in existing or spec["name"] in disabled:
+                    continue
+                specs.append(spec)
         # MCP 工具面（装配期写入，见 _load_mcp_runtime）：与内置工具同口径进入
         # 工具面/事件桥接/授权集合
         specs.extend(agent_config.get("mcp_tool_specs") or [])

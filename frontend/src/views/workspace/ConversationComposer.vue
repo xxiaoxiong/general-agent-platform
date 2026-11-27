@@ -91,6 +91,15 @@
             <Globe :size="16" aria-hidden="true" /><span>联网</span>
             <span class="team-indicator" aria-hidden="true"></span>
           </button>
+          <button
+            type="button" class="selector team-switch" role="switch" aria-label="历史记忆"
+            :aria-checked="historyMemoryEnabled" :disabled="locked || sending"
+            :title="historyMemoryEnabled ? '关闭后本次对话不检索历史会话' : '开启后允许智能体检索你过去授权的会话背景'"
+            @click="historyMemoryEnabled = !historyMemoryEnabled"
+          >
+            <MessagesSquare :size="16" aria-hidden="true" /><span>记忆</span>
+            <span class="team-indicator" aria-hidden="true"></span>
+          </button>
           <DropdownMenuRoot>
             <DropdownMenuTrigger as-child>
               <button type="button" class="selector" aria-label="审批模式">
@@ -167,7 +176,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { ArrowUp, Check, ChevronDown, CircleAlert, CircleCheck, Cpu, FileText, Flag, Globe, LoaderCircle, Mic, Paperclip, ShieldCheck, Square, UsersRound, X } from '@lucide/vue'
+import { ArrowUp, Check, ChevronDown, CircleAlert, CircleCheck, Cpu, FileText, Flag, Globe, LoaderCircle, MessagesSquare, Mic, Paperclip, ShieldCheck, Square, UsersRound, X } from '@lucide/vue'
 import {
   DropdownMenuContent, DropdownMenuItemIndicator, DropdownMenuPortal, DropdownMenuRadioGroup,
   DropdownMenuRadioItem, DropdownMenuRoot, DropdownMenuTrigger,
@@ -200,6 +209,7 @@ const text = defineModel<string>('text', { required: true })
 const teamMode = defineModel<boolean>('teamMode', { required: true })
 const approvalMode = defineModel<'manual' | 'auto'>('approvalMode', { required: true })
 const webEnabled = defineModel<boolean>('webEnabled', { required: true })
+const historyMemoryEnabled = defineModel<boolean>('historyMemoryEnabled', { required: true })
 const goalMode = defineModel<boolean>('goalMode', { required: true })
 const selectedModel = defineModel<number>('model', { required: true })
 const modelId = computed({

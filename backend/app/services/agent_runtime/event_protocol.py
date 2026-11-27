@@ -66,6 +66,8 @@ V2_EVENT_NAMES: Dict[str, str] = {
     "work_step_verification": "work.step.verification",
     "work_plan_completed": "work.plan.completed",
     "work_plan_degraded": "work.plan.degraded",
+    # Conversation Memory：自动历史检索来源（新增事件，旧客户端忽略）
+    "history_sources": "history.sources",
 }
 
 # 终止事件（消费者收到即结束本次事件流）

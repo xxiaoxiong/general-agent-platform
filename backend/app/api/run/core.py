@@ -168,6 +168,10 @@ async def create_run(
     # 崩溃恢复/断点续跑后仍保持原开关状态
     if body.web_enabled is not None:
         agent_config["web_enabled"] = bool(body.web_enabled)
+    # 历史会话检索开关：随 Run 创建写入快照（false=本次 Run 禁用自动预取与历史工具，
+    # None=跟随用户级设置；恢复/续跑后保持原值）
+    if body.history_enabled is not None:
+        agent_config["history_memory_enabled"] = bool(body.history_enabled)
     # 目标模式（/goal）：不限模型调用/工具调用/执行时长，并允许执行中补充要求。
     # 写入配置快照，恢复时由执行侧据此解除预算；团队协作暂不支持执行中补充。
     if body.goal_mode:

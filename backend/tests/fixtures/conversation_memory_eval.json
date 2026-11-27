@@ -1,0 +1,227 @@
+{
+  "version": 1,
+  "description": "Conversation Memory 历史会话检索质量评测集（阶段一）。覆盖续接、隐含偏好、决策查找、旧方案、跨会话、相似项目、冲突、无答案、相似噪声、精确定位与权限隔离。",
+  "projects": [
+    {
+      "key": "p_ecom",
+      "name": "电商项目",
+      "owner": "bob",
+      "members": ["alice", "carol"]
+    }
+  ],
+  "users": {
+    "alice": {"username": "eval_alice", "email": "eval_alice@example.com"},
+    "bob": {"username": "eval_bob", "email": "eval_bob@example.com"},
+    "carol": {"username": "eval_carol", "email": "eval_carol@example.com"}
+  },
+  "conversations": [
+    {
+      "key": "c1",
+      "user": "alice",
+      "title": "Agent Runtime 架构讨论",
+      "messages": [
+        {"id": "c1u1", "role": "user", "content": "我们准备重构 Agent Runtime，你有什么架构建议？", "created_at": "2026-09-02T10:00:00"},
+        {"id": "c1a1", "role": "assistant", "content": "建议先明确 DeepAgents 与 LangGraph 的职责边界，再决定状态持久化方案。", "created_at": "2026-09-02T10:00:08"},
+        {"id": "c1u2", "role": "user", "content": "那就确定由 DeepAgents 负责 Agent 执行，LangGraph 负责团队控制。", "created_at": "2026-09-02T10:02:00"},
+        {"id": "c1a2", "role": "assistant", "content": "已确定：DeepAgents 负责 Agent 执行与工具调用，LangGraph 负责团队协作控制、状态流转和子代理调度。", "created_at": "2026-09-02T10:02:09"}
+      ]
+    },
+    {
+      "key": "c2",
+      "user": "alice",
+      "title": "UI 风格偏好",
+      "messages": [
+        {"id": "c2u1", "role": "user", "content": "以后做页面都按我一贯的 UI 风格来。", "created_at": "2026-09-05T09:00:00"},
+        {"id": "c2a1", "role": "assistant", "content": "请描述你的一贯风格，我会记录为后续默认偏好。", "created_at": "2026-09-05T09:00:05"},
+        {"id": "c2u2", "role": "user", "content": "极简、克制留白、不要花哨渐变，主色用深墨绿。", "created_at": "2026-09-05T09:01:00"},
+        {"id": "c2a2", "role": "assistant", "content": "已记录 UI 风格偏好：极简、克制留白、无花哨渐变、主色深墨绿。", "created_at": "2026-09-05T09:01:05"}
+      ]
+    },
+    {
+      "key": "c3",
+      "user": "alice",
+      "title": "单体 Agent 方案评审",
+      "messages": [
+        {"id": "c3u1", "role": "user", "content": "为什么后来放弃单体 Agent 方案？", "created_at": "2026-09-08T14:00:00"},
+        {"id": "c3a1", "role": "assistant", "content": "单体方案的问题主要是工具权限、状态恢复和团队协作三方面耦合过高。", "created_at": "2026-09-08T14:00:06"},
+        {"id": "c3u2", "role": "user", "content": "把最终决策原因记录一下。", "created_at": "2026-09-08T14:01:00"},
+        {"id": "c3a2", "role": "assistant", "content": "放弃单体 Agent 方案的最终原因：工具权限难隔离、崩溃恢复成本高、无法支持团队协作。", "created_at": "2026-09-08T14:01:07"}
+      ]
+    },
+    {
+      "key": "c4",
+      "user": "alice",
+      "title": "九月部署方案",
+      "messages": [
+        {"id": "c4u1", "role": "user", "content": "九月确定的部署方案是什么？", "created_at": "2026-09-20T16:00:00"},
+        {"id": "c4a1", "role": "assistant", "content": "九月部署方案确定使用单机 Docker Compose，只部署 backend 与 frontend 两个服务。", "created_at": "2026-09-20T16:00:08"}
+      ]
+    },
+    {
+      "key": "c5",
+      "user": "alice",
+      "title": "十月部署方案更新",
+      "messages": [
+        {"id": "c5u1", "role": "user", "content": "十月更新后的部署方案呢？", "created_at": "2026-10-18T11:00:00"},
+        {"id": "c5a1", "role": "assistant", "content": "十月部署方案更新为 Docker Compose 增加 knowledge-worker、sandbox-runner 与 preview-proxy。", "created_at": "2026-10-18T11:00:09"}
+      ]
+    },
+    {
+      "key": "c6",
+      "user": "alice",
+      "title": "电商项目知识库方案",
+      "messages": [
+        {"id": "c6u1", "role": "user", "content": "电商项目的知识库检索方案怎么定？", "created_at": "2026-10-02T10:00:00"},
+        {"id": "c6a1", "role": "assistant", "content": "电商项目知识库采用 BGE-small-zh 向量检索加 BM25 混合检索，并使用 RRF 融合两路结果。", "created_at": "2026-10-02T10:00:08"}
+      ]
+    },
+    {
+      "key": "c7",
+      "user": "alice",
+      "title": "内部文档项目知识库方案",
+      "messages": [
+        {"id": "c7u1", "role": "user", "content": "内部文档项目的知识库方案呢？", "created_at": "2026-10-03T10:00:00"},
+        {"id": "c7a1", "role": "assistant", "content": "内部文档项目只使用 BM25 关键词检索，不启用向量模型，因为语料规模小且术语固定。", "created_at": "2026-10-03T10:00:09"}
+      ]
+    },
+    {
+      "key": "c8",
+      "user": "alice",
+      "title": "模型超时设置变更",
+      "messages": [
+        {"id": "c8u1", "role": "user", "content": "模型超时先设为 20 秒。", "created_at": "2026-10-05T09:00:00"},
+        {"id": "c8a1", "role": "assistant", "content": "模型超时暂定为 20 秒。", "created_at": "2026-10-05T09:00:04"},
+        {"id": "c8u2", "role": "user", "content": "20 秒太短，改成 45 秒。", "created_at": "2026-10-06T09:00:00"},
+        {"id": "c8a2", "role": "assistant", "content": "模型超时最终更新为 45 秒，并写入部署配置。", "created_at": "2026-10-06T09:00:05"}
+      ]
+    },
+    {
+      "key": "c9",
+      "user": "alice",
+      "title": "市面调研验收标准",
+      "messages": [
+        {"id": "c9u1", "role": "user", "content": "市面调研任务怎么验收？", "created_at": "2026-10-10T15:00:00"},
+        {"id": "c9a1", "role": "assistant", "content": "验收标准原话是：必须包含真实来源链接，且核心结论至少由两个独立来源交叉验证。", "created_at": "2026-10-10T15:00:08"}
+      ]
+    },
+    {
+      "key": "c10",
+      "user": "bob",
+      "title": "电商项目缓存方案",
+      "project": "p_ecom",
+      "messages": [
+        {"id": "c10u1", "role": "user", "content": "电商项目的缓存失效时间定多少？", "created_at": "2026-10-12T10:00:00"},
+        {"id": "c10a1", "role": "assistant", "content": "电商项目缓存失效时间确定为 15 分钟，热点数据缓存 5 分钟。", "created_at": "2026-10-12T10:00:09"}
+      ]
+    },
+    {
+      "key": "c11",
+      "user": "carol",
+      "title": "Carols 私人测试数据",
+      "messages": [
+        {"id": "c11u1", "role": "user", "content": "我的私人测试数据保留策略是 7 天。", "created_at": "2026-10-13T10:00:00"},
+        {"id": "c11a1", "role": "assistant", "content": "已记录你的私人测试数据保留策略为 7 天。", "created_at": "2026-10-13T10:00:05"}
+      ]
+    },
+    {
+      "key": "c12",
+      "user": "alice",
+      "title": "Agent 评测数据集",
+      "messages": [
+        {"id": "c12u1", "role": "user", "content": "评测数据集用哪个？", "created_at": "2026-10-15T10:00:00"},
+        {"id": "c12a1", "role": "assistant", "content": "评测默认使用 BFCL 公开数据集，覆盖函数调用与工具选择。", "created_at": "2026-10-15T10:00:06"}
+      ]
+    },
+    {
+      "key": "c13",
+      "user": "alice",
+      "title": "历史会话记忆 MVP",
+      "messages": [
+        {"id": "c13u1", "role": "user", "content": "历史会话检索 MVP 的范围是什么？", "created_at": "2026-10-20T10:00:00"},
+        {"id": "c13a1", "role": "assistant", "content": "历史会话检索 MVP 只做会话索引、自动检索、来源引用和删除一致性，长期记忆放到下一阶段。", "created_at": "2026-10-20T10:00:08"}
+      ]
+    },
+    {
+      "key": "c14",
+      "user": "alice",
+      "title": "沙箱预览端口",
+      "messages": [
+        {"id": "c14u1", "role": "user", "content": "沙箱预览端口约定是多少？", "created_at": "2026-10-22T10:00:00"},
+        {"id": "c14a1", "role": "assistant", "content": "沙箱预览走 Preview Proxy，本地使用 8081 端口，不直接暴露容器端口。", "created_at": "2026-10-22T10:00:07"}
+      ]
+    },
+    {
+      "key": "c15",
+      "user": "alice",
+      "title": "知识库拒答阈值",
+      "messages": [
+        {"id": "c15u1", "role": "user", "content": "知识库低相关拒答阈值怎么定？", "created_at": "2026-10-23T10:00:00"},
+        {"id": "c15a1", "role": "assistant", "content": "知识库低相关拒答使用绝对余弦阈值 0.35，并按评测集校准，不能用本次最高分归一化。", "created_at": "2026-10-23T10:00:09"}
+      ]
+    },
+    {
+      "key": "c16",
+      "user": "alice",
+      "title": "工作流步骤并行",
+      "messages": [
+        {"id": "c16u1", "role": "user", "content": "工作流步骤可以并行吗？", "created_at": "2026-10-24T10:00:00"},
+        {"id": "c16a1", "role": "assistant", "content": "工作流初期只支持串行步骤，并行调度留到后续版本。", "created_at": "2026-10-24T10:00:06"}
+      ]
+    },
+    {
+      "key": "c17",
+      "user": "alice",
+      "title": "右侧文件面板宽度",
+      "messages": [
+        {"id": "c17u1", "role": "user", "content": "右侧文件面板宽度限制是多少？", "created_at": "2026-10-25T10:00:00"},
+        {"id": "c17a1", "role": "assistant", "content": "右侧文件预览面板宽度限制在 320px 到视口宽度 75% 之间。", "created_at": "2026-10-25T10:00:06"}
+      ]
+    },
+    {
+      "key": "c18",
+      "user": "alice",
+      "title": "Sandbox 启用开关",
+      "messages": [
+        {"id": "c18u1", "role": "user", "content": "启用 Sandbox 需要哪些开关？", "created_at": "2026-10-26T10:00:00"},
+        {"id": "c18a1", "role": "assistant", "content": "启用 Sandbox 需要同时设置 SANDBOX_ENABLED=true 和 AGENT_SANDBOX_MODE=external。", "created_at": "2026-10-26T10:00:07"}
+      ]
+    }
+  ],
+  "shares": [
+    {"conversation": "c10", "project": "p_ecom", "shared_by": "bob"}
+  ],
+  "queries": [
+    {"id": "q01", "user": "alice", "category": "明确续接历史任务", "query": "继续上次的 Agent Runtime 改造，之前确定的分工是什么？", "expected_message_ids": ["c1a2"]},
+    {"id": "q02", "user": "alice", "category": "未说之前但依赖历史偏好", "query": "按我一贯的审美做这个新页面", "expected_message_ids": ["c2a2"]},
+    {"id": "q03", "user": "alice", "category": "已确认技术决策", "query": "DeepAgents 和 LangGraph 的职责怎么划分？", "expected_message_ids": ["c1a2"]},
+    {"id": "q04", "user": "alice", "category": "旧方案与决策原因", "query": "为什么后来放弃单体 Agent 方案？", "expected_message_ids": ["c3a2", "c3a1"]},
+    {"id": "q05", "user": "alice", "category": "跨会话综合", "query": "对比九月和十月确定的部署方案有哪些变化？", "expected_message_ids": ["c4a1", "c5a1"]},
+    {"id": "q06", "user": "alice", "category": "相似项目区分", "query": "电商项目的知识库检索方案是怎么定的？", "expected_message_ids": ["c6a1"]},
+    {"id": "q07", "user": "alice", "category": "相似项目区分", "query": "内部文档项目为什么不用向量检索？", "expected_message_ids": ["c7a1"]},
+    {"id": "q08", "user": "alice", "category": "新旧决策冲突", "query": "模型超时最新的设置是多少？", "expected_message_ids": ["c8a2"]},
+    {"id": "q09", "user": "alice", "category": "精确原文定位", "query": "那句关于验收标准的原话是怎么说的？", "expected_message_ids": ["c9a1"]},
+    {"id": "q10", "user": "alice", "category": "项目共享历史", "query": "电商项目缓存热点数据多长时间失效？", "expected_message_ids": ["c10a1"], "project": "p_ecom"},
+    {"id": "q11", "user": "alice", "category": "权限隔离", "query": "Carol 的私人测试数据保留策略是几天？", "no_answer": true},
+    {"id": "q12", "user": "alice", "category": "已确认技术决策", "query": "评测数据集用哪个？", "expected_message_ids": ["c12a1"]},
+    {"id": "q13", "user": "alice", "category": "明确续接历史任务", "query": "历史会话检索 MVP 的范围包括什么？", "expected_message_ids": ["c13a1"]},
+    {"id": "q14", "user": "alice", "category": "已确认技术决策", "query": "沙箱预览端口约定是多少？", "expected_message_ids": ["c14a1"]},
+    {"id": "q15", "user": "alice", "category": "已确认技术决策", "query": "知识库低相关拒答阈值怎么定的？", "expected_message_ids": ["c15a1"]},
+    {"id": "q16", "user": "alice", "category": "已确认技术决策", "query": "工作流步骤能不能并行？", "expected_message_ids": ["c16a1"]},
+    {"id": "q17", "user": "alice", "category": "精确原文定位", "query": "右侧文件面板最宽可以到多少？", "expected_message_ids": ["c17a1"]},
+    {"id": "q18", "user": "alice", "category": "已确认技术决策", "query": "Sandbox 只打开 SANDBOX_ENABLED 够吗？", "expected_message_ids": ["c18a1"]},
+    {"id": "q19", "user": "alice", "category": "新旧决策冲突", "query": "模型超时最开始定的是多少秒？", "expected_message_ids": ["c8a1"]},
+    {"id": "q20", "user": "alice", "category": "跨时间综合", "query": "部署方案从九月到十月经历了哪些变化？", "expected_message_ids": ["c4a1", "c5a1"]},
+    {"id": "q21", "user": "alice", "category": "语义改写", "query": "智能体执行内核和团队控制分别由谁负责？", "expected_message_ids": ["c1a2"]},
+    {"id": "q22", "user": "alice", "category": "历史信息不存在", "query": "我们讨论过量子计算采购预算吗？", "no_answer": true},
+    {"id": "q23", "user": "alice", "category": "历史信息不存在", "query": "年会抽奖奖品清单定了吗？", "no_answer": true},
+    {"id": "q24", "user": "alice", "category": "历史信息不存在", "query": "办公室绿植养护周期是多少？", "no_answer": true},
+    {"id": "q25", "user": "alice", "category": "历史信息不存在", "query": "移动端 App 上架时间定了吗？", "no_answer": true},
+    {"id": "q26", "user": "alice", "category": "相似但不相关", "query": "缓存命中率优化用了什么算法？", "no_answer": true},
+    {"id": "q27", "user": "alice", "category": "项目共享历史", "query": "电商项目缓存热点数据多久失效？", "expected_message_ids": ["c10a1"], "project": "p_ecom"},
+    {"id": "q28", "user": "alice", "category": "相似项目区分", "query": "内部文档项目采用什么检索方式？", "expected_message_ids": ["c7a1"]},
+    {"id": "q29", "user": "alice", "category": "已确认技术决策", "query": "BFCL 数据集覆盖哪些能力？", "expected_message_ids": ["c12a1"]},
+    {"id": "q30", "user": "alice", "category": "明确续接历史任务", "query": "长期记忆是这一期做还是下一阶段？", "expected_message_ids": ["c13a1"]},
+    {"id": "q31", "user": "alice", "category": "精确原文定位", "query": "文件预览面板的宽度区间是多少？", "expected_message_ids": ["c17a1"]},
+    {"id": "q32", "user": "alice", "category": "已确认技术决策", "query": "Sandbox 的两个启用条件是什么？", "expected_message_ids": ["c18a1"]}
+  ]
+}

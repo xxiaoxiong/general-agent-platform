@@ -1,0 +1,1519 @@
+{
+  "dataset": "D:\\MyPersonalFile\\MyStudyFile\\AI\\MyCode\\AI-GeneralPlat\\backend\\tests\\fixtures\\conversation_memory_eval.json",
+  "mode": "hybrid",
+  "top_k": 5,
+  "queries": 32,
+  "index_seconds": 0.45,
+  "seeding_seconds": 0.98,
+  "index_entries": 26,
+  "embedding_status": {
+    "indexed": 26
+  },
+  "embedding_model": "BAAI/bge-small-zh-v1.5",
+  "embedding_dimension": 512,
+  "recall_at_k": 1.0,
+  "precision_at_k": 0.6686,
+  "no_answer_accuracy": 1.0,
+  "source_accuracy": 1.0,
+  "unsupported_memory_rate": 0.0,
+  "permission_violations": [],
+  "permission_violation_count": 0,
+  "latency_ms": {
+    "p50": 0.0,
+    "p95": 16.0,
+    "avg": 7.34
+  },
+  "context_tokens": {
+    "avg": 217.2,
+    "max": 456
+  },
+  "categories": {
+    "明确续接历史任务": {
+      "total": 3,
+      "hit": 3,
+      "no_answer_correct": 0,
+      "no_answer_total": 0
+    },
+    "未说之前但依赖历史偏好": {
+      "total": 1,
+      "hit": 1,
+      "no_answer_correct": 0,
+      "no_answer_total": 0
+    },
+    "已确认技术决策": {
+      "total": 8,
+      "hit": 8,
+      "no_answer_correct": 0,
+      "no_answer_total": 0
+    },
+    "旧方案与决策原因": {
+      "total": 1,
+      "hit": 1,
+      "no_answer_correct": 0,
+      "no_answer_total": 0
+    },
+    "跨会话综合": {
+      "total": 1,
+      "hit": 1,
+      "no_answer_correct": 0,
+      "no_answer_total": 0
+    },
+    "相似项目区分": {
+      "total": 3,
+      "hit": 3,
+      "no_answer_correct": 0,
+      "no_answer_total": 0
+    },
+    "新旧决策冲突": {
+      "total": 2,
+      "hit": 2,
+      "no_answer_correct": 0,
+      "no_answer_total": 0
+    },
+    "精确原文定位": {
+      "total": 3,
+      "hit": 3,
+      "no_answer_correct": 0,
+      "no_answer_total": 0
+    },
+    "项目共享历史": {
+      "total": 2,
+      "hit": 2,
+      "no_answer_correct": 0,
+      "no_answer_total": 0
+    },
+    "权限隔离": {
+      "total": 1,
+      "hit": 0,
+      "no_answer_correct": 1,
+      "no_answer_total": 1
+    },
+    "跨时间综合": {
+      "total": 1,
+      "hit": 1,
+      "no_answer_correct": 0,
+      "no_answer_total": 0
+    },
+    "语义改写": {
+      "total": 1,
+      "hit": 1,
+      "no_answer_correct": 0,
+      "no_answer_total": 0
+    },
+    "历史信息不存在": {
+      "total": 4,
+      "hit": 0,
+      "no_answer_correct": 4,
+      "no_answer_total": 4
+    },
+    "相似但不相关": {
+      "total": 1,
+      "hit": 0,
+      "no_answer_correct": 1,
+      "no_answer_total": 1
+    }
+  },
+  "rows": [
+    {
+      "id": "q01",
+      "category": "明确续接历史任务",
+      "user": "alice",
+      "query": "继续上次的 Agent Runtime 改造，之前确定的分工是什么？",
+      "no_answer": false,
+      "expected": [
+        "c1a2"
+      ],
+      "returned": [
+        {
+          "entry_id": 3,
+          "session_id": 1,
+          "title": "Agent Runtime 架构讨论",
+          "message_ids": [
+            "c1u1",
+            "c1a1",
+            "c1u2",
+            "c1a2"
+          ],
+          "score": 0.016393,
+          "dense_score": 0.543729,
+          "lexical_score": null,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 1,
+      "invalid_sources": [],
+      "latency_ms": 15.0,
+      "context_tokens": 270,
+      "notes": []
+    },
+    {
+      "id": "q02",
+      "category": "未说之前但依赖历史偏好",
+      "user": "alice",
+      "query": "按我一贯的审美做这个新页面",
+      "no_answer": false,
+      "expected": [
+        "c2a2"
+      ],
+      "returned": [
+        {
+          "entry_id": 4,
+          "session_id": 2,
+          "title": "UI 风格偏好",
+          "message_ids": [
+            "c2u1",
+            "c2a1"
+          ],
+          "score": 0.032787,
+          "dense_score": 0.691158,
+          "lexical_score": 31.701573,
+          "scope": "user"
+        },
+        {
+          "entry_id": 6,
+          "session_id": 2,
+          "title": "UI 风格偏好",
+          "message_ids": [
+            "c2u1",
+            "c2a1",
+            "c2u2",
+            "c2a2"
+          ],
+          "score": 0.032258,
+          "dense_score": 0.575488,
+          "lexical_score": 21.757826,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 2,
+      "invalid_sources": [],
+      "latency_ms": 16.0,
+      "context_tokens": 289,
+      "notes": []
+    },
+    {
+      "id": "q03",
+      "category": "已确认技术决策",
+      "user": "alice",
+      "query": "DeepAgents 和 LangGraph 的职责怎么划分？",
+      "no_answer": false,
+      "expected": [
+        "c1a2"
+      ],
+      "returned": [
+        {
+          "entry_id": 3,
+          "session_id": 1,
+          "title": "Agent Runtime 架构讨论",
+          "message_ids": [
+            "c1u1",
+            "c1a1",
+            "c1u2",
+            "c1a2"
+          ],
+          "score": 0.032522,
+          "dense_score": 0.632372,
+          "lexical_score": 15.361681,
+          "scope": "user"
+        },
+        {
+          "entry_id": 1,
+          "session_id": 1,
+          "title": "Agent Runtime 架构讨论",
+          "message_ids": [
+            "c1u1",
+            "c1a1"
+          ],
+          "score": 0.016393,
+          "dense_score": null,
+          "lexical_score": 15.723391,
+          "scope": "user"
+        },
+        {
+          "entry_id": 4,
+          "session_id": 2,
+          "title": "UI 风格偏好",
+          "message_ids": [
+            "c2u1",
+            "c2a1"
+          ],
+          "score": 0.016129,
+          "dense_score": 0.504903,
+          "lexical_score": null,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 3,
+      "invalid_sources": [],
+      "latency_ms": 0.0,
+      "context_tokens": 362,
+      "notes": []
+    },
+    {
+      "id": "q04",
+      "category": "旧方案与决策原因",
+      "user": "alice",
+      "query": "为什么后来放弃单体 Agent 方案？",
+      "no_answer": false,
+      "expected": [
+        "c3a1",
+        "c3a2"
+      ],
+      "returned": [
+        {
+          "entry_id": 7,
+          "session_id": 3,
+          "title": "单体 Agent 方案评审",
+          "message_ids": [
+            "c3u1",
+            "c3a1"
+          ],
+          "score": 0.032787,
+          "dense_score": 0.844779,
+          "lexical_score": 42.321306,
+          "scope": "user"
+        },
+        {
+          "entry_id": 9,
+          "session_id": 3,
+          "title": "单体 Agent 方案评审",
+          "message_ids": [
+            "c3u1",
+            "c3a1",
+            "c3u2",
+            "c3a2"
+          ],
+          "score": 0.032258,
+          "dense_score": 0.783297,
+          "lexical_score": 35.206391,
+          "scope": "user"
+        },
+        {
+          "entry_id": 8,
+          "session_id": 3,
+          "title": "单体 Agent 方案评审",
+          "message_ids": [
+            "c3u2",
+            "c3a2"
+          ],
+          "score": 0.031746,
+          "dense_score": 0.751356,
+          "lexical_score": 19.676408,
+          "scope": "user"
+        },
+        {
+          "entry_id": 10,
+          "session_id": 4,
+          "title": "九月部署方案",
+          "message_ids": [
+            "c4u1",
+            "c4a1"
+          ],
+          "score": 0.03125,
+          "dense_score": 0.503805,
+          "lexical_score": 10.726647,
+          "scope": "user"
+        },
+        {
+          "entry_id": 1,
+          "session_id": 1,
+          "title": "Agent Runtime 架构讨论",
+          "message_ids": [
+            "c1u1",
+            "c1a1"
+          ],
+          "score": 0.015385,
+          "dense_score": null,
+          "lexical_score": 8.600818,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 3,
+      "returned_count": 5,
+      "invalid_sources": [],
+      "latency_ms": 0.0,
+      "context_tokens": 456,
+      "notes": []
+    },
+    {
+      "id": "q05",
+      "category": "跨会话综合",
+      "user": "alice",
+      "query": "对比九月和十月确定的部署方案有哪些变化？",
+      "no_answer": false,
+      "expected": [
+        "c4a1",
+        "c5a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 10,
+          "session_id": 4,
+          "title": "九月部署方案",
+          "message_ids": [
+            "c4u1",
+            "c4a1"
+          ],
+          "score": 0.032787,
+          "dense_score": 0.695282,
+          "lexical_score": 48.917036,
+          "scope": "user"
+        },
+        {
+          "entry_id": 11,
+          "session_id": 5,
+          "title": "十月部署方案更新",
+          "message_ids": [
+            "c5u1",
+            "c5a1"
+          ],
+          "score": 0.032258,
+          "dense_score": 0.68993,
+          "lexical_score": 37.135172,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 2,
+      "returned_count": 2,
+      "invalid_sources": [],
+      "latency_ms": 0.0,
+      "context_tokens": 239,
+      "notes": []
+    },
+    {
+      "id": "q06",
+      "category": "相似项目区分",
+      "user": "alice",
+      "query": "电商项目的知识库检索方案是怎么定的？",
+      "no_answer": false,
+      "expected": [
+        "c6a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 12,
+          "session_id": 6,
+          "title": "电商项目知识库方案",
+          "message_ids": [
+            "c6u1",
+            "c6a1"
+          ],
+          "score": 0.032787,
+          "dense_score": 0.870773,
+          "lexical_score": 68.537439,
+          "scope": "user"
+        },
+        {
+          "entry_id": 13,
+          "session_id": 7,
+          "title": "内部文档项目知识库方案",
+          "message_ids": [
+            "c7u1",
+            "c7a1"
+          ],
+          "score": 0.032002,
+          "dense_score": 0.569069,
+          "lexical_score": 33.342759,
+          "scope": "user"
+        },
+        {
+          "entry_id": 23,
+          "session_id": 15,
+          "title": "知识库拒答阈值",
+          "message_ids": [
+            "c15u1",
+            "c15a1"
+          ],
+          "score": 0.03125,
+          "dense_score": 0.52772,
+          "lexical_score": 21.790828,
+          "scope": "user"
+        },
+        {
+          "entry_id": 17,
+          "session_id": 9,
+          "title": "市面调研验收标准",
+          "message_ids": [
+            "c9u1",
+            "c9a1"
+          ],
+          "score": 0.016129,
+          "dense_score": 0.595848,
+          "lexical_score": null,
+          "scope": "user"
+        },
+        {
+          "entry_id": 18,
+          "session_id": 10,
+          "title": "电商项目缓存方案",
+          "message_ids": [
+            "c10u1",
+            "c10a1"
+          ],
+          "score": 0.015873,
+          "dense_score": null,
+          "lexical_score": 27.604339,
+          "scope": "project"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 5,
+      "invalid_sources": [],
+      "latency_ms": 16.0,
+      "context_tokens": 410,
+      "notes": [
+        "低相关 Dense 候选已过滤 1 条"
+      ]
+    },
+    {
+      "id": "q07",
+      "category": "相似项目区分",
+      "user": "alice",
+      "query": "内部文档项目为什么不用向量检索？",
+      "no_answer": false,
+      "expected": [
+        "c7a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 13,
+          "session_id": 7,
+          "title": "内部文档项目知识库方案",
+          "message_ids": [
+            "c7u1",
+            "c7a1"
+          ],
+          "score": 0.032787,
+          "dense_score": 0.808093,
+          "lexical_score": 55.35137,
+          "scope": "user"
+        },
+        {
+          "entry_id": 12,
+          "session_id": 6,
+          "title": "电商项目知识库方案",
+          "message_ids": [
+            "c6u1",
+            "c6a1"
+          ],
+          "score": 0.032258,
+          "dense_score": 0.574133,
+          "lexical_score": 31.719472,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 2,
+      "invalid_sources": [],
+      "latency_ms": 0.0,
+      "context_tokens": 257,
+      "notes": [
+        "Dense 候选未达到相关性门槛，已拒答",
+        "低相关 Dense 候选已过滤 3 条"
+      ]
+    },
+    {
+      "id": "q08",
+      "category": "新旧决策冲突",
+      "user": "alice",
+      "query": "模型超时最新的设置是多少？",
+      "no_answer": false,
+      "expected": [
+        "c8a2"
+      ],
+      "returned": [
+        {
+          "entry_id": 15,
+          "session_id": 8,
+          "title": "模型超时设置变更",
+          "message_ids": [
+            "c8u2",
+            "c8a2"
+          ],
+          "score": 0.032522,
+          "dense_score": 0.737252,
+          "lexical_score": 25.404795,
+          "scope": "user"
+        },
+        {
+          "entry_id": 16,
+          "session_id": 8,
+          "title": "模型超时设置变更",
+          "message_ids": [
+            "c8u1",
+            "c8a1",
+            "c8u2",
+            "c8a2"
+          ],
+          "score": 0.032266,
+          "dense_score": 0.733679,
+          "lexical_score": 29.975826,
+          "scope": "user"
+        },
+        {
+          "entry_id": 14,
+          "session_id": 8,
+          "title": "模型超时设置变更",
+          "message_ids": [
+            "c8u1",
+            "c8a1"
+          ],
+          "score": 0.032002,
+          "dense_score": 0.735928,
+          "lexical_score": 25.105836,
+          "scope": "user"
+        },
+        {
+          "entry_id": 25,
+          "session_id": 17,
+          "title": "右侧文件面板宽度",
+          "message_ids": [
+            "c17u1",
+            "c17a1"
+          ],
+          "score": 0.015625,
+          "dense_score": 0.502555,
+          "lexical_score": null,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 2,
+      "returned_count": 4,
+      "invalid_sources": [],
+      "latency_ms": 0.0,
+      "context_tokens": 306,
+      "notes": []
+    },
+    {
+      "id": "q09",
+      "category": "精确原文定位",
+      "user": "alice",
+      "query": "那句关于验收标准的原话是怎么说的？",
+      "no_answer": false,
+      "expected": [
+        "c9a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 17,
+          "session_id": 9,
+          "title": "市面调研验收标准",
+          "message_ids": [
+            "c9u1",
+            "c9a1"
+          ],
+          "score": 0.032787,
+          "dense_score": 0.673148,
+          "lexical_score": 39.140022,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 1,
+      "invalid_sources": [],
+      "latency_ms": 16.0,
+      "context_tokens": 200,
+      "notes": []
+    },
+    {
+      "id": "q10",
+      "category": "项目共享历史",
+      "user": "alice",
+      "query": "电商项目缓存热点数据多长时间失效？",
+      "no_answer": false,
+      "expected": [
+        "c10a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 18,
+          "session_id": 10,
+          "title": "电商项目缓存方案",
+          "message_ids": [
+            "c10u1",
+            "c10a1"
+          ],
+          "score": 0.026393,
+          "dense_score": null,
+          "lexical_score": 85.020136,
+          "scope": "project"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 1,
+      "invalid_sources": [],
+      "latency_ms": 15.0,
+      "context_tokens": 193,
+      "notes": [
+        "Dense 候选未达到相关性门槛，已拒答",
+        "低相关 Dense 候选已过滤 4 条"
+      ]
+    },
+    {
+      "id": "q11",
+      "category": "权限隔离",
+      "user": "alice",
+      "query": "Carol 的私人测试数据保留策略是几天？",
+      "no_answer": true,
+      "expected": [],
+      "returned": [],
+      "hit": false,
+      "relevant_count": 0,
+      "returned_count": 0,
+      "invalid_sources": [],
+      "latency_ms": 0.0,
+      "context_tokens": 0,
+      "notes": [
+        "Dense 候选未达到相关性门槛，已拒答",
+        "低相关 Dense 候选已过滤 5 条"
+      ]
+    },
+    {
+      "id": "q12",
+      "category": "已确认技术决策",
+      "user": "alice",
+      "query": "评测数据集用哪个？",
+      "no_answer": false,
+      "expected": [
+        "c12a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 20,
+          "session_id": 12,
+          "title": "Agent 评测数据集",
+          "message_ids": [
+            "c12u1",
+            "c12a1"
+          ],
+          "score": 0.032787,
+          "dense_score": 0.86213,
+          "lexical_score": 48.829118,
+          "scope": "user"
+        },
+        {
+          "entry_id": 23,
+          "session_id": 15,
+          "title": "知识库拒答阈值",
+          "message_ids": [
+            "c15u1",
+            "c15a1"
+          ],
+          "score": 0.016129,
+          "dense_score": null,
+          "lexical_score": 9.04077,
+          "scope": "user"
+        },
+        {
+          "entry_id": 12,
+          "session_id": 6,
+          "title": "电商项目知识库方案",
+          "message_ids": [
+            "c6u1",
+            "c6a1"
+          ],
+          "score": 0.016129,
+          "dense_score": 0.513827,
+          "lexical_score": null,
+          "scope": "user"
+        },
+        {
+          "entry_id": 18,
+          "session_id": 10,
+          "title": "电商项目缓存方案",
+          "message_ids": [
+            "c10u1",
+            "c10a1"
+          ],
+          "score": 0.015873,
+          "dense_score": null,
+          "lexical_score": 7.457587,
+          "scope": "project"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 4,
+      "invalid_sources": [],
+      "latency_ms": 16.0,
+      "context_tokens": 342,
+      "notes": []
+    },
+    {
+      "id": "q13",
+      "category": "明确续接历史任务",
+      "user": "alice",
+      "query": "历史会话检索 MVP 的范围包括什么？",
+      "no_answer": false,
+      "expected": [
+        "c13a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 21,
+          "session_id": 13,
+          "title": "历史会话记忆 MVP",
+          "message_ids": [
+            "c13u1",
+            "c13a1"
+          ],
+          "score": 0.032787,
+          "dense_score": 0.805599,
+          "lexical_score": 63.192734,
+          "scope": "user"
+        },
+        {
+          "entry_id": 12,
+          "session_id": 6,
+          "title": "电商项目知识库方案",
+          "message_ids": [
+            "c6u1",
+            "c6a1"
+          ],
+          "score": 0.016129,
+          "dense_score": 0.516796,
+          "lexical_score": null,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 2,
+      "invalid_sources": [],
+      "latency_ms": 16.0,
+      "context_tokens": 261,
+      "notes": []
+    },
+    {
+      "id": "q14",
+      "category": "已确认技术决策",
+      "user": "alice",
+      "query": "沙箱预览端口约定是多少？",
+      "no_answer": false,
+      "expected": [
+        "c14a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 22,
+          "session_id": 14,
+          "title": "沙箱预览端口",
+          "message_ids": [
+            "c14u1",
+            "c14a1"
+          ],
+          "score": 0.032787,
+          "dense_score": 0.886419,
+          "lexical_score": 70.171359,
+          "scope": "user"
+        },
+        {
+          "entry_id": 25,
+          "session_id": 17,
+          "title": "右侧文件面板宽度",
+          "message_ids": [
+            "c17u1",
+            "c17a1"
+          ],
+          "score": 0.032258,
+          "dense_score": 0.579003,
+          "lexical_score": 20.644836,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 2,
+      "invalid_sources": [],
+      "latency_ms": 0.0,
+      "context_tokens": 232,
+      "notes": []
+    },
+    {
+      "id": "q15",
+      "category": "已确认技术决策",
+      "user": "alice",
+      "query": "知识库低相关拒答阈值怎么定的？",
+      "no_answer": false,
+      "expected": [
+        "c15a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 23,
+          "session_id": 15,
+          "title": "知识库拒答阈值",
+          "message_ids": [
+            "c15u1",
+            "c15a1"
+          ],
+          "score": 0.032787,
+          "dense_score": 0.885059,
+          "lexical_score": 77.615733,
+          "scope": "user"
+        },
+        {
+          "entry_id": 13,
+          "session_id": 7,
+          "title": "内部文档项目知识库方案",
+          "message_ids": [
+            "c7u1",
+            "c7a1"
+          ],
+          "score": 0.032002,
+          "dense_score": 0.600755,
+          "lexical_score": 13.167568,
+          "scope": "user"
+        },
+        {
+          "entry_id": 12,
+          "session_id": 6,
+          "title": "电商项目知识库方案",
+          "message_ids": [
+            "c6u1",
+            "c6a1"
+          ],
+          "score": 0.032002,
+          "dense_score": 0.582442,
+          "lexical_score": 23.031652,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 3,
+      "invalid_sources": [],
+      "latency_ms": 0.0,
+      "context_tokens": 313,
+      "notes": []
+    },
+    {
+      "id": "q16",
+      "category": "已确认技术决策",
+      "user": "alice",
+      "query": "工作流步骤能不能并行？",
+      "no_answer": false,
+      "expected": [
+        "c16a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 24,
+          "session_id": 16,
+          "title": "工作流步骤并行",
+          "message_ids": [
+            "c16u1",
+            "c16a1"
+          ],
+          "score": 0.032787,
+          "dense_score": 0.808763,
+          "lexical_score": 42.976375,
+          "scope": "user"
+        },
+        {
+          "entry_id": 23,
+          "session_id": 15,
+          "title": "知识库拒答阈值",
+          "message_ids": [
+            "c15u1",
+            "c15a1"
+          ],
+          "score": 0.016129,
+          "dense_score": null,
+          "lexical_score": 11.218643,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 2,
+      "invalid_sources": [],
+      "latency_ms": 0.0,
+      "context_tokens": 243,
+      "notes": [
+        "Dense 候选未达到相关性门槛，已拒答",
+        "低相关 Dense 候选已过滤 4 条"
+      ]
+    },
+    {
+      "id": "q17",
+      "category": "精确原文定位",
+      "user": "alice",
+      "query": "右侧文件面板最宽可以到多少？",
+      "no_answer": false,
+      "expected": [
+        "c17a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 25,
+          "session_id": 17,
+          "title": "右侧文件面板宽度",
+          "message_ids": [
+            "c17u1",
+            "c17a1"
+          ],
+          "score": 0.032787,
+          "dense_score": 0.823866,
+          "lexical_score": 57.369455,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 1,
+      "invalid_sources": [],
+      "latency_ms": 16.0,
+      "context_tokens": 190,
+      "notes": [
+        "Dense 候选未达到相关性门槛，已拒答",
+        "低相关 Dense 候选已过滤 3 条"
+      ]
+    },
+    {
+      "id": "q18",
+      "category": "已确认技术决策",
+      "user": "alice",
+      "query": "Sandbox 只打开 SANDBOX_ENABLED 够吗？",
+      "no_answer": false,
+      "expected": [
+        "c18a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 26,
+          "session_id": 18,
+          "title": "Sandbox 启用开关",
+          "message_ids": [
+            "c18u1",
+            "c18a1"
+          ],
+          "score": 0.032787,
+          "dense_score": 0.605563,
+          "lexical_score": 16.01906,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 1,
+      "invalid_sources": [],
+      "latency_ms": 15.0,
+      "context_tokens": 187,
+      "notes": [
+        "Dense 候选未达到相关性门槛，已拒答",
+        "低相关 Dense 候选已过滤 2 条"
+      ]
+    },
+    {
+      "id": "q19",
+      "category": "新旧决策冲突",
+      "user": "alice",
+      "query": "模型超时最开始定的是多少秒？",
+      "no_answer": false,
+      "expected": [
+        "c8a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 16,
+          "session_id": 8,
+          "title": "模型超时设置变更",
+          "message_ids": [
+            "c8u1",
+            "c8a1",
+            "c8u2",
+            "c8a2"
+          ],
+          "score": 0.032522,
+          "dense_score": 0.757313,
+          "lexical_score": 28.850624,
+          "scope": "user"
+        },
+        {
+          "entry_id": 14,
+          "session_id": 8,
+          "title": "模型超时设置变更",
+          "message_ids": [
+            "c8u1",
+            "c8a1"
+          ],
+          "score": 0.032522,
+          "dense_score": 0.792123,
+          "lexical_score": 27.011892,
+          "scope": "user"
+        },
+        {
+          "entry_id": 15,
+          "session_id": 8,
+          "title": "模型超时设置变更",
+          "message_ids": [
+            "c8u2",
+            "c8a2"
+          ],
+          "score": 0.031746,
+          "dense_score": 0.723928,
+          "lexical_score": 24.213547,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 2,
+      "returned_count": 3,
+      "invalid_sources": [],
+      "latency_ms": 16.0,
+      "context_tokens": 264,
+      "notes": []
+    },
+    {
+      "id": "q20",
+      "category": "跨时间综合",
+      "user": "alice",
+      "query": "部署方案从九月到十月经历了哪些变化？",
+      "no_answer": false,
+      "expected": [
+        "c4a1",
+        "c5a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 11,
+          "session_id": 5,
+          "title": "十月部署方案更新",
+          "message_ids": [
+            "c5u1",
+            "c5a1"
+          ],
+          "score": 0.032787,
+          "dense_score": 0.681013,
+          "lexical_score": 33.56726,
+          "scope": "user"
+        },
+        {
+          "entry_id": 10,
+          "session_id": 4,
+          "title": "九月部署方案",
+          "message_ids": [
+            "c4u1",
+            "c4a1"
+          ],
+          "score": 0.032258,
+          "dense_score": 0.659884,
+          "lexical_score": 33.007021,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 2,
+      "returned_count": 2,
+      "invalid_sources": [],
+      "latency_ms": 0.0,
+      "context_tokens": 239,
+      "notes": []
+    },
+    {
+      "id": "q21",
+      "category": "语义改写",
+      "user": "alice",
+      "query": "智能体执行内核和团队控制分别由谁负责？",
+      "no_answer": false,
+      "expected": [
+        "c1a2"
+      ],
+      "returned": [
+        {
+          "entry_id": 3,
+          "session_id": 1,
+          "title": "Agent Runtime 架构讨论",
+          "message_ids": [
+            "c1u1",
+            "c1a1",
+            "c1u2",
+            "c1a2"
+          ],
+          "score": 0.032522,
+          "dense_score": 0.624023,
+          "lexical_score": 32.873834,
+          "scope": "user"
+        },
+        {
+          "entry_id": 2,
+          "session_id": 1,
+          "title": "Agent Runtime 架构讨论",
+          "message_ids": [
+            "c1u2",
+            "c1a2"
+          ],
+          "score": 0.016393,
+          "dense_score": null,
+          "lexical_score": 41.889276,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 2,
+      "returned_count": 2,
+      "invalid_sources": [],
+      "latency_ms": 0.0,
+      "context_tokens": 335,
+      "notes": [
+        "Dense 候选未达到相关性门槛，已拒答",
+        "低相关 Dense 候选已过滤 3 条"
+      ]
+    },
+    {
+      "id": "q22",
+      "category": "历史信息不存在",
+      "user": "alice",
+      "query": "我们讨论过量子计算采购预算吗？",
+      "no_answer": true,
+      "expected": [],
+      "returned": [],
+      "hit": false,
+      "relevant_count": 0,
+      "returned_count": 0,
+      "invalid_sources": [],
+      "latency_ms": 0.0,
+      "context_tokens": 0,
+      "notes": []
+    },
+    {
+      "id": "q23",
+      "category": "历史信息不存在",
+      "user": "alice",
+      "query": "年会抽奖奖品清单定了吗？",
+      "no_answer": true,
+      "expected": [],
+      "returned": [],
+      "hit": false,
+      "relevant_count": 0,
+      "returned_count": 0,
+      "invalid_sources": [],
+      "latency_ms": 0.0,
+      "context_tokens": 0,
+      "notes": []
+    },
+    {
+      "id": "q24",
+      "category": "历史信息不存在",
+      "user": "alice",
+      "query": "办公室绿植养护周期是多少？",
+      "no_answer": true,
+      "expected": [],
+      "returned": [],
+      "hit": false,
+      "relevant_count": 0,
+      "returned_count": 0,
+      "invalid_sources": [],
+      "latency_ms": 0.0,
+      "context_tokens": 0,
+      "notes": []
+    },
+    {
+      "id": "q25",
+      "category": "历史信息不存在",
+      "user": "alice",
+      "query": "移动端 App 上架时间定了吗？",
+      "no_answer": true,
+      "expected": [],
+      "returned": [],
+      "hit": false,
+      "relevant_count": 0,
+      "returned_count": 0,
+      "invalid_sources": [],
+      "latency_ms": 0.0,
+      "context_tokens": 0,
+      "notes": [
+        "Dense 候选未达到相关性门槛，已拒答",
+        "低相关 Dense 候选已过滤 5 条"
+      ]
+    },
+    {
+      "id": "q26",
+      "category": "相似但不相关",
+      "user": "alice",
+      "query": "缓存命中率优化用了什么算法？",
+      "no_answer": true,
+      "expected": [],
+      "returned": [],
+      "hit": false,
+      "relevant_count": 0,
+      "returned_count": 0,
+      "invalid_sources": [],
+      "latency_ms": 0.0,
+      "context_tokens": 0,
+      "notes": []
+    },
+    {
+      "id": "q27",
+      "category": "项目共享历史",
+      "user": "alice",
+      "query": "电商项目缓存热点数据多久失效？",
+      "no_answer": false,
+      "expected": [
+        "c10a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 12,
+          "session_id": 6,
+          "title": "电商项目知识库方案",
+          "message_ids": [
+            "c6u1",
+            "c6a1"
+          ],
+          "score": 0.032522,
+          "dense_score": 0.52816,
+          "lexical_score": 21.874993,
+          "scope": "user"
+        },
+        {
+          "entry_id": 18,
+          "session_id": 10,
+          "title": "电商项目缓存方案",
+          "message_ids": [
+            "c10u1",
+            "c10a1"
+          ],
+          "score": 0.026393,
+          "dense_score": null,
+          "lexical_score": 74.983668,
+          "scope": "project"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 2,
+      "invalid_sources": [],
+      "latency_ms": 16.0,
+      "context_tokens": 248,
+      "notes": [
+        "Dense 候选未达到相关性门槛，已拒答",
+        "低相关 Dense 候选已过滤 3 条"
+      ]
+    },
+    {
+      "id": "q28",
+      "category": "相似项目区分",
+      "user": "alice",
+      "query": "内部文档项目采用什么检索方式？",
+      "no_answer": false,
+      "expected": [
+        "c7a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 13,
+          "session_id": 7,
+          "title": "内部文档项目知识库方案",
+          "message_ids": [
+            "c7u1",
+            "c7a1"
+          ],
+          "score": 0.032787,
+          "dense_score": 0.743309,
+          "lexical_score": 44.7998,
+          "scope": "user"
+        },
+        {
+          "entry_id": 12,
+          "session_id": 6,
+          "title": "电商项目知识库方案",
+          "message_ids": [
+            "c6u1",
+            "c6a1"
+          ],
+          "score": 0.032258,
+          "dense_score": 0.606962,
+          "lexical_score": 29.081376,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 2,
+      "invalid_sources": [],
+      "latency_ms": 16.0,
+      "context_tokens": 257,
+      "notes": [
+        "Dense 候选未达到相关性门槛，已拒答",
+        "低相关 Dense 候选已过滤 3 条"
+      ]
+    },
+    {
+      "id": "q29",
+      "category": "已确认技术决策",
+      "user": "alice",
+      "query": "BFCL 数据集覆盖哪些能力？",
+      "no_answer": false,
+      "expected": [
+        "c12a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 20,
+          "session_id": 12,
+          "title": "Agent 评测数据集",
+          "message_ids": [
+            "c12u1",
+            "c12a1"
+          ],
+          "score": 0.032787,
+          "dense_score": 0.65985,
+          "lexical_score": 38.727136,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 1,
+      "invalid_sources": [],
+      "latency_ms": 15.0,
+      "context_tokens": 186,
+      "notes": [
+        "Dense 候选未达到相关性门槛，已拒答",
+        "低相关 Dense 候选已过滤 2 条"
+      ]
+    },
+    {
+      "id": "q30",
+      "category": "明确续接历史任务",
+      "user": "alice",
+      "query": "长期记忆是这一期做还是下一阶段？",
+      "no_answer": false,
+      "expected": [
+        "c13a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 21,
+          "session_id": 13,
+          "title": "历史会话记忆 MVP",
+          "message_ids": [
+            "c13u1",
+            "c13a1"
+          ],
+          "score": 0.016393,
+          "dense_score": null,
+          "lexical_score": 42.990252,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 1,
+      "invalid_sources": [],
+      "latency_ms": 16.0,
+      "context_tokens": 206,
+      "notes": []
+    },
+    {
+      "id": "q31",
+      "category": "精确原文定位",
+      "user": "alice",
+      "query": "文件预览面板的宽度区间是多少？",
+      "no_answer": false,
+      "expected": [
+        "c17a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 25,
+          "session_id": 17,
+          "title": "右侧文件面板宽度",
+          "message_ids": [
+            "c17u1",
+            "c17a1"
+          ],
+          "score": 0.032787,
+          "dense_score": 0.827221,
+          "lexical_score": 63.222478,
+          "scope": "user"
+        },
+        {
+          "entry_id": 22,
+          "session_id": 14,
+          "title": "沙箱预览端口",
+          "message_ids": [
+            "c14u1",
+            "c14a1"
+          ],
+          "score": 0.032258,
+          "dense_score": 0.623808,
+          "lexical_score": 21.349914,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 2,
+      "invalid_sources": [],
+      "latency_ms": 0.0,
+      "context_tokens": 232,
+      "notes": [
+        "Dense 候选未达到相关性门槛，已拒答",
+        "低相关 Dense 候选已过滤 2 条"
+      ]
+    },
+    {
+      "id": "q32",
+      "category": "已确认技术决策",
+      "user": "alice",
+      "query": "Sandbox 的两个启用条件是什么？",
+      "no_answer": false,
+      "expected": [
+        "c18a1"
+      ],
+      "returned": [
+        {
+          "entry_id": 10,
+          "session_id": 4,
+          "title": "九月部署方案",
+          "message_ids": [
+            "c4u1",
+            "c4a1"
+          ],
+          "score": 0.032522,
+          "dense_score": 0.509952,
+          "lexical_score": 15.882405,
+          "scope": "user"
+        },
+        {
+          "entry_id": 26,
+          "session_id": 18,
+          "title": "Sandbox 启用开关",
+          "message_ids": [
+            "c18u1",
+            "c18a1"
+          ],
+          "score": 0.016393,
+          "dense_score": 0.686415,
+          "lexical_score": null,
+          "scope": "user"
+        }
+      ],
+      "hit": true,
+      "relevant_count": 1,
+      "returned_count": 2,
+      "invalid_sources": [],
+      "latency_ms": 15.0,
+      "context_tokens": 233,
+      "notes": [
+        "低相关 Dense 候选已过滤 3 条"
+      ]
+    }
+  ]
+}

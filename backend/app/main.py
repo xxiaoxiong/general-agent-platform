@@ -16,7 +16,7 @@ from app.api.model import asr, models, prompts
 from app.api.knowledge import databases, knowledge
 from app.api.workflow import app_market, workflows
 from app.api.assistant import assistants, capabilities
-from app.api.chat import conversations, files
+from app.api.chat import conversations, files, memory
 from app.api.run import router as run_router
 from app.api.document import documents as document_api
 from app.api.workspace import artifacts, workspace
@@ -71,6 +71,12 @@ async def lifespan(app: FastAPI):
     evaluation_worker = get_evaluation_worker()
     await evaluation_worker.start()
 
+    # ── 历史会话索引 Worker：独立轮询 Durable Job（不阻塞 Run 领取）──
+    from app.services.conversation_memory.worker import get_conversation_index_worker
+
+    conversation_index_worker = get_conversation_index_worker()
+    await conversation_index_worker.start()
+
     # ── 自进化闭环：周期评估（确定性指标 + LLM-as-judge）────────────────
     evolution_task = None
     if getattr(settings, "EVOLUTION_ENABLED", True):
@@ -104,6 +110,9 @@ async def lifespan(app: FastAPI):
 
     # 先停测评调度，再停 Run Worker：避免 Campaign 在 Runtime 关闭后继续发起新 Run
     await get_evaluation_worker().stop()
+    from app.services.conversation_memory.worker import get_conversation_index_worker
+
+    await get_conversation_index_worker().stop()
     if runtime_worker is not None:
         await runtime_worker.stop()
     from app.services.agent_runtime.persistence import CheckpointerFactory
@@ -278,6 +287,7 @@ app.include_router(workspace.router, prefix=API_V2_PREFIX)
 app.include_router(capabilities.router, prefix=API_V2_PREFIX)
 app.include_router(assistants.router, prefix=API_V2_PREFIX)
 app.include_router(conversations.router, prefix=API_V2_PREFIX)
+app.include_router(memory.router, prefix=API_V2_PREFIX)
 app.include_router(document_api.documents, prefix=API_V2_PREFIX)
 app.include_router(document_api.profiles, prefix=API_V2_PREFIX)
 app.include_router(files.router, prefix=API_V2_PREFIX)

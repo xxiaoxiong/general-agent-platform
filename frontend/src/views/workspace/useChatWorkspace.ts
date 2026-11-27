@@ -143,10 +143,11 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
 
   // ── 消息加载与历史回放 ─────────────────────────────────────────────────────
 
-  function replayConversationRun(convId: number, runId: string, content = '') {
+  function replayConversationRun(convId: number, runId: string, content = '', messageId?: string) {
     const msg = st.pushMsg(convId, {
       role: 'assistant', content, blocks: [], runId, streaming: true, pendingActions: [],
       lastActivity: 'other', lastEventAt: Date.now(), liveStatus: '正在恢复执行进度…',
+      messageId,
     })
     const controller = new AbortController()
     st.historyStreams.set(runId, controller)
@@ -200,6 +201,7 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
           const { text, files } = messageAttachments(m.content || '', m.attachments)
           const msg = st.pushMsg(c.id, {
             role: 'user', content: text, blocks: [], files,
+            messageId: typeof m.message_id === 'string' ? m.message_id : undefined,
           })
           // 图片附件懒加载预览（不阻塞历史渲染；经响应式代理赋值触发视图刷新）
           files.forEach((f, fi) => {
@@ -226,9 +228,11 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
             role: 'assistant', content,
             blocks: content.trim() ? [{ kind: 'text', text: content }] : [],
             runStatus: 'completed', pendingActions: [],
+            messageId: typeof m.message_id === 'string' ? m.message_id : undefined,
           })
         } else {
-          replayConversationRun(c.id, runId, content)
+          replayConversationRun(c.id, runId, content,
+            typeof m.message_id === 'string' ? m.message_id : undefined)
         }
       }
       if (c.active_run_id && !assistantRuns.has(c.active_run_id)) replayConversationRun(c.id, c.active_run_id)
@@ -245,12 +249,14 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
     const id = st.numericQuery(st.route.query.conversation)
     if (!id || st.historyLoading.value || st.inactive.value) return
     if (st.currentConversation.value?.id === id) {
-      if (st.route.query.run) void scroll.focusLinkedRun()
+      if (st.route.query.message) void scroll.focusLinkedMessage()
+      else if (st.route.query.run) void scroll.focusLinkedRun()
       return
     }
     const known = st.conversations.value.find((conversation) => conversation.id === id)
     if (known) {
       await selectConversation(known)
+      if (st.route.query.message) await scroll.focusLinkedMessage()
       return
     }
     try {
@@ -258,12 +264,13 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
       if (st.inactive.value || st.numericQuery(st.route.query.conversation) !== id) return
       if (!st.conversations.value.some((conversation) => conversation.id === id)) st.conversations.value.push(item)
       await selectConversation(item)
+      if (st.route.query.message) await scroll.focusLinkedMessage()
     } catch {
       if (!st.inactive.value && st.numericQuery(st.route.query.conversation) === id) ElMessage.error('无法打开关联会话')
     }
   }
 
-  watch(() => [st.route.query.conversation, st.route.query.run], openLinkedConversation)
+  watch(() => [st.route.query.conversation, st.route.query.run, st.route.query.message], openLinkedConversation)
 
   async function removeConversation(c: Conversation) {
     if (confirmingDelete || st.deletingId.value !== null) return
@@ -370,6 +377,7 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
     const sentModelId = st.selectedModelId.value
     const sentMode = st.approvalMode.value
     const sentWebEnabled = st.webSearchOn.value
+    const sentHistoryEnabled = st.historyMemoryOn.value
     const sentTeamMode = !continueTask && st.teamMode.value
     // 目标模式（/goal）：随本次 Run 提交，不限调用次数与执行时长
     const sentGoalMode = !continueTask && st.goalMode.value
@@ -404,6 +412,7 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
         assistant_id: st.currentAssistant.value?.id,
         approval_mode: sentMode,
         web_enabled: sentWebEnabled,
+        history_enabled: sentHistoryEnabled,
         model_config_id: sentModelId || undefined,
         ...(sentTeamMode ? { team_mode: true } : {}),
         ...(sentGoalMode ? { goal_mode: true } : {}),

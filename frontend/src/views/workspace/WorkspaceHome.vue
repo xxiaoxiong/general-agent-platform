@@ -94,7 +94,8 @@
 
         <div v-else ref="threadRef" class="thread">
           <template v-for="(m, idx) in messages" :key="idx">
-            <article v-if="m.role === 'user'" :id="'q-' + idx" class="msg-user" aria-label="你的消息">
+            <article v-if="m.role === 'user'" :id="'q-' + idx" class="msg-user" aria-label="你的消息"
+              :data-message-id="m.messageId">
               <div class="msg-bubble">
                 <div v-if="m.files?.length" class="msg-files">
                   <button
@@ -114,7 +115,8 @@
               </div>
             </article>
 
-            <article v-else class="msg-assistant" aria-label="助手消息" :data-run-id="m.runId">
+            <article v-else class="msg-assistant" aria-label="助手消息" :data-run-id="m.runId"
+              :data-message-id="m.messageId">
               <div class="assistant-mark"><Bot :size="16" /></div>
               <div class="msg-content">
                 <div class="msg-heading">
@@ -134,6 +136,8 @@
                   <ToolStep v-else-if="block.kind === 'tool'" :tool="block" @preview="openPreview" />
                   <TeamRunCard v-else-if="block.kind === 'team'" :progress="block.progress" :active="Boolean(m.streaming)" />
                   <WorkPlanCard v-else-if="block.kind === 'work_plan'" :plan="block.plan" />
+                  <HistorySourcesCard v-else-if="block.kind === 'history_sources'"
+                    :sources="block.sources" :queries="block.queries" @open="openHistorySource" />
                   <VerificationCard v-else-if="block.kind === 'verification'" :report="block" :run-id="m.runId" />
                   <ProjectDeliveryCard v-else-if="block.kind === 'project'"
                     :delivery="block.delivery" :progress="block.progress" :active="Boolean(m.streaming)"
@@ -267,6 +271,7 @@
           v-model:goal-mode="goalMode"
           v-model:approval-mode="approvalMode"
           v-model:web-enabled="webSearchOn"
+          v-model:history-memory-enabled="historyMemoryOn"
           v-model:model="selectedModelId"
           :options="modelOptions"
           :attachments="attachments"
@@ -354,6 +359,7 @@ import ApprovalPanel from '@/features/run/ApprovalPanel.vue'
 import MessageMarkdown from '@/features/run/MessageMarkdown.vue'
 import TeamRunCard from '@/features/run/TeamRunCard.vue'
 import WorkPlanCard from '@/features/run/WorkPlanCard.vue'
+import HistorySourcesCard from '@/features/run/HistorySourcesCard.vue'
 import { teamPhaseLabels } from '@/features/run/teamProgress'
 import ProjectDeliveryCard from '@/features/run/ProjectDeliveryCard.vue'
 import VerificationCard from '@/features/run/VerificationCard.vue'
@@ -392,7 +398,7 @@ const {
   historyLoading, historyFailed, creatingConversation, deletingId,
   hasMoreConversations, historyLoadingMore, showWelcome, historyToggle,
   currentAssistant, loadingMessages, messagesFailed, messages,
-  inputText, teamMode, goalMode, approvalMode, webSearchOn, selectedModelId, modelOptions,
+  inputText, teamMode, goalMode, approvalMode, webSearchOn, historyMemoryOn, selectedModelId, modelOptions,
   attachments, uploading, sending, streaming, historyRun, blockedReason, steerTarget,
   pendingDecisions, documentContext, documentTask, documentInputsBusy,
   documentInputErrors, repairingProject, projectRepairErrors, downloadingDocuments,
@@ -402,6 +408,17 @@ const {
 } = st
 
 const { messagesRef, threadRef, showJumpToLatest, questionAnchors, onMessagesScroll, onWheelScroll, forceScrollToBottom, jumpToQuestion } = scroll
+
+/** 历史来源卡片：打开原会话并定位到具体消息（保留其他 query，清掉旧 run 锚点）。 */
+function openHistorySource(conversationId: number, messageId?: string) {
+  if (st.route.name !== 'Workspace') return
+  const query: Record<string, any> = { ...st.route.query }
+  query.conversation = String(conversationId)
+  if (messageId) query.message = messageId
+  else delete query.message
+  delete query.run
+  void st.router.push({ query })
+}
 
 const {
   loadConversations, loadMoreConversations, updateConversationMetadata, newConversation,
@@ -787,6 +804,12 @@ onUnmounted(() => {
 }
 @media (max-height: 630px) {
   .is-empty .composer-dock { padding-bottom: 12px; }
+}
+.msg-user.history-located, .msg-assistant.history-located {
+  border-radius: var(--ui-radius-md);
+  outline: 2px solid var(--ui-info);
+  outline-offset: 5px;
+  transition: outline-color 0.3s ease;
 }
 </style>
 

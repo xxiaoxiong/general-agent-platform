@@ -13,6 +13,8 @@ import type { MessageAttachment } from './attachmentHistory'
 export interface ChatMessage extends RunStreamMessage {
   role: 'user' | 'assistant'
   content: string
+  /** 持久化消息 ID（历史来源卡片定位用） */
+  messageId?: string
   runId?: string
   task?: DocumentTaskSelection
   files?: MessageAttachment[]

@@ -51,6 +51,8 @@ export const runApi = {
     approval_mode?: 'manual' | 'auto'
     /** 联网检索开关：false=本次 Run 禁用网络检索工具（缺省跟随助手能力包） */
     web_enabled?: boolean
+    /** 历史会话检索开关：false=本次 Run 禁用自动预取与历史检索工具（缺省跟随用户设置） */
+    history_enabled?: boolean
     /** 手动选模型（仅本次 Run 生效；缺省 = 助手默认模型） */
     model_config_id?: number
     /** 当前会话手动启用团队协作时随本次 Run 提交 */

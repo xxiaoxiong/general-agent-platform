@@ -261,6 +261,46 @@ if _AVAILABLE:
         ["kind"], registry=REGISTRY,
     )
 
+    # ── Conversation Memory（历史会话检索）────────────────────────────────
+    CONVERSATION_INDEX_JOBS = Counter(
+        "conversation_memory_index_jobs_total", "会话索引任务结果",
+        ["job_type", "status"], registry=REGISTRY,
+    )
+    CONVERSATION_INDEX_DURATION = Histogram(
+        "conversation_memory_index_duration_seconds", "会话索引任务耗时",
+        ["job_type"], registry=REGISTRY,
+        buckets=(0.05, 0.1, 0.5, 1, 3, 10, 30, 60, 180),
+    )
+    CONVERSATION_INDEX_LAG = Histogram(
+        "conversation_memory_index_lag_seconds", "消息写入到索引完成的滞后",
+        registry=REGISTRY, buckets=(0.5, 1, 3, 5, 10, 30, 60, 180, 600),
+    )
+    CONVERSATION_RETRIEVAL_DURATION = Histogram(
+        "conversation_memory_retrieval_duration_seconds", "历史会话检索耗时",
+        ["mode"], registry=REGISTRY,
+        buckets=(0.01, 0.05, 0.1, 0.3, 0.5, 1, 3, 10),
+    )
+    CONVERSATION_RETRIEVAL_RESULTS = Histogram(
+        "conversation_memory_retrieval_results", "历史会话检索命中数",
+        registry=REGISTRY, buckets=(0, 1, 2, 3, 5, 8, 12, 20),
+    )
+    CONVERSATION_RETRIEVAL_EMPTY = Counter(
+        "conversation_memory_retrieval_empty_total", "历史会话检索无结果次数",
+        ["reason"], registry=REGISTRY,
+    )
+    CONVERSATION_PLANNER = Counter(
+        "conversation_memory_planner_total", "历史检索规划结果",
+        ["result"], registry=REGISTRY,
+    )
+    CONVERSATION_CONTEXT_TOKENS = Histogram(
+        "conversation_memory_context_tokens", "注入的历史上下文 Token 数",
+        registry=REGISTRY, buckets=(0, 100, 200, 400, 800, 1200, 2000, 4000),
+    )
+    CONVERSATION_SOURCE_VIOLATION = Counter(
+        "conversation_memory_blocked_sources_total", "检索时被 ACL/存在性校验拦截的来源数",
+        registry=REGISTRY,
+    )
+
 
 def _safe(fn):
     """指标记录防御式包装：任何指标异常只记日志、不影响业务。"""
@@ -540,6 +580,48 @@ def inc_work_plan_duplicate_execution() -> None:
 @_safe
 def inc_work_plan_model_overhead(kind: str = "planner") -> None:
     WORK_PLAN_MODEL_CALL_OVERHEAD.labels(kind=(kind or "planner")[:40]).inc()
+
+
+# ── Conversation Memory ──────────────────────────────────────────────────
+
+@_safe
+def observe_conversation_index(job_type: str, status: str, seconds: float = 0.0) -> None:
+    CONVERSATION_INDEX_JOBS.labels(
+        job_type=job_type or "index", status=status or "unknown",
+    ).inc()
+    if seconds > 0:
+        CONVERSATION_INDEX_DURATION.labels(job_type=job_type or "index").observe(
+            max(0.0, seconds)
+        )
+
+
+@_safe
+def observe_conversation_index_lag(seconds: float) -> None:
+    CONVERSATION_INDEX_LAG.observe(max(0.0, seconds))
+
+
+@_safe
+def observe_conversation_retrieval(mode: str, seconds: float, results: int, *,
+                                   empty_reason: str = "") -> None:
+    CONVERSATION_RETRIEVAL_DURATION.labels(mode=mode or "hybrid").observe(max(0.0, seconds))
+    CONVERSATION_RETRIEVAL_RESULTS.observe(max(0, int(results)))
+    if empty_reason:
+        CONVERSATION_RETRIEVAL_EMPTY.labels(reason=empty_reason[:60]).inc()
+
+
+@_safe
+def inc_conversation_planner(result: str) -> None:
+    CONVERSATION_PLANNER.labels(result=(result or "unknown")[:40]).inc()
+
+
+@_safe
+def observe_conversation_context_tokens(tokens: int) -> None:
+    CONVERSATION_CONTEXT_TOKENS.observe(max(0, int(tokens)))
+
+
+@_safe
+def inc_conversation_blocked_sources(count: int = 1) -> None:
+    CONVERSATION_SOURCE_VIOLATION.inc(max(0, int(count)))
 
 
 def render() -> tuple[bytes, str]:

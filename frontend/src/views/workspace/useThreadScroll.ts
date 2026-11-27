@@ -74,6 +74,22 @@ export function useThreadScroll(st: WorkspaceState) {
     return true
   }
 
+  /** 历史来源跳转：按 message_id 定位原始消息（用户/助手均带 data-message-id）。 */
+  async function focusLinkedMessage() {
+    const id = st.route.query.message
+    if (typeof id !== 'string' || !id) return false
+    await nextTick()
+    const target = Array.from(threadRef.value?.querySelectorAll<HTMLElement>('[data-message-id]') || [])
+      .find((message) => message.dataset.messageId === id)
+    const viewport = messagesRef.value
+    if (!target || !viewport) return false
+    stickToBottom.value = false
+    viewport.scrollTop += target.getBoundingClientRect().top - viewport.getBoundingClientRect().top - 12
+    target.classList.add('history-located')
+    window.setTimeout(() => target.classList.remove('history-located'), 1800)
+    return true
+  }
+
   // ── 提问锚点导航（右侧纵向圆点：点击跳转对应提问，悬浮气泡预览内容）────────
 
   const questionAnchors = computed(() =>
@@ -117,7 +133,7 @@ export function useThreadScroll(st: WorkspaceState) {
     messagesRef, threadRef,
     stickToBottom, showJumpToLatest, questionAnchors,
     onMessagesScroll, onWheelScroll, scrollToBottom, forceScrollToBottom,
-    focusLinkedRun, jumpToQuestion, resetFollow,
+    focusLinkedRun, focusLinkedMessage, jumpToQuestion, resetFollow,
     startResizeObserver, stopResizeObserver,
   }
 }

@@ -73,6 +73,9 @@ class RuntimeContext:
     agent_config: Dict[str, Any] = field(default_factory=dict)
     db_info: Optional[Dict[str, Any]] = None
     memory_context: str = ""
+    # 历史会话检索（Conversation Memory）：独立不可信资料块与来源清单
+    history_context: str = ""
+    history_sources: List[Dict[str, Any]] = field(default_factory=list)
     task_contract: Optional[TaskContract] = None
     completion_review: Optional[Dict[str, Any]] = None
     carried_artifacts: Dict[str, str] = field(default_factory=dict)

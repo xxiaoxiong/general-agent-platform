@@ -28,6 +28,9 @@ os.environ.setdefault("EVALUATION_WORKER_ENABLED", "false")
 os.environ.setdefault("AGENT_DECISION_MODE", "off")
 # Work Orchestrator 默认关闭：既有用例不额外调用规划模型；相关用例显式 monkeypatch/传 mode
 os.environ.setdefault("AGENT_WORK_ORCHESTRATOR_MODE", "off")
+# 会话索引 Worker 不在测试进程后台运行（避免真实 Embedding/Qdrant 与 RunWorker 抢 SQLite；
+# 索引相关用例直接调用 ConversationIndexWorker.pump / index_session）
+os.environ.setdefault("CONVERSATION_MEMORY_INDEX_ENABLED", "false")
 # 测试进程禁用真实 Langfuse 导出：密钥经 .env 注入会让 SDK span 导出/flush/
 # LangChain 回调真实打 HTTP（localhost:3100），扰动租约/并发等时序敏感用例；
 # 需要 Langfuse 行为的测试自行 monkeypatch settings（见 test_observability_langfuse）

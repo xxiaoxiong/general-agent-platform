@@ -194,6 +194,9 @@ def _persist_max_len(ev_type: str) -> int:
     if ev_type.startswith("work_"):
         # 工作计划/步骤事件必须能完整回放（默认 400 字符会截断计划结构）
         return 12_000
+    if ev_type == "history_sources":
+        # 历史来源清单含标题/时间/片段，需要完整回放（不含完整原文）
+        return 6_000
     return _FULL_PAYLOAD_MAX_LEN if ev_type in _FULL_PAYLOAD_EVENTS else 400
 
 
@@ -213,6 +216,8 @@ def event_storage_payload(ev: RuntimeEvent) -> dict:
     if ev.type.startswith("work_"):
         # 计划事件含步骤列表、依赖、验收检查与产物引用：允许更多数组项
         return _redact(ev.data, max_len=12_000, max_items=64)
+    if ev.type == "history_sources":
+        return _redact(ev.data, max_len=1200, max_items=20)
     data = ev.data or {}
     if ev.type == VERIFICATION_COMPLETED and data.get("version") == 2:
         return _redact(data, max_len=1200, max_items=128)

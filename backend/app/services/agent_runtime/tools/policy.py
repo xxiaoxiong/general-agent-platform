@@ -88,6 +88,9 @@ def _bootstrap_builtin_profiles() -> None:
         ToolRiskProfile("db_count", ToolRisk.READ, **read_only),
         ToolRiskProfile("db_aggregate", ToolRisk.READ, **read_only),
         ToolRiskProfile("knowledge_search", ToolRisk.READ, **read_only),
+        # 历史会话检索（Conversation Memory）：只读、ACL 由服务端重算
+        ToolRiskProfile("search_conversation_history", ToolRisk.READ, **read_only),
+        ToolRiskProfile("get_conversation_source", ToolRisk.READ, **read_only),
         # 网络只读（GET / 搜索 / 抓取 / 天气）
         ToolRiskProfile("http_get", ToolRisk.NETWORK, network_access=True, **read_only),
         ToolRiskProfile("http_request", ToolRisk.NETWORK, network_access=True, **read_only),

@@ -100,10 +100,11 @@ class DeliveryMixin:
                     ).with_for_update())).one_or_none()
                     if live is None or (live.status, live.attempt) != (row.status, row.attempt):
                         return
+                assistant_message_id = uuid.uuid4().hex
                 await SessionRepository(db).append_messages(
                     session_id,
                     [{
-                        "message_id": uuid.uuid4().hex,
+                        "message_id": assistant_message_id,
                         "role": "assistant",
                         "content": await self._delivered_text(db, run_id, row),
                         "steps": steps,
@@ -113,6 +114,17 @@ class DeliveryMixin:
                     source_run_id=run_id,
                     replace_source=bool(row is not None and (row.input_payload or {}).get("document_retry_count")),
                 )
+                # 历史会话索引：与写回同事务入队（索引失败不影响对话，Worker 异步执行）
+                try:
+                    from app.services.conversation_memory.repository import enqueue_index_job
+
+                    await enqueue_index_job(
+                        db, session_id=session_id,
+                        user_id=row.user_id if row is not None else None,
+                        message_ids=[assistant_message_id],
+                    )
+                except Exception:  # noqa: BLE001 索引入队失败不阻断写回
+                    logger.warning("run %s 会话索引入队失败（忽略）", run_id, exc_info=True)
                 outbox_repo = SessionOutboxRepository(db)
                 if await outbox_repo.get_by_run(run_id) is None:
                     await outbox_repo.enqueue(run_id, session_id)

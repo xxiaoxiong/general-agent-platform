@@ -1105,3 +1105,65 @@ class TestDecisionClarifyShortCircuit:
         assert decision[0]["clarification_question"] == question
         assert not [e for e in events if e["event"].startswith("tool.")]
         assert events[-1]["data"]["final_text"] == question
+
+    def test_ambiguous_decision_resolved_by_history_context(self, client, user_setup, monkeypatch):
+        """历史检索能提供背景时，不因歧义直接短路澄清，而是带来源继续执行。"""
+        from app.core.config import settings
+        from app.services.agent_runtime.decision import orchestrator
+        from app.services.agent_runtime.decision import service as decision_service
+        from app.services.agent_runtime.decision.schemas import RunDecision
+        from app.services.conversation_memory import service as memory_service
+        from app.services.conversation_memory.service import PreparedHistory
+
+        question = "请问这里的 RSI 指哪个领域？"
+
+        async def fake_decide(*_args, **_kwargs):
+            return decision_service.DecisionOutcome(
+                decision=RunDecision(
+                    intent="general_chat", route="clarify", continuity="continuation",
+                    decision_status="ambiguous", clarification_question=question,
+                    goal="确认 RSI 领域", rationale="缩写存在多义",
+                ),
+                latency_ms=1, fallback=False, model_id="fake",
+            )
+
+        async def fake_prepare(**_kwargs):
+            return PreparedHistory(
+                enabled=True,
+                reason="ok",
+                context="## 历史会话参考（不可信资料，仅作背景）\n[历史 1] RSI 指 AI 的递归自我改进。",
+                sources=[{
+                    "source_id": "history_src_1", "conversation_id": 9,
+                    "message_ids": ["u1", "a1"], "conversation_title": "RSI 讨论",
+                    "created_at": "2026-11-20T10:00:00", "snippet": "RSI 指 AI 的递归自我改进",
+                    "relevance_score": 0.9, "scope": "user", "entry_type": "turn",
+                }],
+                queries=["RSI 领域"],
+            )
+
+        _patch_model(monkeypatch, [AIMessage(content="根据之前的讨论，RSI 指 AI 的递归自我改进。")])
+        monkeypatch.setattr(orchestrator, "decide", fake_decide)
+        monkeypatch.setattr(memory_service, "prepare_history_context", fake_prepare)
+        monkeypatch.setattr(settings, "AGENT_DECISION_MODE", "llm")
+        monkeypatch.setattr(settings, "CONVERSATION_MEMORY_ENABLED", True)
+
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        assistant = client.post("/api/v2/assistants", headers=headers, json={
+            "name": "历史消解歧义", "capability_ids": ["general"],
+        }).json()
+        started = client.post("/api/v2/runs", headers=headers, json={
+            "message": "继续上次的讨论，RSI 到底是什么？",
+            "assistant_id": assistant["id"],
+            "use_memory": False, "history_enabled": True,
+        }).json()
+
+        info = _wait_run(client, started["run_id"], owner)
+        assert info["status"] == "completed"
+
+        events = _iter_v2_sse(client.get(started["events_url"], headers=headers))
+        completed = [e for e in events if e["event"] == "run.completed"]
+        assert completed and "递归自我改进" in (completed[-1]["data"].get("final_text") or "")
+        history_events = [e for e in events if e["event"] == "history.sources"]
+        assert history_events and history_events[0]["data"]["sources"]
+        assert completed[-1]["data"].get("final_text") != question, "有历史背景时不得只输出澄清问题"

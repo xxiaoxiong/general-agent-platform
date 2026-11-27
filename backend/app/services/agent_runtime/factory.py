@@ -290,6 +290,9 @@ def _compose_system_prompt(ctx: RuntimeContext) -> str:
         parts.append(ctx.db_info["hint"])
     if ctx.memory_context:
         parts.append("## 参考记忆\n" + ctx.memory_context)
+    if ctx.history_context:
+        # 历史会话上下文是独立不可信资料块（不伪装成用户消息、不授予工具权限）
+        parts.append(ctx.history_context)
     if ctx.task_contract is not None and ctx.task_contract.is_complex:
         from .completion import completion_prompt
 

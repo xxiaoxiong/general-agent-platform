@@ -137,6 +137,17 @@ class ToolExecutor:
                     )
                 return normalize(await _CONTEXT_HANDLERS[tool_name](self.ctx, tool_input))
 
+            # 历史会话检索（Conversation Memory）：需要 Run 身份，ACL 由服务端重算。
+            # 延迟导入避免与 conversation_memory 包初始化形成循环依赖。
+            if tool_name in {"search_conversation_history", "get_conversation_source"}:
+                if self.ctx is None:
+                    return ToolResult.failed(
+                        f"工具 '{tool_name}' 需要 Run 上下文，当前执行环境不支持"
+                    )
+                from app.services.conversation_memory.tools import HANDLERS as HISTORY_HANDLERS
+
+                return normalize(await HISTORY_HANDLERS[tool_name](self.ctx, tool_input))
+
             # MCP 工具（mcp__<server>__<tool>）：外部 MCP 服务调用
             if tool_name.startswith(MCP_TOOL_PREFIX):
                 return await self._mcp_tool(tool_name, tool_input)
