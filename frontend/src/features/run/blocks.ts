@@ -7,6 +7,10 @@ import type { RunEventEnvelope } from '@/api/runs'
 import type { DocumentArtifact, DocumentEditReview, DocumentReviewDecision, InputRequest, ProfileDefinition } from '@/api/documents'
 import { finishTeamProgress, readTeamProgress, teamPhaseLabels, type TeamProgress } from './teamProgress.ts'
 import {
+  applyWorkStepEvent, finishWorkPlan, mergeWorkPlan, planLastActivity, readWorkPlan,
+  type WorkPlanView,
+} from './workPlan.ts'
+import {
   PROJECT_DOWNLOAD_PATH, projectPhaseLabels, readProjectDelivery, readProjectProgress, type ProjectDelivery, type ProjectProgress,
 } from './projectDelivery.ts'
 
@@ -23,6 +27,12 @@ export interface PlanBlock {
 export interface TeamBlock {
   kind: 'team'
   progress: TeamProgress
+}
+
+/** Work Orchestrator：跨执行引擎的工作计划卡片（独立命名空间，不影响 DeepAgents Todo） */
+export interface WorkPlanBlock {
+  kind: 'work_plan'
+  plan: WorkPlanView
 }
 
 export interface ProjectBlock {
@@ -136,7 +146,7 @@ export interface SteerBlock {
 }
 
 export type MsgBlock = TextBlock | ToolBlock | SubagentBlock | PlanBlock | DocumentArtifactBlock | ProfileDraftBlock
-  | InputRequestBlock | DocumentStageBlock | DocumentEditReviewBlock | SteerBlock | TeamBlock | ProjectBlock | VerificationBlock
+  | InputRequestBlock | DocumentStageBlock | DocumentEditReviewBlock | SteerBlock | TeamBlock | ProjectBlock | VerificationBlock | WorkPlanBlock
 
 /** 携带块流的运行消息（工具步骤实时穿插展示的最小状态） */
 export interface RunStreamMessage {
@@ -400,6 +410,78 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
       if (team) team.progress = progress
       else blocks.push({ kind: 'team', progress })
       msg.liveStatus = teamPhaseLabels[progress.phase]
+      msg.lastActivity = 'other'
+      break
+    }
+
+    // ── Work Orchestrator：工作计划与步骤进度（独立命名空间）─────────────────
+    case 'work.plan.created':
+    case 'work.plan.updated': {
+      const next = readWorkPlan(data)
+      if (!next) break
+      const block = blocks.find((item): item is WorkPlanBlock => item.kind === 'work_plan')
+      if (block) block.plan = mergeWorkPlan(block.plan, next)
+      else blocks.push({ kind: 'work_plan', plan: next })
+      const plan = block?.plan ?? next
+      msg.liveStatus = planLastActivity(plan)
+      msg.lastActivity = 'other'
+      break
+    }
+
+    case 'work.step.started':
+    case 'work.step.completed':
+    case 'work.step.failed':
+    case 'work.step.verification': {
+      let block = blocks.find((item): item is WorkPlanBlock => item.kind === 'work_plan')
+      if (!block) {
+        block = {
+          kind: 'work_plan',
+          plan: {
+            planId: String(data.plan_id || 'work'), revision: Number(data.revision) || 1,
+            status: 'running', mode: 'auto', objective: '', steps: [],
+            completedCount: 0, stepCount: 0,
+          },
+        }
+        blocks.push(block)
+      }
+      block.plan = applyWorkStepEvent(block.plan, ev.event, data)
+      msg.liveStatus = planLastActivity(block.plan)
+      msg.lastActivity = 'other'
+      break
+    }
+
+    case 'work.plan.completed': {
+      const next = readWorkPlan(data)
+      const block = blocks.find((item): item is WorkPlanBlock => item.kind === 'work_plan')
+      if (block) {
+        if (next) block.plan = mergeWorkPlan(block.plan, next)
+        block.plan = {
+          ...block.plan,
+          status: block.plan.status === 'degraded' ? 'degraded' : (block.plan.status || 'completed'),
+        }
+        msg.liveStatus = planLastActivity(block.plan)
+      }
+      msg.lastActivity = 'other'
+      break
+    }
+
+    case 'work.plan.degraded': {
+      const reason = String(data.reason || '').slice(0, 500)
+      const block = blocks.find((item): item is WorkPlanBlock => item.kind === 'work_plan')
+      if (block) {
+        block.plan = { ...block.plan, status: 'degraded', degradedReason: reason }
+        msg.liveStatus = planLastActivity(block.plan)
+      } else if (reason) {
+        blocks.push({
+          kind: 'work_plan',
+          plan: {
+            planId: String(data.plan_id || 'work-degraded'), revision: Number(data.revision) || 1,
+            status: 'degraded', mode: String(data.mode || 'shadow'), objective: '',
+            steps: [], completedCount: 0, stepCount: 0, degradedReason: reason,
+          },
+        })
+        msg.liveStatus = `复杂任务计划未启用：${reason}`
+      }
       msg.lastActivity = 'other'
       break
     }
@@ -824,6 +906,7 @@ export function finalizeRunMessage(
     for (const b of msg.blocks) {
       if (b.kind === 'input_request' && b.state === 'pending') b.state = 'closed'
       if (b.kind === 'team') b.progress = finishTeamProgress(b.progress, msg.runStatus)
+      if (b.kind === 'work_plan') b.plan = finishWorkPlan(b.plan, msg.runStatus)
       if (b.kind === 'tool' && b.state === 'running') {
         b.state = 'failed'
         if (!b.error) b.error = '（未收到执行结果，可能被中断）'

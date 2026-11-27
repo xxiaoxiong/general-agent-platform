@@ -54,12 +54,14 @@ async def _latest_event(db, run_id: str, event_type: str) -> dict | None:
 class TeamRun:
     def __init__(self, run: RunHandle, runtime: RuntimeContext, provider: dict, model_config: dict,
                  policy: ToolPolicy, tool_specs: list[dict], flush_budget: Callable[..., Awaitable[None]],
-                 *, project_scope: str | None = None):
+                 *, project_scope: str | None = None, thread_id: str | None = None):
         self.run = run
         self.runtime = runtime
         self.flush_budget = flush_budget
         self.budget_lock = asyncio.Lock()
         self.project_scope = project_scope
+        # Work Orchestrator：步骤级 Checkpoint 隔离；未指定时保持旧 team:{run_id} 线程
+        self.thread_id = thread_id or team_thread_id(run.run_id)
         self.model_call_limit = _PROJECT_MODEL_CALL_LIMIT if project_scope else _MODEL_CALL_LIMIT
         # 每次调用均纳入预算，关闭 SDK 内部的隐藏重试。
         model_settings = {**model_config, "extra_params": {**(model_config.get("extra_params") or {}), "max_retries": 0}}
@@ -180,7 +182,7 @@ class TeamRun:
         context = TeamGraphContext(self.invoke, self.emit, worker=self.worker,
                                    remaining_model_calls=self.remaining_model_calls)
         graph = build_team_graph(checkpointer, context)
-        config = make_run_config(team_thread_id(self.run.run_id), self.run.run_id, self.runtime.scope.user_id)
+        config = make_run_config(self.thread_id, self.run.run_id, self.runtime.scope.user_id)
         state = await graph.aget_state(config)
         initial = {} if state.values else await self._initial(messages, route, synthesize=synthesize)
         if state.values.get("deep_review") or (synthesize and needs_evidence_review(initial.get("objective", ""))):

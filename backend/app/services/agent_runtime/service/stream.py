@@ -298,6 +298,7 @@ class StreamMixin:
         ctx: Optional[RuntimeContext] = None
         project_id: Optional[int] = None
         verification: Optional[Dict[str, Any]] = None  # P4-02：验证结果（异常路径保持 None）
+        planning_input: Dict[str, Any] = {}
         team_stats: dict[str, Any] = {}
         team_incomplete: str | None = None
         log_fields: Dict[str, Any] = {
@@ -357,6 +358,9 @@ class StreamMixin:
                 from app.services.agent_runtime.decision.orchestrator import resolve_run_decision
 
                 original_context = execution_context
+                # Work Orchestrator 规划需要的资源摘要：决策完成后 decision_input 会被清理，
+                # 在决策前保留一份轻量快照（仅元信息，不含附件正文）。
+                planning_input = dict(execution_context.get("decision_input") or {})
                 # 决策器需要知道本轮真实可用工具（能力包 + 联网开关生效后的工具面），
                 # 否则会把「可联网调研」误判为普通对话
                 decision_tools = [spec["name"] for spec in self._resolve_tool_specs(agent_config)]
@@ -599,6 +603,84 @@ class StreamMixin:
                     ctx.db_info["hint"] = self._db_hint(extra_db_info)
 
                 checkpointer = await CheckpointerFactory.get().get_checkpointer()
+                store = await CheckpointerFactory.get().get_store()
+                # Work Orchestrator（off/shadow/auto）：复合任务才规划；简单任务零额外模型调用。
+                # 团队 Run 保持原有显式团队语义；文档 Run 允许“研究 → Word”这类跨引擎计划。
+                work_mode = str(getattr(settings, "AGENT_WORK_ORCHESTRATOR_MODE", "shadow"))
+                if (
+                    execution_context is not None and not is_team_run
+                    and work_mode in {"shadow", "auto"}
+                ):
+                    from app.services.work_orchestrator.integration import drive_plan, prepare_plan
+
+                    try:
+                        work_record = await prepare_plan(
+                            service=self, run=run, ctx=ctx, bus=bus,
+                            provider=provider, model_config=model_config, tool_specs=tool_specs,
+                            execution_context=execution_context, messages=messages,
+                            decision_input=planning_input, mode=work_mode,
+                            auto_team=bool(getattr(settings, "AGENT_AUTO_TEAM_ENABLED", False)),
+                            explicit_team=bool(execution_context.get("team_mode")),
+                            flush_budget=self._flush_budget,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except RunLeaseLost:
+                        raise
+                    except Exception as _work_exc:  # noqa: BLE001 Planner 故障不得拖垮简单任务
+                        logger.warning(
+                            "run %s WorkPlan 准备失败，回退原执行路线: %s",
+                            run.run_id, _work_exc, exc_info=True,
+                        )
+                        work_record = None
+                        try:
+                            await bus.publish(RuntimeEvent(
+                                type="work_plan_degraded", run_id=run.run_id,
+                                data={
+                                    "reason": f"计划准备异常：{type(_work_exc).__name__}",
+                                    "mode": work_mode,
+                                    "fallback_route": "existing_decision_route",
+                                },
+                            ))
+                        except Exception:  # noqa: BLE001
+                            logger.warning("run %s work.plan.degraded 事件发布失败", run.run_id)
+                    if work_record is not None:
+                        work_result = None
+                        for _work_attempt in range(2):
+                            _deadline = ctx.budget_deadline_at
+                            _remaining = (
+                                max(0.0, (_deadline - datetime.utcnow()).total_seconds())
+                                if _deadline else None
+                            )
+                            try:
+                                async with asyncio.timeout(_remaining) as _work_to:
+                                    work_result = await drive_plan(
+                                        service=self, run=run, ctx=ctx, bus=bus,
+                                        provider=provider, model_config=model_config,
+                                        policy=policy, tool_specs=tool_specs,
+                                        checkpointer=checkpointer, store=store,
+                                        execution_context=execution_context, messages=messages,
+                                        record=work_record, resume=resume,
+                                    )
+                                break
+                            except asyncio.TimeoutError as _te:
+                                if _work_to.expired():
+                                    raise _RunLimitExceeded(
+                                        f"运行超时（>{ctx.budget.run_timeout_seconds}s）"
+                                    ) from _te
+                                if _work_attempt >= 1:
+                                    raise RuntimeError(
+                                        "模型请求超时（单次请求无响应，非运行总时长超限），"
+                                        "自动重试未恢复，任务中断"
+                                    ) from _te
+                                await bus.publish(RuntimeEvent(
+                                    type=RUN_RETRYING, run_id=run.run_id,
+                                    data={"reason": "model_stream_timeout", "attempt": _work_attempt + 1},
+                                ))
+                        assert work_result is not None
+                        await self._finish_work_plan(run, ctx, bus, work_result)
+                        return
+
                 document_context = None
                 team = None
                 if is_team_run:
@@ -617,7 +699,6 @@ class StreamMixin:
                     )
                     agent = build_document_graph(checkpointer, document_context)
                 elif team is None:
-                    store = await CheckpointerFactory.get().get_store()
                     # 经包级属性取工厂函数：既有测试 monkeypatch
                     # app.services.agent_runtime.service.build_agent 仍可生效
                     from app.services.agent_runtime.service import build_agent as _factory_build
@@ -1012,6 +1093,67 @@ class StreamMixin:
                 except Exception:  # noqa: BLE001 释放失败由租约 TTL 兜底
                     logger.warning("run %s 释放 Workspace 写租约失败", run.run_id)
 
+    async def _finish_work_plan(self, run: RunHandle, ctx: RuntimeContext, bus: EventBus, result) -> None:
+        """WorkPlan 收尾：复用现有 Run 终态提交 / 会话写回 / 事件语义。"""
+        from app.services.work_orchestrator.integration import outcome_summary
+
+        if result.paused:
+            if run.status == STATUS_RUNNING:
+                run.transition(STATUS_WAITING_APPROVAL)
+                await self._commit(run, status=STATUS_WAITING_APPROVAL)
+                await bus.publish(RuntimeEvent(
+                    type=RUN_WAITING_APPROVAL, run_id=run.run_id,
+                    data={"actions": redact_sensitive(run.pending_actions)},
+                ))
+            return
+        if run.status != STATUS_RUNNING:
+            return
+        summary = {
+            "tool_calls": ctx.tool_calls,
+            "model_calls": ctx.model_calls,
+            "model_node_runs": ctx.model_node_runs,
+            "tokens_generated": ctx.tokens_generated,
+            "steps": ctx.steps,
+            "elapsed_seconds": round(ctx.elapsed(), 2),
+            "work_plan": outcome_summary(result),
+        }
+        verification = result.verification
+        if verification is not None:
+            if run.session_id:
+                try:
+                    await self._publish_completion_artifacts(ctx, run, verification)
+                except Exception:  # noqa: BLE001 产物冻结失败不改变验收结论
+                    logger.warning("run %s WorkPlan 产物冻结失败", run.run_id, exc_info=True)
+            summary["verification"] = verification
+            run.summary = summary
+            if verification.get("status") != "passed":
+                stop_reason = str(verification.get("stop_reason") or "")
+                limited = stop_reason in _STOP_MESSAGES
+                if limited:
+                    summary["stop"] = {"reason": stop_reason, "can_continue": False}
+                await self._fail(
+                    run,
+                    _STOP_MESSAGES[stop_reason] if limited else "任务仍有交付项未通过验收，已保存当前结果。",
+                    status=STATUS_LIMIT_EXCEEDED if limited else STATUS_FAILED,
+                    bus=bus, result_summary=summary, draft=result.final_text,
+                )
+                return
+        run.final_text = result.final_text
+        run.summary = summary
+        run.transition(STATUS_COMPLETED)
+        await self._commit(
+            run, status=STATUS_COMPLETED, final_text=run.final_text,
+            summary=summary, finished=True,
+        )
+        try:
+            await self._write_back_session(run)
+        except Exception:
+            logger.exception("run %s 完成态会话写回失败", run.run_id)
+        await bus.publish(RuntimeEvent(
+            type=RUN_COMPLETED, run_id=run.run_id,
+            data={"final_text": run.final_text, "summary": summary},
+        ))
+
     async def _with_document_preview(
         self, run: RunHandle, messages: List[Dict[str, Any]], route: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
@@ -1122,7 +1264,11 @@ class StreamMixin:
                         # FR-09：权威收集（执行侧）——先累积再发布，消费端时序无关
                         run.final_text_parts.append(text)
                         await bus.publish(RuntimeEvent(
-                            type=MODEL_DELTA, run_id=run.run_id, data={"text": text}
+                            type=MODEL_DELTA, run_id=run.run_id,
+                            data={
+                                "text": text,
+                                **({"work_step_id": ctx.work_step_id} if ctx.work_step_id else {}),
+                            },
                         ))
             elif mode == "updates":
                 if not isinstance(chunk, dict):
@@ -1168,6 +1314,7 @@ class StreamMixin:
                                     "tool": mname,
                                     "tool_call_id": tcid,
                                     "internal": True,
+                                    **({"work_step_id": ctx.work_step_id} if ctx.work_step_id else {}),
                                     **(
                                         {"error": str(m.content)[:500]}
                                         if is_err
@@ -1201,6 +1348,7 @@ class StreamMixin:
                                             "tool": tc_name,
                                             "tool_call_id": (tc.get("id") or "") if isinstance(tc, dict) else "",
                                             "internal": True,
+                                            **({"work_step_id": ctx.work_step_id} if ctx.work_step_id else {}),
                                             # 工具输入是执行证据（评测交付物采集来源）：
                                             # 只脱敏不截断，持久化统一按事件类型截断
                                             "input": redact_secrets(
@@ -1293,15 +1441,27 @@ class StreamMixin:
         artifacts = verification.get("artifacts") or []
         if not artifacts:
             return
+        # WorkPlan 的文档/项目产物已带正式下载地址（document:/project:），
+        # 只冻结会话工作区文件，避免把逻辑引用当成工作区路径。
+        workspace = [
+            artifact for artifact in artifacts
+            if not str(artifact.get("path") or "").startswith(("document:", "project:"))
+        ]
+        if not workspace:
+            return
         if run.session_id:
-            frozen = await freeze_artifacts_async(ctx, artifacts)
+            frozen = await freeze_artifacts_async(ctx, workspace)
             # 旧版 checkpoint 里的产物仍可通过原有会话链接下载。
-            paths = {**{item["path"]: item["path"] for item in artifacts if not item.get("sha256")}, **frozen}
-            verification["artifacts"] = [
-                {**artifact, "download_url": "/api/v2/artifacts/" + make_artifact_id(run.session_id, paths[artifact["path"]])}
-                for artifact in artifacts if artifact["path"] in paths
-            ]
-            if missing := [item["path"] for item in artifacts if item["path"] not in paths]:
+            paths = {**{item["path"]: item["path"] for item in workspace if not item.get("sha256")}, **frozen}
+            for artifact in artifacts:
+                if artifact not in workspace:
+                    continue
+                paths_for_artifact = paths.get(artifact["path"])
+                if paths_for_artifact:
+                    artifact["download_url"] = "/api/v2/artifacts/" + make_artifact_id(
+                        run.session_id, paths_for_artifact
+                    )
+            if missing := [item["path"] for item in workspace if item["path"] not in paths]:
                 verification["status"] = "partial"
                 verification["stop_reason"] = verification.get("stop_reason") or "artifact_publish"
                 verification["checks"] = [*verification["checks"], {

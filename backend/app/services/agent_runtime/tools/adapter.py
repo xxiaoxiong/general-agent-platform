@@ -328,6 +328,12 @@ class ToolAdapterFactory:
         # 同工具连续失败计数（误用熔断：参数各不相同的连续失败也拦，如拿 calculator 跑 shell）
         self._consecutive_failures: Dict[str, int] = {}
 
+    def _event_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Work Orchestrator：工具事件携带步骤归属（供步骤级验收与前端归组）。"""
+        if self.ctx.work_step_id:
+            data = {**data, "work_step_id": self.ctx.work_step_id}
+        return data
+
     def build(self, tool_specs: List[Dict[str, Any]], *, source: Optional[str] = None) -> List[StructuredTool]:
         """构建工具集。``source`` 为子代理名时，工具事件带 subagent 归属标记。"""
         tools: List[StructuredTool] = []
@@ -423,7 +429,8 @@ class ToolAdapterFactory:
             await self.bus.publish(RuntimeEvent(
                 type=TOOL_FAILED,
                 run_id=self.ctx.run_id,
-                data={"tool": name, "tool_call_id": tool_call_id, "error": f"策略拒绝: {e}"},
+                data=self._event_data(
+                    {"tool": name, "tool_call_id": tool_call_id, "error": f"策略拒绝: {e}"}),
             ))
             telemetry.record_tool(
                 self.ctx.to_log_fields(), tool=name, status="rejected", error=str(e),
@@ -440,7 +447,7 @@ class ToolAdapterFactory:
         await self.bus.publish(RuntimeEvent(
             type=TOOL_STARTED,
             run_id=self.ctx.run_id,
-            data=started_data,
+            data=self._event_data(started_data),
         ))
         self.ctx.tool_calls += 1
         reason = self.ctx.budget.exhausted_reason(
@@ -450,7 +457,8 @@ class ToolAdapterFactory:
             await self.bus.publish(RuntimeEvent(
                 type=TOOL_FAILED,
                 run_id=self.ctx.run_id,
-                data={"tool": name, "tool_call_id": tool_call_id, "error": reason},
+                data=self._event_data(
+                    {"tool": name, "tool_call_id": tool_call_id, "error": reason}),
             ))
             raise BudgetExceededError(f"执行预算超限: {reason}")
 
@@ -563,7 +571,7 @@ class ToolAdapterFactory:
                 await self.bus.publish(RuntimeEvent(
                     type=TOOL_COMPLETED,
                     run_id=self.ctx.run_id,
-                    data=event_data,
+                    data=self._event_data(event_data),
                 ))
                 telemetry.record_tool(
                     self.ctx.to_log_fields(), tool=name, status="completed",
@@ -581,7 +589,8 @@ class ToolAdapterFactory:
                 await self.bus.publish(RuntimeEvent(
                     type=TOOL_FAILED,
                     run_id=self.ctx.run_id,
-                    data={"tool": name, "tool_call_id": tool_call_id, "error": err_text[:500]},
+                    data=self._event_data(
+                        {"tool": name, "tool_call_id": tool_call_id, "error": err_text[:500]}),
                 ))
                 telemetry.record_tool(
                     self.ctx.to_log_fields(), tool=name, status="failed",
@@ -642,8 +651,9 @@ class ToolAdapterFactory:
         await self.bus.publish(RuntimeEvent(
             type=TOOL_COMPLETED,
             run_id=self.ctx.run_id,
-            data={"tool": name, "tool_call_id": getattr(rec, "tool_call_id", "") or "",
-                  "output": text[:2000], "replay": "cached"},
+            data=self._event_data(
+                {"tool": name, "tool_call_id": getattr(rec, "tool_call_id", "") or "",
+                 "output": text[:2000], "replay": "cached"}),
         ))
         telemetry.record_tool(self.ctx.to_log_fields(), tool=name, status="cached", duration_ms=0.0)
         return text
@@ -653,11 +663,11 @@ class ToolAdapterFactory:
         await self.bus.publish(RuntimeEvent(
             type=TOOL_FAILED,
             run_id=self.ctx.run_id,
-            data={
+            data=self._event_data({
                 "tool": name,
                 "tool_call_id": getattr(rec, "tool_call_id", "") or "",
                 "error": f"结果未知（{rec.status}），阻止自动重放",
-            },
+            }),
         ))
         telemetry.record_tool(self.ctx.to_log_fields(), tool=name, status="refused", duration_ms=0.0)
         return (
@@ -727,6 +737,7 @@ class ToolAdapterFactory:
                 args_hash=args_hash,
                 args_snapshot=args_snapshot,
                 idempotency_key=idempotency_key,
+                work_step_id=self.ctx.work_step_id,
                 lease=lease,
             )
 

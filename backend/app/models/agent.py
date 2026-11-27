@@ -265,6 +265,8 @@ class AgentToolExecution(Base):
     external_operation_id = Column(String(128), nullable=True)  # 下游业务操作 ID
     worker_id = Column(String(128), nullable=True)
     lease_version = Column(Integer, default=0, nullable=False)
+    # Work Orchestrator：步骤归属（nullable，旧 Run 无此字段仍可正常读取）
+    work_step_id = Column(String(40), nullable=True, index=True)
 
     # 人工核对（P1-03 §11 D）：needs_reconciliation 之后由管理员核对处置的审计留痕
     reconcile_decision = Column(String(32), nullable=True)   # confirmed_succeeded/confirmed_not_executed/unresolved

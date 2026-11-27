@@ -129,6 +129,15 @@ class Settings(BaseSettings):
     AGENT_DECISION_MODE: str = "llm"
     AGENT_DECISION_TIMEOUT: float = 12.0        # 秒；超时/非法输出回退规则路由
     AGENT_DECISION_MAX_TOKENS: int = 600        # 结构化决策输出上限
+    # Work Orchestrator（工作任务编排层）：
+    # off=完全走当前执行路径；shadow=生成并校验候选计划但不改变路线；
+    # auto=对符合条件的复合任务应用 WorkPlan（简单任务不增加 Planner 调用）。
+    AGENT_WORK_ORCHESTRATOR_MODE: str = "shadow"
+    AGENT_WORK_PLAN_TIMEOUT: float = 30.0       # 单次规划模型调用超时（秒；慢模型可调高）
+    AGENT_WORK_PLAN_MAX_TOKENS: int = 1200      # 规划输出 Token 上限
+    AGENT_WORK_MAX_STEPS: int = 6               # 单个 WorkPlan 最大步骤数（1~6）
+    AGENT_WORK_MAX_REPLANS: int = 1             # 单次 Run 内自动修复/重规划上限
+    AGENT_WORK_MAX_PARALLEL_STEPS: int = 1      # 跨执行器并行步骤数（初期固定串行）
     # 自动模式下是否允许软件项目意图自动进入团队工程路线（默认关闭，保持兼容）
     AGENT_AUTO_TEAM_ENABLED: bool = False
     AGENT_SANDBOX_MODE: str = "restricted"      # restricted / disabled / external（disabled 时禁用高危执行工具）
@@ -344,6 +353,20 @@ class Settings(BaseSettings):
             raise RuntimeError(
                 "配置非法：AGENT_DECISION_MODE 只能为 off / shadow / llm。"
             )
+        if self.AGENT_WORK_ORCHESTRATOR_MODE not in {"off", "shadow", "auto"}:
+            raise RuntimeError(
+                "配置非法：AGENT_WORK_ORCHESTRATOR_MODE 只能为 off / shadow / auto。"
+            )
+        if not 1 <= int(self.AGENT_WORK_MAX_STEPS) <= 6:
+            raise RuntimeError("配置非法：AGENT_WORK_MAX_STEPS 必须在 1~6 之间。")
+        if not 0 <= int(self.AGENT_WORK_MAX_REPLANS) <= 3:
+            raise RuntimeError("配置非法：AGENT_WORK_MAX_REPLANS 必须在 0~3 之间。")
+        if int(self.AGENT_WORK_MAX_PARALLEL_STEPS) != 1:
+            raise RuntimeError(
+                "配置非法：初期仅支持 AGENT_WORK_MAX_PARALLEL_STEPS=1（跨执行器串行）。"
+            )
+        if float(self.AGENT_WORK_PLAN_TIMEOUT) <= 0:
+            raise RuntimeError("配置非法：AGENT_WORK_PLAN_TIMEOUT 必须大于 0。")
         if self.asr_enabled:
             self._validate_asr_settings()
         self._validate_sandbox_settings()

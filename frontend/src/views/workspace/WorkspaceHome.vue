@@ -133,6 +133,7 @@
                   </div>
                   <ToolStep v-else-if="block.kind === 'tool'" :tool="block" @preview="openPreview" />
                   <TeamRunCard v-else-if="block.kind === 'team'" :progress="block.progress" :active="Boolean(m.streaming)" />
+                  <WorkPlanCard v-else-if="block.kind === 'work_plan'" :plan="block.plan" />
                   <VerificationCard v-else-if="block.kind === 'verification'" :report="block" :run-id="m.runId" />
                   <ProjectDeliveryCard v-else-if="block.kind === 'project'"
                     :delivery="block.delivery" :progress="block.progress" :active="Boolean(m.streaming)"
@@ -352,6 +353,7 @@ import ToolStep from '@/features/run/ToolStep.vue'
 import ApprovalPanel from '@/features/run/ApprovalPanel.vue'
 import MessageMarkdown from '@/features/run/MessageMarkdown.vue'
 import TeamRunCard from '@/features/run/TeamRunCard.vue'
+import WorkPlanCard from '@/features/run/WorkPlanCard.vue'
 import { teamPhaseLabels } from '@/features/run/teamProgress'
 import ProjectDeliveryCard from '@/features/run/ProjectDeliveryCard.vue'
 import VerificationCard from '@/features/run/VerificationCard.vue'

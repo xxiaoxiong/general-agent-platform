@@ -115,6 +115,8 @@ class RuntimeContext:
 
     # 目标模式（/goal）：不限模型调用/工具调用/执行时长，允许执行中补充要求
     goal_mode: bool = False
+    # Work Orchestrator：当前执行步骤 ID（工具事件/账本按步骤归属，供步骤级验收取证）
+    work_step_id: Optional[str] = None
 
     def elapsed(self) -> float:
         return time.monotonic() - self.started_at

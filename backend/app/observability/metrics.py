@@ -222,6 +222,45 @@ if _AVAILABLE:
         buckets=(0.01, 0.05, 0.1, 0.3, 0.5, 1, 3), registry=REGISTRY,
     )
 
+    # ── Work Orchestrator（任务书 §15）──────────────────────────────────
+    WORK_PLAN_GENERATION_LATENCY = Histogram(
+        "work_plan_generation_latency_seconds", "WorkPlan 生成耗时",
+        ["mode", "outcome"], registry=REGISTRY,
+        buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 40),
+    )
+    WORK_PLAN_INVALID = Counter(
+        "work_plan_invalid_total", "WorkPlan 非法/校验失败次数",
+        ["reason"], registry=REGISTRY,
+    )
+    WORK_PLAN_FALLBACK = Counter(
+        "work_plan_fallback_total", "WorkPlan 安全回退次数",
+        ["reason"], registry=REGISTRY,
+    )
+    WORK_PLAN_STEP_COUNT = Histogram(
+        "work_plan_step_count", "WorkPlan 步骤数",
+        buckets=(1, 2, 3, 4, 5, 6), registry=REGISTRY,
+    )
+    WORK_STEP_COMPLETION = Counter(
+        "work_step_completion_total", "工作步骤完成情况",
+        ["executor_profile", "status"], registry=REGISTRY,
+    )
+    WORK_PLAN_FINAL_VERIFICATION = Counter(
+        "work_plan_final_verification_total", "WorkPlan 最终验收结果",
+        ["status"], registry=REGISTRY,
+    )
+    WORK_PLAN_RECOVERY = Counter(
+        "work_plan_recovery_total", "WorkPlan 恢复次数",
+        ["result"], registry=REGISTRY,
+    )
+    WORK_PLAN_DUPLICATE_EXECUTION = Counter(
+        "work_plan_duplicate_execution_total", "WorkPlan 重复执行检测次数",
+        registry=REGISTRY,
+    )
+    WORK_PLAN_MODEL_CALL_OVERHEAD = Counter(
+        "work_plan_model_call_overhead_total", "编排层额外模型调用数",
+        ["kind"], registry=REGISTRY,
+    )
+
 
 def _safe(fn):
     """指标记录防御式包装：任何指标异常只记日志、不影响业务。"""
@@ -450,6 +489,57 @@ def observe_knowledge_retrieval(mode: str, seconds: float, candidates: int = 0,
 @_safe
 def observe_knowledge_reranker(seconds: float) -> None:
     KNOWLEDGE_RERANKER_DURATION.observe(max(0.0, seconds))
+
+
+# ── Work Orchestrator 指标 ──────────────────────────────────────────────
+
+@_safe
+def observe_work_plan_generation(seconds: float, *, mode: str = "auto", outcome: str = "ok") -> None:
+    WORK_PLAN_GENERATION_LATENCY.labels(mode=mode or "auto", outcome=outcome or "ok").observe(
+        max(0.0, seconds)
+    )
+
+
+@_safe
+def inc_work_plan_invalid(reason: str = "invalid") -> None:
+    WORK_PLAN_INVALID.labels(reason=(reason or "invalid")[:60]).inc()
+
+
+@_safe
+def inc_work_plan_fallback(reason: str = "unknown") -> None:
+    WORK_PLAN_FALLBACK.labels(reason=(reason or "unknown")[:60]).inc()
+
+
+@_safe
+def observe_work_plan_steps(count: int) -> None:
+    WORK_PLAN_STEP_COUNT.observe(max(1, int(count)))
+
+
+@_safe
+def observe_work_step(executor_profile: str, status: str) -> None:
+    WORK_STEP_COMPLETION.labels(
+        executor_profile=executor_profile or "unknown", status=status or "unknown",
+    ).inc()
+
+
+@_safe
+def inc_work_plan_verification(status: str) -> None:
+    WORK_PLAN_FINAL_VERIFICATION.labels(status=status or "unknown").inc()
+
+
+@_safe
+def inc_work_plan_recovery(result: str = "resumed") -> None:
+    WORK_PLAN_RECOVERY.labels(result=(result or "resumed")[:40]).inc()
+
+
+@_safe
+def inc_work_plan_duplicate_execution() -> None:
+    WORK_PLAN_DUPLICATE_EXECUTION.inc()
+
+
+@_safe
+def inc_work_plan_model_overhead(kind: str = "planner") -> None:
+    WORK_PLAN_MODEL_CALL_OVERHEAD.labels(kind=(kind or "planner")[:40]).inc()
 
 
 def render() -> tuple[bytes, str]:

@@ -111,6 +111,8 @@ class DocumentGraphContext:
         return str(result.content if isinstance(result, ToolMessage) else result)
 
     async def emit(self, event_type: str, payload: dict[str, Any]) -> None:
+        if self.runtime.work_step_id:
+            payload = {**payload, "work_step_id": self.runtime.work_step_id}
         event = RuntimeEvent(
             type=event_type, run_id=self.run.run_id, thread_id=self.run.thread_id, data=payload,
         )

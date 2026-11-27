@@ -102,6 +102,7 @@ class ToolExecutionRepository:
         args_hash: Optional[str] = None,
         args_snapshot: Optional[Dict[str, Any]] = None,
         idempotency_key: Optional[str] = None,
+        work_step_id: Optional[str] = None,
         lease: RunExecutionLease,
     ) -> Tuple[AgentToolExecution, bool]:
         """登记执行意图（prepared）。返回 (record, created)。
@@ -128,6 +129,7 @@ class ToolExecutionRepository:
             args_hash=args_hash,
             args_snapshot=args_snapshot,
             idempotency_key=idempotency_key,
+            work_step_id=work_step_id,
             status=TOOL_EXEC_PREPARED,
         )
         self.session.add(rec)

@@ -143,7 +143,7 @@ async def drive_project(team: TeamRun, checkpointer, messages: list[dict], route
         review=review, publish=publish, browser_checks=runtime_enabled, audit=audit if runtime_enabled else None,
     )
     graph = build_project_graph(checkpointer, context)
-    config = make_run_config(team_thread_id(run.run_id), run.run_id, team.runtime.scope.user_id)
+    config = make_run_config(team.thread_id, run.run_id, team.runtime.scope.user_id)
     checkpoint = await graph.aget_state(config)
     if checkpoint.values or checkpoint.next:
         return await drive_project_graph(graph, config, {})

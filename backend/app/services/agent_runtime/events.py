@@ -58,6 +58,15 @@ TEAM_UPDATED = "team.updated"
 # 执行中补充要求（通用能力）：已受理 / 已注入模型上下文
 RUN_STEERED = "run_steered"
 RUN_STEERING_APPLIED = "run_steering_applied"
+# Work Orchestrator：工作计划与步骤进度（独立命名空间，不复用 plan_updated）
+WORK_PLAN_CREATED = "work_plan_created"
+WORK_PLAN_UPDATED = "work_plan_updated"
+WORK_STEP_STARTED = "work_step_started"
+WORK_STEP_COMPLETED = "work_step_completed"
+WORK_STEP_FAILED = "work_step_failed"
+WORK_STEP_VERIFICATION = "work_step_verification"
+WORK_PLAN_COMPLETED = "work_plan_completed"
+WORK_PLAN_DEGRADED = "work_plan_degraded"
 
 # 流边界事件：消费者收到即结束本次事件流（Run 可能稍后由其他 Worker 恢复，
 # 恢复后的执行产生新的事件流）。任务书 §12.2：SSE 消费者必须能终止。
@@ -182,6 +191,9 @@ def _persist_max_len(ev_type: str) -> int:
     if ev_type == "task_decision":
         # 决策快照含目标/约束/验收标准/引用，需要完整保留供审计回放
         return 6000
+    if ev_type.startswith("work_"):
+        # 工作计划/步骤事件必须能完整回放（默认 400 字符会截断计划结构）
+        return 12_000
     return _FULL_PAYLOAD_MAX_LEN if ev_type in _FULL_PAYLOAD_EVENTS else 400
 
 
@@ -198,6 +210,9 @@ def event_storage_payload(ev: RuntimeEvent) -> dict:
         return _redact(ev.data, max_len=1200, max_items=64)
     if ev.type == WORKSPACE_PROJECT_REVIEWED:
         return redact_sensitive(ev.data, max_len=1200)
+    if ev.type.startswith("work_"):
+        # 计划事件含步骤列表、依赖、验收检查与产物引用：允许更多数组项
+        return _redact(ev.data, max_len=12_000, max_items=64)
     data = ev.data or {}
     if ev.type == VERIFICATION_COMPLETED and data.get("version") == 2:
         return _redact(data, max_len=1200, max_items=128)
@@ -295,6 +310,47 @@ class LegacyEventAdapter:
                 "type": "thought",
                 "content": f"⏸ 等待人工审批：{', '.join(map(str, tools))}",
                 "approval": {"run_id": self.run_id, "actions": redact_sensitive(ev.data.get("actions"))},
+            }]
+
+        if t == WORK_PLAN_CREATED:
+            steps = ev.data.get("steps") or []
+            lines = [
+                f"- [ ] {item.get('title') or item.get('id')}（{item.get('executor_profile')}）"
+                for item in steps[:8] if isinstance(item, dict)
+            ]
+            return [{"type": "thought", "content": "工作任务计划：\n" + "\n".join(lines)}] if lines else []
+
+        if t == WORK_STEP_STARTED:
+            return [{"type": "thought", "content": f"▶ 开始：{ev.data.get('title') or ev.data.get('step_id')}"}]
+
+        if t == WORK_STEP_COMPLETED:
+            return [{"type": "thought", "content": f"✓ 完成：{ev.data.get('title') or ev.data.get('step_id')}"}]
+
+        if t == WORK_STEP_FAILED:
+            reason = str(ev.data.get("message") or ev.data.get("error_code") or "")
+            return [{
+                "type": "thought",
+                "content": f"✗ 步骤失败：{ev.data.get('title') or ev.data.get('step_id')}"
+                           + (f"（{reason[:200]}）" if reason else ""),
+            }]
+
+        if t == WORK_STEP_VERIFICATION and (ev.data.get("status") or "passed") != "passed":
+            return [{
+                "type": "thought",
+                "content": f"步骤验收未通过：{ev.data.get('title') or ev.data.get('step_id')}",
+            }]
+
+        if t == WORK_PLAN_COMPLETED:
+            return [{
+                "type": "thought",
+                "content": f"工作计划{'完成' if ev.data.get('status') == 'completed' else '结束'}："
+                           f"{ev.data.get('completed_count', 0)}/{ev.data.get('step_count', 0)} 个步骤完成",
+            }]
+
+        if t == WORK_PLAN_DEGRADED:
+            return [{
+                "type": "thought",
+                "content": f"复杂任务计划未启用，回退到原有执行路径：{str(ev.data.get('reason') or '')[:200]}",
             }]
 
         if t == STATE_CHANGED:

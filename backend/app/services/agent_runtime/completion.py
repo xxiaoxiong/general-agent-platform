@@ -590,11 +590,13 @@ async def freeze_artifacts_async(ctx: RuntimeContext, artifacts: list[dict]) -> 
     return published
 
 
-def _event_read_evidence(events, seen_calls: set[str]) -> list[ToolEvidence]:
+def _event_read_evidence(events, seen_calls: set[str], work_step_id: str | None = None) -> list[ToolEvidence]:
     """内置文件读取工具只发 internal 事件、不写执行账本，从事件补齐读取证据（按调用 ID 去重）。"""
     evidence: list[ToolEvidence] = []
     for _, event_type, payload in sorted(events, key=lambda row: row[0]):
         if event_type != TOOL_COMPLETED or not isinstance(payload, dict) or not payload.get("internal"):
+            continue
+        if work_step_id and payload.get("work_step_id") != work_step_id:
             continue
         tool, call_id = payload.get("tool"), str(payload.get("tool_call_id") or "")
         if tool not in _READ_TOOLS or not call_id or call_id in seen_calls:
@@ -606,17 +608,21 @@ def _event_read_evidence(events, seen_calls: set[str]) -> list[ToolEvidence]:
 
 async def _collect_evidence(ctx: RuntimeContext) -> tuple[list[ToolEvidence], list[dict[str, Any]], bool]:
     ledger, internal = AgentToolExecution, AgentRunEvent
+    step_id = ctx.work_step_id
     async with AsyncSessionLocal() as db:
-        rows = (await db.execute(select(ledger.tool_name, ledger.status, ledger.external_operation_id,
-                                        ledger.result_payload, ledger.tool_call_id)
-                                 .where(ledger.run_id == ctx.run_id))).all()
+        ledger_query = select(ledger.tool_name, ledger.status, ledger.external_operation_id,
+                              ledger.result_payload, ledger.tool_call_id).where(ledger.run_id == ctx.run_id)
+        if step_id:
+            # Work Orchestrator：步骤级验收只取本步骤的工具账本证据
+            ledger_query = ledger_query.where(ledger.work_step_id == step_id)
+        rows = (await db.execute(ledger_query)).all()
         events = (await db.execute(select(internal.sequence, internal.event_type, internal.payload)
                                    .where(internal.run_id == ctx.run_id,
                                           internal.event_type.in_((TOOL_STARTED, TOOL_COMPLETED, TOOL_FAILED))))).all()
     evidence = [ToolEvidence(row.tool_name, row.status, row.external_operation_id, str(row.result_payload or ""))
                 for row in rows]
     seen_calls = {str(row.tool_call_id or "") for row in rows if row.tool_call_id}
-    evidence.extend(_event_read_evidence(events, seen_calls))
+    evidence.extend(_event_read_evidence(events, seen_calls, step_id))
     # 已获得回执或仍需核对的外部操作均阻止自动返工，避免重新推理生成另一笔操作。
     external_handled = any(row.status in _UNRESOLVED_OR_EXECUTED
                            and get_side_effect_contract(row.tool_name).side_effect_class in _EXTERNAL_CLASSES for row in rows)
@@ -625,6 +631,8 @@ async def _collect_evidence(ctx: RuntimeContext) -> tuple[list[ToolEvidence], li
     for _, event_type, payload in sorted(events, key=lambda row: row[0]):
         event = payload or {}
         if not event.get("internal") or event.get("tool") not in _FILE_TOOLS:
+            continue
+        if step_id and event.get("work_step_id") != step_id:
             continue
         call_id = str(event.get("tool_call_id") or "")
         if event_type == TOOL_STARTED:

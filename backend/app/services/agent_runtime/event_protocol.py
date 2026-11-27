@@ -57,6 +57,15 @@ V2_EVENT_NAMES: Dict[str, str] = {
     "run_steering_applied": "run.steering_applied",
     # Decision Architecture：模型建议 + 服务端最终接受结果（与 task.routed 分离）
     "task_decision": "task.decision",
+    # Work Orchestrator：工作计划与步骤进度（独立命名空间，不复用 plan.updated）
+    "work_plan_created": "work.plan.created",
+    "work_plan_updated": "work.plan.updated",
+    "work_step_started": "work.step.started",
+    "work_step_completed": "work.step.completed",
+    "work_step_failed": "work.step.failed",
+    "work_step_verification": "work.step.verification",
+    "work_plan_completed": "work.plan.completed",
+    "work_plan_degraded": "work.plan.degraded",
 }
 
 # 终止事件（消费者收到即结束本次事件流）
@@ -77,6 +86,9 @@ def _iso(ts: Optional[datetime]) -> str:
 def _reshape_data(name: str, event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """内部 payload -> v2 data（§7.1 字段口径）。"""
     payload = payload or {}
+    if name.startswith("work."):
+        # 计划事件 payload 已按协议结构化，原样透传（敏感信息在落库前已脱敏）
+        return dict(payload)
     if name == "tool.started":
         data = {
             "tool_name": payload.get("tool"),
@@ -106,7 +118,10 @@ def _reshape_data(name: str, event_type: str, payload: Dict[str, Any]) -> Dict[s
             data["replay"] = payload.get("replay")
         return data
     if name == "assistant.delta":
-        return {"text": payload.get("text") or ""}
+        data = {"text": payload.get("text") or ""}
+        if payload.get("work_step_id"):
+            data["work_step_id"] = payload.get("work_step_id")
+        return data
     if name == "subagent.started" or name == "subagent.completed":
         data = {"name": payload.get("name")}
         if payload.get("tool_call_id"):

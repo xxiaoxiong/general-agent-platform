@@ -43,6 +43,8 @@ backend/
     sandbox/          # Workspace Sandbox 控制面（manager/runtime/scheduler/jobs/preview/
                       #   service_manager/agent_client/write_lease/reconciler/session_files）
     tools/            # 工具注册表与执行器（含 sandbox_tools.py）
+    work_orchestrator/ # 工作任务编排层（schemas/planner/validator/registry/
+                      #   graph/adapters/integration；跨 DeepAgents/Document/Team/Project）
   app/sandbox_runner/ # 独立 Sandbox Runner 进程（Docker Provider / Job 执行 / Gateway）
   app/knowledge_worker/ # 独立 Knowledge Ingestion Worker（解析/OCR/Embedding/Qdrant 写入）
   app/preview_proxy/  # 独立 Preview Proxy（Preview Grant 校验 + HTTP/WS 转发）
@@ -64,8 +66,9 @@ docs/                 # 需求设计、任务书、阶段交付说明（历史�
 
 ```bash
 # 后端测试（必须在 backend/ 目录下执行，否则 ModuleNotFoundError: app）
-cd backend && python -m pytest -q                 # 全量回归（~1101 passed）
+cd backend && python -m pytest -q                 # 全量回归（~1125 passed, 13 skipped）
 cd backend && python -m pytest tests/test_xxx.py -q   # 单文件
+cd backend && python -m pytest tests/test_work_orchestrator_graph.py tests/test_work_planner.py tests/test_work_plan_schema.py tests/test_work_orchestrator_integration.py -q  # Work Orchestrator
 cd backend && python -m pytest tests/test_knowledge_rag.py -q  # Knowledge RAG（真实解析/Embedding/Qdrant）
 
 # 知识库迁移与评测（backend/ 目录）
@@ -112,6 +115,8 @@ cd backend && python -m alembic upgrade head
 - **可观测**：Agent Run 上报 Langfuse trace（确定性 `trace_id = create_trace_id(seed=f"run:{run_id}")`，15-span 树）；trace URL 必须为 `{base}/project/{project_id}/traces/{trace_id}`（缺 projectId 会 404）。评估结果回写 Langfuse scores。
 - **自进化闭环**：`evolution/metrics.py` 从 `agent_tool_executions` / `agent_approvals` / `agent_run_events` 算确定性指标；`judge.py` 做六维 LLM 裁判；`evolution_advisor.py` 生成建议并支持应用/回滚/验证；`dev_briefing.py` 汇总**纯客观数据**供开发迭代决策。
 - **Durable Execution**：LangGraph state 由共享 PostgreSQL Checkpointer（`checkpoint_pg` 服务）持久化，多 Worker / 重启可恢复。
+- **Work Orchestrator**：复合任务由 `services/work_orchestrator` 规划、校验和跨引擎调度；简单任务不额外调用 Planner。一个用户任务仍只有一个 `AgentRun` / `RunWorker` / EventBus；编排状态在 `work:{run_id}` Checkpoint，步骤执行器在 `work:{run_id}:step:{step_id}`；计划快照在 `input_payload.execution_context.work_plan`；`work.plan.*` / `work.step.*` 事件独立于 DeepAgents 的 `plan.updated`。
+- **Work Orchestrator 执行器**：`executor_profile` 只能由服务端 Registry 解析到真实引擎（DeepAgents / Document Graph / Team Graph / Team Project Graph）；模型不能指定工具名、类名、URL、工作区路径或权限。默认 `AGENT_WORK_ORCHESTRATOR_MODE=shadow`，回滚用 `off`。
 
 ## 测试约定
 
@@ -159,6 +164,10 @@ cd backend && python -m alembic upgrade head
 34. **Qdrant 数据卷名固定**：`ai-generalplat_qdrant_data`，不要重建容器时丢索引；Backend/Worker 都不允许把 Qdrant 端口映射到宿主/公网（`KNOWLEDGE_QDRANT_API_KEY` 生产必须设置）。
 35. **Docling 只在 Worker 镜像**：Backend 镜像装 fastembed/rapidocr/pypdfium2，不装 Docling（重型解析依赖）；`KNOWLEDGE_PARSER_PROVIDER=auto` 时 Worker 用 Docling、宿主机/测试用 Native 结构化解析器。新增格式解析不要把所有逻辑堆进 `knowledge_service.py`（旧文件仅保留回退链路）。
 36. **知识库 ACL 与 Agent 绑定是两层防线**：所有 API 走 `knowledge_acl.require_base_access`（owner/项目角色/组织只读），Agent Tool 每次检索再用 Run Context 复核用户 ACL；无权限统一 404（防 IDOR 枚举）。
+37. **Work Orchestrator 不得新建第二套 Run 生命周期**：步骤复用同一 `AgentRun` / `RunWorker` / Lease / EventBus / ToolPolicy / Ledger；不要在 `work_orchestrator` 里再建 Worker、队列或 Run 状态机。编排图只做调度与验收。
+38. **编排图 Thread 与步骤 Thread 必须分离**：编排状态用 `work:{run_id}`；步骤执行器用 `work:{run_id}:step:{step_id}`（重试用 `:attempt:N`）。不要复用 `agent-{id}-session-{sid}`，否则与直接路径串状态。
+39. **WorkPlan 快照写入必须带 Lease/Fencing**：运行态写 `agent_runs.input_payload.execution_context.work_plan` 前必须 `verify_running_lease`；暂停态不写快照（Run 状态 + Checkpoint 是权威），不要无保护覆盖整个 `input_payload`。
+40. **WorkPlan 事件不得复用 `plan.updated`**：`plan.updated` 是 DeepAgents Todo；计划事件必须走 `work_plan_*` → `work.plan.*` / `work.step.*`，且存储上限不能落回默认 400 字符（否则计划无法回放）。`work_step_id` 只做 nullable 扩展，旧账本读取路径保持兼容。
 
 ## 修改范围原则
 
