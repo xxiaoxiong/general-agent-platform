@@ -27,7 +27,13 @@ async def check_source_bindings(
     db: AsyncSession, user_id: int | None, config: dict[str, Any]
 ) -> DatabaseConnection | None:
     connection_id = config.get("database_connection_id")
-    knowledge_id = config.get("knowledge_base_id")
+    knowledge_ids = [
+        int(x) for x in (
+            config.get("knowledge_base_ids")
+            or ([config.get("knowledge_base_id")] if config.get("knowledge_base_id") else [])
+        ) if x
+    ]
+    knowledge_ids = list(dict.fromkeys(knowledge_ids))
     connection = None
     if connection_id is not None:
         connection = await db.scalar(select(DatabaseConnection).where(
@@ -45,12 +51,20 @@ async def check_source_bindings(
                 raise SourceBindingError("SQLite 数据源路径无效") from None
             if not in_workspace and not await db.scalar(select(User.is_superuser).where(User.id == user_id)):
                 raise SourceBindingError("当前用户无权读取该 SQLite 数据源位置")
-    if knowledge_id is not None:
-        knowledge = await db.scalar(select(KnowledgeBase.id).where(
-            KnowledgeBase.id == knowledge_id, KnowledgeBase.owner_id == user_id,
-            KnowledgeBase.is_active.is_(True),
-        ))
-        if knowledge is None:
+    if knowledge_ids:
+        user = await db.scalar(select(User).where(User.id == user_id))
+        if user is None:
+            raise SourceBindingError("助手绑定的知识库不存在或当前用户无权访问")
+        from app.services.knowledge.acl import accessible_bases_filter
+
+        allowed = (await db.execute(
+            select(KnowledgeBase.id).where(
+                KnowledgeBase.id.in_(knowledge_ids),
+                accessible_bases_filter(user),
+                KnowledgeBase.is_active.is_(True),
+            )
+        )).scalars().all()
+        if set(int(x) for x in allowed) != set(knowledge_ids):
             raise SourceBindingError("助手绑定的知识库不存在或当前用户无权访问")
     return connection
 

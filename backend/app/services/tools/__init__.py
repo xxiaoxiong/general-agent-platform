@@ -116,6 +116,14 @@ class ToolExecutor:
             if tool_name in _DB_HANDLERS:
                 return normalize(await _DB_HANDLERS[tool_name](self.db, tool_input))
 
+            # 知识检索：需要 Run Context 复核用户 ACL（撤销授权立即生效）
+            if tool_name == "knowledge_search":
+                from .knowledge_tools import execute_knowledge_search
+
+                return normalize(await execute_knowledge_search(
+                    self.db, self.agent_config, tool_input, ctx=self.ctx,
+                ))
+
             if tool_name in _AGENT_HANDLERS:
                 return normalize(
                     await _AGENT_HANDLERS[tool_name](self.db, self.agent_config, tool_input)

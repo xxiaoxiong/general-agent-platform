@@ -21,6 +21,10 @@ def assistant_to_dict(a: Agent, version: Optional[AgentVersion] = None) -> Dict[
         "tools": list(a.tools or []),
         "model_config_id": a.model_config_id,
         "knowledge_base_id": a.knowledge_base_id,
+        "knowledge_base_ids": list(
+            getattr(a, "knowledge_base_ids", None)
+            or ([a.knowledge_base_id] if a.knowledge_base_id else [])
+        ),
         "database_connection_id": a.database_connection_id,
         "max_iterations": a.max_iterations,
         "temperature": a.temperature,

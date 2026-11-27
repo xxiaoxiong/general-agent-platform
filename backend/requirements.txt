@@ -63,6 +63,12 @@ prometheus-client==0.26.0
 
 # Vector DB
 chromadb==1.5.9
+# Knowledge RAG：真实 Embedding（本地 ONNX）/ Qdrant / OCR / PDF 渲染 / HTML 解析
+fastembed==0.9.1
+qdrant-client==1.20.0
+pypdfium2==5.15.2
+beautifulsoup4==4.15.0
+rapidocr-onnxruntime==1.4.4
 
 # Document Processing
 pypdf==7.0.0

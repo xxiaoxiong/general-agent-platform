@@ -1,0 +1,11 @@
+# Knowledge Ingestion Worker 专用依赖：在 Backend 依赖之上增加 Docling 多格式解析。
+# Backend 镜像不安装 Docling（避免解析/OCR 重型依赖拖慢 API 进程）；
+# Worker 镜像通过 docker/knowledge-worker.Dockerfile 安装本文件。
+-r requirements.txt
+
+# Docling：PDF/DOCX/PPTX/XLSX/Markdown/HTML/CSV/图片 统一结构化解析
+# （含版面分析 / 表格结构 / OCR 流水线；模型在镜像构建阶段预下载）
+# 2.153.0：docling-slim 在 PyPI/国内镜像均有同步发布；2.154.0 的 slim 镜像尚未同步。
+docling==2.153.0
+
+# 旧版二进制 Office 转换（doc/xls/ppt）由 apt 的 libreoffice 提供

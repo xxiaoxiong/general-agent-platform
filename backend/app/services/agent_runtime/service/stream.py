@@ -566,7 +566,9 @@ class StreamMixin:
                 tool_specs = [
                     spec for spec in tool_specs
                     if (spec["name"] not in DATABASE_TOOLS or agent_config.get("database_connection_id"))
-                    and (spec["name"] != "knowledge_search" or agent_config.get("knowledge_base_id"))
+                    and (spec["name"] != "knowledge_search"
+                         or agent_config.get("knowledge_base_ids")
+                         or agent_config.get("knowledge_base_id"))
                 ]
             policy = ToolPolicy.from_settings({s["name"] for s in tool_specs}, enable_hitl=ctx.enable_hitl)
             # MCP 工具 HITL 审批面：requires_approval 的 MCP 工具进入 interrupt_on 集合

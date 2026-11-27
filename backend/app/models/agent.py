@@ -33,8 +33,9 @@ class Agent(Base):
     capability_ids = Column(JSON, default=list)
     is_default = Column(Boolean, default=False)
 
-    # 知识库关联（可选）
+    # 知识库关联（可选）：旧单库字段保留兼容；多库授权以 knowledge_base_ids 为准
     knowledge_base_id = Column(Integer, ForeignKey("knowledge_bases.id"), nullable=True)
+    knowledge_base_ids = Column(JSON, default=list)
 
     # 数据库连接关联（可选，用于自然语言查询外部数据库）
     database_connection_id = Column(Integer, ForeignKey("database_connections.id"), nullable=True)

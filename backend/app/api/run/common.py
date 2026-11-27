@@ -31,6 +31,10 @@ async def _load_agent_config(db: AsyncSession, agent: Agent, *, use_memory: bool
             "tools": list(agent.tools or []),
             "capability_ids": list(getattr(agent, "capability_ids", None) or []),
             "knowledge_base_id": agent.knowledge_base_id,
+            "knowledge_base_ids": list(
+                getattr(agent, "knowledge_base_ids", None)
+                or ([agent.knowledge_base_id] if agent.knowledge_base_id else [])
+            ),
             "database_connection_id": agent.database_connection_id,
         }
     cfg["name"] = agent.name

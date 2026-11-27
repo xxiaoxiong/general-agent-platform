@@ -55,9 +55,13 @@ def build_snapshot(
         # skill references / subagent profiles（P2-05/P2-06 注册表接管后填充）
         "skill_sources": [],
         "subagent_profiles": [],
-        # resource bindings
+        # resource bindings（多知识库授权快照 + 旧单库字段兼容）
         "resource_bindings": {
             "knowledge_base_id": agent.knowledge_base_id,
+            "knowledge_base_ids": list(
+                getattr(agent, "knowledge_base_ids", None)
+                or ([agent.knowledge_base_id] if agent.knowledge_base_id else [])
+            ),
             "database_connection_id": agent.database_connection_id,
         },
         # memory policy（P2-04 Store 接管后细化）
@@ -153,5 +157,9 @@ def config_from_version(version: AgentVersion) -> Dict[str, Any]:
         "tools": snap.get("tools") or [],
         "capability_ids": snap.get("capability_ids") or [],
         "knowledge_base_id": resources.get("knowledge_base_id"),
+        "knowledge_base_ids": list(
+            resources.get("knowledge_base_ids")
+            or ([resources.get("knowledge_base_id")] if resources.get("knowledge_base_id") else [])
+        ),
         "database_connection_id": resources.get("database_connection_id"),
     }

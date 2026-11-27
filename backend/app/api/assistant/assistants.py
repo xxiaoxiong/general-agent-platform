@@ -64,11 +64,22 @@ def _validate_capability_ids(
     return ids
 
 
-def _bindings(knowledge_base_id, database_connection_id) -> dict:
+def _bindings(knowledge_base_id, database_connection_id, knowledge_base_ids=None) -> dict:
+    ids = [int(x) for x in (knowledge_base_ids or []) if x]
+    if not ids and knowledge_base_id:
+        ids = [int(knowledge_base_id)]
     return {
-        "knowledge_base": knowledge_base_id,
+        "knowledge_base": ids or None,
+        "knowledge_base_id": knowledge_base_id,
         "database_connection": database_connection_id,
     }
+
+
+def _knowledge_ids(body) -> list:
+    ids = [int(x) for x in (getattr(body, "knowledge_base_ids", None) or []) if x]
+    if not ids and getattr(body, "knowledge_base_id", None):
+        ids = [int(body.knowledge_base_id)]
+    return list(dict.fromkeys(ids))
 
 
 async def _check_bindings(db: AsyncSession, user_id: int, config: dict) -> None:
@@ -125,10 +136,12 @@ async def create_assistant(
     """创建助手（草稿确认后一键创建并立即使用）。"""
     capability_ids = _validate_capability_ids(
         body.capability_ids,
-        _bindings(body.knowledge_base_id, body.database_connection_id),
+        _bindings(body.knowledge_base_id, body.database_connection_id,
+                  body.knowledge_base_ids),
     )
     await _check_bindings(db, current_user.id, {
         "knowledge_base_id": body.knowledge_base_id,
+        "knowledge_base_ids": _knowledge_ids(body),
         "database_connection_id": body.database_connection_id,
     })
     agent = Agent(
@@ -140,6 +153,7 @@ async def create_assistant(
         tools=body.tools,
         model_config_id=body.model_config_id,
         knowledge_base_id=body.knowledge_base_id,
+        knowledge_base_ids=_knowledge_ids(body),
         database_connection_id=body.database_connection_id,
         max_iterations=body.max_iterations,
         temperature=str(body.temperature),
@@ -190,14 +204,26 @@ async def patch_assistant(
             _bindings(
                 data.get("knowledge_base_id", agent.knowledge_base_id),
                 data.get("database_connection_id", agent.database_connection_id),
+                data.get("knowledge_base_ids", getattr(agent, "knowledge_base_ids", None)),
             ),
         )
     if "temperature" in data and data["temperature"] is not None:
         data["temperature"] = str(data["temperature"])
-    if {"knowledge_base_id", "database_connection_id"}.intersection(data):
+    if "knowledge_base_ids" in data:
+        ids = [int(x) for x in (data.get("knowledge_base_ids") or []) if x]
+        data["knowledge_base_ids"] = list(dict.fromkeys(ids))
+        # 兼容旧字段：多库时 knowledge_base_id 取第一个（只是旧 UI 的展示锚点）
+        if ids and not data.get("knowledge_base_id"):
+            data["knowledge_base_id"] = ids[0]
+    if {"knowledge_base_id", "knowledge_base_ids", "database_connection_id"}.intersection(data):
         await _check_bindings(db, current_user.id, {
-            key: data.get(key, getattr(agent, key))
-            for key in ("knowledge_base_id", "database_connection_id")
+            "knowledge_base_id": data.get("knowledge_base_id", agent.knowledge_base_id),
+            "knowledge_base_ids": data.get(
+                "knowledge_base_ids", getattr(agent, "knowledge_base_ids", None)
+            ) or ([agent.knowledge_base_id] if agent.knowledge_base_id else []),
+            "database_connection_id": data.get(
+                "database_connection_id", agent.database_connection_id
+            ),
         })
     for field, val in data.items():
         setattr(agent, field, val)
@@ -238,13 +264,16 @@ async def publish_assistant(
 
     await _check_bindings(db, current_user.id, {
         "knowledge_base_id": agent.knowledge_base_id,
+        "knowledge_base_ids": list(getattr(agent, "knowledge_base_ids", None) or [])
+        or ([agent.knowledge_base_id] if agent.knowledge_base_id else []),
         "database_connection_id": agent.database_connection_id,
     })
     capability_ids = None
     if body and body.capability_ids is not None:
         capability_ids = _validate_capability_ids(
             body.capability_ids,
-            _bindings(agent.knowledge_base_id, agent.database_connection_id),
+            _bindings(agent.knowledge_base_id, agent.database_connection_id,
+                      getattr(agent, "knowledge_base_ids", None)),
         )
     version = await publish_version(db, agent_id, created_by=current_user.id,
                                     capability_ids=capability_ids)

@@ -31,6 +31,8 @@ backend/
   app/services/       # 业务逻辑
     agent_runtime/    # Agent 执行内核（service/ 包 = core + lifecycle/stream/approval/
                       #   delivery/config 五个 Mixin + _common，导入路径兼容层见 service/__init__）
+    knowledge/        # 知识库解析/切分/Embedding/Qdrant/检索（parsers/ embedding/
+                      #   chunking/ retrieval/ ingestion/ evaluation/ acl/ security/ storage）
     assistant/        # 助手域（capability / versions / task_contract / verification / model_router）
     audit/            # 审计（core / capture / context / http）
     documents/        # 文档智能
@@ -42,6 +44,7 @@ backend/
                       #   service_manager/agent_client/write_lease/reconciler/session_files）
     tools/            # 工具注册表与执行器（含 sandbox_tools.py）
   app/sandbox_runner/ # 独立 Sandbox Runner 进程（Docker Provider / Job 执行 / Gateway）
+  app/knowledge_worker/ # 独立 Knowledge Ingestion Worker（解析/OCR/Embedding/Qdrant 写入）
   app/preview_proxy/  # 独立 Preview Proxy（Preview Grant 校验 + HTTP/WS 转发）
   app/browser_service/ # 独立内置浏览器（无头 Chromium + CDP 帧流 + 输入转发）
   app/observability/  # langfuse_tracing.py、otel_tracing.py、metrics.py
@@ -61,8 +64,14 @@ docs/                 # 需求设计、任务书、阶段交付说明（历史�
 
 ```bash
 # 后端测试（必须在 backend/ 目录下执行，否则 ModuleNotFoundError: app）
-cd backend && python -m pytest -q                 # 全量回归（~550 passed）
+cd backend && python -m pytest -q                 # 全量回归（~1101 passed）
 cd backend && python -m pytest tests/test_xxx.py -q   # 单文件
+cd backend && python -m pytest tests/test_knowledge_rag.py -q  # Knowledge RAG（真实解析/Embedding/Qdrant）
+
+# 知识库迁移与评测（backend/ 目录）
+cd backend && python -m scripts.migrate_legacy_knowledge          # 旧索引体检
+cd backend && python -m scripts.migrate_legacy_knowledge --apply --run
+cd backend && python -m scripts.knowledge_eval --kb-id 1 --dataset golden.json --mode hybrid
 
 # 前端（vue-tsc 类型检查 + 构建）
 cd frontend && npm run build
@@ -141,6 +150,15 @@ cd backend && python -m alembic upgrade head
 25. **Sandbox 长期服务必须监听 `0.0.0.0` 且由 `start_service` 管理**：`execute_command` 结束后 workspace-agent 会清理残留后台进程（`&`/nohup 启动的 dev server 不可用）；健康检查同时探测 IPv4/IPv6 回环与容器非回环 IP，仅监听 localhost 会标记 unhealthy 并写提示；`start_service` 启动前检测端口占用；同名同端口服务停止后可用新命令重新启动（更新原记录）。
 26. **内置浏览器是独立 `browser-service` 进程**：`app/browser_service` 用无头 Chromium + CDP screencast，经 `{token}.preview.internal`（Preview Proxy，Grant 校验）访问 Sandbox；不挂 Docker Socket、不映射端口、不加入 Sandbox 网络。`BROWSER_SERVICE_TOKEN` 为空时 fail-closed；镜像必须安装 `uvicorn[standard]`（否则 WebSocket 升级 404）；Nginx `/api/v2/workspaces/browser-sessions/` 必须转发 `Upgrade`，Vite dev 代理需 `ws: true`。会话 JWT 绑定用户/项目/服务，WS 连接每次复核 ACL。
 27. **Preview Proxy / Runner Gateway 必须原样转发查询串**：不要用 `request.query_params` 重新编码（空值标记会变成 `key=`）。Vite 的 `?vue&type=style&index=0&lang.css` 被改写后会把样式模块当直接 CSS 返回，浏览器执行 CSS 报 `Unexpected token '*'`、页面白屏。使用 `_forward_query` / `_raw_query` 保留原始 query string。
+28. **Knowledge 解析 / OCR / Embedding 只在 `knowledge-worker` 执行**：Backend 请求进程只做控制面与检索查询；不要在 API 里恢复 `BackgroundTasks` 长任务。Job 以 MySQL 为权威队列（Lease/Heartbeat/attempt），Redis 最多做唤醒。
+29. **Embedding 模型 / 维度变更必须开新 Generation**：Qdrant Collection 由 `模型+维度` 决定，Payload 带 `index_generation_id`；检索过滤只能由服务端注入，不允许模型/前端传任意 kb/owner 条件。维度不匹配必须显式失败，不得静默写入。
+30. **低相关拒答阈值必须按评测集校准**：不要用"本次查询最高分"归一化冒充相关性。`KNOWLEDGE_MIN_DENSE_SCORE` 是绝对余弦阈值；`KNOWLEDGE_MIN_LEXICAL_COVERAGE` 用 IDF 覆盖率过滤只命中"的/是"等常见字的 BM25 噪声。改阈值后跑 `scripts/knowledge_eval.py` / 质量评测页对比 Recall、No-answer Accuracy。
+31. **上传必须流式 + Magic Bytes**：禁止恢复 `await file.read()` 全量读内存；Office ZIP 必须检查解压大小/条目数（压缩炸弹）；未支持格式明确拒绝，不能按 UTF-8 文本兜底后标记成功。
+32. **解析失败不得冒充成功**：`done` 语义已废弃，只有 Chunk + Qdrant Point 数校验通过才写 `ready/partial`；`empty_extraction` / `source_missing` / `unsupported_format` 必须是 failed 或 migration_required。
+33. **删除顺序固定**：先标记 `deleting`（阻止检索命中）→ 删 Qdrant Points → 删 Chunk → 删解析产物/源文件 → 删版本/Job/文档行 → 重算统计。不要先删索引再因事务失败留下"表面正常但无法检索"的知识库。
+34. **Qdrant 数据卷名固定**：`ai-generalplat_qdrant_data`，不要重建容器时丢索引；Backend/Worker 都不允许把 Qdrant 端口映射到宿主/公网（`KNOWLEDGE_QDRANT_API_KEY` 生产必须设置）。
+35. **Docling 只在 Worker 镜像**：Backend 镜像装 fastembed/rapidocr/pypdfium2，不装 Docling（重型解析依赖）；`KNOWLEDGE_PARSER_PROVIDER=auto` 时 Worker 用 Docling、宿主机/测试用 Native 结构化解析器。新增格式解析不要把所有逻辑堆进 `knowledge_service.py`（旧文件仅保留回退链路）。
+36. **知识库 ACL 与 Agent 绑定是两层防线**：所有 API 走 `knowledge_acl.require_base_access`（owner/项目角色/组织只读），Agent Tool 每次检索再用 Run Context 复核用户 ACL；无权限统一 404（防 IDOR 枚举）。
 
 ## 修改范围原则
 

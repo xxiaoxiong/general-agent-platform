@@ -515,6 +515,28 @@ class WorkflowEngine:
         if not kb:
             return {"status": "error", "error": "知识库不存在"}
 
+        if kb.active_index_generation_id:
+            from app.services.knowledge.retrieval import (
+                KnowledgeRetrievalService, RetrievalOptions,
+            )
+
+            retrieved = await KnowledgeRetrievalService(db).search(
+                knowledge_base_ids=[kb.id], query=query,
+                options=RetrievalOptions(top_k=int(top_k or 3)),
+            )
+            items = [
+                {
+                    "content": item.context,
+                    "score": item.score,
+                    "document_id": (item.citation or {}).get("document_id"),
+                    "filename": (item.citation or {}).get("filename"),
+                    "citation": item.citation,
+                }
+                for item in retrieved.items
+            ]
+            return {"status": "ok", "results": items, "query": query,
+                    "retrieval_mode": retrieved.mode, "retrieval_id": retrieved.retrieval_id}
+
         items = await KnowledgeService.search(
             collection_name=kb.collection_name,
             query=query,
@@ -559,6 +581,10 @@ class WorkflowEngine:
             # P3-07：能力包随配置进入 Runtime（工作流 Agent 节点与对话同口径）
             "capability_ids": getattr(agent, "capability_ids", None) or [],
             "knowledge_base_id": agent.knowledge_base_id,
+            "knowledge_base_ids": list(
+                getattr(agent, "knowledge_base_ids", None)
+                or ([agent.knowledge_base_id] if agent.knowledge_base_id else [])
+            ),
         }
 
         messages = [{"role": "user", "content": user_input}]

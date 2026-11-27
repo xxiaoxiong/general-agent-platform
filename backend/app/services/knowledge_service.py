@@ -100,12 +100,22 @@ class KnowledgeService:
 
     @staticmethod
     def _split_text(text: str, chunk_size: int = 500, chunk_overlap: int = 50) -> List[str]:
+        """旧版字符切分（仅历史回退链路使用）。
+
+        任务书 §1.4 P1：``chunk_overlap >= chunk_size`` 会使步长为零/负数导致
+        死循环；这里显式修正为安全步长，新链路请使用结构感知 Chunker。
+        """
+        chunk_size = max(1, int(chunk_size or 1))
+        chunk_overlap = max(0, int(chunk_overlap or 0))
+        if chunk_overlap >= chunk_size:
+            chunk_overlap = max(0, chunk_size // 5)
+        step = max(1, chunk_size - chunk_overlap)
         chunks = []
         start = 0
         while start < len(text):
             end = start + chunk_size
             chunks.append(text[start:end])
-            start += chunk_size - chunk_overlap
+            start += step
         return [c for c in chunks if c.strip()]
 
     @staticmethod

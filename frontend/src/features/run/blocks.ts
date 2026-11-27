@@ -48,6 +48,18 @@ export interface ToolSource {
   desc?: string
   /** 来源发布时间（SearXNG publishedDate），时效判断依据 */
   published?: string
+  /** 来源类型：knowledge=企业知识库引用（不可点击跳转，展示文件名与页码） */
+  kind?: string
+  knowledge_base_id?: number
+  knowledge_base_name?: string
+  document_id?: number
+  chunk_id?: string
+  page_start?: number | null
+  page_end?: number | null
+  sheet_name?: string | null
+  slide_number?: number | null
+  heading_path?: string[]
+  score?: number
 }
 
 export interface ToolBlock {

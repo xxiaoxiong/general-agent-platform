@@ -7,12 +7,21 @@ RUN apt-get update && apt-get install -y \
     gcc \
     default-libmysqlclient-dev \
     pkg-config \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY backend/requirements.txt .
 # PIP_INDEX_URL 可在构建时覆盖（compose 构建参数默认使用国内镜像加速）
 ARG PIP_INDEX_URL=https://pypi.org/simple
 RUN pip install --no-cache-dir -i ${PIP_INDEX_URL} -r requirements.txt
+
+# Knowledge RAG：预下载中文 Embedding 模型（运行时不再依赖外网；离线部署必需）
+ARG HF_ENDPOINT=https://huggingface.co
+ENV HF_ENDPOINT=${HF_ENDPOINT}
+ENV FASTEMBED_CACHE_PATH=/opt/fastembed
+RUN mkdir -p /opt/fastembed \
+    && python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-zh-v1.5'); print('embedding model cached')"
 
 # 语音转写网关使用 CPU 解码校验录音时长。
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \

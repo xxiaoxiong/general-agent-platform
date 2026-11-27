@@ -42,6 +42,10 @@ class ConfigMixin:
                 # P3-01：能力包绑定随配置进入运行时（_resolve_tool_specs 消费）
                 "capability_ids": getattr(agent, "capability_ids", None) or [],
                 "knowledge_base_id": agent.knowledge_base_id,
+                "knowledge_base_ids": list(
+                    getattr(agent, "knowledge_base_ids", None)
+                    or ([agent.knowledge_base_id] if agent.knowledge_base_id else [])
+                ),
                 "database_connection_id": agent.database_connection_id,
             }
 
@@ -103,7 +107,10 @@ class ConfigMixin:
                 cap_ids,
                 {
                     "database_connection": agent_config.get("database_connection_id"),
-                    "knowledge_base": agent_config.get("knowledge_base_id"),
+                    "knowledge_base": (
+                        agent_config.get("knowledge_base_ids")
+                        or agent_config.get("knowledge_base_id")
+                    ),
                 },
             )
             names.extend(resolved.tools)

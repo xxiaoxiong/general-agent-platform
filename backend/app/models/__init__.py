@@ -1,6 +1,9 @@
 from app.models.user import User, Role, Permission, UserRole, RolePermission
 from app.models.model_provider import ModelProvider, ModelConfig
-from app.models.knowledge import KnowledgeBase, KnowledgeDocument
+from app.models.knowledge import (
+    KnowledgeBase, KnowledgeChunk, KnowledgeDocument, KnowledgeDocumentVersion,
+    KnowledgeEvaluation, KnowledgeIndexGeneration, KnowledgeIngestionJob,
+)
 from app.models.workflow import Workflow, WorkflowExecution
 from app.models.app_market import AppTemplate, AppInstance
 from app.models.audit import AuditLog
@@ -25,7 +28,9 @@ from app.models.sandbox import (
 __all__ = [
     "User", "Role", "Permission", "UserRole", "RolePermission",
     "ModelProvider", "ModelConfig",
-    "KnowledgeBase", "KnowledgeDocument",
+    "KnowledgeBase", "KnowledgeDocument", "KnowledgeDocumentVersion",
+    "KnowledgeIngestionJob", "KnowledgeIndexGeneration", "KnowledgeChunk",
+    "KnowledgeEvaluation",
     "Workflow", "WorkflowExecution",
     "AppTemplate", "AppInstance",
     "AuditLog",

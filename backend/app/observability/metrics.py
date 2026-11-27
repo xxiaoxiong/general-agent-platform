@@ -162,6 +162,65 @@ if _AVAILABLE:
     PREVIEW_REQUESTS = Counter(
         "preview_request_total", "Preview 请求数", ["result"], registry=REGISTRY,
     )
+    # ── Knowledge Ingestion & RAG（任务书 §14）──────────────────────────
+    KNOWLEDGE_JOBS_TOTAL = Counter(
+        "knowledge_ingestion_jobs_total", "知识构建 Job 数",
+        ["status", "stage"], registry=REGISTRY,
+    )
+    KNOWLEDGE_JOBS_PENDING = Gauge(
+        "knowledge_ingestion_jobs_pending", "待处理 / 运行中的知识构建 Job 数",
+        registry=REGISTRY,
+    )
+    KNOWLEDGE_JOB_DURATION = Histogram(
+        "knowledge_ingestion_job_duration_seconds", "知识构建 Job 总耗时",
+        buckets=(1, 5, 15, 30, 60, 120, 300, 600, 1800), registry=REGISTRY,
+    )
+    KNOWLEDGE_PARSE_DURATION = Histogram(
+        "knowledge_parse_duration_seconds", "文档解析耗时",
+        buckets=(0.1, 0.5, 1, 3, 10, 30, 60, 180, 600), registry=REGISTRY,
+    )
+    KNOWLEDGE_OCR_DURATION = Histogram(
+        "knowledge_ocr_duration_seconds", "OCR 耗时",
+        buckets=(0.5, 1, 3, 10, 30, 60, 180), registry=REGISTRY,
+    )
+    KNOWLEDGE_EMBEDDING_DURATION = Histogram(
+        "knowledge_embedding_duration_seconds", "Embedding 耗时",
+        buckets=(0.1, 0.5, 1, 3, 10, 30, 60, 180), registry=REGISTRY,
+    )
+    KNOWLEDGE_INDEX_WRITE_DURATION = Histogram(
+        "knowledge_index_write_duration_seconds", "向量写入耗时",
+        buckets=(0.1, 0.5, 1, 3, 10, 30, 60, 180), registry=REGISTRY,
+    )
+    KNOWLEDGE_PARSE_FAILURE = Counter(
+        "knowledge_parse_failure_total", "解析失败次数", ["code"], registry=REGISTRY,
+    )
+    KNOWLEDGE_OCR_FAILURE = Counter(
+        "knowledge_ocr_failure_total", "OCR 失败次数", ["code"], registry=REGISTRY,
+    )
+    KNOWLEDGE_EMPTY_EXTRACTION = Counter(
+        "knowledge_empty_extraction_total", "空内容提取次数", registry=REGISTRY,
+    )
+    KNOWLEDGE_CHUNK_COUNT = Gauge(
+        "knowledge_chunk_count", "知识库 Chunk 数", ["knowledge_base_id"], registry=REGISTRY,
+    )
+    KNOWLEDGE_VECTOR_COUNT = Gauge(
+        "knowledge_vector_count", "知识库向量点数", ["knowledge_base_id"], registry=REGISTRY,
+    )
+    KNOWLEDGE_RETRIEVAL_DURATION = Histogram(
+        "knowledge_retrieval_duration_seconds", "检索耗时",
+        ["mode"], buckets=(0.01, 0.05, 0.1, 0.3, 0.5, 1, 3, 10), registry=REGISTRY,
+    )
+    KNOWLEDGE_RETRIEVAL_CANDIDATES = Histogram(
+        "knowledge_retrieval_candidates", "检索候选数",
+        buckets=(0, 1, 5, 10, 20, 30, 60, 100), registry=REGISTRY,
+    )
+    KNOWLEDGE_RETRIEVAL_EMPTY = Counter(
+        "knowledge_retrieval_empty_total", "无可靠证据（拒答）次数", registry=REGISTRY,
+    )
+    KNOWLEDGE_RERANKER_DURATION = Histogram(
+        "knowledge_reranker_duration_seconds", "Reranker 耗时",
+        buckets=(0.01, 0.05, 0.1, 0.3, 0.5, 1, 3), registry=REGISTRY,
+    )
 
 
 def _safe(fn):
@@ -322,6 +381,75 @@ def set_service_health(workspace_id: int, service: str, healthy: bool) -> None:
 @_safe
 def inc_preview_request(denied: bool = False) -> None:
     PREVIEW_REQUESTS.labels(result="denied" if denied else "ok").inc()
+
+
+# ── Knowledge Ingestion & RAG ────────────────────────────────────────────
+
+@_safe
+def observe_knowledge_job(status: str, stage: str, duration_seconds: Optional[float] = None) -> None:
+    KNOWLEDGE_JOBS_TOTAL.labels(status=status, stage=stage).inc()
+    if duration_seconds is not None:
+        KNOWLEDGE_JOB_DURATION.observe(max(0.0, duration_seconds))
+
+
+@_safe
+def set_knowledge_pending_jobs(count: int) -> None:
+    KNOWLEDGE_JOBS_PENDING.set(max(0, int(count)))
+
+
+@_safe
+def observe_knowledge_parse(seconds: float) -> None:
+    KNOWLEDGE_PARSE_DURATION.observe(max(0.0, seconds))
+
+
+@_safe
+def observe_knowledge_ocr(seconds: float) -> None:
+    KNOWLEDGE_OCR_DURATION.observe(max(0.0, seconds))
+
+
+@_safe
+def observe_knowledge_embedding(seconds: float) -> None:
+    KNOWLEDGE_EMBEDDING_DURATION.observe(max(0.0, seconds))
+
+
+@_safe
+def observe_knowledge_index_write(seconds: float) -> None:
+    KNOWLEDGE_INDEX_WRITE_DURATION.observe(max(0.0, seconds))
+
+
+@_safe
+def inc_knowledge_parse_failure(code: str = "parse_failed") -> None:
+    KNOWLEDGE_PARSE_FAILURE.labels(code=code or "parse_failed").inc()
+
+
+@_safe
+def inc_knowledge_ocr_failure(code: str = "ocr_failed") -> None:
+    KNOWLEDGE_OCR_FAILURE.labels(code=code or "ocr_failed").inc()
+
+
+@_safe
+def inc_knowledge_empty_extraction() -> None:
+    KNOWLEDGE_EMPTY_EXTRACTION.inc()
+
+
+@_safe
+def set_knowledge_counts(knowledge_base_id: int, chunk_count: int, vector_count: int) -> None:
+    KNOWLEDGE_CHUNK_COUNT.labels(knowledge_base_id=str(knowledge_base_id)).set(max(0, chunk_count))
+    KNOWLEDGE_VECTOR_COUNT.labels(knowledge_base_id=str(knowledge_base_id)).set(max(0, vector_count))
+
+
+@_safe
+def observe_knowledge_retrieval(mode: str, seconds: float, candidates: int = 0,
+                                empty: bool = False) -> None:
+    KNOWLEDGE_RETRIEVAL_DURATION.labels(mode=mode or "hybrid").observe(max(0.0, seconds))
+    KNOWLEDGE_RETRIEVAL_CANDIDATES.observe(max(0, int(candidates)))
+    if empty:
+        KNOWLEDGE_RETRIEVAL_EMPTY.inc()
+
+
+@_safe
+def observe_knowledge_reranker(seconds: float) -> None:
+    KNOWLEDGE_RERANKER_DURATION.observe(max(0.0, seconds))
 
 
 def render() -> tuple[bytes, str]:

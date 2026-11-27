@@ -258,6 +258,62 @@ class Settings(BaseSettings):
     BROWSER_FRAME_QUALITY: int = 60             # 帧 JPEG 质量
     BROWSER_FRAME_INTERVAL_MS: int = 70         # 帧最小间隔（≈14fps）
 
+    # ── Knowledge Ingestion & RAG（任务书 §17.2）──────────────────────────
+    KNOWLEDGE_ENABLED: bool = True
+    KNOWLEDGE_STORAGE_DIR: str = "./data/knowledge"   # 源文件集中存储（服务端生成路径）
+    KNOWLEDGE_MAX_UPLOAD_SIZE_MB: int = Field(default=100, ge=1)
+    # 支持矩阵（任务书 §3.2）；未列出的格式明确拒绝，不按文本兜底
+    KNOWLEDGE_ALLOWED_FORMATS: str = (
+        "pdf,docx,doc,xlsx,xls,pptx,ppt,txt,md,markdown,csv,html,htm,"
+        "rtf,odt,ods,odp,png,jpg,jpeg,tif,tiff"
+    )
+    KNOWLEDGE_PARSER_PROVIDER: str = "auto"      # auto | docling | native
+    KNOWLEDGE_OCR_ENABLED: bool = True
+    KNOWLEDGE_OCR_LANGUAGES: str = "ch,en"       # RapidOCR 语言（ch/en）
+    KNOWLEDGE_OCR_MIN_TEXT_CHARS: int = 24        # PDF 单页可提取文本低于此值触发 OCR
+    KNOWLEDGE_OCR_MIN_SCORE: float = 0.5          # OCR 平均置信度低于此值标记 needs_review
+    KNOWLEDGE_PARSE_TIMEOUT_SECONDS: int = 300
+    KNOWLEDGE_MAX_PAGES: int = 500
+    KNOWLEDGE_MAX_ARCHIVE_EXPANDED_BYTES: int = 1_073_741_824  # Office ZIP 解压总大小
+    KNOWLEDGE_MAX_IMAGE_PIXELS: int = 50_000_000
+    KNOWLEDGE_CHUNK_SIZE_TOKENS: int = 512
+    KNOWLEDGE_CHUNK_OVERLAP_TOKENS: int = 64
+    KNOWLEDGE_PARENT_CHUNK_MAX_TOKENS: int = 1536
+    KNOWLEDGE_CONTEXT_TOKEN_BUDGET: int = 2400
+
+    KNOWLEDGE_WORKER_ENABLED: bool = True
+    KNOWLEDGE_WORKER_CONCURRENCY: int = 2
+    KNOWLEDGE_WORKER_POLL_INTERVAL: float = 2.0
+    KNOWLEDGE_WORKER_HEARTBEAT_INTERVAL: float = 15.0
+    KNOWLEDGE_JOB_LEASE_SECONDS: int = 120
+    KNOWLEDGE_JOB_MAX_ATTEMPTS: int = 3
+
+    KNOWLEDGE_EMBEDDING_PROVIDER: str = "local"   # local(fastembed) | openai(兼容 API)
+    KNOWLEDGE_EMBEDDING_BASE_URL: str = ""
+    KNOWLEDGE_EMBEDDING_API_KEY: str = ""
+    KNOWLEDGE_EMBEDDING_MODEL: str = "BAAI/bge-small-zh-v1.5"
+    KNOWLEDGE_EMBEDDING_DIMENSION: int = 512
+    KNOWLEDGE_EMBEDDING_BATCH_SIZE: int = 16
+    KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS: float = 60.0
+    KNOWLEDGE_EMBEDDING_CACHE_DIR: str = ""       # 空=fastembed 默认缓存
+
+    # 空=进程内 embedded 模式（本地 Qdrant 引擎，单进程）；生产必须配置服务地址
+    KNOWLEDGE_QDRANT_URL: str = ""
+    KNOWLEDGE_QDRANT_API_KEY: str = ""
+    KNOWLEDGE_QDRANT_COLLECTION_PREFIX: str = "gap_knowledge"
+
+    KNOWLEDGE_RETRIEVAL_MODE: str = "hybrid"      # dense | bm25 | hybrid
+    KNOWLEDGE_DENSE_TOP_K: int = 30
+    KNOWLEDGE_BM25_TOP_K: int = 30
+    KNOWLEDGE_RRF_K: int = 60
+    KNOWLEDGE_MIN_DENSE_SCORE: float = 0.35       # 绝对余弦阈值（低相关拒答，需按评测校准）
+    KNOWLEDGE_MIN_LEXICAL_COVERAGE: float = 0.2   # BM25 查询词 IDF 覆盖率下限（过滤只命中常见字的噪声）
+    KNOWLEDGE_MIN_RRF_SCORE: float = 0.0
+    KNOWLEDGE_RERANKER_ENABLED: bool = False      # 默认关闭，便于性能对比
+    KNOWLEDGE_RERANKER_MODEL: str = "BAAI/bge-reranker-base"
+    KNOWLEDGE_RERANK_TOP_K: int = 20
+    KNOWLEDGE_LEGACY_FALLBACK: bool = True        # 新索引不可用时回退旧词法检索
+
     OTEL_ENABLED: bool = False                  # OpenTelemetry 导出（P1-02）
     OTEL_EXPORTER_OTLP_ENDPOINT: str = ""       # 如 http://localhost:4317
     OTEL_SERVICE_NAME: str = "general-agent-platform"
@@ -291,6 +347,7 @@ class Settings(BaseSettings):
         if self.asr_enabled:
             self._validate_asr_settings()
         self._validate_sandbox_settings()
+        self._validate_knowledge_settings()
         verifier_directory = self.AGENT_PROJECT_VERIFIER_DIR.strip()
         if verifier_directory and not Path(verifier_directory).is_absolute():
             raise RuntimeError("配置非法：AGENT_PROJECT_VERIFIER_DIR 须为共享队列的绝对路径。")
@@ -348,6 +405,45 @@ class Settings(BaseSettings):
                     "配置非法：生产环境 PREVIEW_PUBLIC_BASE_URL 必须为 https:// 地址"
                     "（Preview 与控制台必须不同 Origin）。"
                 )
+
+    def _validate_knowledge_settings(self) -> None:
+        """Knowledge / RAG 配置校验：非法配置在启动期拒绝（chunk 配置 422 之外的第二道防线）。"""
+        if self.KNOWLEDGE_PARSER_PROVIDER not in {"auto", "docling", "native"}:
+            raise RuntimeError(
+                "配置非法：KNOWLEDGE_PARSER_PROVIDER 只能为 auto / docling / native。"
+            )
+        if self.KNOWLEDGE_EMBEDDING_PROVIDER not in {"local", "openai"}:
+            raise RuntimeError(
+                "配置非法：KNOWLEDGE_EMBEDDING_PROVIDER 只能为 local / openai。"
+            )
+        if self.KNOWLEDGE_EMBEDDING_PROVIDER == "openai" and not (
+            self.KNOWLEDGE_EMBEDDING_BASE_URL or ""
+        ).strip():
+            raise RuntimeError(
+                "配置非法：KNOWLEDGE_EMBEDDING_PROVIDER=openai 时必须配置"
+                " KNOWLEDGE_EMBEDDING_BASE_URL（OpenAI 兼容 Embedding 服务）。"
+            )
+        if self.KNOWLEDGE_RETRIEVAL_MODE not in {"dense", "bm25", "hybrid"}:
+            raise RuntimeError(
+                "配置非法：KNOWLEDGE_RETRIEVAL_MODE 只能为 dense / bm25 / hybrid。"
+            )
+        if not 0.0 <= self.KNOWLEDGE_MIN_LEXICAL_COVERAGE <= 1.0:
+            raise RuntimeError("配置非法：KNOWLEDGE_MIN_LEXICAL_COVERAGE 必须在 0~1 之间。")
+        if not -1.0 <= self.KNOWLEDGE_MIN_DENSE_SCORE <= 1.0:
+            raise RuntimeError("配置非法：KNOWLEDGE_MIN_DENSE_SCORE 必须在 -1~1 之间。")
+        if self.KNOWLEDGE_CHUNK_SIZE_TOKENS <= 0:
+            raise RuntimeError("配置非法：KNOWLEDGE_CHUNK_SIZE_TOKENS 必须大于 0。")
+        if not 0 <= self.KNOWLEDGE_CHUNK_OVERLAP_TOKENS < self.KNOWLEDGE_CHUNK_SIZE_TOKENS:
+            raise RuntimeError(
+                "配置非法：KNOWLEDGE_CHUNK_OVERLAP_TOKENS 必须 >= 0 且小于"
+                " KNOWLEDGE_CHUNK_SIZE_TOKENS（否则切分步长为零或负数）。"
+            )
+        if self.KNOWLEDGE_RERANKER_ENABLED and not (self.KNOWLEDGE_RERANKER_MODEL or "").strip():
+            raise RuntimeError("配置非法：启用 Reranker 时 KNOWLEDGE_RERANKER_MODEL 不能为空。")
+        if self.KNOWLEDGE_MAX_ARCHIVE_EXPANDED_BYTES <= 0:
+            raise RuntimeError("配置非法：KNOWLEDGE_MAX_ARCHIVE_EXPANDED_BYTES 必须大于 0。")
+        if self.KNOWLEDGE_MAX_PAGES <= 0:
+            raise RuntimeError("配置非法：KNOWLEDGE_MAX_PAGES 必须大于 0。")
 
     def _validate_asr_settings(self) -> None:
         error = "配置非法：ASR_BASE_URL 必须是无认证、查询参数和片段的 HTTP(S) 服务地址。"

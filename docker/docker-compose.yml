@@ -4,6 +4,51 @@ name: general-agent-platform
 # 启动前先准备 .env（参考 docker/.env.example），缺失必填变量时 compose 直接报错。
 # MySQL/PostgreSQL/Redis 端口仅绑定 127.0.0.1，不对公网暴露。
 
+# ── Knowledge Ingestion & RAG 共享配置（Backend 检索 + Worker 构建）────────
+x-knowledge-env: &knowledge-env
+  KNOWLEDGE_ENABLED: ${KNOWLEDGE_ENABLED:-true}
+  KNOWLEDGE_STORAGE_DIR: /app/data/knowledge
+  KNOWLEDGE_MAX_UPLOAD_SIZE_MB: ${KNOWLEDGE_MAX_UPLOAD_SIZE_MB:-100}
+  KNOWLEDGE_ALLOWED_FORMATS: ${KNOWLEDGE_ALLOWED_FORMATS:-pdf,docx,doc,xlsx,xls,pptx,ppt,txt,md,markdown,csv,html,htm,rtf,odt,ods,odp,png,jpg,jpeg,tif,tiff}
+  KNOWLEDGE_PARSER_PROVIDER: ${KNOWLEDGE_PARSER_PROVIDER:-auto}
+  KNOWLEDGE_OCR_ENABLED: ${KNOWLEDGE_OCR_ENABLED:-true}
+  KNOWLEDGE_OCR_LANGUAGES: ${KNOWLEDGE_OCR_LANGUAGES:-ch,en}
+  KNOWLEDGE_OCR_MIN_TEXT_CHARS: ${KNOWLEDGE_OCR_MIN_TEXT_CHARS:-24}
+  KNOWLEDGE_OCR_MIN_SCORE: ${KNOWLEDGE_OCR_MIN_SCORE:-0.5}
+  KNOWLEDGE_PARSE_TIMEOUT_SECONDS: ${KNOWLEDGE_PARSE_TIMEOUT_SECONDS:-300}
+  KNOWLEDGE_MAX_PAGES: ${KNOWLEDGE_MAX_PAGES:-500}
+  KNOWLEDGE_MAX_ARCHIVE_EXPANDED_BYTES: ${KNOWLEDGE_MAX_ARCHIVE_EXPANDED_BYTES:-1073741824}
+  KNOWLEDGE_MAX_IMAGE_PIXELS: ${KNOWLEDGE_MAX_IMAGE_PIXELS:-50000000}
+  KNOWLEDGE_CHUNK_SIZE_TOKENS: ${KNOWLEDGE_CHUNK_SIZE_TOKENS:-512}
+  KNOWLEDGE_CHUNK_OVERLAP_TOKENS: ${KNOWLEDGE_CHUNK_OVERLAP_TOKENS:-64}
+  KNOWLEDGE_PARENT_CHUNK_MAX_TOKENS: ${KNOWLEDGE_PARENT_CHUNK_MAX_TOKENS:-1536}
+  KNOWLEDGE_CONTEXT_TOKEN_BUDGET: ${KNOWLEDGE_CONTEXT_TOKEN_BUDGET:-2400}
+  KNOWLEDGE_WORKER_ENABLED: ${KNOWLEDGE_WORKER_ENABLED:-true}
+  KNOWLEDGE_WORKER_CONCURRENCY: ${KNOWLEDGE_WORKER_CONCURRENCY:-2}
+  KNOWLEDGE_WORKER_POLL_INTERVAL: ${KNOWLEDGE_WORKER_POLL_INTERVAL:-2}
+  KNOWLEDGE_WORKER_HEARTBEAT_INTERVAL: ${KNOWLEDGE_WORKER_HEARTBEAT_INTERVAL:-15}
+  KNOWLEDGE_JOB_LEASE_SECONDS: ${KNOWLEDGE_JOB_LEASE_SECONDS:-120}
+  KNOWLEDGE_JOB_MAX_ATTEMPTS: ${KNOWLEDGE_JOB_MAX_ATTEMPTS:-3}
+  KNOWLEDGE_EMBEDDING_PROVIDER: ${KNOWLEDGE_EMBEDDING_PROVIDER:-local}
+  KNOWLEDGE_EMBEDDING_BASE_URL: ${KNOWLEDGE_EMBEDDING_BASE_URL:-}
+  KNOWLEDGE_EMBEDDING_API_KEY: ${KNOWLEDGE_EMBEDDING_API_KEY:-}
+  KNOWLEDGE_EMBEDDING_MODEL: ${KNOWLEDGE_EMBEDDING_MODEL:-BAAI/bge-small-zh-v1.5}
+  KNOWLEDGE_EMBEDDING_DIMENSION: ${KNOWLEDGE_EMBEDDING_DIMENSION:-512}
+  KNOWLEDGE_EMBEDDING_BATCH_SIZE: ${KNOWLEDGE_EMBEDDING_BATCH_SIZE:-16}
+  KNOWLEDGE_QDRANT_URL: ${KNOWLEDGE_QDRANT_URL:-http://qdrant:6333}
+  KNOWLEDGE_QDRANT_API_KEY: ${KNOWLEDGE_QDRANT_API_KEY:-}
+  KNOWLEDGE_QDRANT_COLLECTION_PREFIX: ${KNOWLEDGE_QDRANT_COLLECTION_PREFIX:-gap_knowledge}
+  KNOWLEDGE_RETRIEVAL_MODE: ${KNOWLEDGE_RETRIEVAL_MODE:-hybrid}
+  KNOWLEDGE_DENSE_TOP_K: ${KNOWLEDGE_DENSE_TOP_K:-30}
+  KNOWLEDGE_BM25_TOP_K: ${KNOWLEDGE_BM25_TOP_K:-30}
+  KNOWLEDGE_RRF_K: ${KNOWLEDGE_RRF_K:-60}
+  KNOWLEDGE_MIN_DENSE_SCORE: ${KNOWLEDGE_MIN_DENSE_SCORE:-0.35}
+  KNOWLEDGE_MIN_LEXICAL_COVERAGE: ${KNOWLEDGE_MIN_LEXICAL_COVERAGE:-0.2}
+  KNOWLEDGE_RERANKER_ENABLED: ${KNOWLEDGE_RERANKER_ENABLED:-false}
+  KNOWLEDGE_RERANKER_MODEL: ${KNOWLEDGE_RERANKER_MODEL:-BAAI/bge-reranker-base}
+  KNOWLEDGE_RERANK_TOP_K: ${KNOWLEDGE_RERANK_TOP_K:-20}
+  KNOWLEDGE_LEGACY_FALLBACK: ${KNOWLEDGE_LEGACY_FALLBACK:-true}
+
 services:
   mysql:
     image: mysql:8.0
@@ -61,6 +106,29 @@ services:
       timeout: 5s
       retries: 5
 
+  # ── Knowledge RAG：Qdrant 向量库（仅容器网络，不映射宿主/公网端口）─────
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    container_name: ai_plat_qdrant
+    restart: unless-stopped
+    environment:
+      QDRANT__SERVICE__API_KEY: ${KNOWLEDGE_QDRANT_API_KEY:-}
+      QDRANT__LOG_LEVEL: ${KNOWLEDGE_QDRANT_LOG_LEVEL:-WARN}
+    volumes:
+      - qdrant_data:/qdrant/storage
+    mem_limit: 2g
+    pids_limit: 512
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+
   # SearXNG 内网元搜索（web_search 工具的搜索引擎，方案 A：独立容器，不合并进 Backend 镜像）
   searxng:
     image: searxng/searxng:2026.11.23-a7163d091
@@ -99,6 +167,7 @@ services:
       # 仅回环绑定：Sandbox 不能经宿主机网关访问平台管理 API（生产再用反向代理暴露）
       - "127.0.0.1:8000:8000"
     environment:
+      <<: *knowledge-env
       APP_ENV: ${APP_ENV:-production}
       DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-ai_plat}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-ai_plat}
       DATABASE_SYNC_URL: mysql+pymysql://${MYSQL_USER:-ai_plat}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-ai_plat}
@@ -220,6 +289,8 @@ services:
       checkpoint_pg:
         condition: service_healthy
       searxng:
+        condition: service_healthy
+      qdrant:
         condition: service_healthy
 
   # ── Workspace Sandbox：独立 Runner（唯一持有 Docker Socket 的平台服务）─────
@@ -350,6 +421,49 @@ services:
       preview-proxy:
         condition: service_started
 
+  # ── Knowledge Ingestion Worker：Docling / OCR / Embedding / Qdrant 写入 ──
+  # 独立进程（API 请求进程不执行 CPU 密集型解析）；数据库 Job 队列 + Lease/Heartbeat
+  knowledge-worker:
+    build:
+      context: ..
+      dockerfile: docker/knowledge-worker.Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+        HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    container_name: ai_plat_knowledge_worker
+    restart: unless-stopped
+    init: true
+    command: ["python", "-m", "app.knowledge_worker"]
+    environment:
+      <<: *knowledge-env
+      APP_ENV: ${APP_ENV:-production}
+      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-ai_plat}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-ai_plat}
+      DATABASE_SYNC_URL: mysql+pymysql://${MYSQL_USER:-ai_plat}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-ai_plat}
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required (openssl rand -hex 32)}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      AGENT_TIMEZONE: ${AGENT_TIMEZONE:-Asia/Shanghai}
+      # 启动校验沿用生产规则（不连接 Checkpointer，仅要求非 memory DSN）
+      AGENT_CHECKPOINT_DSN: postgresql://${POSTGRES_USER:-ai_cp}:${POSTGRES_PASSWORD}@checkpoint_pg:5432/${POSTGRES_DB:-agent_checkpoints}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DEBUG: "false"
+    volumes:
+      - app_data:/app/data
+    mem_limit: 4g
+    pids_limit: 1024
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - default
+    depends_on:
+      mysql:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+
   # ── Sandbox 基础镜像（只构建不常驻）：docker compose --profile sandbox-image build
   workspace-sandbox-image:
     image: ${SANDBOX_IMAGE:-general-agent-platform/workspace-sandbox:1.0.0}
@@ -430,6 +544,9 @@ volumes:
     name: ai-generalplat_app_data
   checkpoint_pg_data:
     name: ai-generalplat_checkpoint_pg_data
+  # 知识库向量索引（Qdrant）：必须持久化，容器重建后索引仍在
+  qdrant_data:
+    name: ai-generalplat_qdrant_data
   # 沿用原独立部署的模型卷，新装环境由 Compose 创建。
   asr_model_cache:
     name: general-agent-platform-asr_model_cache

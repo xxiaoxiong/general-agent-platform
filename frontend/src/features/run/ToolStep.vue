@@ -44,7 +44,12 @@
         <div class="detail-label">来源（{{ tool.sources.length }}）</div>
         <ul class="source-list">
           <li v-for="s in tool.sources" :key="s.id" class="source-item">
-            <a class="source-link" :href="s.url" target="_blank" rel="noopener noreferrer" :title="s.url">
+            <span v-if="s.kind === 'knowledge'" class="source-link source-link-static" :title="s.title || ''">
+              <span class="source-id">{{ s.id }}</span>
+              <span class="source-title">{{ s.title }}</span>
+              <span class="source-host">知识库</span>
+            </span>
+            <a v-else class="source-link" :href="s.url" target="_blank" rel="noopener noreferrer" :title="s.url">
               <span class="source-id">{{ s.id }}</span>
               <span class="source-title">{{ s.title || s.url }}</span>
               <span v-if="s.published" class="source-published" :title="`发布时间 ${s.published}`">{{ formatDate(s.published) }}</span>
@@ -217,6 +222,8 @@ const diffStat = computed(() => {
   background: var(--ui-bg); color: var(--ui-secondary); text-decoration: none; font-size: 12px;
 }
 .source-link:hover { color: var(--ui-accent); border-color: var(--ui-accent); }
+.source-link-static { cursor: default; }
+.source-link-static:hover { color: var(--ui-secondary); border-color: var(--ui-border); }
 .source-id {
   flex: none; min-width: 16px; text-align: center;
   background: var(--ui-accent-soft); color: var(--ui-accent); border-radius: var(--ui-radius-sm);

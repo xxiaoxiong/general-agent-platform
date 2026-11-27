@@ -17,6 +17,7 @@ class AssistantCreate(BaseModel):
     tools: List[Any] = Field(default_factory=list)  # [{"name","enabled"}] 显式收窄
     model_config_id: Optional[int] = None
     knowledge_base_id: Optional[int] = None
+    knowledge_base_ids: List[int] = Field(default_factory=list)
     database_connection_id: Optional[int] = None
     max_iterations: int = 10
     temperature: str = "0.7"
@@ -32,6 +33,7 @@ class AssistantPatch(BaseModel):
     tools: Optional[List[Any]] = None
     model_config_id: Optional[int] = None
     knowledge_base_id: Optional[int] = None
+    knowledge_base_ids: Optional[List[int]] = None
     database_connection_id: Optional[int] = None
     max_iterations: Optional[int] = None
     temperature: Optional[str] = None
