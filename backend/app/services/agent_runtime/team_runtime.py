@@ -5,14 +5,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from sqlalchemy import func, select
 
+from app.core.config import settings
 from app.core.database import AsyncSessionLocal
-from app.models.agent import AgentRunEvent
+from app.models.agent import AgentRun, AgentRunEvent
 from app.observability.langfuse_tracing import platform_span
 from app.services.documents.workflow_support import read_attachments
 
@@ -24,7 +26,8 @@ from .persistence import make_run_config
 from .repositories import RunRepository
 from .repositories.errors import RunLeaseLost
 from .team_graph import (
-    TeamGraphContext, TeamResponseTruncated, build_team_graph, drive_team_graph, needs_evidence_review, terminal_team_snapshot,
+    TeamExecutionError, TeamGraphContext, TeamResponseTruncated, build_team_graph, drive_team_graph,
+    needs_evidence_review, terminal_team_snapshot,
 )
 from .tools.adapter import ToolAdapterFactory
 from .tools.classification import CLASS_READ_ONLY, get_side_effect_contract
@@ -36,6 +39,8 @@ _DEEP_MODEL_CALL_LIMIT = 20
 _PROJECT_MODEL_CALL_LIMIT = 40
 _MAX_TOOL_CALLS_PER_MEMBER = 2
 _MAX_REFERENCE_CHARS = 16_000
+
+logger = logging.getLogger("ai_plat.team")
 
 
 def team_thread_id(run_id: str) -> str:
@@ -60,6 +65,12 @@ class TeamRun:
         self.flush_budget = flush_budget
         self.budget_lock = asyncio.Lock()
         self.project_scope = project_scope
+        # Agent Team Runtime（阶段一/二）：Leader/Member 统一 DeepAgents
+        self.provider = provider
+        self.model_config = model_config
+        self.policy = policy
+        self.tool_specs = tool_specs
+        self.collaboration = None
         # Work Orchestrator：步骤级 Checkpoint 隔离；未指定时保持旧 team:{run_id} 线程
         self.thread_id = thread_id or team_thread_id(run.run_id)
         self.model_call_limit = _PROJECT_MODEL_CALL_LIMIT if project_scope else _MODEL_CALL_LIMIT
@@ -179,15 +190,88 @@ class TeamRun:
             from .team_project_runtime import drive_project
 
             return await drive_project(self, checkpointer, messages, route)
+        if settings.AGENT_TEAM_RUNTIME_ENABLED:
+            try:
+                self.collaboration = await self._create_collaboration(
+                    checkpointer, messages, route,
+                )
+            except Exception as exc:
+                logger.exception("run %s 团队运行时初始化失败", self.run.run_id)
+                raise TeamExecutionError(
+                    "团队运行时初始化失败，本轮已终止（请检查团队数据表迁移与模型配置）"
+                ) from exc
         context = TeamGraphContext(self.invoke, self.emit, worker=self.worker,
-                                   remaining_model_calls=self.remaining_model_calls)
+                                   remaining_model_calls=self.remaining_model_calls,
+                                   collaboration=self.collaboration)
         graph = build_team_graph(checkpointer, context)
         config = make_run_config(self.thread_id, self.run.run_id, self.runtime.scope.user_id)
         state = await graph.aget_state(config)
         initial = {} if state.values else await self._initial(messages, route, synthesize=synthesize)
         if state.values.get("deep_review") or (synthesize and needs_evidence_review(initial.get("objective", ""))):
             self.model_call_limit = _DEEP_MODEL_CALL_LIMIT
-        return await drive_team_graph(graph, config, initial)
+        try:
+            result = await drive_team_graph(graph, config, initial)
+        except asyncio.CancelledError:
+            if self.collaboration is not None:
+                await self.collaboration.cancel_members("团队已取消")
+            raise
+        if self.collaboration is not None:
+            board = result.get("team") or {}
+            phase = board.get("phase") or ("failed" if result.get("failure") else "completed")
+            await self.collaboration.finish(phase, summary=str(board.get("summary") or ""))
+            if phase in {"failed", "cancelled"}:
+                await self.collaboration.cancel_members("团队任务已结束")
+        return result
+
+    async def _create_collaboration(self, checkpointer, messages: list[dict], route: dict):
+        """创建 Team Run / Leader / Member Runtime（失败向上抛出，由 Run 结束）。"""
+        from .team.runtime.collaboration import create_team_collaboration
+
+        objective = await self._objective(messages, route)
+        team_config = self.runtime.agent_config.get("team_config")
+        if not isinstance(team_config, dict):
+            team_config = {}
+        return await create_team_collaboration(
+            run=self.run,
+            ctx=self.runtime,
+            provider=self.provider,
+            model_config=self.model_config,
+            policy=self.policy,
+            tool_specs=self.tool_specs,
+            bus=self.run.bus,
+            checkpointer=checkpointer,
+            flush_budget=self.flush_budget,
+            objective=objective,
+            mode="team",
+            team_config=team_config,
+        )
+
+    async def _objective(self, messages: list[dict], route: dict) -> str:
+        source = messages or []
+        if not source:
+            # 恢复续跑：messages 为空，从 Run 输入快照取原始消息
+            async with AsyncSessionLocal() as db:
+                payload = await db.scalar(
+                    select(AgentRun.input_payload).where(AgentRun.id == self.run.run_id)
+                )
+            source = (payload or {}).get("messages") or []
+        if not source:
+            # 缺少原始输入的团队 Run（如测试/异常创建）不得进入 Agent Loop：
+            # 立即失败，避免空目标规划长时间占用 Worker 与数据库锁。
+            raise ValueError("团队运行缺少原始输入消息，拒绝执行")
+        turns = [
+            (entry.get("role"), entry["content"])
+            for entry in source
+            if isinstance(entry, dict) and entry.get("role") in ("user", "assistant")
+            and isinstance(entry.get("content"), str)
+        ]
+        current = turns[-1][1] if turns and turns[-1][0] == "user" else ""
+        request_text, _, _ = current.partition("\n\n[参考文档]")
+        objective, _, _ = request_text.partition("\n\n[附件]")
+        clarification = (route.get("document_context") or {}).get("request")
+        if clarification and clarification != objective:
+            objective = f"{clarification}\n本轮要求：{objective}"
+        return objective.strip()[:12_000] or "根据本轮附件和对话背景完成分析。"
 
     async def _initial(self, messages: list[dict], route: dict, *, synthesize: bool) -> dict:
         turns = [(entry.get("role"), entry["content"]) for entry in messages
@@ -229,5 +313,40 @@ async def close_team_board(run: RunHandle, phase: str) -> None:
     async with AsyncSessionLocal() as db:
         previous = await _latest_event(db, run.run_id, TEAM_UPDATED)
     if not previous or previous.get("phase") not in {"completed", "failed", "cancelled"}:
-        await run.bus.publish(RuntimeEvent(type=TEAM_UPDATED, run_id=run.run_id,
-                                           data=terminal_team_snapshot(previous, phase)))
+        # 持久化任务板是事实来源：仅当本次 Run 有团队行时从数据库重建终态快照；
+        # 旧版团队 Run（无 agent_team_runs 行）继续使用事件快照，避免空任务板覆盖。
+        snapshot = None
+        try:
+            from .team.runtime.team_service import TeamService
+            from .team.services.task_board import TaskBoardService
+
+            if await TeamService().get(run.run_id) is not None:
+                snapshot = await TaskBoardService().snapshot(run.run_id, phase=phase)
+        except Exception:  # noqa: BLE001 团队表不存在/旧 Run：回退事件快照
+            logger.warning("run %s 团队快照读取失败，回退事件快照", run.run_id)
+        await run.bus.publish(RuntimeEvent(
+            type=TEAM_UPDATED, run_id=run.run_id,
+            data=snapshot or terminal_team_snapshot(previous, phase),
+        ))
+    try:
+        from .team.runtime.team_service import TeamService
+
+        await TeamService().update(
+            run.run_id, phase=phase,
+            status="cancelled" if phase == "cancelled" else "failed",
+            finished=True,
+        )
+        from .team.repositories import MemberRepository
+        from .team.states import MEMBER_ACTIVE
+
+        async with AsyncSessionLocal() as db:
+            repo = MemberRepository(db)
+            for member in await repo.list(run.run_id):
+                if member.status in MEMBER_ACTIVE:
+                    await repo.transition(
+                        run.run_id, member.member_id, target="cancelled",
+                        last_error="团队已结束", completed_at=None,
+                    )
+            await db.commit()
+    except Exception:  # noqa: BLE001 团队表不存在/旧 Run：忽略
+        logger.debug("run %s 团队行收尾失败", run.run_id, exc_info=True)

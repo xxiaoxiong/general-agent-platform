@@ -140,6 +140,24 @@ class Settings(BaseSettings):
     AGENT_WORK_MAX_PARALLEL_STEPS: int = 1      # 跨执行器并行步骤数（初期固定串行）
     # 自动模式下是否允许软件项目意图自动进入团队工程路线（默认关闭，保持兼容）
     AGENT_AUTO_TEAM_ENABLED: bool = False
+    # ── Agent Team Runtime（阶段一 Member Runtime / 阶段二 Team Collaboration）──
+    # 总开关：关闭后退回旧版团队执行路径（一次性 Leader 规划 + 简化 worker），
+    # 作为回滚机制；开启时 Leader/Member 均为完整 DeepAgents Agent。
+    AGENT_TEAM_RUNTIME_ENABLED: bool = True
+    AGENT_TEAM_MAX_MEMBERS: int = 4             # 单团队最大成员数（含 Leader 之外的角色上限）
+    AGENT_TEAM_MAX_TASKS: int = 4               # Leader 规划任务数上限（2~6，受最大成员数约束）
+    AGENT_TEAM_MAX_PARALLEL: int = 4            # 单轮并行执行的成员上限
+    AGENT_TEAM_MEMBER_MAX_MODEL_CALLS: int = 8  # 成员单次执行模型调用预算
+    AGENT_TEAM_MEMBER_MAX_TOOL_CALLS: int = 12  # 成员单次执行工具调用预算
+    AGENT_TEAM_MEMBER_TIMEOUT: float = 300.0   # 成员单次执行时限（秒，0=不限）
+    AGENT_TEAM_TASK_LEASE_SECONDS: int = 120    # 任务认领租约时长
+    AGENT_TEAM_TASK_LEASE_HEARTBEAT: float = 30.0  # 任务续租间隔（应小于租约的 1/2）
+    AGENT_TEAM_MAX_TASK_RETRIES: int = 2        # 任务失败自动重试上限
+    AGENT_TEAM_MODEL_MAX_CONCURRENCY: int = 4   # Provider/模型维度并发上限（0=不限）
+    AGENT_TEAM_MODEL_MIN_INTERVAL: float = 0.0  # 同一模型相邻调用最小间隔（秒，0=不限制；防供应商限流）
+    AGENT_TEAM_MESSAGE_WAIT_SECONDS: float = 30.0  # wait_for_message 最长等待
+    AGENT_TEAM_ARTIFACT_MAX_BYTES: int = 200_000   # Artifact 单条内容上限（字节）
+    AGENT_TEAM_ARTIFACT_PREVIEW_CHARS: int = 2_000  # Artifact 预览长度
     AGENT_SANDBOX_MODE: str = "restricted"      # restricted / disabled / external（disabled 时禁用高危执行工具）
     AGENT_ALLOW_UNSAFE_PYTHON: bool = False     # 代码执行逃生开关（仅开发）：restricted 不是安全沙箱，生产强制禁用 python_exec/execute
     AGENT_EGRESS_PROXY: str = ""                # 受控 Egress Proxy（HTTP 出口统一收口；DNS Rebinding 防护的等价机制）
@@ -410,6 +428,30 @@ class Settings(BaseSettings):
             )
         if float(self.CONVERSATION_MEMORY_INDEX_INTERVAL) <= 0:
             raise RuntimeError("配置非法：CONVERSATION_MEMORY_INDEX_INTERVAL 必须大于 0。")
+        if not 1 <= int(self.AGENT_TEAM_MAX_MEMBERS) <= 12:
+            raise RuntimeError("配置非法：AGENT_TEAM_MAX_MEMBERS 必须在 1~12 之间。")
+        if not 2 <= int(self.AGENT_TEAM_MAX_TASKS) <= 6:
+            raise RuntimeError("配置非法：AGENT_TEAM_MAX_TASKS 必须在 2~6 之间。")
+        if not 1 <= int(self.AGENT_TEAM_MAX_PARALLEL) <= int(self.AGENT_TEAM_MAX_MEMBERS):
+            raise RuntimeError(
+                "配置非法：AGENT_TEAM_MAX_PARALLEL 必须在 1~AGENT_TEAM_MAX_MEMBERS 之间。"
+            )
+        if int(self.AGENT_TEAM_MEMBER_MAX_MODEL_CALLS) < 1:
+            raise RuntimeError("配置非法：AGENT_TEAM_MEMBER_MAX_MODEL_CALLS 必须大于 0。")
+        if int(self.AGENT_TEAM_MEMBER_MAX_TOOL_CALLS) < 0:
+            raise RuntimeError("配置非法：AGENT_TEAM_MEMBER_MAX_TOOL_CALLS 不得为负数。")
+        if float(self.AGENT_TEAM_MEMBER_TIMEOUT) < 0:
+            raise RuntimeError("配置非法：AGENT_TEAM_MEMBER_TIMEOUT 不得为负数。")
+        if int(self.AGENT_TEAM_TASK_LEASE_SECONDS) < 10:
+            raise RuntimeError("配置非法：AGENT_TEAM_TASK_LEASE_SECONDS 不得小于 10。")
+        if float(self.AGENT_TEAM_TASK_LEASE_HEARTBEAT) <= 0:
+            raise RuntimeError("配置非法：AGENT_TEAM_TASK_LEASE_HEARTBEAT 必须大于 0。")
+        if int(self.AGENT_TEAM_MODEL_MAX_CONCURRENCY) < 0:
+            raise RuntimeError("配置非法：AGENT_TEAM_MODEL_MAX_CONCURRENCY 不得为负数。")
+        if float(self.AGENT_TEAM_MODEL_MIN_INTERVAL) < 0:
+            raise RuntimeError("配置非法：AGENT_TEAM_MODEL_MIN_INTERVAL 不得为负数。")
+        if int(self.AGENT_TEAM_ARTIFACT_MAX_BYTES) < 1024:
+            raise RuntimeError("配置非法：AGENT_TEAM_ARTIFACT_MAX_BYTES 不得小于 1024。")
         if self.asr_enabled:
             self._validate_asr_settings()
         self._validate_sandbox_settings()

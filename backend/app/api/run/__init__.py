@@ -15,11 +15,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from . import admin, core, review
+from . import admin, core, review, team
 
 router = APIRouter(tags=["runs-v2"])
 router.include_router(core.router)
 router.include_router(admin.router)
 router.include_router(review.router)
+router.include_router(team.router)
 
 __all__ = ["router"]

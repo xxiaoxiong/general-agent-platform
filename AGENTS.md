@@ -31,6 +31,8 @@ backend/
   app/services/       # 业务逻辑
     agent_runtime/    # Agent 执行内核（service/ 包 = core + lifecycle/stream/approval/
                       #   delivery/config 五个 Mixin + _common，导入路径兼容层见 service/__init__）
+      team/           # Agent Team Runtime（Member Runtime / Task Board / Message Bus /
+                      #   Artifact Store / Team Tools / LeaderRunner / Collaboration）
     knowledge/        # 知识库解析/切分/Embedding/Qdrant/检索（parsers/ embedding/
                       #   chunking/ retrieval/ ingestion/ evaluation/ acl/ security/ storage）
     assistant/        # 助手域（capability / versions / task_contract / verification / model_router）
@@ -68,12 +70,14 @@ docs/                 # 需求设计、任务书、阶段交付说明（历史�
 
 ```bash
 # 后端测试（必须在 backend/ 目录下执行，否则 ModuleNotFoundError: app）
-cd backend && python -m pytest -q                 # 全量回归（~1143 passed, 13 skipped）
+cd backend && python -m pytest -q                 # 全量回归（~1161 passed, 13 skipped；必须单进程前台）
 cd backend && python -m pytest tests/test_xxx.py -q   # 单文件
 cd backend && python -m pytest tests/test_work_orchestrator_graph.py tests/test_work_planner.py tests/test_work_plan_schema.py tests/test_work_orchestrator_integration.py -q  # Work Orchestrator
 cd backend && python -m pytest tests/test_conversation_memory.py tests/test_conversation_memory_api.py -q  # Conversation Memory
+cd backend && python -m pytest tests/test_team_runtime.py tests/test_team_graph.py tests/test_team_project_runtime.py -q  # Agent Team Runtime
 cd backend && python -m scripts.conversation_memory_eval --report ../docs/conversation-memory-eval-report.md  # 历史检索质量评测
 cd backend && python -m pytest tests/test_knowledge_rag.py -q  # Knowledge RAG（真实解析/Embedding/Qdrant）
+python backend/tests/e2e/team_mock_model.py --port 9999  # 确定性团队 E2E 端点（OpenAI 兼容）
 
 # 知识库迁移与评测（backend/ 目录）
 cd backend && python -m scripts.migrate_legacy_knowledge          # 旧索引体检
@@ -122,6 +126,7 @@ cd backend && python -m alembic upgrade head
 - **Work Orchestrator**：复合任务由 `services/work_orchestrator` 规划、校验和跨引擎调度；简单任务不额外调用 Planner。一个用户任务仍只有一个 `AgentRun` / `RunWorker` / EventBus；编排状态在 `work:{run_id}` Checkpoint，步骤执行器在 `work:{run_id}:step:{step_id}`；计划快照在 `input_payload.execution_context.work_plan`；`work.plan.*` / `work.step.*` 事件独立于 DeepAgents 的 `plan.updated`。
 - **Conversation Memory**：原始会话 `agent_sessions.messages` 是唯一事实来源；派生索引分 `turn` / `segment` 两级，写回事务入队 Durable Job，独立 `ConversationIndexWorker` 执行；自动预取在语义决策后、`build_agent` 前，Planner 失败/超时降级为无历史上下文；历史内容作为独立不可信资料块注入，不授予工具权限；检索 ACL 由服务端 SQL/Qdrant Filter 强制，来源必须回查会话与消息仍存在。
 - **Work Orchestrator 执行器**：`executor_profile` 只能由服务端 Registry 解析到真实引擎（DeepAgents / Document Graph / Team Graph / Team Project Graph）；模型不能指定工具名、类名、URL、工作区路径或权限。默认 `AGENT_WORK_ORCHESTRATOR_MODE=shadow`，回滚用 `off`。
+- **Agent Team Runtime**：`AGENT_TEAM_RUNTIME_ENABLED=true` 时 Leader/Member 均为完整 DeepAgents Agent；Leader 规划/复核/综合通过 Team Tools 操作 Task Board，Member 在独立 Thread 执行；Task/Member/Message/Artifact 是协作事实来源，LangGraph 只做控制流。`team_run_id = agent_runs.id`；成员 Thread `team:{run}:member:{member_id}`，Leader 阶段 Thread `:synthesis`/`:review`；Task Board 用 revision CAS + lease token，Message Bus 至少一次投递 + 幂等键，Artifact 引用式共享。软件项目团队仍走原 `team_project_graph`；回滚用 `AGENT_TEAM_RUNTIME_ENABLED=false`。
 
 ## 测试约定
 
@@ -178,6 +183,15 @@ cd backend && python -m alembic upgrade head
 43. **低相关拒答阈值必须按评测集校准**：短会话的无关 Dense 相似度常见 0.42~0.55，不能只用单一绝对阈值；现有 `MIN_DENSE_SCORE=0.5` + `DENSE_STRONG_SCORE=0.62` + `DENSE_MARGIN=0.04` 是按 32 条评测集校准的结果，改阈值后必须重跑 `scripts.conversation_memory_eval.py` 并对比 Recall / No-answer Accuracy。
 44. **历史内容是不可信资料**：只能作为独立 Context Block 注入，不得伪造成用户消息、不得继承工具授权、不得覆盖系统指令；`history.sources` 事件的来源 ID 必须由服务端校验后才返回给前端。
 45. **更换 Embedding 模型/维度必须递增索引代际**：`CONVERSATION_MEMORY_INDEX_VERSION` 参与条目过滤与 Qdrant Collection 名；不要复用旧版本静默混用维度，重建走 `POST /api/v2/memory/reindex`。
+46. **成员 Agent 必须显式传 general-purpose 占位**：deepagents 在子代理清单缺少 `general-purpose` 时会自动注入全工具默认子代理，绕过平台白名单；占位必须 `tools=[]` 且带空文件栈 middleware。
+47. **FilesystemMiddleware 不能空工具**：DeepAgents 基栈要求 `FilesystemMiddleware` 存在且 `tools` 必含 `read_file`；成员只暴露虚拟 StateBackend 的 `read_file`，不得传入真实 backend 或 `write_file/edit_file/execute`。
+48. **Team 表主键作用域**：`team_run_id = agent_runs.id`；`member_id`/`task_id` 只在团队内唯一（`UniqueConstraint(team_run_id, member_id/task_id)`），不要改回全局唯一，否则不同 Run 的 `leader`/`research` 会冲突。
+49. **Task Board 不得先查后改**：认领/完成/失败/更新必须用条件 UPDATE（revision + owner + lease_token）的 rowcount 判定；`fail` 不递增 `retry_count`，`retry` 才递增，避免少一次重试。
+50. **Leader 阶段 Thread 必须隔离**：规划用成员基础 Thread，复核/综合用 `:review`/`:synthesis`；规划被预算/限流中断且任务已创建时调用 `LeaderRunner.rotate_thread()`，否则综合会续跑未完成规划并输出规划文本。
+51. **成员工具面是运行时收窄，不是权限绕过**：Team Tools 仍经风险登记 + ToolPolicy + Tool Ledger，handler 内再次校验 team/member/leader；无消息不暴露 Inbox、正常任务不暴露 `team_task_get`（返工/唤醒按需暴露），不要移除服务端校验。
+52. **团队工具必须登记风险**：`team_*` 未在 `_TOOL_RISK_REGISTRY` 登记会被 fail-closed 拒绝；新增团队工具必须在 `team/tools/team_tools.py` 注册并加入 Leader/Member 白名单。
+53. **成员用量必须同步父 Run 预算**：`MemberRuntimeManager._flush_usage` 把成员模型/工具/Token 增量累计到父 `RuntimeContext` 并刷新预算镜像；只记 `agent_team_members` 会让团队级预算失真。
+54. **真实模型团队 E2E 受供应商限流影响**：连续 10+ 次调用可能 429/空响应循环；用 `AGENT_TEAM_MODEL_MIN_INTERVAL`、并发上限、成员时限与预算缓解；验收链路可用 `backend/tests/e2e/team_mock_model.py` 做确定性 Docker E2E。
 
 ## 修改范围原则
 

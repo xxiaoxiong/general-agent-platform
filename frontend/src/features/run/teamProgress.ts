@@ -30,6 +30,10 @@ export interface TeamTask {
   status: TeamTaskStatus
   result?: string
   error?: string
+  /** Agent Team Runtime：执行成员身份与持久化状态（服务端 Task Board 事实） */
+  owner_member_id?: string | null
+  board_status?: string
+  revision?: number
 }
 
 export interface TeamProgress {

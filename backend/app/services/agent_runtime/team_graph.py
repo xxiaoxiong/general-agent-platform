@@ -28,6 +28,13 @@ _MAX_MEMBER_RESULT = 4_000
 _MAX_FINAL_TEXT = 16_000
 _MAX_REWORK_WAVES = 2
 _INTERRUPTIONS = (GraphBubbleUp, PersistenceError, BudgetExceededError)
+# Leader 阶段预算（真实团队）：规划允许有限任务创建，复核/综合只读引用
+_LEADER_STAGE_LIMITS: dict[str, tuple[int, int]] = {
+    "planning": (6, 8),
+    "review": (3, 3),
+    "rework": (3, 3),
+    "synthesis": (4, 4),
+}
 _REASONING_PREFIX = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
 _DEPTH_REQUEST = re.compile(
     r"深入|深度|全面|系统性|系统地|详尽|严谨|多维|交叉验证|交叉核对|可核验|可追溯|"
@@ -60,6 +67,7 @@ class _TaskSpec(BaseModel):
     title: str = Field(min_length=1, max_length=100)
     brief: str = Field(min_length=1, max_length=600)
     depends_on: list[TaskId] = Field(default_factory=list, max_length=3)
+    priority: int = Field(default=0, ge=-10, le=10)
 
 
 class _TeamPlan(BaseModel):
@@ -108,6 +116,7 @@ class _Task(TypedDict):
     title: str
     brief: str
     depends_on: list[str]
+    priority: int
 
 
 class _Outcome(TypedDict, total=False):
@@ -148,12 +157,18 @@ class _MemberInput(TypedDict):
 
 @dataclass(frozen=True)
 class TeamGraphContext:
-    """预算、模型与事件仍由调用方的 Run 上下文管理。"""
+    """预算、模型与事件仍由调用方的 Run 上下文管理。
+
+    ``collaboration`` 存在时（Agent Team Runtime）：Leader/Member 均为完整
+    DeepAgents Agent，任务事实以 Task Board 为准；不存在时保留旧版
+    invoke/worker 路径（隔离单测与回滚开关）。
+    """
 
     invoke: Callable[[str, str, str], Awaitable[str]]
     emit: Callable[[str, dict[str, Any]], Awaitable[None]]
     worker: Callable[[_Task, str, str], Awaitable[str]] | None = None
     remaining_model_calls: Callable[[], int] | None = None
+    collaboration: Any = None
 
 
 class TeamExecutionError(RuntimeError):
@@ -192,6 +207,38 @@ def _parse_plan(payload: str, *, deep_review: bool) -> dict[str, Any]:
     if deep_review and (len(plan.tasks) > 3 or len(set(plan.acceptance)) < 2):
         raise ValueError("深度任务须有 2 至 3 个角色及至少两条不同验收标准")
     return plan.model_dump()
+
+
+def _extract_acceptance(payload: str) -> list[str]:
+    """从 Leader 回复中提取验收标准（JSON 块或纯 JSON）。"""
+    text = _REASONING_PREFIX.sub("", payload or "").strip()
+    candidates = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    candidates.append(text)
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+        acceptance = data.get("acceptance") if isinstance(data, dict) else None
+        if isinstance(acceptance, list):
+            items = [str(item).strip()[:160] for item in acceptance if str(item).strip()]
+            if items:
+                return list(dict.fromkeys(items))[:4]
+    return []
+
+
+def _board_plan_tasks(board_tasks: list[dict[str, Any]]) -> list[_Task]:
+    return [
+        {
+            "id": str(task["id"]),
+            "role": str(task["role"]),
+            "title": str(task["title"]),
+            "brief": str(task["brief"]),
+            "depends_on": list(task.get("depends_on") or []),
+            "priority": int(task.get("priority") or 0),
+        }
+        for task in board_tasks
+    ]
 
 
 def _snapshot(
@@ -289,8 +336,31 @@ def build_team_graph(checkpointer, context: TeamGraphContext):
         # 深度流程本身按最坏 12 次调用设计。较低助手预算从运行时查询。
         return context.remaining_model_calls() if context.remaining_model_calls else 12
 
+    async def invoke(stage: str, system: str, user: str) -> str:
+        """Leader 统一入口：真实团队用 Leader DeepAgents；旧路径保持 invoke。"""
+        if context.collaboration is not None:
+            model_limit, tool_limit = _LEADER_STAGE_LIMITS.get(stage, (None, None))
+            text, truncated = await context.collaboration.leader.invoke(
+                stage, system, user,
+                stage_model_limit=model_limit, stage_tool_limit=tool_limit,
+            )
+            if truncated:
+                raise TeamResponseTruncated(text)
+            return text
+        return await context.invoke(stage, system, user)
+
     async def publish(state: _TeamState, phase: str, **kwargs: Any) -> dict[str, Any]:
-        board = _snapshot(state, phase, **kwargs)
+        if context.collaboration is not None:
+            board = await context.collaboration.snapshot(
+                phase=phase,
+                running=kwargs.get("running", frozenset()),
+                summary=str(kwargs.get("summary") or ""),
+                lead=_LEAD,
+            )
+            if state.get("review"):
+                board["review"] = state["review"]
+        else:
+            board = _snapshot(state, phase, **kwargs)
         if board != state.get("team"):
             await context.emit("team.updated", board)
         return board
@@ -313,12 +383,25 @@ def build_team_graph(checkpointer, context: TeamGraphContext):
                 "制定 2 至 4 条可检查的标准，将用户关心的关键决策、证据和必要的反例或边界写清楚。"
                 "每项角色任务应交付可复核的依据、分歧及局限，避免几位成员重复概括同一结论。"
             )
+        if context.collaboration is not None:
+            max_tasks = int(getattr(context.collaboration, "max_tasks", 4))
+            leader_instructions = (
+                f"使用 team_task_create 在 Task Board 创建 2 至 {max_tasks} 项任务（不要只输出 JSON）；"
+                "尽量在同一轮并行创建全部任务，创建后立即结束本轮，不要更新任务状态或发送消息。"
+                "完成后在回复末尾输出一行 JSON：{\"acceptance\":[\"...\"]}。"
+            )
+            if deep_review:
+                leader_instructions += "深度任务请创建 2 至 3 个角色，并给出至少 2 条不同的验收标准。"
+            return await _plan_with_leader(
+                state, _system(state["assistant_prompt"], instructions + "\n" + leader_instructions),
+                board, deep_review,
+            )
         prompt = _system(state["assistant_prompt"], instructions)
         invalid = False
         for _ in range(2):
             correction = {"correction": "上一份计划格式、角色或依赖不符合要求，请给出完整有效的 JSON。"} if invalid else {}
             try:
-                raw = await context.invoke("planning", prompt, _user(state, **correction))
+                raw = await invoke("planning", prompt, _user(state, **correction))
             except TeamResponseTruncated:
                 invalid = True
                 continue
@@ -334,15 +417,159 @@ def build_team_graph(checkpointer, context: TeamGraphContext):
         failure = "团队负责人未能生成有效的分工计划，请重试。"
         return {"failure": failure, "team": await publish(state, "failed", summary=failure)}
 
+    async def _plan_with_leader(
+        state: _TeamState, prompt: str, board: dict[str, Any], deep_review: bool,
+    ) -> dict[str, Any]:
+        """Leader 用 Team Tools 建任务；Task Board 是计划事实来源。"""
+        from .team.errors import PlanValidationError
+
+        collab = context.collaboration
+        task_cap = max(2, int(getattr(collab, "max_tasks", 4)))
+        plan_max = min(3 if deep_review else task_cap, task_cap)
+        last_error = ""
+        for _ in range(2):
+            correction = {"correction": last_error} if last_error else {}
+            stage_prompt = prompt
+            if last_error:
+                stage_prompt += f"\n\n上一份计划未通过校验：{last_error}\n请修正后重新创建任务。"
+            try:
+                raw, truncated = await collab.leader.invoke(
+                    "planning", stage_prompt, _user(state, **correction),
+                    stage_model_limit=_LEADER_STAGE_LIMITS["planning"][0],
+                    stage_tool_limit=_LEADER_STAGE_LIMITS["planning"][1],
+                )
+            except _INTERRUPTIONS:
+                raise
+            except Exception as exc:
+                # Leader 调用可能被阶段工具/模型上限或供应商限流中断；
+                # 若任务已写入 Task Board，则按任务板事实继续（工具循环限制不是业务失败）
+                try:
+                    board_tasks = await collab.board.validate_plan(
+                        collab.team_run_id, min_tasks=2, max_tasks=plan_max,
+                    )
+                except Exception:  # noqa: BLE001
+                    board_tasks = []
+                if board_tasks:
+                    logger.warning(
+                        "Leader 规划调用被中断（%s），按已创建任务继续", type(exc).__name__,
+                    )
+                    try:
+                        # 旧 Leader Thread 可能停在未完成的规划节点；切换代际，
+                        # 避免后续复核/综合误续跑规划输出。
+                        await collab.leader.rotate_thread(
+                            f"planning interrupted: {type(exc).__name__}"
+                        )
+                    except Exception:  # noqa: BLE001 轮换失败不阻断已创建任务
+                        logger.warning("Leader Thread 代际轮换失败", exc_info=True)
+                    acceptance = [
+                        f"{task['title']}已交付且可核验" for task in board_tasks
+                    ][:4]
+                    return {
+                        "tasks": _board_plan_tasks(board_tasks),
+                        "acceptance": acceptance,
+                        "team": board,
+                    }
+                logger.warning("团队负责人 DeepAgents 规划失败: %s", type(exc).__name__)
+                failure = "团队负责人未能完成规划，请重试。"
+                return {"failure": failure, "team": await publish(state, "failed", summary=failure)}
+            acceptance = _extract_acceptance(raw)
+            board_tasks = await collab.board.list_tasks(collab.team_run_id)
+            if not board_tasks:
+                if truncated:
+                    last_error = "规划输出被长度上限截断，请重新规划并用 team_task_create 创建更紧凑的任务"
+                    continue
+                try:
+                    parsed = _parse_plan(raw, deep_review=deep_review)
+                except (TypeError, ValueError, AttributeError):
+                    last_error = "未调用 team_task_create 且未给出有效的 JSON 计划"
+                    continue
+                try:
+                    board_tasks = await collab.board.ensure_tasks_from_plan(
+                        collab.team_run_id, parsed["tasks"],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    last_error = f"任务写入任务板失败：{type(exc).__name__}"
+                    continue
+                acceptance = acceptance or list(parsed.get("acceptance") or [])
+            try:
+                board_tasks = await collab.board.validate_plan(
+                    collab.team_run_id, min_tasks=2, max_tasks=plan_max,
+                )
+            except PlanValidationError as exc:
+                last_error = str(exc)
+                try:
+                    await collab.board.reset_plan(collab.team_run_id)
+                except Exception:  # noqa: BLE001 任务已开始执行时保留事实
+                    logger.warning("团队计划重置失败", exc_info=True)
+                continue
+            if deep_review and len(set(acceptance)) < 2:
+                acceptance = [
+                    f"{task['title']}已交付且可核验" for task in board_tasks
+                ][:4]
+            return {
+                "tasks": _board_plan_tasks(board_tasks),
+                "acceptance": acceptance[:4],
+                "team": board,
+            }
+        failure = "团队负责人未能生成有效的分工计划，请重试。"
+        return {"failure": failure, "team": await publish(state, "failed", summary=failure)}
+
     async def schedule(state: _TeamState) -> dict[str, Any]:
+        if context.collaboration is not None:
+            return await _schedule_with_board(state)
         changes = _blocked_tasks(state)
         current = {**state, "outcomes": {**state.get("outcomes", {}), **changes}}
         running = frozenset(task["id"] for task in _ready_tasks(current))
         board = await publish(current, "working", running=running)
         return {"outcomes": changes, "team": board}
 
+    async def _schedule_with_board(state: _TeamState) -> dict[str, Any]:
+        """任务事实以 Task Board 为准：回收租约、跳过失败依赖、唤醒空闲成员。"""
+        collab = context.collaboration
+        try:
+            await collab.board.reclaim_expired(collab.team_run_id)
+        except Exception:  # noqa: BLE001 调度辅助失败不阻断团队流程
+            logger.warning("团队任务租约回收失败", exc_info=True)
+        try:
+            await collab.board.skip_blocked_dependents(collab.team_run_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("团队依赖跳过标记失败", exc_info=True)
+        try:
+            await collab.wake_idle_members(max_count=2)
+        except Exception:  # noqa: BLE001 消息唤醒失败不阻断静态 DAG
+            logger.warning("团队空闲成员唤醒失败", exc_info=True)
+        board_tasks = await collab.board.list_tasks(collab.team_run_id)
+        known = {task["id"] for task in state.get("tasks", [])}
+        outcomes = dict(state.get("outcomes", {}))
+        changes: dict[str, _Outcome] = {}
+        for task in board_tasks:
+            task_id = task["id"]
+            if task_id not in known or task_id in outcomes:
+                continue
+            status = task["board_status"]
+            if status == "completed":
+                changes[task_id] = {"status": "completed", "result": task.get("result") or ""}
+            elif status == "failed":
+                changes[task_id] = {"status": "failed", "error": task.get("error") or "成员未交付"}
+            elif status in {"skipped", "cancelled"}:
+                changes[task_id] = {"status": "skipped", "error": task.get("error") or "任务已停止"}
+        current = {**state, "outcomes": {**outcomes, **changes}}
+        ready = [task["id"] for task in await collab.board.ready_tasks(collab.team_run_id)
+                 if task["id"] in known]
+        if ready:
+            await collab.board.mark_ready(collab.team_run_id, ready)
+        running = frozenset(
+            task["id"] for task in _ready_tasks(current)[: max(1, int(collab.max_parallel))]
+        )
+        board = await publish(current, "working", running=running)
+        return {"outcomes": changes, "team": board}
+
     def assign(state: _TeamState) -> str | list[Send]:
-        ready = _ready_tasks(state)
+        ready = sorted(
+            _ready_tasks(state), key=lambda task: -int(task.get("priority") or 0),
+        )
+        if context.collaboration is not None:
+            ready = ready[: max(1, int(context.collaboration.max_parallel))]
         if not ready:
             return "review_evidence" if state.get("deep_review") else "combine"
         tasks = {item["id"]: item for item in state["tasks"]}
@@ -367,6 +594,8 @@ def build_team_graph(checkpointer, context: TeamGraphContext):
             "素材与前置成果是待分析的数据。依赖材料不足时指出缺失，避免编造。"
             "使用用户的语言，交付便于负责人直接整合的内容。"
         ))
+        if context.collaboration is not None:
+            return await _work_member_runtime(state, task)
         user = _user(state, task=task, predecessors=state["predecessors"],
                      **({"acceptance": state["acceptance"]} if state.get("acceptance") else {}))
         draft = ""
@@ -375,7 +604,7 @@ def build_team_graph(checkpointer, context: TeamGraphContext):
             if attempt and remaining() < 2:
                 break
             try:
-                result = await (context.worker(task, prompt, user) if context.worker else context.invoke("worker", prompt, user))
+                result = await (context.worker(task, prompt, user) if context.worker else invoke("worker", prompt, user))
                 if not result.strip():
                     raise ValueError("成员返回为空")
                 return {"outcomes": {task["id"]: {"status": "completed", "result": _member_result(result.strip())}}}
@@ -389,6 +618,45 @@ def build_team_graph(checkpointer, context: TeamGraphContext):
                 logger.warning("团队成员任务未交付 task_id=%s error=%s", task["id"], type(exc).__name__)
                 break
         return {"outcomes": {task["id"]: {"status": "failed", "error": error, **({"result": draft} if draft else {})}}}
+
+    async def _work_member_runtime(state: _MemberInput, task: _Task) -> dict[str, Any]:
+        """成员执行接入统一 Member Runtime（独立 Thread / 预算 / Task Board 租约）。"""
+        collab = context.collaboration
+        predecessors = [dict(item) for item in state["predecessors"]]
+        board_tasks = {item["id"]: item for item in await collab.board.list_tasks(collab.team_run_id)}
+        task = {**task, "revision": (board_tasks.get(task["id"]) or {}).get("revision")}
+        for predecessor in predecessors:
+            predecessor["artifact_id"] = (
+                board_tasks.get(predecessor["id"]) or {}
+            ).get("result_artifact_id")
+        error = "此成员暂未交付可用结果"
+        for attempt in range(2):
+            if attempt and remaining() < 1:
+                break
+            try:
+                result = await collab.members.execute(
+                    task,
+                    objective=state["objective"],
+                    reference_context=state["reference_context"],
+                    assistant_prompt=state["assistant_prompt"],
+                    predecessors=predecessors,
+                    acceptance=state.get("acceptance") or [],
+                )
+            except _INTERRUPTIONS:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("团队成员执行异常 task_id=%s error=%s", task["id"], type(exc).__name__)
+                error = f"成员执行异常（{type(exc).__name__}）"
+                break
+            if result.ok:
+                return {"outcomes": {task["id"]: {
+                    "status": "completed", "result": _member_result(result.output),
+                }}}
+            error = (result.error or "成员未能交付可用结果")[:400]
+            if result.status != "interrupted":
+                break
+            # 中断（Checkpoint/Persistence）：任务已释放，重试一次从成员自身 Thread 恢复
+        return {"outcomes": {task["id"]: {"status": "failed", "error": error}}}
 
     async def assess(state: _TeamState, *, recheck: bool) -> dict[str, Any]:
         reports = _reports(state)
@@ -411,7 +679,7 @@ def build_team_graph(checkpointer, context: TeamGraphContext):
             "每项标准只检查一次，criterion 从 1 开始。"
         ))
         try:
-            raw = await context.invoke("review", prompt, _user(
+            raw = await invoke("review", prompt, _user(
                 state, acceptance=criteria, reports=reports, previous_review=state.get("review") if recheck else None,
             ))
             checks = _review_results(raw, criteria, completed)
@@ -461,6 +729,33 @@ def build_team_graph(checkpointer, context: TeamGraphContext):
 
     async def revise_member(state: dict[str, Any]) -> dict[str, Any]:
         task = state["task"]
+        if context.collaboration is not None:
+            try:
+                board_task = await context.collaboration.board.get_task(
+                    context.collaboration.team_run_id, task["id"],
+                )
+                task = {**task, "revision": board_task.get("revision")}
+                result = await context.collaboration.members.execute(
+                    task,
+                    objective=state["objective"],
+                    reference_context=state["reference_context"],
+                    assistant_prompt=state["assistant_prompt"],
+                    acceptance=state["acceptance"],
+                    findings=state["findings"],
+                    prior_result=state["prior_result"],
+                )
+            except BudgetExceededError:
+                return {}
+            except _INTERRUPTIONS:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("团队成员返工未完成 task_id=%s error=%s", task["id"], type(exc).__name__)
+                return {}
+            if result.ok and result.output.strip():
+                return {"outcomes": {task["id"]: {
+                    "status": "completed", "result": _member_result(result.output),
+                }}}
+            return {}
         prompt = _system(state["assistant_prompt"], (
             f"团队返工。你以「{task['role']}」角色逐项回应独立复核指出的缺口。"
             "保留已有依据，补充分析、反例、量化条件或可复现核验步骤。"
@@ -471,7 +766,7 @@ def build_team_graph(checkpointer, context: TeamGraphContext):
                 state, task=task, prior_result=state["prior_result"], findings=state["findings"],
                 acceptance=state["acceptance"],
             )
-            result = (await (context.worker(task, prompt, user) if context.worker else context.invoke("rework", prompt, user))).strip()
+            result = (await (context.worker(task, prompt, user) if context.worker else invoke("rework", prompt, user))).strip()
         except BudgetExceededError:
             return {}
         except _INTERRUPTIONS:
@@ -512,7 +807,7 @@ def build_team_graph(checkpointer, context: TeamGraphContext):
                 data.update({"acceptance": state["acceptance"], "review": review})
             prompt = _system(state["assistant_prompt"], instructions)
             try:
-                final = (await context.invoke("synthesis", prompt, _user(state, **data))).strip()
+                final = (await invoke("synthesis", prompt, _user(state, **data))).strip()
             except TeamResponseTruncated as exc:
                 final = exc.text.strip()
                 failure = "团队综合回答达到长度上限，已保留草稿与成员成果。"

@@ -55,6 +55,8 @@ WORKSPACE_PROJECT_REVIEWED = "workspace_project_reviewed"
 RUN_RETRYING = "run_retrying"
 RUN_RECOVERING = "run_recovering"
 TEAM_UPDATED = "team.updated"
+# Agent Team Runtime：成员身份/状态/当前任务/预算/错误摘要（与 team.updated 并行）
+TEAM_MEMBER_UPDATED = "team.member.updated"
 # 执行中补充要求（通用能力）：已受理 / 已注入模型上下文
 RUN_STEERED = "run_steered"
 RUN_STEERING_APPLIED = "run_steering_applied"
@@ -188,6 +190,9 @@ def _persist_max_len(ev_type: str) -> int:
     """按事件类型取持久化截断上限（仅长文本上限不同，脱敏遮蔽一律保留）。"""
     if ev_type == TEAM_UPDATED:
         return 4200
+    if ev_type == TEAM_MEMBER_UPDATED:
+        # 成员事件：身份/角色/状态/当前任务/预算/错误摘要，需要完整回放
+        return 2_000
     if ev_type == "task_decision":
         # 决策快照含目标/约束/验收标准/引用，需要完整保留供审计回放
         return 6000

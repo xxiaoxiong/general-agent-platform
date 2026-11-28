@@ -148,6 +148,19 @@ class ToolExecutor:
 
                 return normalize(await HISTORY_HANDLERS[tool_name](self.ctx, tool_input))
 
+            # 团队协作工具（Leader/Member）：身份与团队作用域由 team_context 服务端注入
+            if tool_name.startswith("team_"):
+                if self.ctx is None or not getattr(self.ctx, "team_context", None):
+                    return ToolResult.failed(
+                        f"工具 '{tool_name}' 仅团队 Leader/Member 执行上下文可用"
+                    )
+                from app.services.agent_runtime.team.tools.team_tools import HANDLERS as TEAM_HANDLERS
+
+                handler = TEAM_HANDLERS.get(tool_name)
+                if handler is None:
+                    return ToolResult.failed(f"错误：未知团队工具 '{tool_name}'")
+                return normalize(await handler(self.ctx, tool_input))
+
             # MCP 工具（mcp__<server>__<tool>）：外部 MCP 服务调用
             if tool_name.startswith(MCP_TOOL_PREFIX):
                 return await self._mcp_tool(tool_name, tool_input)

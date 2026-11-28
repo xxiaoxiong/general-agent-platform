@@ -1167,3 +1167,54 @@ class TestDecisionClarifyShortCircuit:
         history_events = [e for e in events if e["event"] == "history.sources"]
         assert history_events and history_events[0]["data"]["sources"]
         assert completed[-1]["data"].get("final_text") != question, "有历史背景时不得只输出澄清问题"
+
+# ── Team Runtime 快照 API（断线重连恢复）──────────────────────────────────────
+
+class TestTeamSnapshotAPI:
+    def test_team_snapshot_owner_only_and_board_facts(self, client, user_setup):
+        import os
+        import uuid
+
+        from sqlalchemy import delete
+
+        from app.models.agent import Agent, AgentRun
+        from app.models.team import TeamRun, TeamTask
+
+        engine = create_engine(os.environ["DATABASE_SYNC_URL"])
+        run_id = uuid.uuid4().hex
+        with Session(engine) as s:
+            agent = Agent(name=f"team-snap-{run_id[:6]}", owner_id=user_setup["user1_id"])
+            s.add(agent)
+            s.flush()
+            agent_id = agent.id
+            s.add(AgentRun(
+                id=run_id, agent_id=agent_id, user_id=user_setup["user1_id"],
+                thread_id=f"team:{run_id}", status="running",
+            ))
+            s.add(TeamRun(
+                team_run_id=run_id, objective="快照测试", status="running",
+                phase="working", config_snapshot={},
+            ))
+            s.add(TeamTask(
+                team_run_id=run_id, task_id="facts", subject="核对事实",
+                description="交付事实", role="事实核对", status="completed",
+                revision=2, write_scopes=[],
+            ))
+            s.commit()
+        try:
+            other = client.get(f"/api/v2/runs/{run_id}/team", headers=_auth(user_setup["user2_id"]))
+            assert other.status_code == 404
+            resp = client.get(f"/api/v2/runs/{run_id}/team", headers=_auth(user_setup["user1_id"]))
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            assert data["team"]["team_run_id"] == run_id
+            assert data["team"]["phase"] == "working"
+            assert data["tasks"][0]["id"] == "facts"
+            assert data["tasks"][0]["status"] == "completed"
+        finally:
+            with Session(engine) as s:
+                s.execute(delete(TeamTask).where(TeamTask.team_run_id == run_id))
+                s.execute(delete(TeamRun).where(TeamRun.team_run_id == run_id))
+                s.execute(delete(AgentRun).where(AgentRun.id == run_id))
+                s.execute(delete(Agent).where(Agent.id == agent_id))
+                s.commit()

@@ -120,6 +120,8 @@ class RuntimeContext:
     goal_mode: bool = False
     # Work Orchestrator：当前执行步骤 ID（工具事件/账本按步骤归属，供步骤级验收取证）
     work_step_id: Optional[str] = None
+    # Agent Team Runtime：团队成员身份与协作服务（仅 Leader/Member 执行上下文注入）
+    team_context: Optional[Dict[str, Any]] = None
 
     def elapsed(self) -> float:
         return time.monotonic() - self.started_at

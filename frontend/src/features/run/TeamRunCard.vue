@@ -33,6 +33,11 @@
             </summary>
             <div class="task-content">
               <p v-if="task.brief" class="task-brief">{{ task.brief }}</p>
+              <p v-if="task.owner_member_id || task.board_status" class="task-owner">
+                <UserRound :size="13" aria-hidden="true" />
+                <span v-if="task.owner_member_id">执行成员 {{ task.owner_member_id }}</span>
+                <span v-if="task.board_status">状态 {{ task.board_status }}</span>
+              </p>
               <div v-if="task.depends_on.length" class="task-dependencies">
                 <GitBranch :size="14" aria-hidden="true" />
                 <span>依赖</span>
@@ -110,6 +115,8 @@ const terminalCount = computed(() => props.progress.tasks.filter((task) => task.
 .task-content { padding: 8px 10px 11px 33px; border-top: var(--ui-line); color: var(--ui-secondary); font-size: 13px; overflow-wrap: anywhere; }
 .task-content > * + * { margin-top: 7px; }
 .task-brief { white-space: pre-wrap; }
+.task-owner { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; color: var(--ui-muted); font-size: 11px; }
+.task-owner svg { flex: none; }
 .task-dependencies, .task-dependencies ul { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px; }
 .task-dependencies svg { align-self: center; flex: none; }
 .task-dependencies ul { padding: 0; list-style: none; }

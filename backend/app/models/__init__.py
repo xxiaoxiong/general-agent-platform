@@ -12,6 +12,9 @@ from app.models.conversation_memory import (
     ConversationIndexEntry, ConversationIndexJob, ConversationMemoryExclusion,
     ConversationMemorySetting, ConversationMemoryShare,
 )
+from app.models.team import (
+    TeamArtifact, TeamMember, TeamMessage, TeamRun, TeamTask, TeamTaskDependency,
+)
 from app.models.database_connection import DatabaseConnection
 from app.models.evolution import AgentEvaluation, EvolutionReport, EvolutionChangeLog
 from app.models.skill import Skill
@@ -41,6 +44,7 @@ __all__ = [
     "Agent", "AgentSession",
     "ConversationIndexEntry", "ConversationIndexJob", "ConversationMemorySetting",
     "ConversationMemoryExclusion", "ConversationMemoryShare",
+    "TeamRun", "TeamMember", "TeamTask", "TeamTaskDependency", "TeamMessage", "TeamArtifact",
     "DatabaseConnection",
     "AgentEvaluation", "EvolutionReport", "EvolutionChangeLog",
     "Skill", "MCPServer",
