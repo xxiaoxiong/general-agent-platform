@@ -39,4 +39,8 @@ def goal_protocol_prompt(ctx: RuntimeContext) -> str:
     ]
     if objective:
         lines.extend(["", "本次目标（用户原始请求）：", objective])
+    if ctx.goal_contract:
+        from app.services.goal_runtime.contracts import contract_prompt
+
+        lines.append(contract_prompt(ctx.goal_contract))
     return "\n".join(lines)

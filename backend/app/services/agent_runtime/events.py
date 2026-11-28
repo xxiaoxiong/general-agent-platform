@@ -69,6 +69,16 @@ WORK_STEP_FAILED = "work_step_failed"
 WORK_STEP_VERIFICATION = "work_step_verification"
 WORK_PLAN_COMPLETED = "work_plan_completed"
 WORK_PLAN_DEGRADED = "work_plan_degraded"
+# Goal Runtime：目标契约、迭代、验收进度（独立命名空间，不复用 plan_updated）
+GOAL_CONTRACT_CREATED = "goal_contract_created"
+GOAL_ITERATION_STARTED = "goal_iteration_started"
+GOAL_EVALUATED = "goal_evaluated"
+GOAL_PROGRESS_UPDATED = "goal_progress_updated"
+GOAL_PAUSED = "goal_paused"
+GOAL_COMPLETED = "goal_completed"
+# Deep Research：研究计划创建/更新（证据与主张通过 API 查询）
+RESEARCH_PLAN_CREATED = "research_plan_created"
+RESEARCH_PLAN_UPDATED = "research_plan_updated"
 
 # 流边界事件：消费者收到即结束本次事件流（Run 可能稍后由其他 Worker 恢复，
 # 恢复后的执行产生新的事件流）。任务书 §12.2：SSE 消费者必须能终止。
@@ -199,6 +209,12 @@ def _persist_max_len(ev_type: str) -> int:
     if ev_type.startswith("work_"):
         # 工作计划/步骤事件必须能完整回放（默认 400 字符会截断计划结构）
         return 12_000
+    if ev_type.startswith("goal_"):
+        # 目标契约/验收条件/逐轮结果需要完整回放（不能按 400 字符截断）
+        return 12_000
+    if ev_type.startswith("research_"):
+        # 研究计划/问题/证据缺口需要完整回放
+        return 8_000
     if ev_type == "history_sources":
         # 历史来源清单含标题/时间/片段，需要完整回放（不含完整原文）
         return 6_000
@@ -221,6 +237,11 @@ def event_storage_payload(ev: RuntimeEvent) -> dict:
     if ev.type.startswith("work_"):
         # 计划事件含步骤列表、依赖、验收检查与产物引用：允许更多数组项
         return _redact(ev.data, max_len=12_000, max_items=64)
+    if ev.type.startswith("goal_"):
+        # 目标事件含验收条件列表与逐项状态：允许更多数组项
+        return _redact(ev.data, max_len=12_000, max_items=64)
+    if ev.type.startswith("research_"):
+        return _redact(ev.data, max_len=8_000, max_items=64)
     if ev.type == "history_sources":
         return _redact(ev.data, max_len=1200, max_items=20)
     data = ev.data or {}
@@ -361,6 +382,51 @@ class LegacyEventAdapter:
             return [{
                 "type": "thought",
                 "content": f"复杂任务计划未启用，回退到原有执行路径：{str(ev.data.get('reason') or '')[:200]}",
+            }]
+
+        if t == GOAL_CONTRACT_CREATED:
+            criteria = ev.data.get("acceptance_criteria") or []
+            lines = [f"- {item.get('id')} {item.get('description')}"
+                     for item in criteria[:10] if isinstance(item, dict)]
+            return [{
+                "type": "thought",
+                "content": "目标契约：\n" + "\n".join(lines) if lines else "目标契约已创建",
+            }]
+
+        if t == GOAL_ITERATION_STARTED:
+            return [{
+                "type": "thought",
+                "content": f"目标第 {ev.data.get('iteration')} 轮继续执行："
+                           f"{str(ev.data.get('reason') or '')[:200]}",
+            }]
+
+        if t == GOAL_EVALUATED:
+            progress = ev.data.get("progress") or {}
+            blocking = ev.data.get("blocking") or []
+            if blocking:
+                detail = "、".join(
+                    str(item.get("description") or item.get("id")) for item in blocking[:4]
+                    if isinstance(item, dict)
+                )
+                content = (f"目标验收：{progress.get('percent', 0)}% 完成；"
+                           f"未通过 {detail}")
+            else:
+                content = f"目标验收：{progress.get('percent', 0)}% 完成，全部必需项通过"
+            return [{"type": "thought", "content": content}]
+
+        if t == GOAL_PAUSED:
+            return [{
+                "type": "thought",
+                "content": f"目标已暂停：{str(ev.data.get('reason') or '')[:200]}",
+            }]
+
+        if t == RESEARCH_PLAN_CREATED:
+            questions = ev.data.get("questions") or []
+            lines = [f"- {item.get('id')} {item.get('question')}"
+                     for item in questions[:8] if isinstance(item, dict)]
+            return [{
+                "type": "thought",
+                "content": "研究计划：\n" + "\n".join(lines) if lines else "研究计划已创建",
             }]
 
         if t == STATE_CHANGED:

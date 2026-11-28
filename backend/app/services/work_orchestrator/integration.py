@@ -96,7 +96,14 @@ async def prepare_plan(
     if int(getattr(run, "attempt", 1) or 1) > 1:
         # 恢复中的 Run 不临时改路线：只有已持久化的 auto 计划会被复用（见上）
         return None
-    if ctx.goal_mode or execution_context.get("team_mode") or execution_context.get("completion_resume"):
+    if ctx.goal_mode and (
+        not bool(getattr(settings, "GOAL_ENABLE_WORK_ORCHESTRATOR", True))
+        or bool(ctx.agent_config.get("research_enabled"))
+    ):
+        # 目标模式默认允许 WorkPlan（Goal 只判断是否达成，不重复执行）；
+        # 研究型目标交给 Deep Research 的调查循环，不叠加第二套计划。
+        return None
+    if execution_context.get("team_mode") or execution_context.get("completion_resume"):
         return None
     if execution_context.get("task_type") in {"document_edit", "document_analyze", "profile_extract"}:
         return None

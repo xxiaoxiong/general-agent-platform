@@ -448,6 +448,64 @@ class GoalProbe:
         report["passed"] = all(item["passed"] for item in checks)
         report["issues"] = [f"{item['check']}={item['detail']}" for item in checks if not item["passed"]]
 
+    async def audit_goal_contract(self, run_id: str, checks: list[dict[str, Any]]) -> None:
+        """真实验收目标契约：持久化、验收项、revision，以及完成时必需项是否真的通过。"""
+        if self.args.mode != "goal":
+            return
+        try:
+            response = await self.client.get(f"/api/v2/goals/by-run/{run_id}")
+            if response.status_code != 200:
+                checks.append({
+                    "check": "goal_contract_persisted", "passed": False,
+                    "detail": f"HTTP {response.status_code}",
+                })
+                return
+            payload = response.json()
+            criteria = [
+                item for item in (payload.get("acceptance_criteria") or [])
+                if isinstance(item, dict)
+            ]
+            required = [item for item in criteria if item.get("required", True)]
+            self.report["goal_contract"] = {
+                "goal_id": payload.get("goal_id"),
+                "revision": payload.get("revision"),
+                "status": payload.get("status"),
+                "criteria": len(criteria),
+                "required_passed": sum(
+                    1 for item in required if item.get("status") == "passed"),
+                "required_total": len(required),
+                "progress": payload.get("progress"),
+                "iterations": payload.get("iterations"),
+            }
+            checks.append({
+                "check": "goal_contract_persisted",
+                "passed": bool(payload.get("goal_id")) and bool(criteria),
+                "detail": {"goal_id": payload.get("goal_id"), "criteria": len(criteria)},
+            })
+            checks.append({
+                "check": "goal_contract_revision",
+                "passed": int(payload.get("revision") or 0) >= 1,
+                "detail": payload.get("revision"),
+            })
+            # 完成 ≠ 丢失验收证据：completed 时必须所有必需项 passed
+            completed = payload.get("status") == "completed"
+            required_ok = all(item.get("status") == "passed" for item in required)
+            checks.append({
+                "check": "goal_no_false_completion",
+                "passed": (required_ok if completed else True),
+                "detail": {
+                    "status": payload.get("status"),
+                    "required_passed": sum(
+                        1 for item in required if item.get("status") == "passed"),
+                    "required_total": len(required),
+                },
+            })
+        except Exception as exc:  # noqa: BLE001 探针审计失败如实记录
+            checks.append({
+                "check": "goal_contract_persisted", "passed": False,
+                "detail": f"{type(exc).__name__}: {exc}",
+            })
+
     def db_audit(self, run_id: str) -> None:
         try:
             import pymysql
@@ -497,8 +555,9 @@ class GoalProbe:
                         "detail": snapshot.get("goal_mode"),
                     })
                     self.report["checks"].append({
-                        "check": "db_no_deadline",
-                        "passed": row.get("budget_deadline_at") is None,
+                        # 目标模式保留全局安全预算：应有绝对截止时间，而不是无限制
+                        "check": "db_global_deadline",
+                        "passed": row.get("budget_deadline_at") is not None,
                         "detail": str(row.get("budget_deadline_at")),
                     })
                 else:
@@ -587,7 +646,16 @@ async def main() -> int:
         except Exception as exc:  # noqa: BLE001
             probe.report["messages_error"] = str(exc)
         probe.audit(watch, steers, messages)
+        await probe.audit_goal_contract(run_id, probe.report["checks"])
         probe.db_audit(run_id)
+        # 目标契约/DB 审计可能追加检查项，最终结论以追加后的完整清单为准
+        probe.report["passed"] = all(
+            item.get("passed") for item in probe.report["checks"]
+        )
+        probe.report["issues"] = [
+            f"{item.get('check')}={item.get('detail')}"
+            for item in probe.report["checks"] if not item.get("passed")
+        ]
 
         Path(args.report).write_text(json.dumps(probe.report, ensure_ascii=False, indent=2, default=str),
                                      encoding="utf-8")

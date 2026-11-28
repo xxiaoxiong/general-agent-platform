@@ -38,8 +38,11 @@ from app.services.agent_runtime.context import (
 )
 from app.services.agent_runtime.events import (
     APPROVAL_REQUIRED,
+    GOAL_CONTRACT_CREATED,
+    GOAL_PAUSED,
     MODEL_DELTA,
     PLAN_UPDATED,
+    RESEARCH_PLAN_CREATED,
     RUN_CANCELLED,
     RUN_COMPLETED,
     RUN_FAILED,
@@ -76,6 +79,7 @@ from app.services.agent_runtime.lifecycle import (
     STATUS_WAITING_APPROVAL,
     STATUS_WAITING_INPUT,
     TERMINAL_STATUSES,
+    GoalPauseRequested,
     InvalidTransition,
     RunExecutionLease,
     RunHandle,
@@ -118,7 +122,28 @@ logger = logging.getLogger("agent_runtime")
 _STOP_MESSAGES = {
     "budget": "已达到本次执行上限，任务已暂停。",
     "no_progress": "连续尝试后进度未变化，任务已自动暂停。",
+    # Goal Runtime：目标未达成时明确暂停/受阻，禁止伪装成完成
+    "goal_budget": "已达到目标模式的全局安全预算，任务已暂停并保留已完成结果；可回复“继续”接着执行。",
+    "goal_rounds": "已达到目标模式的最大迭代轮次，任务已暂停并保留已完成结果；可回复“继续”接着执行。",
+    "goal_blocked": "目标仍未达成且连续多轮没有实质进展，任务已暂停以避免空转；请补充信息或调整目标后继续。",
+    "goal_work_plan": "目标执行计划未通过验收，任务已暂停并保留已完成步骤；请核对后回复“继续”接着执行。",
+    "goal_paused": "任务已按你的要求暂停，已完成的结果与目标契约已保留；可回复“继续”接着执行。",
+    "model_rate_limited": "模型服务暂时限流（429），任务已暂停并保留进度；请稍后回复“继续”接着执行。",
 }
+
+
+def is_resumable_stop(
+    stop_reason: str, *, goal_mode: bool, team_mode: bool, private_document: bool,
+) -> bool:
+    """中断语义（暂停并保留可续做状态）判定。
+
+    目标模式的中断语义对 Team 同样成立：团队任务板仍未达成目标时必须
+    暂停并可凭“继续”接着执行，不能按普通团队失败收口。私有文档内容
+    一律不在此列（与原有文档图收口语义保持兼容）。
+    """
+    if private_document or stop_reason not in _STOP_MESSAGES:
+        return False
+    return bool(goal_mode) or not team_mode
 
 # Langfuse Trace 富化等后台 best-effort 任务的强引用（防 GC 提前回收）
 _BG_TASKS: set = set()
@@ -164,6 +189,22 @@ def _extract_text(content: Any) -> str:
                 parts.append(str(block.get("text") or ""))
         return "".join(parts)
     return ""
+
+
+def _is_model_rate_limit_error(exc: BaseException) -> bool:
+    """模型供应商限流（429）：属于可恢复的暂停，不应把长任务直接判失败。"""
+    try:
+        import openai
+
+        if isinstance(exc, openai.RateLimitError):
+            return True
+    except Exception:  # noqa: BLE001 openai SDK 缺失/异常类型差异
+        pass
+    text = str(exc or "").lower()
+    return any(token in text for token in (
+        "error code: 429", "status code: 429", "too many requests",
+        "rate limit", "调用太频繁", "限流",
+    ))
 
 
 def _derive_title(content: str, *, max_len: int = 24) -> Optional[str]:

@@ -11,9 +11,11 @@ from ._common import (
     _derive_title,
     _extract_text,
     _field,
+    _is_model_rate_limit_error,
     _last_user_input,
     _synthetic_terminal_event,
     compute_request_hash,
+    is_resumable_stop,
 )
 
 
@@ -525,16 +527,18 @@ class StreamMixin:
             )
             # P4-05/06：Run 级预算优先取 AgentVersion 快照的 execution_budget
             # （P2-01 版本绑定语义），缺省回落全局 settings。
-            # 目标模式（/goal）：不限模型调用/工具调用/步数/执行时长——
-            # 预算全部置 0（0=不限制，不挂 Limit 中间件）且不设墙钟截止。
+            # 目标模式（/goal）：不套用普通任务的短预算，但必须保留全局安全边界
+            # （轮次/模型调用/工具调用/时长），禁止通过“解除全部预算”实现长任务。
             goal_mode = bool(agent_config.get("goal_mode"))
             _budget_cfg = agent_config.get("execution_budget") or {}
             if goal_mode:
-                run_timeout = 0.0
                 budget = ExecutionBudget(
-                    max_steps=0, max_tool_calls=0, max_model_calls=0,
-                    run_timeout_seconds=0.0,
+                    max_steps=int(getattr(settings, "GOAL_MAX_STEPS", 400)),
+                    max_tool_calls=int(getattr(settings, "GOAL_MAX_TOOL_CALLS", 400)),
+                    max_model_calls=int(getattr(settings, "GOAL_MAX_MODEL_CALLS", 300)),
+                    run_timeout_seconds=float(getattr(settings, "GOAL_MAX_SECONDS", 21600.0)),
                 )
+                run_timeout = budget.run_timeout_seconds
             else:
                 run_timeout = settings.AGENT_RUN_TIMEOUT
                 if run_timeout > 0:
@@ -619,6 +623,82 @@ class StreamMixin:
                     from app.services.agent_runtime.completion import prepare_completion_continuation
 
                     await prepare_completion_continuation(ctx, continued)
+
+            if ctx.goal_mode and bool(getattr(settings, "GOAL_RUNTIME_ENABLED", True)):
+                # 目标契约：持久化原始目标、必需验收项与版本；续做时复用同一 goal_id。
+                # 契约由服务端构建，模型只能提出修订，不能删除用户必需条件。
+                continuation = (execution_context or {}).get("completion_resume") or {}
+                try:
+                    from app.services.goal_runtime.contracts import ensure_goal_contract
+
+                    contract = await ensure_goal_contract(
+                        run_id=run.run_id,
+                        user_id=scope.user_id,
+                        agent_id=run.agent_id,
+                        session_id=run.session_id,
+                        objective=str(agent_config.get("_goal_objective") or ""),
+                        task_contract=ctx.task_contract,
+                        decision=(execution_context or {}).get("decision") or {},
+                        previous_run_id=continuation.get("run_id"),
+                    )
+                    ctx.goal_contract = contract
+                    await bus.publish(RuntimeEvent(
+                        type=GOAL_CONTRACT_CREATED, run_id=run.run_id,
+                        data={
+                            "goal_id": contract["goal_id"],
+                            "revision": contract["revision"],
+                            "objective": contract["objective"],
+                            "acceptance_criteria": contract["acceptance_criteria"],
+                            "progress": contract["progress"],
+                        },
+                    ))
+                except Exception:  # noqa: BLE001 目标运行时故障降级为原完成检查
+                    logger.warning(
+                        "run %s 目标契约创建失败，降级到原完成检查", run.run_id,
+                        exc_info=True,
+                    )
+
+            if ctx.goal_mode and ctx.goal_contract:
+                # Deep Research Profile：研究类目标建立持久化研究计划并开放研究工具。
+                # 非研究目标不注入，避免无关任务被证据链流程拖慢。
+                try:
+                    from app.services.research.service import (
+                        activate_research_plan, should_activate_research,
+                    )
+
+                    if should_activate_research(
+                        goal_mode=ctx.goal_mode,
+                        task_contract=ctx.task_contract,
+                        execution_context=execution_context,
+                        capability_ids=agent_config.get("capability_ids") or [],
+                    ):
+                        continuation = (execution_context or {}).get("completion_resume") or {}
+                        plan = await activate_research_plan(
+                            run_id=run.run_id,
+                            goal_id=str(ctx.goal_contract.get("goal_id") or ""),
+                            user_id=scope.user_id,
+                            session_id=run.session_id,
+                            objective=str(agent_config.get("_goal_objective") or ""),
+                            execution_context=execution_context,
+                            previous_run_id=continuation.get("run_id"),
+                        )
+                        agent_config["research_enabled"] = True
+                        ctx.agent_config["research_enabled"] = True
+                        await bus.publish(RuntimeEvent(
+                            type=RESEARCH_PLAN_CREATED, run_id=run.run_id,
+                            data={
+                                "research_id": plan["research_id"],
+                                "goal_id": plan.get("goal_id"),
+                                "topic": plan["topic"],
+                                "questions": plan["questions"],
+                                "status": plan["status"],
+                            },
+                        ))
+                except Exception:  # noqa: BLE001 研究计划故障降级为普通目标执行
+                    logger.warning(
+                        "run %s 研究计划初始化失败，降级为普通目标执行", run.run_id,
+                        exc_info=True,
+                    )
 
             tool_specs = self._resolve_tool_specs(agent_config)
             if execution_context is not None:
@@ -789,6 +869,10 @@ class StreamMixin:
                         route["completion_resume"] = True
                     route["attachment_count"] = len(execution_context.get("attachment_refs") or [])
                     route["goal_mode"] = ctx.goal_mode
+                    if ctx.goal_contract:
+                        route["goal_id"] = ctx.goal_contract.get("goal_id")
+                        route["goal_revision"] = ctx.goal_contract.get("revision")
+                        route["research_enabled"] = bool(agent_config.get("research_enabled"))
                     if source_attachment := execution_context.get("source_attachment"):
                         route["source_name"] = source_attachment.get("name")
                     await bus.publish(RuntimeEvent(type="task.routed", run_id=run.run_id, data=route))
@@ -821,13 +905,11 @@ class StreamMixin:
                 # 约消耗 10~14 步：before/after model 钩子 + model + tools + 工具钩子），
                 # 过小的系数会让长任务误触发 GraphRecursionError。预算上限本身由
                 # ModelCallLimit/ToolCallLimit 与 ctx.budget 独立执行，这里只是兜底。
-                # 目标模式不设业务上限：递归上限只保留技术性兜底（防真正的死循环图）。
-                if ctx.goal_mode:
-                    config["recursion_limit"] = 1_000_000
-                else:
-                    config["recursion_limit"] = (
-                        max(ctx.budget.max_steps, ctx.budget.max_model_calls, 1000) * 16 + 40
-                    )
+                # 递归上限按全局安全预算换算（Goal 模式同样保留技术性兜底，
+                # 不通过无限递归实现长任务）。
+                config["recursion_limit"] = (
+                    max(ctx.budget.max_steps, ctx.budget.max_model_calls, 1000) * 16 + 40
+                )
                 run_config = config
 
                 # FR-09：挂起/重启恢复后从事件日志重建已产生的最终文本片段，
@@ -960,6 +1042,59 @@ class StreamMixin:
                 }
                 if document_context is not None:
                     run.summary.update(document_context.summary)
+                if is_team_run and ctx.goal_contract:
+                    # Goal + Team：团队任务板提供结构化结果，目标契约负责是否达成。
+                    # 本轮未达成时暂停（可回复“继续”在新 Run 中接着执行），不在
+                    # 同一个团队板上无限重跑。
+                    try:
+                        from app.services.goal_runtime.supervisor import supervise_goal
+
+                        total_tasks = int(team_stats.get("team_task_count") or 0)
+                        completed_tasks = int(team_stats.get("team_completed_count") or 0)
+                        checks = {
+                            "answer_present": {
+                                "passed": bool((run.final_text or "").strip()),
+                                "detail": "团队未产出最终回答" if not (run.final_text or "").strip() else "",
+                            },
+                        }
+                        if total_tasks:
+                            checks["plan_finished"] = {
+                                "passed": completed_tasks >= total_tasks,
+                                "detail": (
+                                    f"团队任务未全部完成（{completed_tasks}/{total_tasks}）"
+                                    if completed_tasks < total_tasks else ""
+                                ),
+                            }
+                        failed_ids = [key for key, item in checks.items() if not item["passed"]]
+                        decision = await supervise_goal(
+                            goal_id=str(ctx.goal_contract.get("goal_id") or ""),
+                            run_id=run.run_id,
+                            text=run.final_text or "",
+                            checks=checks,
+                            failed_ids=failed_ids,
+                            executor="team",
+                            budget_reason="",
+                        )
+                        if decision is not None:
+                            run.summary["goal"] = decision.goal
+                            if decision.action != "complete":
+                                verification = {
+                                    "version": 2,
+                                    "status": "partial",
+                                    "checks": [{
+                                        "id": "goal_incomplete", "passed": False,
+                                        "detail": decision.reason or "目标尚未达成",
+                                    }],
+                                    "artifacts": [],
+                                    "stop_reason": (
+                                        decision.stop_reason or "goal_blocked"
+                                    ),
+                                    "goal": decision.goal,
+                                }
+                                team_incomplete = None
+                    except Exception:  # noqa: BLE001 团队目标验收失败降级为原团队结果
+                        logger.warning("run %s 团队目标验收失败（忽略）", run.run_id,
+                                       exc_info=True)
                 if team_incomplete:
                     await self._fail(run, team_incomplete, status=STATUS_FAILED, bus=bus, team_mode=True,
                                      result_summary=run.summary, draft=run.final_text)
@@ -968,14 +1103,25 @@ class StreamMixin:
                     run.summary["verification"] = verification
                     if verification["status"] != "passed":
                         stop_reason = verification.get("stop_reason")
-                        limited = stop_reason in _STOP_MESSAGES and not (is_team_run or private_document_content)
+                        limited = is_resumable_stop(
+                            str(stop_reason or ""),
+                            goal_mode=bool(ctx.goal_mode),
+                            team_mode=bool(is_team_run),
+                            private_document=bool(private_document_content),
+                        )
                         if limited:
                             from app.services.agent_runtime.completion import supports_completion_resume
 
                             run.summary["stop"] = {
                                 "reason": stop_reason,
-                                "can_continue": bool(run.session_id and task_type in (None, "general_chat")
-                                                     and supports_completion_resume(ctx.task_contract)),
+                                # 目标模式暂停后目标契约仍在，可凭“继续”接着执行
+                                "can_continue": bool(run.session_id and (
+                                    ctx.goal_mode
+                                    or (task_type in (None, "general_chat")
+                                        and supports_completion_resume(ctx.task_contract))
+                                )),
+                                **({"goal_id": ctx.goal_contract.get("goal_id")}
+                                   if ctx.goal_contract else {}),
                             }
                         await self._fail(
                             run, _STOP_MESSAGES[stop_reason] if limited else "任务仍有交付项未通过验收，已保存当前结果。",
@@ -1060,6 +1206,42 @@ class StreamMixin:
                     "final_text": draft, "summary": partial,
                 } if partial else {}))
             raise
+        except GoalPauseRequested:
+            logger.info("run %s 用户请求暂停目标，保留部分成果", run.run_id)
+            if ctx and ctx.goal_contract:
+                try:
+                    from app.services.goal_runtime.supervisor import mark_goal_status
+
+                    await mark_goal_status(
+                        str(ctx.goal_contract.get("goal_id") or ""), "paused",
+                    )
+                except Exception:  # noqa: BLE001 目标状态失败不阻断暂停
+                    logger.warning("run %s 暂停目标状态写入失败", run.run_id, exc_info=True)
+                try:
+                    await bus.publish(RuntimeEvent(
+                        type=GOAL_PAUSED, run_id=run.run_id, data={
+                            "goal_id": ctx.goal_contract.get("goal_id"),
+                            "reason": "用户请求暂停",
+                            "stop_reason": "goal_paused",
+                        },
+                    ))
+                except Exception:  # noqa: BLE001 事件失败不影响暂停
+                    logger.warning("run %s 目标暂停事件发布失败", run.run_id)
+            draft, summary = await self._retain_interrupted_completion(
+                run, ctx, "goal_paused", graceful=True, resumable_route=True,
+            )
+            if isinstance(summary, dict):
+                summary.setdefault("stop", {})
+                summary["stop"].update({
+                    "reason": "goal_paused",
+                    "can_continue": bool(run.session_id),
+                    **({"goal_id": ctx.goal_contract.get("goal_id")}
+                       if ctx and ctx.goal_contract else {}),
+                })
+            await self._fail(
+                run, _STOP_MESSAGES["goal_paused"], status=STATUS_LIMIT_EXCEEDED,
+                bus=bus, draft=draft, result_summary=summary,
+            )
         except (_RunLimitExceeded, BudgetExceededError, ToolCallLimitExceededError,
                 ModelCallLimitExceededError, GraphRecursionError, ToolLoopStopped) as e:
             reason = "no_progress" if isinstance(e, ToolLoopStopped) else "budget"
@@ -1101,6 +1283,36 @@ class StreamMixin:
                 logger.exception("run %s 执行权丢失事件发布失败", run.run_id)
             raise
         except Exception as e:
+            if (not is_team_run and not private_document_content
+                    and ctx is not None and _is_model_rate_limit_error(e)):
+                # 供应商限流是可恢复暂停：保留进度，稍后“继续”，不要把长任务判死
+                logger.warning("run %s 模型服务限流，暂停并保留进度：%s", run.run_id, e)
+                if ctx.goal_contract:
+                    try:
+                        from app.services.goal_runtime.supervisor import mark_goal_status
+
+                        await mark_goal_status(
+                            str(ctx.goal_contract.get("goal_id") or ""), "paused",
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning("run %s 限流暂停目标状态写入失败", run.run_id)
+                draft, summary = await self._retain_interrupted_completion(
+                    run, ctx, "model_rate_limited", graceful=True, resumable_route=True,
+                )
+                if isinstance(summary, dict):
+                    summary.setdefault("stop", {})
+                    summary["stop"].update({
+                        "reason": "model_rate_limited",
+                        "can_continue": bool(run.session_id),
+                        **({"goal_id": ctx.goal_contract.get("goal_id")}
+                           if ctx.goal_contract else {}),
+                    })
+                await self._fail(
+                    run, _STOP_MESSAGES["model_rate_limited"],
+                    status=STATUS_LIMIT_EXCEEDED, bus=bus,
+                    draft=draft, result_summary=summary,
+                )
+                return
             failure_code = None
             if is_team_run and not private_document_content:
                 from app.services.agent_runtime.team_graph import TeamExecutionError
@@ -1141,6 +1353,34 @@ class StreamMixin:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # Goal Runtime：Run 终态同步目标状态（completed/cancelled/failed）。
+            # paused/blocked 已由目标监督评估写入，这里不覆盖。
+            if ctx is not None and ctx.goal_contract and run.status in {
+                STATUS_COMPLETED, STATUS_CANCELLED, STATUS_FAILED, STATUS_LIMIT_EXCEEDED,
+            }:
+                try:
+                    from app.services.goal_runtime.supervisor import mark_goal_status
+
+                    await mark_goal_status(
+                        str(ctx.goal_contract.get("goal_id") or ""), run.status,
+                        # 预算/轮次暂停时目标可能已被监督评估标记 paused/blocked，
+                        # 这里仅在仍为 active 时补记暂停，避免覆盖更精确的状态
+                        only_if_active=run.status == STATUS_LIMIT_EXCEEDED,
+                    )
+                except Exception:  # noqa: BLE001 目标状态同步失败不影响 Run 终态
+                    logger.warning("run %s 目标状态同步失败", run.run_id, exc_info=True)
+            if (ctx is not None and ctx.agent_config.get("research_enabled")
+                    and run.status in {STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED}):
+                try:
+                    from app.services.research.service import finish_research_plan
+
+                    await finish_research_plan(
+                        run_id=run.run_id,
+                        user_id=ctx.scope.user_id,
+                        status="completed" if run.status == STATUS_COMPLETED else run.status,
+                    )
+                except Exception:  # noqa: BLE001 研究状态同步失败不影响 Run 终态
+                    logger.warning("run %s 研究计划状态同步失败", run.run_id, exc_info=True)
             # Workspace 写租约释放：Run 结束后其他写任务可立即接管（任务书 §3.2）
             if settings.SANDBOX_ENABLED and project_id:
                 try:
@@ -1185,6 +1425,52 @@ class StreamMixin:
             run.summary = summary
             if verification.get("status") != "passed":
                 stop_reason = str(verification.get("stop_reason") or "")
+                if ctx.goal_mode and ctx.goal_contract:
+                    # 目标模式下计划失败只是本轮未达成：暂停并保留已完成步骤，
+                    # 由用户“继续”在新 Run 重新规划，不能直接把目标判死。
+                    goal_id = str(ctx.goal_contract.get("goal_id") or "")
+                    try:
+                        from app.services.goal_runtime.supervisor import (
+                            mark_goal_status, record_goal_iteration,
+                        )
+
+                        await mark_goal_status(goal_id, "paused", only_if_active=True)
+                        await record_goal_iteration(
+                            goal_id=goal_id, run_id=run.run_id, status="paused",
+                            executor="work_plan",
+                            plan=list((outcome_summary(result) or {}).get("steps") or []),
+                            result={
+                                "action": "paused",
+                                "reason": "目标执行计划未通过验收",
+                                "stop_reason": "goal_work_plan",
+                                "detail": str(verification.get("stop_reason") or ""),
+                            },
+                            evidence_refs=list(verification.get("evidence_refs") or []),
+                        )
+                    except Exception:  # noqa: BLE001 目标状态失败不阻断暂停
+                        logger.warning("run %s 计划失败暂停目标状态写入失败", run.run_id,
+                                       exc_info=True)
+                    try:
+                        await bus.publish(RuntimeEvent(
+                            type=GOAL_PAUSED, run_id=run.run_id, data={
+                                "goal_id": goal_id,
+                                "reason": "目标执行计划未通过验收",
+                                "stop_reason": "goal_work_plan",
+                                "detail": str(verification.get("stop_reason") or ""),
+                            },
+                        ))
+                    except Exception:  # noqa: BLE001 事件失败不影响暂停
+                        logger.warning("run %s 计划失败暂停事件发布失败", run.run_id)
+                    summary["stop"] = {
+                        "reason": "goal_work_plan",
+                        "can_continue": bool(run.session_id),
+                        "goal_id": goal_id,
+                    }
+                    await self._fail(
+                        run, _STOP_MESSAGES["goal_work_plan"], status=STATUS_LIMIT_EXCEEDED,
+                        bus=bus, result_summary=summary, draft=result.final_text,
+                    )
+                    return
                 limited = stop_reason in _STOP_MESSAGES
                 if limited:
                     summary["stop"] = {"reason": stop_reason, "can_continue": False}
@@ -1197,6 +1483,19 @@ class StreamMixin:
                 return
         run.final_text = result.final_text
         run.summary = summary
+        # WorkPlan 已完成全部步骤验收：目标契约同步为完成（不重复二次验收）
+        if ctx.goal_contract:
+            try:
+                from app.services.goal_runtime.supervisor import complete_goal_contract
+
+                await complete_goal_contract(
+                    str(ctx.goal_contract.get("goal_id") or ""), evidence="work_plan",
+                    run_id=run.run_id,
+                    plan=list((summary.get("work_plan") or {}).get("steps") or []),
+                    evidence_refs=list((verification or {}).get("evidence_refs") or []),
+                )
+            except Exception:  # noqa: BLE001 目标同步失败不影响 Run 完成
+                logger.warning("run %s 目标契约完成同步失败", run.run_id, exc_info=True)
         run.transition(STATUS_COMPLETED)
         await self._commit(
             run, status=STATUS_COMPLETED, final_text=run.final_text,
@@ -1485,7 +1784,7 @@ class StreamMixin:
                 if graceful:
                     summary["stop"]["can_continue"] = bool(
                         run.session_id and resumable_route and evidence.get("stop_reason") != "external_operation"
-                        and supports_completion_resume(ctx.task_contract)
+                        and (ctx.goal_mode or supports_completion_resume(ctx.task_contract))
                     )
         except Exception:
             logger.warning("run %s 中断后未能完成产物核对", run.run_id, exc_info=True)

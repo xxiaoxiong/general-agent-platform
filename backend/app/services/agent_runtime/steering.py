@@ -64,7 +64,9 @@ async def submit_steering(run_id: str, user_id: int, content: str) -> Dict[str, 
         if run is None or run.user_id != user_id:
             raise SteeringError(404, "运行不存在")
         route = (run.input_payload or {}).get("execution_context") or {}
-        if route.get("team_mode"):
+        goal_team = bool((run.agent_config_snapshot or {}).get("goal_mode"))
+        if route.get("team_mode") and not goal_team:
+            # 普通团队 Run 未接入补充注入；目标模式的团队由 Goal 契约统一记录
             raise SteeringError(409, "团队协作任务暂不支持执行中补充")
         if run.status not in ("pending", "running") or run.cancel_requested:
             raise SteeringError(409, "任务当前不在可补充的执行状态")
@@ -77,9 +79,24 @@ async def submit_steering(run_id: str, user_id: int, content: str) -> Dict[str, 
         await db.flush()
         message_id = row.message_id
 
+        # Goal Runtime：执行中补充要求必须形成目标契约新 revision，
+        # 并把已通过项标记为待复核；只注入消息不算目标契约已更新。
+        goal_revision = None
+        try:
+            from app.services.goal_runtime.contracts import record_steering_revision
+
+            goal_revision = await record_steering_revision(
+                db, run_id, text, message_id,
+            )
+        except Exception:  # noqa: BLE001 目标契约写入失败不得阻断补充受理
+            logger.warning("run %s 补充要求写入目标契约失败（忽略）", run_id, exc_info=True)
+
         event = RuntimeEvent(
             type=RUN_STEERED, run_id=run_id, thread_id=run.thread_id or "",
-            data={"message_id": message_id, "content": text},
+            data={
+                "message_id": message_id, "content": text,
+                **({"goal_revision": goal_revision} if goal_revision else {}),
+            },
         )
         event.sequence = await EventBus.persist_in_transaction(event, db)
         if run.session_id:

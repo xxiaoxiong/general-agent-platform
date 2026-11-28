@@ -30,6 +30,7 @@ from . import (
     web_tools,
     code_tools,
     sandbox_tools,
+    research_tools,
 )
 
 # ── 汇总所有工具注册表 ────────────────────────────────────────────────────────
@@ -54,6 +55,10 @@ BUILTIN_TOOLS: List[Dict[str, Any]] = (
 # Workspace Sandbox 工具（仅在 SANDBOX_ENABLED 且会话绑定项目时注入）
 SANDBOX_TOOLS: List[Dict[str, Any]] = sandbox_tools.TOOLS
 SANDBOX_TOOL_NAMES = sandbox_tools.SANDBOX_TOOL_NAMES
+
+# Deep Research 工具（仅在目标模式研究类任务中注入）
+RESEARCH_TOOLS: List[Dict[str, Any]] = research_tools.TOOLS
+RESEARCH_TOOL_NAMES = research_tools.RESEARCH_TOOL_NAMES
 
 # ── 工具路由表 ────────────────────────────────────────────────────────────────
 # 按调用签名分类（handler 返回 str | ToolResult，execute 边界统一归一化）：
@@ -138,7 +143,6 @@ class ToolExecutor:
                 return normalize(await _CONTEXT_HANDLERS[tool_name](self.ctx, tool_input))
 
             # 历史会话检索（Conversation Memory）：需要 Run 身份，ACL 由服务端重算。
-            # 延迟导入避免与 conversation_memory 包初始化形成循环依赖。
             if tool_name in {"search_conversation_history", "get_conversation_source"}:
                 if self.ctx is None:
                     return ToolResult.failed(
@@ -147,6 +151,19 @@ class ToolExecutor:
                 from app.services.conversation_memory.tools import HANDLERS as HISTORY_HANDLERS
 
                 return normalize(await HISTORY_HANDLERS[tool_name](self.ctx, tool_input))
+
+            # 深度研究工具：研究计划由当前 Run 服务端解析，模型不能指定其他研究范围
+            if tool_name.startswith("research_"):
+                if self.ctx is None:
+                    return ToolResult.failed(
+                        f"工具 '{tool_name}' 需要 Run 上下文，当前执行环境不支持"
+                    )
+                from .research_tools import HANDLERS as RESEARCH_HANDLERS
+
+                handler = RESEARCH_HANDLERS.get(tool_name)
+                if handler is None:
+                    return ToolResult.failed(f"错误：未知研究工具 '{tool_name}'")
+                return normalize(await handler(self.ctx, tool_input))
 
             # 团队协作工具（Leader/Member）：身份与团队作用域由 team_context 服务端注入
             if tool_name.startswith("team_"):

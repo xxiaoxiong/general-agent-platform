@@ -68,6 +68,16 @@ V2_EVENT_NAMES: Dict[str, str] = {
     "work_plan_degraded": "work.plan.degraded",
     # Conversation Memory：自动历史检索来源（新增事件，旧客户端忽略）
     "history_sources": "history.sources",
+    # Goal Runtime：目标契约 / 逐轮验收 / 进度（新增事件，旧客户端忽略）
+    "goal_contract_created": "goal.contract.created",
+    "goal_iteration_started": "goal.iteration.started",
+    "goal_evaluated": "goal.evaluated",
+    "goal_progress_updated": "goal.progress.updated",
+    "goal_paused": "goal.paused",
+    "goal_completed": "goal.completed",
+    # Deep Research：研究计划（新增事件，旧客户端忽略）
+    "research_plan_created": "research.plan.created",
+    "research_plan_updated": "research.plan.updated",
 }
 
 # 终止事件（消费者收到即结束本次事件流）

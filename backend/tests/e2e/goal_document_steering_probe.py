@@ -335,7 +335,7 @@ class DocProbe:
                     "detail": snapshot.get("goal_mode"),
                 })
                 self.report["checks"].append({
-                    "check": "db_no_deadline", "passed": row.get("budget_deadline_at") is None,
+                    "check": "db_global_deadline", "passed": row.get("budget_deadline_at") is not None,
                     "detail": str(row.get("budget_deadline_at")),
                 })
                 self.report["checks"].append({

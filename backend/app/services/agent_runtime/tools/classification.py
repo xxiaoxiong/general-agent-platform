@@ -74,6 +74,24 @@ READ_ONLY_TOOLS = frozenset({
     "knowledge_search",
     "weather",
     "web_search",
+    # Deep Research 读取/核验：网络读取或本地只读查询，无外部业务副作用
+    "research_get_state",
+    "research_read_source",
+    "research_verify_claim",
+})
+
+# 平台内部状态写入（研究计划/证据/主张）：不是外部业务副作用，结果未知时
+# 允许安全重试；服务端按自然键去重，不能因此阻断“继续”续做。
+PLATFORM_STATE_TOOLS = frozenset({
+    "research_update_plan",
+    "research_add_evidence",
+    "research_add_claim",
+})
+
+# 本地受限执行（python_exec：AST 白名单、无文件/网络/系统调用）：没有外部
+# 业务副作用；结果未知时可安全重试，也不能被步骤验收当作“外部操作”阻塞。
+LOCAL_SANDBOX_TOOLS = frozenset({
+    "python_exec",
 })
 
 # 显式登记的不可幂等副作用工具（其余未声明工具按默认 non_idempotent 处理）
@@ -140,7 +158,7 @@ def get_side_effect_contract(tool_name: str) -> SideEffectContract:
     contract = _CONTRACTS.get(tool_name)
     if contract is not None:
         return contract
-    if tool_name in READ_ONLY_TOOLS:
+    if tool_name in READ_ONLY_TOOLS or tool_name in PLATFORM_STATE_TOOLS:
         return SideEffectContract(
             tool_name=tool_name,
             side_effect_class=CLASS_READ_ONLY,
@@ -159,6 +177,20 @@ def idempotency_key_header(tool_name: str) -> Optional[str]:
 
 def tool_outcome_class(name: str) -> str:
     return get_side_effect_contract(name).side_effect_class
+
+
+def has_external_side_effect(tool_name: str) -> bool:
+    """该工具是否可能产生需要人工核对的外部业务副作用。
+
+    ``python_exec`` 是本地受限执行（AST 白名单、无文件/网络/系统调用），
+    即使恢复时按 non_idempotent 保守处理，也不能在步骤/目标验收中被当作
+    “外部操作”阻塞（否则任何代码步骤都无法通过）。
+    """
+    if tool_name in LOCAL_SANDBOX_TOOLS:
+        return False
+    return get_side_effect_contract(tool_name).side_effect_class in (
+        CLASS_EXTERNAL_IDEMPOTENT, CLASS_NON_IDEMPOTENT,
+    )
 
 
 def replay_action(status: str, tool_name: str) -> str:

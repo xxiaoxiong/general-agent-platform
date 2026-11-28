@@ -400,6 +400,35 @@ class RunRepository:
         )
         return bool(res.scalar_one_or_none())
 
+    async def request_pause(self, run_id: str, user_id: Optional[int] = None) -> bool:
+        """CAS 写入暂停意图（Goal Runtime）：仅运行中/待执行 Run 可暂停。
+
+        暂停不是取消：Worker 在下一个模型调用安全边界保留部分成果并进入
+        limit_exceeded，用户可回复“继续”从目标契约继续。
+        """
+        res = await self.session.execute(
+            update(AgentRun)
+            .where(
+                AgentRun.id == run_id,
+                AgentRun.pause_requested.is_(False),
+                AgentRun.status.in_((STATUS_PENDING, STATUS_RUNNING)),
+            )
+            .values(
+                pause_requested=True,
+                pause_requested_at=datetime.utcnow(),
+                pause_requested_by=user_id,
+                updated_at=datetime.utcnow(),
+            ),
+            execution_options={"synchronize_session": False},
+        )
+        return res.rowcount == 1
+
+    async def is_pause_requested(self, run_id: str) -> bool:
+        res = await self.session.execute(
+            select(AgentRun.pause_requested).where(AgentRun.id == run_id)
+        )
+        return bool(res.scalar_one_or_none())
+
     # ── 租约：原子 Claim / Heartbeat / Release（FR-02 / P0-02 B） ───────
 
     async def claim(self, run_id: str, worker_id: str, lease_seconds: int) -> Optional[int]:

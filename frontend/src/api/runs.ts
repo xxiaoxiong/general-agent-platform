@@ -75,6 +75,9 @@ export const runApi = {
   get: (runId: string) => request.get<any, RunInfo>(`/runs/${runId}`),
   cancel: (runId: string, reason = '') =>
     request.post<any, { run_id: string; status: string; message: string }>(`/runs/${runId}/cancel`, { reason }),
+  /** 目标模式暂停：保留已完成结果与目标契约，可回复“继续”接着执行 */
+  pause: (runId: string) =>
+    request.post<any, { run_id: string; status: string; idempotent: boolean }>(`/runs/${runId}/pause`, {}),
   /** 目标模式执行中补充要求（不新起 Run，下一次模型调用前生效） */
   steer: (runId: string, message: string) =>
     request.post<any, { run_id: string; status: string; message_id: string; events_url: string }>(

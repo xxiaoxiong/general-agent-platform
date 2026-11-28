@@ -63,6 +63,10 @@ class InvalidTransition(Exception):
     pass
 
 
+class GoalPauseRequested(Exception):
+    """用户请求暂停目标 Run：在模型调用安全边界收敛，保留部分成果。"""
+
+
 @dataclass
 class RunExecutionLease:
     """执行权身份（P0-02）。

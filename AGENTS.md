@@ -70,12 +70,14 @@ docs/                 # 需求设计、任务书、阶段交付说明（历史�
 
 ```bash
 # 后端测试（必须在 backend/ 目录下执行，否则 ModuleNotFoundError: app）
-cd backend && python -m pytest -q                 # 全量回归（~1161 passed, 13 skipped；必须单进程前台）
+cd backend && python -m pytest -q                 # 全量回归（~1190 passed, 13 skipped；必须单进程前台）
 cd backend && python -m pytest tests/test_xxx.py -q   # 单文件
 cd backend && python -m pytest tests/test_work_orchestrator_graph.py tests/test_work_planner.py tests/test_work_plan_schema.py tests/test_work_orchestrator_integration.py -q  # Work Orchestrator
 cd backend && python -m pytest tests/test_conversation_memory.py tests/test_conversation_memory_api.py -q  # Conversation Memory
+cd backend && python -m pytest tests/test_goal_runtime.py tests/test_goal_mode_steering.py -q  # Goal Runtime + Deep Research
 cd backend && python -m pytest tests/test_team_runtime.py tests/test_team_graph.py tests/test_team_project_runtime.py -q  # Agent Team Runtime
 cd backend && python -m scripts.conversation_memory_eval --report ../docs/conversation-memory-eval-report.md  # 历史检索质量评测
+cd backend && python -m scripts.goal_research_eval --report ../docs/goal-research-eval.md  # Goal/Deep Research 质量与成本评测
 cd backend && python -m pytest tests/test_knowledge_rag.py -q  # Knowledge RAG（真实解析/Embedding/Qdrant）
 python backend/tests/e2e/team_mock_model.py --port 9999  # 确定性团队 E2E 端点（OpenAI 兼容）
 
@@ -127,6 +129,7 @@ cd backend && python -m alembic upgrade head
 - **Conversation Memory**：原始会话 `agent_sessions.messages` 是唯一事实来源；派生索引分 `turn` / `segment` 两级，写回事务入队 Durable Job，独立 `ConversationIndexWorker` 执行；自动预取在语义决策后、`build_agent` 前，Planner 失败/超时降级为无历史上下文；历史内容作为独立不可信资料块注入，不授予工具权限；检索 ACL 由服务端 SQL/Qdrant Filter 强制，来源必须回查会话与消息仍存在。
 - **Work Orchestrator 执行器**：`executor_profile` 只能由服务端 Registry 解析到真实引擎（DeepAgents / Document Graph / Team Graph / Team Project Graph）；模型不能指定工具名、类名、URL、工作区路径或权限。默认 `AGENT_WORK_ORCHESTRATOR_MODE=shadow`，回滚用 `off`。
 - **Agent Team Runtime**：`AGENT_TEAM_RUNTIME_ENABLED=true` 时 Leader/Member 均为完整 DeepAgents Agent；Leader 规划/复核/综合通过 Team Tools 操作 Task Board，Member 在独立 Thread 执行；Task/Member/Message/Artifact 是协作事实来源，LangGraph 只做控制流。`team_run_id = agent_runs.id`；成员 Thread `team:{run}:member:{member_id}`，Leader 阶段 Thread `:synthesis`/`:review`；Task Board 用 revision CAS + lease token，Message Bus 至少一次投递 + 幂等键，Artifact 引用式共享。软件项目团队仍走原 `team_project_graph`；回滚用 `AGENT_TEAM_RUNTIME_ENABLED=false`。
+- **Goal Runtime / Deep Research**：`/goal` 是目标控制层，不新建 Agent Runtime。`goal_contracts` 持久化原始目标、稳定验收 ID（AC-xxx）、revision 与进度；`goal_iterations` 记录逐轮结构化结果；Goal Supervisor（`services/goal_runtime/supervisor.py`）在 CompletionMiddleware 中按验收条件决定继续/完成/暂停/受阻，Todo、模型自述与报告标题都不能单独证明完成。研究类目标启用 `services/research`（ResearchPlan/Source/Evidence/Claim + 确定性 Verifier），单轮执行仍由现有 DeepAgents + 研究工具完成。Goal 模式保留 `GOAL_MAX_*` 全局安全预算，不再解除全部限制。
 
 ## 测试约定
 
@@ -199,6 +202,22 @@ cd backend && python -m alembic upgrade head
 59. **中断续做必须带执行进度快照**：`resolve_completion_resume` 在最近 Assistant 消息缺失时必须回退到会话内最近一次失败/取消/待核对 Run；`handoff` 汇总上次计划、已执行命令、写入文件、服务状态和未决项并注入系统提示，todos 同步恢复。沙箱命令/服务类未决允许续做，外部业务副作用（邮件/Webhook 等）未决必须先人工核对。
 60. **needs_reconciliation 必须收口会话**：`_pause_run` 以 `finished=True` 提交暂停说明并释放 Session 执行权；不得只改 Run 状态而不写回 Assistant 消息，否则用户看不到中断原因，下一轮“继续”也没有任何历史上下文。
 61. **续做不得被歧义澄清短路**：存在 `execution_context.completion_resume` 时，“继续”不再按歧义澄清处理；决策可保留 ambiguous 标记，但服务端必须执行续做而不是只输出澄清问题。
+62. **目标完成只能由 Goal Supervisor 判定**：`goal_contracts.acceptance_criteria` 的必需项全部通过、且过程检查（计划关闭/目标核对/正文完整/研究证据）无失败时才允许 `completed`；Todo 全勾、模型自述“已完成”、报告里有标题都不算证据。未达成必须 `continue` 或如实 `paused/blocked/failed`，禁止伪装成功。
+63. **Goal 模式必须保留全局安全预算**：`GOAL_MAX_ITERATIONS` / `GOAL_MAX_MODEL_CALLS` / `GOAL_MAX_TOOL_CALLS` / `GOAL_MAX_SECONDS` 是目标执行的安全边界，不能改回“预算全部置 0”；轮次/停滞/预算耗尽应暂停并保留部分成果，可凭“继续”在新 Run 续做。
+64. **目标契约 revision 与 steering 是两件事**：执行中补充要求成功注入消息 ≠ 目标契约已更新；`record_steering_revision` 必须在受理事务内递增 revision、把已通过项标记为待复核并新增语义验收项，消息注入只负责让模型看到要求。
+65. **Goal/Research 事件不得复用 `plan.updated`**：使用 `goal_contract_created` / `goal_evaluated` / `goal_paused` 与 `research_plan_*` 独立命名空间（v2：`goal.*` / `research.*`），持久化上限不能落回默认 400 字符，否则验收条件与逐轮结果无法回放。
+66. **Deep Research 的状态流转必须确定性**：搜索发现 ≠ 读取、读取 ≠ 相关、相关 ≠ 支持；只有 `research_read_source` 真实读到正文的来源才能登记证据，`quote` 必须能在正文中定位，Claim 核验由服务端 Verifier 输出 `supported/conflicting/insufficient`，模型不能自评通过。
+67. **研究工具范围只能由服务端绑定**：`research_*` 工具通过 `ctx.run_id` 解析当前研究计划，模型不得传入 research_id / user_id / 知识库范围；研究工具必须在 `_TOOL_RISK_REGISTRY` 登记（写操作 WRITE、`research_read_source` NETWORK + SSRF），未登记会被 ToolPolicy fail-closed 拒绝。
+68. **Goal 与 Team/Document/WorkPlan 组合的验收边界**：Goal+Team 由 `team_task_count/team_completed_count` 与最终回答生成结构化检查，未达成暂停并可在新 Run 续做（暂停判定统一走 `service._common.is_resumable_stop`，不能因 `is_team_run` 把目标暂停降级为失败）；Goal+WorkPlan 通过后由 `complete_goal_contract` 同步目标完成；Goal+Document 沿用文档图自身校验，Run 完成时同步目标状态。不要让这些执行器各自宣布 Goal 完成。
+69. **新增 Goal/Research 表走迁移**：`goal_contracts` / `goal_iterations` / `research_plans|sources|evidence|claims` 已在 Alembic `e1f2a3b4c5d6` 建表；改已有表结构必须补新 migration，`init_db` 只补新表。
+70. **目标暂停是“意图”不是“取消”**：`POST /api/v2/runs/{id}/pause` 只写 `agent_runs.pause_requested`（仅目标模式），由 `CompletionMiddleware.abefore_model` 在模型调用边界抛出 `GoalPauseRequested`，收敛为 `limit_exceeded + goal_paused` 并保留目标契约；不要把它实现成取消或强杀在途副作用。暂停后用户回复“继续”走原有续做链路。
+71. **研究完成检查不止 Claim 状态**：`research_checks` 还要求研究问题覆盖目标契约必需项（中文二元词覆盖）、来源发布时间符合 `scope.time_range`、冲突证据在最终报告中被披露；`quote` 必须在已读正文中定位。放宽这些检查会让“搜到 URL 就宣布完成”重新出现。
+72. **评测脚本只读且确定性**：`scripts/goal_research_eval.py` 从 `goal_contracts`、`goal_iterations`、`research_*`、`agent_runs.summary` 计算指标，不调用模型、不写业务数据；禁止让执行 Agent 自评完成率/引用准确率。
+73. **研究工具不是外部副作用**：`research_get_state/read_source/verify_claim` 属于只读，`research_update_plan/add_evidence/add_claim` 属于平台内部状态（自然键去重）；它们必须在 `classification.py` 中可安全重试，否则 `resolve_completion_resume` 会把“继续”误判为外部副作用未决并拒绝续做。
+74. **模型 429 是可恢复暂停**：`_is_model_rate_limit_error` 识别供应商限流后走 `limit_exceeded + model_rate_limited`，保留进度并允许“继续”；不要退回通用 failed，否则长目标会被一次限流直接判死。
+75. **Deep Research 真实基线**：`docs/goal-research-eval.md` 由 `goal_research_eval.py` 从真实库生成（当前 16 个目标、12 个完成、False Completion=0、Recovery Success=1.0、Citation Accuracy=0.9、Source Read Rate=1.0、Conflict Detection/Disclosure=1.0）；新增评测后重跑并更新报告，禁止手写指标。
+76. **python_exec 不是外部副作用**：本地受限执行（AST 白名单、无文件/网络/系统调用）在崩溃恢复时仍按 non_idempotent 保守处理，但 `has_external_side_effect()` 必须返回 False；否则 WorkPlan 代码步骤会被 `external_operation` 阻塞、Goal 被误判失败。判断“外部副作用”用 `has_external_side_effect`，不要只看 side_effect_class。
+77. **Goal + WorkPlan 失败必须暂停而非判死**：目标模式下计划未通过验收时标记目标 `paused` 并以 `limit_exceeded + goal_work_plan` 收口（保留可续做状态），不能把单轮计划失败当成整个目标失败；只有非目标 Run 才按原失败语义收口。
 
 ## 修改范围原则
 

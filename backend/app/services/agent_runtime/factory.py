@@ -306,6 +306,11 @@ def _compose_system_prompt(ctx: RuntimeContext) -> str:
         from .goal import goal_protocol_prompt
 
         parts.append(goal_protocol_prompt(ctx))
+    if ctx.agent_config.get("research_enabled"):
+        # 研究类目标：证据链协议（计划/读取/证据/主张核验），工具面由服务端收窄注入
+        from app.services.research.prompt import research_protocol_prompt
+
+        parts.append(research_protocol_prompt())
     deliverable = ctx.agent_config.get("_deliverable")
     if isinstance(deliverable, dict) and deliverable.get("format"):
         fmt = str(deliverable["format"])

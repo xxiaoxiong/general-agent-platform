@@ -33,8 +33,14 @@ from .backends import RUN_ARTIFACT_FOLDER, workspace_root
 from .context import RuntimeContext
 from .events import PLAN_UPDATED, TOOL_COMPLETED, TOOL_FAILED, TOOL_STARTED, WORKSPACE_PROJECT_REVIEWED, EventBus, RuntimeEvent
 from .goal import GOAL_AUDIT_HEADING
+from .lifecycle import GoalPauseRequested
 from .persistence import CheckpointerFactory, make_run_config
-from .tools.classification import CLASS_EXTERNAL_IDEMPOTENT, CLASS_NON_IDEMPOTENT, get_side_effect_contract
+from .tools.classification import (
+    CLASS_EXTERNAL_IDEMPOTENT,
+    CLASS_NON_IDEMPOTENT,
+    get_side_effect_contract,
+    has_external_side_effect,
+)
 from .tools.policy import BudgetExceededError
 from .workspace_delivery import ProjectReview, review_workspace_project, workspace_project_digest
 
@@ -784,8 +790,10 @@ async def _collect_evidence(ctx: RuntimeContext) -> tuple[list[ToolEvidence], li
     seen_calls = {str(row.tool_call_id or "") for row in rows if row.tool_call_id}
     evidence.extend(_event_read_evidence(events, seen_calls, step_id))
     # 已获得回执或仍需核对的外部操作均阻止自动返工，避免重新推理生成另一笔操作。
-    external_handled = any(row.status in _UNRESOLVED_OR_EXECUTED
-                           and get_side_effect_contract(row.tool_name).side_effect_class in _EXTERNAL_CLASSES for row in rows)
+    external_handled = any(
+        row.status in _UNRESOLVED_OR_EXECUTED and has_external_side_effect(row.tool_name)
+        for row in rows
+    )
     writes: dict[str, str] = {}
     finished_paths: set[str] = set()
     for _, event_type, payload in sorted(events, key=lambda row: row[0]):
@@ -967,6 +975,71 @@ class CompletionMiddleware(AgentMiddleware[CompletionState]):
             "artifacts": [item["path"] for item in review.artifacts],
         }, ensure_ascii=False)
 
+    async def _supervise_goal(self, *, result, text: str, failures: list[str],
+                              previous: dict, state: dict, budget: str):
+        """执行 Goal Supervisor 并发布目标事件（失败降级，不阻断任务）。"""
+        from app.services.goal_runtime.supervisor import supervise_goal
+
+        try:
+            decision = await supervise_goal(
+                goal_id=str(self.ctx.goal_contract.get("goal_id") or ""),
+                run_id=self.ctx.run_id,
+                text=text,
+                checks={item.id: item.to_dict() for item in result.checks},
+                failed_ids=failures,
+                previous_review=previous,
+                plan=list(state.get("todos") or []),
+                budget_reason=budget,
+            )
+        except Exception:  # noqa: BLE001 目标监督故障降级为原完成检查
+            logger.warning("run %s 目标监督评估失败，降级到原完成检查", self.ctx.run_id,
+                           exc_info=True)
+            return None
+        if decision is None or self.bus is None:
+            return decision
+        try:
+            from .events import (
+                GOAL_COMPLETED, GOAL_EVALUATED, GOAL_ITERATION_STARTED, GOAL_PAUSED,
+            )
+
+            await self.bus.publish(RuntimeEvent(
+                type=GOAL_EVALUATED, run_id=self.ctx.run_id, data={
+                    **decision.goal,
+                    "reason": decision.reason,
+                    "stop_reason": decision.stop_reason,
+                },
+            ))
+            if decision.action == "continue":
+                await self.bus.publish(RuntimeEvent(
+                    type=GOAL_ITERATION_STARTED, run_id=self.ctx.run_id, data={
+                        "goal_id": decision.goal.get("goal_id"),
+                        "iteration": decision.iteration + 1,
+                        "reason": decision.reason,
+                        "progress": decision.goal.get("progress"),
+                    },
+                ))
+            elif decision.action in ("paused", "blocked"):
+                await self.bus.publish(RuntimeEvent(
+                    type=GOAL_PAUSED, run_id=self.ctx.run_id, data={
+                        "goal_id": decision.goal.get("goal_id"),
+                        "iteration": decision.iteration,
+                        "reason": decision.reason,
+                        "stop_reason": decision.stop_reason,
+                        "progress": decision.goal.get("progress"),
+                    },
+                ))
+            elif decision.action == "complete":
+                await self.bus.publish(RuntimeEvent(
+                    type=GOAL_COMPLETED, run_id=self.ctx.run_id, data={
+                        "goal_id": decision.goal.get("goal_id"),
+                        "iteration": decision.iteration,
+                        "progress": decision.goal.get("progress"),
+                    },
+                ))
+        except Exception:  # noqa: BLE001 事件失败不影响验收结论
+            logger.warning("run %s 目标事件发布失败", self.ctx.run_id, exc_info=True)
+        return decision
+
     async def abefore_agent(self, state, runtime):
         if state.get("completion_run_id") == self.ctx.run_id:
             return None
@@ -998,6 +1071,18 @@ class CompletionMiddleware(AgentMiddleware[CompletionState]):
         return update
 
     async def abefore_model(self, state, runtime):
+        # 用户请求暂停：在模型调用前收敛，避免继续产生新的模型/工具副作用。
+        # 仅目标模式开放该能力（非目标 Run 没有可续做的目标契约）。
+        if self.ctx.goal_mode:
+            try:
+                async with AsyncSessionLocal() as db:
+                    requested = await db.scalar(
+                        select(AgentRun.pause_requested).where(AgentRun.id == self.ctx.run_id)
+                    )
+            except Exception:  # noqa: BLE001 暂停检查失败不阻断执行
+                requested = False
+            if requested:
+                raise GoalPauseRequested("用户请求暂停目标")
         if reason := self.ctx.budget.exhausted_reason(self.ctx.steps + 1, self.ctx.tool_calls, self.ctx.model_calls + 1):
             raise BudgetExceededError(reason)
 
@@ -1041,11 +1126,12 @@ class CompletionMiddleware(AgentMiddleware[CompletionState]):
         # 项目会话里声称“已清空/已删除/已写入”等实际动作时，必须核对执行证据，
         # 防止模型直接复述历史回答而未真正执行。
         claimed_action = bool(self.ctx.project_id) and action_claim_present(text)
-        if not (self.contract.is_complex or execution_checks or previous or claimed_action):
+        if not (self.contract.is_complex or execution_checks or previous or claimed_action
+                or self.ctx.goal_mode):
             # 普通问答保留既有返回语义，也允许调用方明确要求不输出文本。
             return None
         evidence, artifacts, external = await _collect_evidence(self.ctx) if (
-            self.contract.is_complex or execution_checks or claimed_action
+            self.contract.is_complex or execution_checks or claimed_action or self.ctx.goal_mode
         ) else ([], [], False)
         execution_checks.extend(delivery_path_checks(text, evidence, artifacts))
         if self.ctx.project_id:
@@ -1060,6 +1146,35 @@ class CompletionMiddleware(AgentMiddleware[CompletionState]):
                 execution_checks.extend(project.checks)
                 if project.artifacts:
                     artifacts = _include_project_artifacts(evidence, artifacts, project.artifacts)
+        if self.ctx.agent_config.get("research_enabled"):
+            # Deep Research：计划/证据/主张由服务端持久化状态确定性核验
+            try:
+                from app.services.research.service import research_state
+                from app.services.research.verifier import research_checks
+
+                for item in await research_checks(
+                    run_id=self.ctx.run_id, user_id=self.ctx.scope.user_id,
+                ):
+                    execution_checks.append(CheckResult(
+                        item["id"], item["passed"], item["detail"],
+                    ))
+                state = await research_state(
+                    run_id=self.ctx.run_id, user_id=self.ctx.scope.user_id,
+                )
+                conflicts = int((state.get("counts") or {}).get("claims_conflicting") or 0)
+                if conflicts:
+                    disclosed = any(
+                        word in text for word in ("冲突", "矛盾", "不一致", "分歧", "conflicting")
+                    )
+                    execution_checks.append(CheckResult(
+                        "research_conflicts_disclosed", disclosed,
+                        "" if disclosed else (
+                            f"存在 {conflicts} 条冲突证据，最终报告必须披露冲突与不确定性"
+                        ),
+                    ))
+            except Exception:  # noqa: BLE001 研究状态读取失败不改变原验收
+                logger.warning("run %s 研究证据检查失败（忽略）", self.ctx.run_id,
+                               exc_info=True)
         result = verify_task(self.contract, text, evidence, execution_checks=execution_checks)
         rounds = previous.get("fix_rounds", 0)
         continuations = int(previous.get("continuations") or 0)
@@ -1069,18 +1184,54 @@ class CompletionMiddleware(AgentMiddleware[CompletionState]):
         progress = ([project.digest, open_tasks, failures, artifacts] if project else [text, failures, artifacts, len(evidence)])
         signature = hashlib.sha256(json.dumps(progress, ensure_ascii=False).encode()).hexdigest()
         budget = self.ctx.budget.exhausted_reason(self.ctx.steps + 1, self.ctx.tool_calls, self.ctx.model_calls + 1)
+        # Goal Runtime：目标契约验收（未达成则进入下一轮；预算/停滞/轮次上限则暂停）。
+        # 目标运行时的持久化故障降级为原完成检查，不阻断正常任务。
+        goal_decision = None
+        if self.ctx.goal_mode and self.ctx.goal_contract:
+            goal_decision = await self._supervise_goal(
+                result=result, text=text, failures=failures,
+                previous=previous, state=state, budget=budget or "",
+            )
+            if goal_decision is not None:
+                data["goal"] = goal_decision.goal
+                if goal_decision.action == "complete":
+                    # 目标契约必需项全部通过：以目标验收为准，原任务检查只作证据
+                    data["status"] = "passed"
+                else:
+                    data["status"] = "partial"
+                    data.setdefault("checks", []).append({
+                        "id": "goal_incomplete", "passed": False,
+                        "detail": goal_decision.reason or "目标尚未达成",
+                    })
         # 外部操作回执只有在缺口无法靠补记状态解决时才阻止返工。
         external_blocking = external and any(item not in _BOOKKEEPING_CHECKS for item in failures)
+        rounds_limit = (
+            int(getattr(settings, "GOAL_MAX_ITERATIONS", 12)) if self.ctx.goal_mode
+            else settings.AGENT_VERIFICATION_MAX_ROUNDS
+        )
         stop_reason = ("external_operation" if external_blocking else "budget" if budget else
                        "verification_environment" if project and project.unavailable else
                        "length" if too_large else "no_progress" if signature == previous.get("signature") else
-                       "rounds" if rounds >= settings.AGENT_VERIFICATION_MAX_ROUNDS else "")
+                       "rounds" if rounds >= rounds_limit else "")
+        if goal_decision is not None:
+            if goal_decision.action in ("complete", "continue"):
+                stop_reason = ""
+            else:
+                stop_reason = goal_decision.stop_reason
         review = {"run_id": self.ctx.run_id,
                   "answer": text or previous.get("preserve_answer") or previous.get("answer", ""),
                   "signature": signature,
                   "report": data, "fix_rounds": rounds, "continuations": continuations,
-                  "stop_reason": stop_reason if failures else ""}
-        if not failures or stop_reason:
+                  "stop_reason": stop_reason if (failures or (goal_decision and goal_decision.blocking)) else ""}
+        if goal_decision is not None:
+            review.update(
+                goal_signature=str(goal_decision.goal.get("signature") or ""),
+                goal_stall=goal_decision.stall_count,
+                goal_iteration=goal_decision.iteration,
+            )
+        if goal_decision is not None and goal_decision.action == "complete":
+            return {"completion_review": review}
+        if (not failures and not (goal_decision and goal_decision.blocking)) or stop_reason:
             return {"completion_review": review}
 
         # 长度截断说明正文还没写完：先补齐余下内容，再做其他缺口的返工。
@@ -1095,7 +1246,7 @@ class CompletionMiddleware(AgentMiddleware[CompletionState]):
                         "计划项若有实际完成，随后用 write_todos 标记 completed。")
             review["prefix"] = text
         else:
-            feedback = result.feedback_text()
+            feedback = result.feedback_text() if failures else ""
             failed_ids = {item.id for item in result.failed_checks}
             # 仅缺计划关闭时，当前正文已经通过其余检查：保留它，只要求补记状态，
             # 避免模型在返工轮重写正文或重复执行已经成功的外部操作。
@@ -1131,9 +1282,24 @@ class CompletionMiddleware(AgentMiddleware[CompletionState]):
                     "\n交付前请补上「## 目标核对」表：逐条列出目标项/计划项、完成情况（已完成/未完成/受阻）"
                     "和证据（文件路径、来源链接或工具回执）；未完成项如实列出，不得虚报完成。"
                 )
+            research_failed = {item for item in failed_ids if item.startswith("research_")}
+            if research_failed:
+                feedback += (
+                    "\n研究证据链未通过验收：请用 research_update_plan 补齐研究问题、"
+                    "research_read_source 真实读取来源、research_add_evidence 引用原文片段、"
+                    "research_add_claim 登记关键结论并 research_verify_claim 核验；"
+                    "research_get_state 可查看剩余缺口。没有证据的结论不得写入报告。"
+                )
+            if "research_conflicts_disclosed" in failed_ids:
+                feedback += (
+                    "\n研究证据存在冲突：请在报告中明确披露冲突来源、分歧点与不确定性，"
+                    "不要只采用支持结论的一方证据。"
+                )
             if "preserve_answer" not in review:
                 feedback += ("\n沿用原始任务和已经确认的证据，处理缺口后交付完整结果。"
                              "若已有文件需要修正，先读取其内容，再按原路径编辑。")
+        if goal_decision is not None and goal_decision.feedback:
+            feedback += "\n\n" + goal_decision.feedback
         review.update(fix_rounds=rounds if continuing else rounds + 1,
                       continuations=continuations + 1 if continuing else continuations,
                       continuing=True)

@@ -13,6 +13,9 @@ import {
 import {
   PROJECT_DOWNLOAD_PATH, projectPhaseLabels, readProjectDelivery, readProjectProgress, type ProjectDelivery, type ProjectProgress,
 } from './projectDelivery.ts'
+import {
+  applyGoalEvaluation, mergeResearch, readGoalContract, type GoalView,
+} from './goal.ts'
 
 export interface TextBlock {
   kind: 'text'
@@ -33,6 +36,12 @@ export interface TeamBlock {
 export interface WorkPlanBlock {
   kind: 'work_plan'
   plan: WorkPlanView
+}
+
+/** Goal Runtime：目标契约、验收条件与 Deep Research 计划 */
+export interface GoalBlock {
+  kind: 'goal'
+  goal: GoalView
 }
 
 export interface ProjectBlock {
@@ -153,7 +162,7 @@ export interface SteerBlock {
 }
 
 export type MsgBlock = TextBlock | ToolBlock | SubagentBlock | PlanBlock | DocumentArtifactBlock | ProfileDraftBlock
-  | InputRequestBlock | DocumentStageBlock | DocumentEditReviewBlock | SteerBlock | TeamBlock | ProjectBlock | VerificationBlock | WorkPlanBlock
+  | InputRequestBlock | DocumentStageBlock | DocumentEditReviewBlock | SteerBlock | TeamBlock | ProjectBlock | VerificationBlock | WorkPlanBlock | GoalBlock
 
 /** 携带块流的运行消息（工具步骤实时穿插展示的最小状态） */
 export interface RunStreamMessage {
@@ -166,7 +175,7 @@ export interface RunStreamMessage {
   liveStatus?: string
   error?: string
   runStatus?: string
-  executionStop?: { reason: 'budget' | 'no_progress'; canContinue: boolean }
+  executionStop?: { reason: string; canContinue: boolean }
   pendingActions?: any[]
   documentRetryable?: boolean
   documentCompleted?: number
@@ -185,12 +194,20 @@ export interface RunStreamMessage {
 export function executionPause(message: RunStreamMessage) {
   if (message.runStatus !== 'limit_exceeded') return undefined
   const report = message.blocks.find(block => block.kind === 'verification')
-  const requiresReconciliation = report?.stopReason === 'external_operation'
+  const stopReason = message.executionStop?.reason ?? report?.stopReason ?? ''
+  const requiresReconciliation = stopReason === 'external_operation'
   const savedFileTask = !!report && (report.artifacts.length > 0 || report.checks.some(check => check.id === 'artifact_produced'))
+  const goalPaused = ['goal_budget', 'goal_rounds', 'goal_blocked', 'goal_paused', 'goal_work_plan'].includes(stopReason)
   const canContinue = !requiresReconciliation && (message.executionStop?.canContinue
-    ?? (savedFileTask && (report.stopReason === 'budget' || report.stopReason === 'no_progress')))
-  const noProgress = (message.executionStop?.reason ?? report?.stopReason) === 'no_progress'
-  const reason = noProgress ? '连续尝试后暂无新进展。' : '本轮已达到执行上限。'
+    ?? (goalPaused ? true
+      : savedFileTask && (stopReason === 'budget' || stopReason === 'no_progress')))
+  const noProgress = stopReason === 'no_progress' || stopReason === 'goal_blocked'
+  const reason = stopReason === 'model_rate_limited' ? '模型服务暂时限流，任务已暂停。'
+    : stopReason === 'goal_paused' ? '任务已按你的要求暂停。'
+    : stopReason === 'goal_blocked' ? '目标连续多轮没有实质进展，已暂停。'
+      : stopReason === 'goal_work_plan' ? '目标执行计划未通过验收，已暂停并保留已完成步骤。'
+      : goalPaused ? '已达到目标模式的全局安全预算或最大轮次。'
+        : noProgress ? '连续尝试后暂无新进展。' : '本轮已达到执行上限。'
   return {
     text: requiresReconciliation ? '本轮已暂停，请先核对外部操作记录。'
       : reason + (canContinue ? '可从已记录的进度继续。' : ''),
@@ -489,6 +506,54 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
         })
         msg.liveStatus = `复杂任务计划未启用：${reason}`
       }
+      msg.lastActivity = 'other'
+      break
+    }
+
+    // ── Goal Runtime：目标契约、逐轮验收与 Deep Research 计划 ──────────────
+    case 'goal.contract.created': {
+      const goal = readGoalContract(data)
+      const block = blocks.find((item): item is GoalBlock => item.kind === 'goal')
+      if (block) block.goal = { ...block.goal, ...goal }
+      else blocks.push({ kind: 'goal', goal })
+      msg.goalMode = true
+      msg.liveStatus = '目标契约已创建…'
+      msg.lastActivity = 'other'
+      break
+    }
+
+    case 'goal.evaluated':
+    case 'goal.progress.updated': {
+      const block = blocks.find((item): item is GoalBlock => item.kind === 'goal')
+      if (!block) break
+      block.goal = applyGoalEvaluation(block.goal, data)
+      msg.liveStatus = data.blocking?.length
+        ? '目标验收未通过，继续执行…'
+        : '目标验收进行中…'
+      msg.lastActivity = 'other'
+      break
+    }
+
+    case 'goal.paused':
+    case 'goal.completed': {
+      const block = blocks.find((item): item is GoalBlock => item.kind === 'goal')
+      if (!block) break
+      block.goal = {
+        ...block.goal,
+        status: ev.event === 'goal.completed' ? 'completed' : 'paused',
+        iteration: Number(data.iteration) || block.goal.iteration,
+        progress: data.progress ? applyGoalEvaluation(block.goal, data).progress : block.goal.progress,
+      }
+      msg.lastActivity = 'other'
+      break
+    }
+
+    case 'research.plan.created':
+    case 'research.plan.updated': {
+      const block = blocks.find((item): item is GoalBlock => item.kind === 'goal')
+      if (!block) break
+      block.goal = mergeResearch(block.goal, data)
+      msg.liveStatus = '研究计划已更新…'
       msg.lastActivity = 'other'
       break
     }
@@ -844,14 +909,29 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
         setVerification(msg, data.summary.verification, 'passed')
       }
       msg.runStatus = 'completed'
+      {
+        const goal = blocks.find((item): item is GoalBlock => item.kind === 'goal')
+        if (goal && goal.goal.status !== 'completed') goal.goal = { ...goal.goal, status: 'completed' }
+      }
       break
 
     case 'run.failed':
       if (data.historical) break
       msg.runStatus = data.status === 'limit_exceeded' ? 'limit_exceeded' : 'failed'
       msg.error = msg.runStatus === 'failed' ? String(data.error || '运行失败') : undefined
+      {
+        // 目标卡片与 Run 终态保持一致；监督评估已写入更精确的 paused/blocked 时保留
+        const goal = blocks.find((item): item is GoalBlock => item.kind === 'goal')
+        if (goal && goal.goal.status === 'active') {
+          goal.goal = {
+            ...goal.goal,
+            status: msg.runStatus === 'limit_exceeded' ? 'paused' : 'failed',
+          }
+        }
+      }
       const stop = data.summary?.stop
-      if (msg.runStatus === 'limit_exceeded' && (stop?.reason === 'budget' || stop?.reason === 'no_progress')) {
+      const pausableReasons = ['budget', 'no_progress', 'goal_budget', 'goal_rounds', 'goal_blocked', 'goal_paused', 'goal_work_plan', 'model_rate_limited']
+      if (msg.runStatus === 'limit_exceeded' && pausableReasons.includes(stop?.reason)) {
         msg.executionStop = { reason: stop.reason, canContinue: stop.can_continue === true }
       }
       if (data.summary?.verification) {
@@ -914,6 +994,13 @@ export function finalizeRunMessage(
       if (b.kind === 'input_request' && b.state === 'pending') b.state = 'closed'
       if (b.kind === 'team') b.progress = finishTeamProgress(b.progress, msg.runStatus)
       if (b.kind === 'work_plan') b.plan = finishWorkPlan(b.plan, msg.runStatus)
+      if (b.kind === 'goal' && b.goal.status === 'active') {
+        b.goal = {
+          ...b.goal,
+          status: msg.runStatus === 'cancelled' ? 'cancelled'
+            : msg.runStatus === 'completed' ? 'completed' : 'paused',
+        }
+      }
       if (b.kind === 'tool' && b.state === 'running') {
         b.state = 'failed'
         if (!b.error) b.error = '（未收到执行结果，可能被中断）'

@@ -18,6 +18,7 @@ from app.api.workflow import app_market, workflows
 from app.api.assistant import assistants, capabilities
 from app.api.chat import conversations, files, memory
 from app.api.run import router as run_router
+from app.api.goal import router as goal_router
 from app.api.document import documents as document_api
 from app.api.workspace import artifacts, workspace
 from app.api.sandbox import internal_router as sandbox_internal_router
@@ -292,6 +293,7 @@ app.include_router(document_api.documents, prefix=API_V2_PREFIX)
 app.include_router(document_api.profiles, prefix=API_V2_PREFIX)
 app.include_router(files.router, prefix=API_V2_PREFIX)
 app.include_router(run_router, prefix=API_V2_PREFIX)
+app.include_router(goal_router, prefix=API_V2_PREFIX)
 app.include_router(artifacts.router, prefix=API_V2_PREFIX)
 app.include_router(admin.router, prefix=API_V2_PREFIX)
 app.include_router(evolution.router, prefix=API_V2_PREFIX)

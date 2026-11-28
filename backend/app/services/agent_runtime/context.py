@@ -77,6 +77,8 @@ class RuntimeContext:
     history_context: str = ""
     history_sources: List[Dict[str, Any]] = field(default_factory=list)
     task_contract: Optional[TaskContract] = None
+    # Goal Runtime：持久化目标契约（含验收条件/进度），由服务层注入，模型不可修改
+    goal_contract: Dict[str, Any] = field(default_factory=dict)
     completion_review: Optional[Dict[str, Any]] = None
     carried_artifacts: Dict[str, str] = field(default_factory=dict)
     completion_continuation: Dict[str, Any] = field(default_factory=dict)

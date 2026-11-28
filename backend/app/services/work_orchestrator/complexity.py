@@ -82,7 +82,15 @@ def is_composite(
     if not text:
         return ComplexityVerdict(False, "空请求")
     if goal_mode:
-        return ComplexityVerdict(False, "目标模式使用既有 goal 协议，不叠加 WorkPlan")
+        # Goal 负责目标是否达成，Work Orchestrator 只负责跨引擎工作包拆分；
+        # 由配置决定是否叠加，研究型目标由 Deep Research Profile 自行管理调查循环。
+        from app.core.config import settings as _settings
+
+        if not bool(getattr(_settings, "GOAL_ENABLE_WORK_ORCHESTRATOR", True)):
+            return ComplexityVerdict(False, "目标模式未启用 WorkPlan（配置关闭）")
+        intent_hint = str((execution_context or {}).get("intent") or intent or "")
+        if intent_hint == "research":
+            return ComplexityVerdict(False, "研究型目标由 Deep Research 管理调查循环")
     if route.get("completion_resume"):
         return ComplexityVerdict(False, "续做任务沿用原执行上下文")
     if route.get("team_mode") or intent == "software_project" or task_type == "software_project":

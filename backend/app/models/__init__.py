@@ -31,6 +31,10 @@ from app.models.sandbox import (
     SandboxInstance, SandboxJob, SandboxResourceProfile, SandboxResourceReservation,
     SandboxRunnerNode, Workspace, WorkspaceService,
 )
+from app.models.goal import GoalContract, GoalIteration
+from app.models.research import (
+    ResearchClaim, ResearchEvidence, ResearchPlan, ResearchSource,
+)
 
 __all__ = [
     "User", "Role", "Permission", "UserRole", "RolePermission",
@@ -54,4 +58,6 @@ __all__ = [
     "Project", "ProjectMember", "Workspace", "SandboxRunnerNode", "SandboxInstance",
     "SandboxJob", "SandboxResourceReservation", "WorkspaceService", "PreviewGrant",
     "SandboxCommandOperation", "SandboxEvent", "SandboxResourceProfile",
+    "GoalContract", "GoalIteration",
+    "ResearchPlan", "ResearchSource", "ResearchEvidence", "ResearchClaim",
 ]

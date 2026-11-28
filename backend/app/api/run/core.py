@@ -172,11 +172,9 @@ async def create_run(
     # None=跟随用户级设置；恢复/续跑后保持原值）
     if body.history_enabled is not None:
         agent_config["history_memory_enabled"] = bool(body.history_enabled)
-    # 目标模式（/goal）：不限模型调用/工具调用/执行时长，并允许执行中补充要求。
-    # 写入配置快照，恢复时由执行侧据此解除预算；团队协作暂不支持执行中补充。
+    # 目标模式（/goal）：使用全局安全预算并允许执行中补充要求；写入配置快照，
+    # 恢复时由执行侧据此重建。团队/文档组合由 Goal Runtime 统一验收。
     if body.goal_mode:
-        if body.team_mode:
-            raise HTTPException(status_code=422, detail="目标模式暂不支持团队协作，请关闭团队后重试")
         agent_config["goal_mode"] = True
     else:
         agent_config["goal_mode"] = False
@@ -428,6 +426,36 @@ async def stream_run_events(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Run-Id": run_id},
     )
+
+
+@router.post("/{run_id}/pause")
+async def pause_run(
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """暂停目标 Run（Goal Runtime）：Worker 在下一个模型调用边界收敛。
+
+    暂停不是取消：已完成结果与目标契约保留，用户回复“继续”可接着执行。
+    """
+    from app.services.agent_runtime.repositories import RunRepository
+
+    run = (await db.execute(
+        select(AgentRun).where(AgentRun.id == run_id, AgentRun.user_id == current_user.id)
+    )).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="运行不存在")
+    if not bool((run.agent_config_snapshot or {}).get("goal_mode")):
+        raise HTTPException(status_code=409, detail="仅目标模式任务支持暂停")
+    if run.pause_requested:
+        return {"run_id": run_id, "status": "pause_requested", "idempotent": True}
+    if run.status not in ("pending", "running"):
+        raise HTTPException(status_code=409, detail="任务当前不在可暂停的执行状态")
+    if not await RunRepository(db).request_pause(run_id, current_user.id):
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="暂停请求与状态变更冲突，请刷新后重试")
+    await db.commit()
+    return {"run_id": run_id, "status": "pause_requested", "idempotent": False}
 
 
 @router.post("/{run_id}/cancel")

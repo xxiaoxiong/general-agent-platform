@@ -177,6 +177,19 @@ class Settings(BaseSettings):
     AGENT_VERIFICATION_ENABLED: bool = True     # 复杂任务完成条件验证（确定性，不调模型）
     AGENT_VERIFICATION_MAX_ROUNDS: int = 2      # 原运行中的补充轮数（0=只验证不补充）
     AGENT_PROJECT_VERIFIER_DIR: str = ""       # 离线工程验收共享队列（Compose 默认接入）
+    # ── Goal Runtime / Deep Research（目标驱动持续执行闭环）───────────────
+    GOAL_RUNTIME_ENABLED: bool = True           # 目标契约/监督循环（/goal 生效时使用）
+    # 目标模式不是“解除全部预算”：以下为全局安全边界（0=该维度不限制）
+    GOAL_MAX_ITERATIONS: int = 12               # 最大目标迭代轮次
+    GOAL_MAX_MODEL_CALLS: int = 300             # 目标全局模型调用上限
+    GOAL_MAX_TOOL_CALLS: int = 400              # 目标全局工具调用上限
+    GOAL_MAX_STEPS: int = 400                   # 目标全局图步数上限
+    GOAL_MAX_SECONDS: float = 21600.0           # 目标全局墙钟上限（秒）
+    GOAL_STALL_LIMIT: int = 2                   # 连续无进展轮次后暂停
+    GOAL_RESEARCH_ENABLED: bool = True          # 研究类目标启用 Deep Research Profile
+    GOAL_RESEARCH_MAX_SOURCES: int = 60         # 单研究最多登记来源数
+    GOAL_RESEARCH_MAX_EVIDENCE: int = 300       # 单研究最多证据片段数
+    GOAL_ENABLE_WORK_ORCHESTRATOR: bool = True  # 目标模式允许 Work Orchestrator 拆分工作包
     # ── P4-03：工具瞬态失败重试（按风险策略；非幂等绝不盲目重放）──────────
     AGENT_TOOL_MAX_RETRIES: int = 2             # 运行内瞬态失败重试上限（0=不重试）
     AGENT_TOOL_RETRY_BACKOFF_SECONDS: float = 0.5  # 重试退避基数（线性退避 attempt*基数）

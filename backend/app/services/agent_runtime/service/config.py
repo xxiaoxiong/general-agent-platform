@@ -176,6 +176,14 @@ class ConfigMixin:
             for spec in SANDBOX_TOOLS:
                 if spec["name"] not in existing:
                     specs.append(spec)
+        # Deep Research 工具：仅研究类目标（服务端决策）注入，模型不能自行开启
+        if agent_config.get("research_enabled"):
+            from app.services.tools import RESEARCH_TOOLS
+
+            existing = {spec["name"] for spec in specs}
+            for spec in RESEARCH_TOOLS:
+                if spec["name"] not in existing:
+                    specs.append(spec)
         return specs
 
     async def _load_session_project_id(self, session_id: Optional[int]) -> Optional[int]:

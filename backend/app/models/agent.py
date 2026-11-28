@@ -204,6 +204,11 @@ class AgentRun(Base):
     cancel_requested = Column(Boolean, default=False, nullable=False)  # 是否请求取消
     cancel_requested_at = Column(DateTime, nullable=True)              # 取消请求时间
     cancel_requested_by = Column(Integer, ForeignKey("users.id"), nullable=True)  # 请求者
+    # 暂停请求（Goal Runtime）：Worker 在下一个模型调用安全边界收敛为 limit_exceeded，
+    # 保留部分成果并允许“继续”；与取消不同，不产生终态取消语义。
+    pause_requested = Column(Boolean, default=False, nullable=False)
+    pause_requested_at = Column(DateTime, nullable=True)
+    pause_requested_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

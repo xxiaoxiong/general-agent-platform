@@ -113,6 +113,7 @@ _NET_TARGET_PARAMS: Dict[str, tuple] = {
     "http_post": ("url",),
     "http_request": ("url",),
     "fetch_webpage": ("url",),
+    "research_read_source": ("url",),
     "webhook_notify": ("webhook_url",),
     "send_email_tool": ("smtp_host",),   # SMTP 目标按 URL 形式过同一策略
 }

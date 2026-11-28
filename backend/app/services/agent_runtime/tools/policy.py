@@ -91,6 +91,14 @@ def _bootstrap_builtin_profiles() -> None:
         # 历史会话检索（Conversation Memory）：只读、ACL 由服务端重算
         ToolRiskProfile("search_conversation_history", ToolRisk.READ, **read_only),
         ToolRiskProfile("get_conversation_source", ToolRisk.READ, **read_only),
+        # Deep Research：计划/证据/主张写入属于平台内状态，不触达外部副作用；
+        # 来源读取是只读网络访问，仍需 SSRF 校验
+        ToolRiskProfile("research_get_state", ToolRisk.READ, **read_only),
+        ToolRiskProfile("research_verify_claim", ToolRisk.READ, **read_only),
+        ToolRiskProfile("research_read_source", ToolRisk.NETWORK, network_access=True, **read_only),
+        ToolRiskProfile("research_update_plan", ToolRisk.WRITE, **non_idem),
+        ToolRiskProfile("research_add_evidence", ToolRisk.WRITE, **non_idem),
+        ToolRiskProfile("research_add_claim", ToolRisk.WRITE, **non_idem),
         # 网络只读（GET / 搜索 / 抓取 / 天气）
         ToolRiskProfile("http_get", ToolRisk.NETWORK, network_access=True, **read_only),
         ToolRiskProfile("http_request", ToolRisk.NETWORK, network_access=True, **read_only),

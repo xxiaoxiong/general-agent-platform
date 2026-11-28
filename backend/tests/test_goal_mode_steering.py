@@ -118,8 +118,12 @@ def user_setup():
         ids = {"user_id": user.id, "agent_id": agent.id}
     yield ids
     with Session(sync_engine) as s:
+        from app.models.goal import GoalContract, GoalIteration
+
         runs = [row[0] for row in s.execute(select(AgentRun.id).where(AgentRun.user_id == ids["user_id"]))]
         if runs:
+            s.execute(delete(GoalIteration).where(GoalIteration.run_id.in_(runs)))
+            s.execute(delete(GoalContract).where(GoalContract.run_id.in_(runs)))
             s.execute(delete(AgentRunSteering).where(AgentRunSteering.run_id.in_(runs)))
             s.execute(delete(AgentRunEvent).where(AgentRunEvent.run_id.in_(runs)))
             s.execute(delete(AgentRun).where(AgentRun.id.in_(runs)))
@@ -165,14 +169,16 @@ def test_goal_mode_disables_budget_and_injects_steering(client, user_setup, monk
         "args": {"todos": [{"content": "收集资料", "status": "completed"}]},
     }])
     model = _patch_model(
-        monkeypatch,
-        [plan, AIMessage(content=(
-            "已按补充要求完成。\n\n## 目标核对\n"
-            "| 目标项 | 完成情况 | 证据 |\n| --- | --- | --- |\n"
-            "| 收集资料 | 已完成 | write_todos 记录 |"
-        ))],
-        gate=gate,
-    )
+            monkeypatch,
+            [plan, AIMessage(content=(
+                "已按补充要求完成。\n\n## 目标核对\n"
+                "| 目标项 | 完成情况 | 证据 |\n| --- | --- | --- |\n"
+                "| 收集资料 | 已完成 | write_todos 记录 |\n"
+                f"| 执行中补充要求：最终结果必须包含 {STEER_TOKEN}，并按两部分组织 | 已完成 | 正文包含该标识 |\n\n"
+                f"第一部分完成。\n\n第二部分包含 {STEER_TOKEN}。"
+            ))],
+            gate=gate,
+        )
     user_id = user_setup["user_id"]
     response = client.post("/api/v2/runs", headers=_auth(user_id), json={
         "message": "执行一个长任务", "assistant_id": user_setup["agent_id"],
@@ -215,9 +221,68 @@ def test_goal_mode_disables_budget_and_injects_steering(client, user_setup, monk
         assert steering[0].delivered_at is not None
         assert steering[0].delivered_via == "agent"
         run = s.get(AgentRun, run_id)
-        assert run.budget_deadline_at is None
+        # 目标模式不套用普通任务的短预算，但保留全局安全截止（GOAL_MAX_SECONDS）
+        assert run.budget_deadline_at is not None
+        # Goal Runtime：目标契约必须持久化，并由目标验收而非模型自述决定完成
+        from app.models.goal import GoalContract, GoalIteration
+
+        contract = s.execute(
+            select(GoalContract).where(GoalContract.run_id == run_id)
+        ).scalar_one_or_none()
+        assert contract is not None and contract.status == "completed"
+        iterations = s.execute(
+            select(GoalIteration).where(GoalIteration.goal_id == contract.goal_id)
+        ).scalars().all()
+        assert iterations and iterations[-1].status == "completed"
         session = s.get(AgentSession, run.session_id)
         assert any(STEER_TOKEN in str(message.get("content")) for message in session.messages)
+
+
+def test_goal_pause_stops_at_next_model_boundary(client, user_setup, monkeypatch):
+    """用户暂停目标：下一个模型调用边界收敛，不产生第二笔模型/工具副作用。"""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "AGENT_RUN_TIMEOUT", 0.0)
+    gate = threading.Event()
+    plan = AIMessage(content="", tool_calls=[{
+        "name": "write_todos", "id": "call-pause-plan",
+        "args": {"todos": [{"content": "收集资料", "status": "pending"}]},
+    }])
+    model = _patch_model(
+        monkeypatch,
+        [plan, AIMessage(content="暂停后不应继续执行")],
+        gate=gate,
+    )
+    user_id = user_setup["user_id"]
+    response = client.post("/api/v2/runs", headers=_auth(user_id), json={
+        "message": "执行一个可暂停的目标", "assistant_id": user_setup["agent_id"],
+        "use_memory": False, "goal_mode": True,
+    })
+    assert response.status_code == 200, response.text
+    run_id = response.json()["run_id"]
+    _wait(client, run_id, user_id, lambda info: info["status"] == "running")
+    time.sleep(0.4)
+    paused = client.post(f"/api/v2/runs/{run_id}/pause", headers=_auth(user_id))
+    assert paused.status_code == 200, paused.text
+    assert paused.json()["status"] == "pause_requested"
+    gate.set()
+
+    info = _wait(client, run_id, user_id, lambda row: row["status"] in {
+        "completed", "failed", "limit_exceeded", "cancelled",
+    })
+    assert info["status"] == "limit_exceeded", info
+    assert len(model.seen) == 1, model.seen
+    with Session(sync_engine) as s:
+        run = s.get(AgentRun, run_id)
+        assert run.pause_requested is True
+        assert run.summary["stop"]["reason"] == "goal_paused"
+        assert run.summary["stop"]["can_continue"] is True
+        from app.models.goal import GoalContract
+
+        contract = s.execute(
+            select(GoalContract).where(GoalContract.run_id == run_id)
+        ).scalar_one_or_none()
+        assert contract is not None and contract.status == "paused"
 
 
 def test_steer_works_for_normal_run_and_rejects_terminal(client, user_setup, monkeypatch):
