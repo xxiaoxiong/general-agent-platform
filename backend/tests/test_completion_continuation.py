@@ -137,6 +137,7 @@ async def test_completed_run_continue_requires_unverified_project_gates(objectiv
     monkeypatch.setattr(settings, "AGENT_VERIFICATION_ENABLED", True)
     record = SimpleNamespace(
         id="old-run", status="completed", thread_id="thread",
+        user_id=1, session_id=2, error=None, recovery_error=None,
         input_payload={"messages": [{"role": "user", "content": objective}], "execution_context": {"task_type": "general_chat"}},
         summary={"verification": {"version": 2, "checks": [{"id": key, "passed": True}
                                                         for key in ["answer_present", "artifact_produced", *passed]]}},
@@ -144,8 +145,12 @@ async def test_completed_run_continue_requires_unverified_project_gates(objectiv
     plan = [{"content": "完成运行测试", "status": "in_progress"}]
     monkeypatch.setattr(completion, "_read_continuation_todos", AsyncMock(return_value=plan))
     monkeypatch.setattr(completion, "_continuation_file_actions", AsyncMock(return_value=[]))
-    db = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(one_or_none=lambda: record)),
-                         scalars=AsyncMock(return_value=SimpleNamespace(all=lambda: [])))
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(one_or_none=lambda: record, all=lambda: [])),
+        scalars=AsyncMock(return_value=SimpleNamespace(all=lambda: [])),
+        get=AsyncMock(return_value=record),
+        scalar=AsyncMock(return_value=None),
+    )
     resume = await completion.resolve_completion_resume(db, 1, 2, "继续", [{"role": "assistant", "source_run_id": record.id}])
 
     if should_continue:

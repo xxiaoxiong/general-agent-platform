@@ -227,6 +227,42 @@ async def restart_service(
     return service
 
 
+async def stop_all_services(
+    db: AsyncSession, workspace: Workspace, user: User,
+) -> tuple[list[WorkspaceService], list[int]]:
+    """停止全部服务并清理容器内残留进程（含脱离服务进程组的孤儿进程）。"""
+    services = await list_services(db, workspace)
+    sandbox_id = next((svc.sandbox_id for svc in services if svc.sandbox_id), None)
+    if sandbox_id is None:
+        # 即使没有服务记录，也要能清理 Sandbox 内的残留进程
+        from . import runtime
+
+        sandbox = await runtime.latest_sandbox(db, workspace.id)
+        if sandbox is not None and sandbox.observed_state == "ready":
+            sandbox_id = sandbox.id
+    killed: list[int] = []
+    if sandbox_id:
+        try:
+            result = await agent_client.stop_all_services(int(sandbox_id))
+            killed = [int(pid) for pid in (result.get("killed_pids") or [])
+                      if str(pid).isdigit()]
+        except SandboxOperationError:
+            # Sandbox 已停止/不可达：Desired State 仍然生效，Observed 标记停止
+            pass
+    exited_at = utcnow()
+    for service in services:
+        service.desired_state = "stopped"
+        service.observed_state = "stopped"
+        service.last_exited_at = exited_at
+        await emit_event(
+            db, "service.stopped", user_id=user.id, tenant_id=workspace.tenant_id,
+            project_id=workspace.project_id, workspace_id=workspace.id,
+            sandbox_id=service.sandbox_id,
+            payload={"name": service.name, "port": service.port, "all": True},
+        )
+    return services, killed
+
+
 async def fetch_logs(service: WorkspaceService, *, tail: int = 200) -> dict:
     if not service.sandbox_id:
         raise SandboxNotReadyError("服务尚未绑定 Sandbox")
@@ -291,6 +327,13 @@ async def sync_service_states(
         metrics.set_service_health(
             workspace.id, service.name, service.observed_state == "healthy")
     return changed
+
+
+def ensure_service_healthy(service: WorkspaceService) -> None:
+    """预览/浏览器会话只允许健康且期望运行的服务。"""
+    if service.desired_state != "running" or service.observed_state != "healthy":
+        raise SandboxNotReadyError(
+            "服务尚未就绪，请先在「项目服务」中启动并等待健康检查通过")
 
 
 def service_to_dict(service: WorkspaceService, *, include_command: bool = True) -> dict:

@@ -238,6 +238,7 @@ def build_task_contract(
     goal_limit: int = 200,
     web_searchable: bool = True,
     decision_intent: Optional[str] = None,
+    requires_action: bool = False,
     project_scope_override: Optional[str] = None,
 ) -> TaskContract:
     """用户目标 → 结构化任务契约（确定性，不调用模型）。"""
@@ -323,6 +324,10 @@ def build_task_contract(
             checks.append("db_evidence")
         elif decision_intent == "business_action":
             checks.append("side_effect_evidence")
+    if requires_action and not (advisory or text_only):
+        # 决策模型判断本轮要求实际执行（改文件/跑命令/改状态）：必须留下执行证据，
+        # 防止模型复述历史回答或仅声明“已完成”而未真正执行。
+        checks.append("action_evidence")
     minimum = _CHAR_COUNT.search(request)
     minimum_chars = int(minimum.group(1)) if minimum and not paths and not formats else 0
     if minimum_chars:

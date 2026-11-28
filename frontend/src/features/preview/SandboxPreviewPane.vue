@@ -335,17 +335,29 @@ async function load(silent = false) {
     error.value = ''
     const current = services.value.find((item) => item.id === selectedId.value)
     if (!current) {
+      // 只自动选择真正就绪的服务，避免对已停止服务反复创建预览会话
       const preferred = services.value.find((item) => item.observed_state === 'healthy')
-        || services.value.find((item) => item.desired_state === 'running')
-        || services.value[0]
+        || null
       selectedId.value = preferred?.id ?? null
+    } else if (current.observed_state !== 'healthy') {
+      const record = browserSessions.get(current.id)
+      if (record) {
+        void sandboxApi.closeBrowserSession(record.id, record.token).catch(() => {})
+        browserSessions.delete(current.id)
+      }
+      if (browserWsUrl.value || previewUrl.value) {
+        previewUrl.value = ''
+        fallbackUrl.value = ''
+        browserWsUrl.value = ''
+        browserNotice.value = '当前服务已停止或异常，预览已断开。'
+      }
     }
     if (props.active && canStartSandbox.value && !starting.value && !autoStartAttempted) {
       autoStartAttempted = true
       await startEnvironment(true)
       return
     }
-    if (sandbox.value?.observed_state === 'ready' && selectedService.value) {
+    if (sandbox.value?.observed_state === 'ready' && selectedService.value?.observed_state === 'healthy') {
       await ensurePreview(selectedService.value)
     }
   } catch (exc: any) {
@@ -452,8 +464,8 @@ async function waitUntilReady(timeoutMs = 90_000) {
     sandbox.value = detail.workspace?.sandbox || null
     services.value = detail.services || []
     if (sandbox.value?.observed_state === 'ready') {
-      const preferred = services.value.find((item) => item.id === selectedId.value)
-        || services.value[0]
+      const preferred = services.value.find((item) => item.observed_state === 'healthy')
+        || null
       selectedId.value = preferred?.id ?? null
       if (preferred) await ensurePreview(preferred)
       return
@@ -484,6 +496,16 @@ async function restartEnvironment() {
 
 async function ensurePreview(service: WorkspaceServiceInfo, force = false) {
   if (!workspace.value || sandbox.value?.observed_state !== 'ready') return
+  if (service.observed_state !== 'healthy') {
+    // 服务已停止/异常：不要创建浏览器会话，否则会得到 502 全局错误提示
+    previewUrl.value = ''
+    fallbackUrl.value = ''
+    browserWsUrl.value = ''
+    browserNotice.value = service.observed_state === 'starting'
+      ? '服务正在启动，就绪后再预览。'
+      : '服务未运行，无法预览；请先在“服务”页启动服务。'
+    return
+  }
   if (mode.value === 'browser') {
     const browserCached = browserSessions.get(service.id)
     if (!force && browserCached && browserCached.expires > Date.now() / 1000 + 30) {

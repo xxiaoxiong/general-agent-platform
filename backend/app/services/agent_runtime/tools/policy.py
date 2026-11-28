@@ -133,6 +133,7 @@ def _bootstrap_builtin_profiles() -> None:
         ToolRiskProfile("restart_service", ToolRisk.EXECUTE, requires_approval=True,
                         exec_access=True, **non_idem),
         ToolRiskProfile("stop_service", ToolRisk.WRITE, **non_idem),
+        ToolRiskProfile("stop_all_services", ToolRisk.WRITE, **non_idem),
         ToolRiskProfile("list_services", ToolRisk.READ, **read_only),
         ToolRiskProfile("get_service_status", ToolRisk.READ, **read_only),
         ToolRiskProfile("get_service_logs", ToolRisk.READ, **read_only),

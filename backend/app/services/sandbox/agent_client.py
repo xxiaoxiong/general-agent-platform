@@ -194,6 +194,13 @@ async def restart_service(sandbox_id: int, name: str) -> dict:
     )
 
 
+async def stop_all_services(sandbox_id: int) -> dict:
+    """停止全部服务并清理脱离进程组的残留进程。"""
+    return await _request(
+        "POST", agent_path(sandbox_id, "services/stop-all"), timeout=120,
+    )
+
+
 async def service_logs(sandbox_id: int, name: str, *, tail: int = 200) -> dict:
     data = await _request(
         "GET", agent_path(sandbox_id, f"services/{name}/logs"),

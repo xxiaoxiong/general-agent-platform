@@ -32,6 +32,9 @@ class PreparedHistory:
     notes: List[str] = field(default_factory=list)
     queries: List[str] = field(default_factory=list)
     retrieval_id: str = ""
+    # 是否检索到足以消解语义歧义的历史证据：只有强语义命中才算。
+    # 仅靠关键词重合（BM25）召回的内容不足以代替服务端澄清。
+    resolves_ambiguity: bool = False
 
     def event_payload(self) -> Dict[str, Any]:
         # 事件脱敏会把包含 "token" 的键名整体打码；对外使用 budget_used 字段
@@ -205,6 +208,14 @@ async def prepare_history_context(
         merged = _merge_results(results)
         prepared.retrieval_id = merged.retrieval_id
         prepared.notes = merged.notes[:6]
+        strong_score = float(
+            getattr(settings, "CONVERSATION_MEMORY_DENSE_STRONG_SCORE", 0.62) or 0.0
+        )
+        # 关键词重合召回只能作为背景资料；只有强语义命中才视为能消解本轮歧义。
+        prepared.resolves_ambiguity = any(
+            item.dense_score is not None and float(item.dense_score) >= strong_score
+            for item in merged.items
+        )
         context, sources, stats = build_history_context(merged)
         prepared.context = context
         prepared.sources = sources

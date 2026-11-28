@@ -73,6 +73,7 @@ def apply_decision(
     route["decision_acceptance"] = list(decision.acceptance_criteria)
     route["decision_context_refs"] = list(validated.valid_refs)
     route["decision_capabilities"] = list(validated.allowed_capabilities)
+    route["requires_action"] = bool(decision.requires_action)
 
     if intent == "general_chat":
         _clear_document_binding(route)

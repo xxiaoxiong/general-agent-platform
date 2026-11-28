@@ -834,6 +834,44 @@ async def test_stopped_service_can_restart_with_updated_command(monkeypatch):
     assert calls == ["npm run dev", "npm run dev -- --host 0.0.0.0"]
 
 
+async def test_stop_all_services_marks_stopped_and_cleans_orphans(monkeypatch):
+    """停止全部服务：数据库状态收口，并调用 Agent 清理脱离进程组的残留进程。"""
+    from app.services.sandbox import agent_client
+
+    user = await _user("u-svc-stopall")
+    _project, workspace, _sandbox = await _ready_for_session(user)
+    calls: list[int] = []
+
+    async def _start(_sandbox_id, _config):
+        return {"observed_state": "starting", "process_id": "111"}
+
+    async def _stop_all(sandbox_id):
+        calls.append(int(sandbox_id))
+        return {"services": [], "killed_pids": [123, 456]}
+
+    monkeypatch.setattr(agent_client, "start_service", _start)
+    monkeypatch.setattr(agent_client, "stop_all_services", _stop_all)
+    async with AsyncSessionLocal() as s:
+        workspace_row = await s.get(Workspace, workspace.id)
+        sandbox_row = await runtime.active_sandbox(s, workspace.id)
+        await service_manager.create_service(
+            s, workspace_row, sandbox_row, user,
+            name="frontend", command="npm run dev", port=5173,
+        )
+        await service_manager.create_service(
+            s, workspace_row, sandbox_row, user,
+            name="backend", command="npm run dev", port=3001,
+        )
+        await s.commit()
+        services, killed = await service_manager.stop_all_services(s, workspace_row, user)
+        await s.commit()
+
+    assert killed == [123, 456]
+    assert len(calls) == 1
+    assert {svc.desired_state for svc in services} == {"stopped"}
+    assert {svc.observed_state for svc in services} == {"stopped"}
+
+
 async def test_directory_listing_for_lazy_tree(monkeypatch):
     """按目录懒加载：返回直接子项（目录+文件），排除平台内部目录，不按总数截断。"""
     from app.services.sandbox import agent_client

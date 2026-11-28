@@ -141,26 +141,6 @@ export interface DocumentStageBlock {
   tone?: 'warning' | 'success'
 }
 
-/** 历史会话来源（自动预取或主动检索返回，可点击打开原会话并定位消息） */
-export interface HistorySourceItem {
-  source_id: string
-  conversation_id: number
-  message_ids: string[]
-  conversation_title: string
-  created_at?: string | null
-  snippet: string
-  relevance_score?: number
-  scope?: string
-  entry_type?: string
-}
-
-/** 历史上下文来源卡片（独立块，无来源时不渲染） */
-export interface HistorySourcesBlock {
-  kind: 'history_sources'
-  sources: HistorySourceItem[]
-  queries?: string[]
-}
-
 /** 执行中补充要求：按提交时机插入运行块流的最新执行位置 */
 export interface SteerBlock {
   kind: 'steer'
@@ -174,7 +154,6 @@ export interface SteerBlock {
 
 export type MsgBlock = TextBlock | ToolBlock | SubagentBlock | PlanBlock | DocumentArtifactBlock | ProfileDraftBlock
   | InputRequestBlock | DocumentStageBlock | DocumentEditReviewBlock | SteerBlock | TeamBlock | ProjectBlock | VerificationBlock | WorkPlanBlock
-  | HistorySourcesBlock
 
 /** 携带块流的运行消息（工具步骤实时穿插展示的最小状态） */
 export interface RunStreamMessage {
@@ -533,50 +512,6 @@ export function applyRunEvent(msg: RunStreamMessage, ev: RunEventEnvelope): void
       if (project) project.delivery = delivery
       else blocks.push({ kind: 'project', delivery })
       msg.liveStatus = delivery.state === 'passed' ? '项目已打包' : '已保存项目草稿'
-      msg.lastActivity = 'other'
-      break
-    }
-
-    // ── Conversation Memory：历史上下文来源（无来源不渲染空区域）──────────
-    case 'history.sources': {
-      const raw = Array.isArray(data.sources) ? data.sources : []
-      const sources: HistorySourceItem[] = raw
-        .filter((item: any) => item && typeof item.source_id === 'string'
-          && Number.isSafeInteger(item.conversation_id) && item.conversation_id > 0
-          && typeof item.conversation_title === 'string')
-        .map((item: any) => ({
-          source_id: String(item.source_id),
-          conversation_id: Number(item.conversation_id),
-          message_ids: Array.isArray(item.message_ids)
-            ? item.message_ids.filter((mid: any) => typeof mid === 'string').slice(0, 8) : [],
-          conversation_title: String(item.conversation_title || '未命名会话'),
-          created_at: typeof item.created_at === 'string' ? item.created_at : null,
-          snippet: String(item.snippet || ''),
-          relevance_score: typeof item.relevance_score === 'number' ? item.relevance_score : undefined,
-          scope: typeof item.scope === 'string' ? item.scope : undefined,
-          entry_type: typeof item.entry_type === 'string' ? item.entry_type : undefined,
-        }))
-      if (!sources.length) break
-      const existing = blocks.find((block): block is HistorySourcesBlock => block.kind === 'history_sources')
-      if (existing) {
-        const seen = new Set(existing.sources.map((item) => item.source_id))
-        for (const source of sources) {
-          if (!seen.has(source.source_id)) {
-            existing.sources.push(source)
-            seen.add(source.source_id)
-          }
-        }
-        if (Array.isArray(data.queries)) {
-          existing.queries = data.queries.filter((q: any) => typeof q === 'string').slice(0, 3)
-        }
-      } else {
-        blocks.push({
-          kind: 'history_sources',
-          sources,
-          queries: Array.isArray(data.queries)
-            ? data.queries.filter((q: any) => typeof q === 'string').slice(0, 3) : [],
-        })
-      }
       msg.lastActivity = 'other'
       break
     }

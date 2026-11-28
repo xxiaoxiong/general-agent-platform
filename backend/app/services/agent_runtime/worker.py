@@ -341,8 +341,18 @@ class RunWorker:
             ))
         else:
             handle.transition(STATUS_NEEDS_RECONCILIATION)
+            # 待核对是死终态：必须结束 Run、写回会话并释放执行权，
+            # 否则用户看不到中断原因，也无法在会话里继续后续任务。
+            final_text = "".join(handle.final_text_parts) or (
+                "任务已暂停：上次执行存在未确认的沙箱操作，需要核对后才能继续。"
+                "已完成的步骤、文件和计划状态已保留；可回复“继续”接着做。"
+            )
+            handle.final_text_parts = [final_text]
             await self.service._commit(
-                handle, status=STATUS_NEEDS_RECONCILIATION, recovery_error=reason,
+                handle, status=STATUS_NEEDS_RECONCILIATION,
+                error=reason or None, final_text=final_text,
+                summary={"paused": True, "reason": reason, "verification": None},
+                recovery_error=reason, finished=True,
             )
         logger.info("run %s 恢复检查后进入 %s：%s", handle.run_id, status, reason or "-")
 

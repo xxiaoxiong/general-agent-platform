@@ -1,4 +1,4 @@
-﻿"""Sandbox Agent 工具集（任务书 §9.1）。
+"""Sandbox Agent 工具集（任务书 §9.1）。
 
 - 命令：execute_command / get_command_status / get_command_output / cancel_command
 - 服务：start_service / list_services / get_service_status / get_service_logs /
@@ -42,7 +42,7 @@ logger = logging.getLogger("ai_plat.sandbox.tools")
 SANDBOX_TOOL_NAMES = (
     "execute_command", "get_command_status", "get_command_output", "cancel_command",
     "start_service", "list_services", "get_service_status", "get_service_logs",
-    "stop_service", "restart_service", "get_preview_url",
+    "stop_service", "stop_all_services", "restart_service", "get_preview_url",
 )
 
 # 需要 HITL 审批的 Sandbox 工具（装配期加入 policy.hitl_tools）
@@ -159,6 +159,18 @@ TOOLS: List[Dict[str, Any]] = [
             "name": {"type": "string", "description": "服务名"},
         },
         "required": ["name"],
+    },
+    {
+        "name": "stop_all_services",
+        "display_name": "🧹 停止全部服务",
+        "category": "项目工作空间",
+        "description": (
+            "停止项目内全部服务，并清理容器内脱离服务进程组的残留进程。"
+            "文件被清空、端口冲突、环境异常或需要彻底收尾时使用；"
+            "服务文件已删除时优先用它，而不是逐个 stop_service。"
+        ),
+        "parameters": {},
+        "required": [],
     },
     {
         "name": "restart_service",
@@ -621,6 +633,30 @@ async def handle_stop_service(ctx: Any, params: dict) -> ToolResult:
     )
 
 
+async def handle_stop_all_services(ctx: Any, params: dict) -> ToolResult:
+    ref = await _resolve(ctx)
+    lease_error = await ensure_write_lease(ctx, ref)
+    if lease_error:
+        return ToolResult.failed(lease_error)
+    async with AsyncSessionLocal() as db:
+        workspace = (await db.execute(
+            select(Workspace).where(Workspace.id == ref.workspace_id)
+        )).scalar_one()
+        user = (await db.execute(
+            select(User).where(User.id == ctx.scope.user_id)
+        )).scalar_one()
+        services, killed = await service_manager.stop_all_services(db, workspace, user)
+        await db.commit()
+        states = [service_manager.service_to_dict(service) for service in services]
+    summary = f"已停止 {len(states)} 个服务"
+    if killed:
+        summary += f"，并清理 {len(killed)} 个残留进程"
+    return ToolResult.succeeded(
+        summary,
+        metadata={"services": states, "killed_pids": killed},
+    )
+
+
 async def handle_restart_service(ctx: Any, params: dict) -> ToolResult:
     ref = await _resolve(ctx)
     lease_error = await ensure_write_lease(ctx, ref)
@@ -686,6 +722,7 @@ HANDLERS = {
     "get_service_status": handle_get_service_status,
     "get_service_logs": handle_get_service_logs,
     "stop_service": handle_stop_service,
+    "stop_all_services": handle_stop_all_services,
     "restart_service": handle_restart_service,
     "get_preview_url": handle_get_preview_url,
 }

@@ -377,7 +377,6 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
     const sentModelId = st.selectedModelId.value
     const sentMode = st.approvalMode.value
     const sentWebEnabled = st.webSearchOn.value
-    const sentHistoryEnabled = st.historyMemoryOn.value
     const sentTeamMode = !continueTask && st.teamMode.value
     // 目标模式（/goal）：随本次 Run 提交，不限调用次数与执行时长
     const sentGoalMode = !continueTask && st.goalMode.value
@@ -412,7 +411,6 @@ export function useChatWorkspace(st: WorkspaceState, scroll: ReturnType<typeof u
         assistant_id: st.currentAssistant.value?.id,
         approval_mode: sentMode,
         web_enabled: sentWebEnabled,
-        history_enabled: sentHistoryEnabled,
         model_config_id: sentModelId || undefined,
         ...(sentTeamMode ? { team_mode: true } : {}),
         ...(sentGoalMode ? { goal_mode: true } : {}),

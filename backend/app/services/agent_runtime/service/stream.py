@@ -418,6 +418,8 @@ class StreamMixin:
                     ).strip()
                     decision_ambiguous = (
                         decision.get("decision_status") == "ambiguous" and bool(clarify_question)
+                        # 已明确续做中断任务时，“继续”不再视为歧义：直接执行并携带进度摘要
+                        and not (execution_context or {}).get("completion_resume")
                     )
                 # 决策后可能补入历史附件（延续任务）：系统提示显式列出可用文件，
                 # 避免通用 Agent 只看到初始注记而漏读后续解析出的附件
@@ -435,6 +437,7 @@ class StreamMixin:
             # 执行器保持原有语义（阶段一先接入普通 Agent）。
             history_context = ""
             history_sources: List[Dict[str, Any]] = []
+            history_resolves_ambiguity = False
             if (
                 bool(getattr(settings, "CONVERSATION_MEMORY_ENABLED", True))
                 and messages and not resume and not is_team_run and not is_document_run
@@ -454,6 +457,7 @@ class StreamMixin:
                 if prepared.enabled:
                     history_context = prepared.context
                     history_sources = prepared.sources
+                    history_resolves_ambiguity = bool(prepared.resolves_ambiguity)
                     agent_config["_history_context"] = history_context
                     try:
                         await bus.publish(RuntimeEvent(
@@ -463,8 +467,8 @@ class StreamMixin:
                     except Exception:  # noqa: BLE001 来源事件失败不影响执行
                         logger.warning("run %s history.sources 事件发布失败", run.run_id)
             if decision_ambiguous:
-                if history_context:
-                    # 历史上下文已消解关键歧义：移除强制澄清提示，继续正常执行
+                if history_context and history_resolves_ambiguity:
+                    # 历史上下文（强语义命中）已消解关键歧义：移除强制澄清提示，继续正常执行
                     _decision_cfg = agent_config.get("_decision")
                     if isinstance(_decision_cfg, dict):
                         _decision_cfg["clarification_question"] = ""
@@ -605,6 +609,7 @@ class StreamMixin:
                     ),
                     # TaskContract 不再承担第二套 Router：任务类型优先取已校验决策
                     decision_intent=applied_intent,
+                    requires_action=bool((execution_context or {}).get("requires_action")),
                     project_scope_override=(
                         decision_meta.get("project_scope")
                         if applied_intent == "software_project" else None

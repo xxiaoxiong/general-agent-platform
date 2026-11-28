@@ -134,6 +134,9 @@ class RunDecision(BaseModel):
     acceptance_criteria: list[ShortText] = Field(default_factory=list, max_length=8)
 
     project_scope: Optional[ProjectScope] = None
+    # 本轮是否要求实际执行操作（改写文件/工作区、运行命令、改变系统状态等）。
+    # 纯问答、解释、建议为 false；由决策模型判断，服务端据此增加执行证据验收。
+    requires_action: bool = False
     decision_status: Literal["clear", "ambiguous"] = "clear"
     clarification_question: Optional[str] = Field(default=None, max_length=300)
     rationale: str = Field(default="", max_length=300)

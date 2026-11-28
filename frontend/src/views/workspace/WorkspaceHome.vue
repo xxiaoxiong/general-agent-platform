@@ -136,8 +136,6 @@
                   <ToolStep v-else-if="block.kind === 'tool'" :tool="block" @preview="openPreview" />
                   <TeamRunCard v-else-if="block.kind === 'team'" :progress="block.progress" :active="Boolean(m.streaming)" />
                   <WorkPlanCard v-else-if="block.kind === 'work_plan'" :plan="block.plan" />
-                  <HistorySourcesCard v-else-if="block.kind === 'history_sources'"
-                    :sources="block.sources" :queries="block.queries" @open="openHistorySource" />
                   <VerificationCard v-else-if="block.kind === 'verification'" :report="block" :run-id="m.runId" />
                   <ProjectDeliveryCard v-else-if="block.kind === 'project'"
                     :delivery="block.delivery" :progress="block.progress" :active="Boolean(m.streaming)"
@@ -271,7 +269,6 @@
           v-model:goal-mode="goalMode"
           v-model:approval-mode="approvalMode"
           v-model:web-enabled="webSearchOn"
-          v-model:history-memory-enabled="historyMemoryOn"
           v-model:model="selectedModelId"
           :options="modelOptions"
           :attachments="attachments"
@@ -359,7 +356,6 @@ import ApprovalPanel from '@/features/run/ApprovalPanel.vue'
 import MessageMarkdown from '@/features/run/MessageMarkdown.vue'
 import TeamRunCard from '@/features/run/TeamRunCard.vue'
 import WorkPlanCard from '@/features/run/WorkPlanCard.vue'
-import HistorySourcesCard from '@/features/run/HistorySourcesCard.vue'
 import { teamPhaseLabels } from '@/features/run/teamProgress'
 import ProjectDeliveryCard from '@/features/run/ProjectDeliveryCard.vue'
 import VerificationCard from '@/features/run/VerificationCard.vue'
@@ -398,7 +394,7 @@ const {
   historyLoading, historyFailed, creatingConversation, deletingId,
   hasMoreConversations, historyLoadingMore, showWelcome, historyToggle,
   currentAssistant, loadingMessages, messagesFailed, messages,
-  inputText, teamMode, goalMode, approvalMode, webSearchOn, historyMemoryOn, selectedModelId, modelOptions,
+  inputText, teamMode, goalMode, approvalMode, webSearchOn, selectedModelId, modelOptions,
   attachments, uploading, sending, streaming, historyRun, blockedReason, steerTarget,
   pendingDecisions, documentContext, documentTask, documentInputsBusy,
   documentInputErrors, repairingProject, projectRepairErrors, downloadingDocuments,
@@ -407,18 +403,8 @@ const {
   openHistory, closeHistory, resetDocumentTask, closePreview,
 } = st
 
-const { messagesRef, threadRef, showJumpToLatest, questionAnchors, onMessagesScroll, onWheelScroll, forceScrollToBottom, jumpToQuestion } = scroll
-
-/** 历史来源卡片：打开原会话并定位到具体消息（保留其他 query，清掉旧 run 锚点）。 */
-function openHistorySource(conversationId: number, messageId?: string) {
-  if (st.route.name !== 'Workspace') return
-  const query: Record<string, any> = { ...st.route.query }
-  query.conversation = String(conversationId)
-  if (messageId) query.message = messageId
-  else delete query.message
-  delete query.run
-  void st.router.push({ query })
-}
+const {
+  messagesRef, threadRef, showJumpToLatest, questionAnchors, onMessagesScroll, onWheelScroll, forceScrollToBottom, jumpToQuestion } = scroll
 
 const {
   loadConversations, loadMoreConversations, updateConversationMetadata, newConversation,

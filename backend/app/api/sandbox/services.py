@@ -84,6 +84,25 @@ async def list_services(
     return {"items": [service_manager.service_to_dict(svc) for svc in services]}
 
 
+@router.post("/{workspace_id}/services/stop-all")
+async def stop_all_services(
+    workspace_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """停止全部服务并清理容器内残留进程（用于文件清空/环境异常后的收尾）。"""
+    ensure_enabled()
+    workspace, _project, _role = await acl.require_workspace_access(
+        db, workspace_id, current_user, "operator",
+    )
+    services, killed = await service_manager.stop_all_services(db, workspace, current_user)
+    await db.commit()
+    return {
+        "items": [service_manager.service_to_dict(svc) for svc in services],
+        "killed_pids": killed,
+    }
+
+
 @router.get("/{workspace_id}/services/{service_id}")
 async def get_service(
     workspace_id: int,
@@ -173,6 +192,14 @@ async def create_preview_grant(
         db, workspace_id, current_user, "operator",
     )
     service = await service_manager.get_service(db, workspace, service_id)
+    sandbox = await runtime.latest_sandbox(db, workspace.id)
+    if sandbox is not None and sandbox.observed_state == "ready":
+        try:
+            await service_manager.sync_service_states(db, workspace, sandbox)
+            await db.refresh(service)
+        except Exception:  # noqa: BLE001 同步失败时按数据库状态判断
+            pass
+    service_manager.ensure_service_healthy(service)
     grant, token = await preview_service.create_grant(
         db, workspace, service, current_user,
         ttl_seconds=(body.ttl_seconds or None),

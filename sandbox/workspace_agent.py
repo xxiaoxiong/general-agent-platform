@@ -832,14 +832,23 @@ class Service:
     def to_dict(self) -> dict:
         with self._lock:
             process = self.process
+            state = self.status
+            detail = self.last_error
+            if state in ("starting", "healthy") and not os.path.isdir(self.cwd):
+                # 文件被清空后进程可能仍占着端口：明确标记异常，避免 UI 继续显示 Ready
+                state = "unhealthy"
+                detail = (
+                    "服务工作目录已被删除，当前进程无法继续提供项目内容；"
+                    "请停止服务或重新创建项目文件后再启动"
+                )
             return {
                 "name": self.name,
                 "port": self.port,
                 "protocol": self.protocol,
-                "observed_state": self.status,
+                "observed_state": state,
                 "process_id": str(process.pid) if process and process.poll() is None else None,
                 "exit_code": self.exit_code,
-                "detail": self.last_error,
+                "detail": detail,
                 "last_started_at": self.last_started_at,
                 "last_exited_at": self.last_exited_at,
                 "auto_restart": self.auto_restart,
@@ -892,7 +901,67 @@ def service_logs(name: str, tail: int) -> dict:
     return _get_service(name).logs(tail)
 
 
-def stop_all() -> None:
+def _protected_pids() -> set[int]:
+    """Agent 自身及其祖先进程：清理用户进程时必须保留。"""
+    protected = {1, os.getpid()}
+    pid = os.getpid()
+    while pid > 1:
+        try:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
+                raw = handle.read()
+            # comm 字段可能含空格/括号：从最后一个 ')' 之后再取 state 与 ppid
+            fields = raw[raw.rfind(")") + 2:].split()
+            pid = int(fields[1])
+        except (OSError, ValueError, IndexError):
+            break
+        protected.add(pid)
+    return protected
+
+
+def _kill_user_processes() -> list[int]:
+    """清理 Sandbox 内所有非 Agent 用户进程（含脱离服务进程组的孤儿进程）。
+
+    ``Service.stop`` 只能杀服务启动时的进程组；npm/vite 等可能把子进程放到
+    新会话，文件被删除后仍残留。停止全部服务时按 UID 兜底清理，保证容器
+    内不会留下无人管理的后台进程。
+    """
+    try:
+        uid = os.getuid()
+        entries = os.listdir("/proc")
+    except (AttributeError, OSError):
+        return []
+    protected = _protected_pids()
+    targets: list[int] = []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid in protected:
+            continue
+        try:
+            with open(f"/proc/{pid}/status", "r", encoding="utf-8") as handle:
+                status = handle.read()
+        except OSError:
+            continue
+        if f"Uid:\t{uid}\t" not in status:
+            continue
+        targets.append(pid)
+    for pid in targets:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            continue
+    if targets:
+        time.sleep(0.6)
+    for pid in targets:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            continue
+    return targets
+
+
+def stop_all() -> dict:
     for operation in list(_OPERATIONS.values()):
         try:
             operation.cancel()
@@ -903,6 +972,8 @@ def stop_all() -> None:
             service.stop()
         except Exception:  # noqa: BLE001
             pass
+    killed = _kill_user_processes()
+    return {"services": list_services().get("services", []), "killed_pids": killed}
 
 
 # ── HTTP ─────────────────────────────────────────────────────────────────
@@ -985,6 +1056,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, list_services())
             elif path == "/services" and method == "POST":
                 self._send(200, start_service(payload))
+            elif path == "/services/stop-all" and method == "POST":
+                self._send(200, stop_all())
             elif path.startswith("/services/"):
                 parts = path.strip("/").split("/")
                 name = parts[1]

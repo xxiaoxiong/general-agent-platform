@@ -291,6 +291,35 @@ class TestVerification:
         # 3 检查 1 失败 → partial
         assert r.status == STATUS_PARTIAL
 
+    def test_requires_action_requires_execution_evidence(self):
+        """决策判定为执行型任务：仅声称完成、没有工具执行记录时必须判失败。"""
+        c = build_task_contract("清空目录下所有文件", decision_intent="general_chat",
+                                requires_action=True)
+        assert "action_evidence" in c.completion_checks
+        r = verify_task(c, "目录已清空。", [])
+        assert {item.id: item.passed for item in r.checks}["action_evidence"] is False
+        assert r.status == STATUS_FAILED
+
+        ev = [ToolEvidence(tool_name="execute_command", status="succeeded")]
+        r2 = verify_task(c, "目录已清空。", ev)
+        assert r2.status == STATUS_PASSED
+
+        # 未要求实际执行时，不额外增加执行证据义务
+        plain = build_task_contract("解释一下什么是目录", decision_intent="general_chat")
+        assert "action_evidence" not in plain.completion_checks
+
+    def test_action_claim_requires_evidence(self):
+        """声称“已执行/已清空”但没有任何执行记录时必须判定为缺口。"""
+        from app.services.assistant.verification import action_claim_checks, action_claim_present
+
+        assert action_claim_present("目录已清空。")
+        assert not action_claim_present("可以执行 rm -rf 来清空目录。")
+        failed = action_claim_checks("目录已清空。", [])
+        assert [item.id for item in failed] == ["action_evidence"]
+        assert action_claim_checks(
+            "目录已清空。", [ToolEvidence(tool_name="execute_command", status="succeeded")],
+        ) == []
+
     def test_feedback_text_lists_failed_checks(self):
         c = build_task_contract("研究行业趋势")
         r = verify_task(c, "结论无来源", [])
@@ -516,3 +545,80 @@ class TestVerificationRuntimeIntegration:
             )).scalar_one()
         ver = (run.summary or {}).get("verification")
         assert ver is None or ver.get("fix_rounds", 0) == 0
+
+    @pytest.mark.asyncio
+    async def test_external_receipt_allows_plan_bookkeeping_rework(self, monkeypatch):
+        """外部操作已成功但计划未关闭：补记计划属于账务性缺口，不得直接判失败。"""
+        import app.services.agent_runtime.completion as completion_mod
+        import app.services.agent_runtime.factory as factory_mod
+        import app.services.agent_runtime.service as svc_mod
+        from langchain_core.language_models.chat_models import BaseChatModel
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        from app.services.agent_runtime import get_runtime_service
+
+        def plan(status):
+            return AIMessage(content="", tool_calls=[{
+                "name": "write_todos", "id": f"plan-{status}", "type": "tool_call",
+                "args": {"todos": [{"content": "清空目录下所有文件", "status": status}]},
+            }])
+
+        class ScriptedModel(BaseChatModel):
+            script: list = []
+
+            @property
+            def _llm_type(self):
+                return "fake-external-bookkeeping"
+
+            def bind_tools(self, tools, **kwargs):
+                return self
+
+            def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+                item = self.script.pop(0) if self.script else AIMessage(content="（结束）")
+                msg = item() if callable(item) else item
+                return ChatResult(generations=[ChatGeneration(message=msg)])
+
+        async def fake_load_model(self, model_config_id):
+            return (
+                {"name": "fake-provider", "base_url": "http://fake.local/v1", "api_key": "none",
+                 "extra_config": {}},
+                {"name": "fake", "max_tokens": None, "supports_streaming": True,
+                 "supports_function_call": True, "extra_params": {}},
+            )
+
+        async def fake_evidence(ctx):
+            # 模拟 execute_command 已成功：工具账本存在外部回执
+            return [], [], True
+
+        monkeypatch.setattr(svc_mod.AgentRuntimeService, "_load_model", fake_load_model)
+        monkeypatch.setattr(completion_mod, "_collect_evidence", fake_evidence)
+        monkeypatch.setattr(factory_mod, "build_chat_model", lambda *a, **k: ScriptedModel(script=[
+            plan("in_progress"),
+            AIMessage(content="目录已清空。"),
+            plan("completed"),
+            AIMessage(content="目录已清空，计划已关闭。"),
+        ]))
+
+        svc = get_runtime_service()
+        result = await svc.run_to_completion(
+            agent_config={"id": 990304, "tools": [], "capability_ids": ["general"],
+                          "system_prompt": "t", "temperature": "0.1"},
+            messages=[{"role": "user", "content": "清空目录下所有文件"}],
+            user_id=1,
+        )
+        assert result["status"] == "completed"
+        assert result["content"] == "目录已清空，计划已关闭。"
+
+        from app.core.database import AsyncSessionLocal
+        from app.models.agent import AgentRun
+        from sqlalchemy import select
+
+        async with AsyncSessionLocal() as db:
+            run = (await db.execute(
+                select(AgentRun).where(AgentRun.id == result["run_id"])
+            )).scalar_one()
+        ver = (run.summary or {}).get("verification") or {}
+        assert ver.get("status") == "passed"
+        assert ver.get("stop_reason") in ("", None)
+        assert ver.get("fix_rounds") == 1

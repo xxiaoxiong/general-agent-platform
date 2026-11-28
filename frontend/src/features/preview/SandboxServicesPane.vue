@@ -17,6 +17,9 @@
         <button v-if="sandbox?.observed_state === 'ready'" type="button" class="sv-btn" :disabled="busy" @click="stopEnv">
           <Square :size="13" />停止环境
         </button>
+        <button v-if="sandbox?.observed_state === 'ready'" type="button" class="sv-btn" :disabled="busy" @click="stopAllServices">
+          <Square :size="13" />停止全部服务
+        </button>
         <button type="button" class="sv-btn" :disabled="busy" @click="load(false)">
           <RefreshCw :size="13" />刷新
         </button>
@@ -227,6 +230,21 @@ async function stopService(service: WorkspaceServiceInfo) {
     ElMessage.success(`服务 ${service.name} 已停止`)
   } catch (exc: any) {
     ElMessage.error(exc?.response?.data?.message || exc?.message || '停止服务失败')
+  }
+}
+
+async function stopAllServices() {
+  if (!workspace.value || busy.value) return
+  busy.value = true
+  try {
+    const result = await sandboxApi.stopAllServices(workspace.value.id)
+    await load(true)
+    const killed = result.killed_pids?.length || 0
+    ElMessage.success(killed ? `已停止全部服务，并清理 ${killed} 个残留进程` : '已停止全部服务')
+  } catch (exc: any) {
+    ElMessage.error(exc?.response?.data?.message || exc?.message || '停止全部服务失败')
+  } finally {
+    busy.value = false
   }
 }
 

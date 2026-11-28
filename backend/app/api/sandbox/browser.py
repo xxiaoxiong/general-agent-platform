@@ -30,8 +30,6 @@ logger = logging.getLogger("ai_plat.sandbox.browser")
 
 router = APIRouter(prefix="/workspaces", tags=["workspace-browser-v2"])
 
-_STOPPED_SERVICE_STATES = {"created", "stopped", "exited", "failed"}
-
 
 class BrowserSessionCreate(BaseModel):
     viewport_width: int = Field(default=0, ge=0, le=4096)
@@ -56,11 +54,14 @@ async def create_browser_session(
             "内置浏览器未启用：请在部署配置中设置 BROWSER_SERVICE_TOKEN 并启动 browser-service。"
         )
     service = await service_manager.get_service(db, workspace, service_id)
-    if (
-        service.desired_state != "running"
-        or service.observed_state in _STOPPED_SERVICE_STATES
-    ):
-        raise SandboxNotReadyError("服务尚未运行，请先在「项目服务」中启动服务")
+    sandbox = await runtime.latest_sandbox(db, workspace.id)
+    if sandbox is not None and sandbox.observed_state == "ready":
+        try:
+            await service_manager.sync_service_states(db, workspace, sandbox)
+            await db.refresh(service)
+        except Exception:  # noqa: BLE001 同步失败时按数据库状态判断
+            pass
+    service_manager.ensure_service_healthy(service)
 
     ttl = int(body.ttl_seconds or settings.BROWSER_SESSION_TTL)
     grant, grant_token = await preview_service.create_grant(

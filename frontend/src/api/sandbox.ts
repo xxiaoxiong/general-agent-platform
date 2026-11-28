@@ -236,6 +236,10 @@ export const sandboxApi = {
   }) => request.post<any, WorkspaceServiceInfo>(`/workspaces/${workspaceId}/services`, data),
   stopService: (workspaceId: number, serviceId: number) =>
     request.post<any, WorkspaceServiceInfo>(`/workspaces/${workspaceId}/services/${serviceId}/stop`),
+  stopAllServices: (workspaceId: number) =>
+    request.post<any, { items: WorkspaceServiceInfo[]; killed_pids: number[] }>(
+      `/workspaces/${workspaceId}/services/stop-all`,
+    ),
   restartService: (workspaceId: number, serviceId: number) =>
     request.post<any, WorkspaceServiceInfo>(`/workspaces/${workspaceId}/services/${serviceId}/restart`),
   serviceLogs: (workspaceId: number, serviceId: number, tail = 200) =>

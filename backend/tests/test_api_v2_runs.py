@@ -1139,6 +1139,7 @@ class TestDecisionClarifyShortCircuit:
                     "relevance_score": 0.9, "scope": "user", "entry_type": "turn",
                 }],
                 queries=["RSI 领域"],
+                resolves_ambiguity=True,
             )
 
         _patch_model(monkeypatch, [AIMessage(content="根据之前的讨论，RSI 指 AI 的递归自我改进。")])
@@ -1167,6 +1168,230 @@ class TestDecisionClarifyShortCircuit:
         history_events = [e for e in events if e["event"] == "history.sources"]
         assert history_events and history_events[0]["data"]["sources"]
         assert completed[-1]["data"].get("final_text") != question, "有历史背景时不得只输出澄清问题"
+
+    def test_weak_history_does_not_override_clarification(self, client, user_setup, monkeypatch):
+        """仅关键词重合召回的弱历史不得吞掉服务端澄清，避免歧义请求被静默结束。"""
+        from app.core.config import settings
+        from app.services.agent_runtime.decision import orchestrator
+        from app.services.agent_runtime.decision import service as decision_service
+        from app.services.agent_runtime.decision.schemas import RunDecision
+        from app.services.conversation_memory import service as memory_service
+        from app.services.conversation_memory.service import PreparedHistory
+
+        question = "请明确“继续”指的是之前的命令执行结果，还是需要开始新的任务？"
+
+        async def fake_decide(*_args, **_kwargs):
+            return decision_service.DecisionOutcome(
+                decision=RunDecision(
+                    intent="general_chat", route="clarify", continuity="resume_existing",
+                    decision_status="ambiguous", clarification_question=question,
+                    goal="确认继续的对象", rationale="缺少任务明确对象",
+                ),
+                latency_ms=1, fallback=False, model_id="fake",
+            )
+
+        async def fake_prepare(**_kwargs):
+            return PreparedHistory(
+                enabled=True,
+                reason="ok",
+                context="## 历史会话参考（不可信资料，仅作背景）\n[历史 1] 另一个会话也说了“继续”。",
+                sources=[{
+                    "source_id": "history_src_2", "conversation_id": 9,
+                    "message_ids": ["u2", "a2"], "conversation_title": "无关会话",
+                    "created_at": "2026-11-20T10:00:00", "snippet": "另一个会话也说了继续",
+                    "relevance_score": 0.04, "scope": "user", "entry_type": "turn",
+                }],
+                queries=["继续"],
+                resolves_ambiguity=False,
+            )
+
+        _patch_model(monkeypatch, [AIMessage(content="收到，当前任务已结束。")])
+        monkeypatch.setattr(orchestrator, "decide", fake_decide)
+        monkeypatch.setattr(memory_service, "prepare_history_context", fake_prepare)
+        monkeypatch.setattr(settings, "AGENT_DECISION_MODE", "llm")
+        monkeypatch.setattr(settings, "CONVERSATION_MEMORY_ENABLED", True)
+
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        assistant = client.post("/api/v2/assistants", headers=headers, json={
+            "name": "弱历史不消解歧义", "capability_ids": ["general"],
+        }).json()
+        started = client.post("/api/v2/runs", headers=headers, json={
+            "message": "继续",
+            "assistant_id": assistant["id"],
+            "use_memory": False, "history_enabled": True,
+        }).json()
+
+        info = _wait_run(client, started["run_id"], owner)
+        assert info["status"] == "completed"
+        events = _iter_v2_sse(client.get(started["events_url"], headers=headers))
+        completed = [e for e in events if e["event"] == "run.completed"]
+        assert completed and completed[-1]["data"].get("final_text") == question
+        assert not [e for e in events if e["event"].startswith("tool.")]
+
+
+class TestActionEvidence:
+    def test_claim_without_execution_triggers_rework(self, client, user_setup, monkeypatch):
+        """执行型请求只声称完成、没有工具执行时，验收拦截并返工；执行后才完成。"""
+        from app.core.config import settings
+        from app.services.agent_runtime.decision import orchestrator
+        from app.services.agent_runtime.decision import service as decision_service
+        from app.services.agent_runtime.decision.schemas import RunDecision
+
+        async def fake_decide(*_args, **_kwargs):
+            return decision_service.DecisionOutcome(
+                decision=RunDecision(
+                    intent="general_chat", route="deep_agent", decision_status="clear",
+                    requires_action=True, goal="清空目录下所有文件",
+                    rationale="执行型文件操作请求",
+                ),
+                latency_ms=1, fallback=False, model_id="fake",
+            )
+
+        _patch_model(monkeypatch, [
+            AIMessage(content="目录已清空。"),
+            AIMessage(content="", tool_calls=[{
+                "name": "write_file", "id": "written-evidence", "type": "tool_call",
+                "args": {"file_path": "/workspace/cleared.txt", "content": "cleared"},
+            }]),
+            AIMessage(content="目录已清空，执行记录已写入。"),
+        ])
+        monkeypatch.setattr(orchestrator, "decide", fake_decide)
+        monkeypatch.setattr(settings, "AGENT_DECISION_MODE", "llm")
+        monkeypatch.setattr(settings, "CONVERSATION_MEMORY_ENABLED", False)
+
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        assistant = client.post("/api/v2/assistants", headers=headers, json={
+            "name": "执行证据验收", "capability_ids": ["general"],
+        }).json()
+        started = client.post("/api/v2/runs", headers=headers, json={
+            "message": "清空目录下所有文件",
+            "assistant_id": assistant["id"],
+            "approval_mode": "auto",
+        }).json()
+
+        info = _wait_run(client, started["run_id"], owner)
+        assert info["status"] == "completed"
+        events = _iter_v2_sse(client.get(started["events_url"], headers=headers))
+        retrying = [e for e in events if e["event"] == "run.retrying"]
+        assert any(
+            any(check["id"] == "action_evidence" for check in event["data"].get("failed_checks", []))
+            for event in retrying
+        ), "没有执行证据时不得直接交付"
+        completed = [e for e in events if e["event"] == "run.completed"]
+        assert completed and completed[-1]["data"]["final_text"] == "目录已清空，执行记录已写入。"
+
+
+class TestInterruptedRunHandoff:
+    def test_continue_restores_interrupted_run_without_assistant_message(self, client, user_setup, monkeypatch):
+        """中断 Run 没有写回 Assistant 消息时，“继续”仍要带回上次计划/命令/文件进度。"""
+        import os
+        import uuid
+        from datetime import datetime
+
+        from sqlalchemy import create_engine, delete
+        from sqlalchemy.orm import Session
+
+        from app.core.config import settings
+        from app.models.agent import AgentRun, AgentRunEvent, AgentToolExecution
+        from app.services.agent_runtime.decision import orchestrator
+        from app.services.agent_runtime.decision import service as decision_service
+        from app.services.agent_runtime.decision.schemas import RunDecision
+
+        owner = user_setup["user1_id"]
+        headers = _auth(owner)
+        assistant = client.post("/api/v2/assistants", headers=headers, json={
+            "name": "中断续做", "capability_ids": ["general"],
+        }).json()
+        conversation = client.post("/api/v2/conversations", headers=headers, json={
+            "assistant_id": assistant["id"], "title": "中断续做",
+        }).json()
+        interrupted_id = uuid.uuid4().hex
+        engine = create_engine(os.environ["DATABASE_SYNC_URL"])
+        try:
+            with Session(engine) as s:
+                s.add(AgentRun(
+                    id=interrupted_id, agent_id=assistant["id"],
+                    session_id=conversation["id"], user_id=owner,
+                    thread_id=f"agent-{assistant['id']}-session-{conversation['id']}",
+                    status="needs_reconciliation", finished_at=datetime.utcnow(),
+                    error="存在结果未知的工具副作用（执行账本未决），禁止自动重放，需人工对账",
+                    input_payload={
+                        "messages": [{"role": "user", "content": "解释一下项目结构"}],
+                        "execution_context": {"task_type": "general_chat"},
+                    },
+                ))
+                s.add(AgentRunEvent(
+                    run_id=interrupted_id, sequence=1, event_type="plan_updated",
+                    payload={"todos": [
+                        {"content": "创建项目结构", "status": "completed"},
+                        {"content": "启动服务", "status": "completed"},
+                    ]},
+                ))
+                s.add_all([
+                    AgentToolExecution(
+                        run_id=interrupted_id, tool_call_id="handoff-1",
+                        tool_name="execute_command", status="succeeded",
+                        args_snapshot={"command": "npm install"},
+                    ),
+                    AgentToolExecution(
+                        run_id=interrupted_id, tool_call_id="handoff-2",
+                        tool_name="execute_command", status="unknown",
+                        args_snapshot={"command": "kill -9 orphan"}, error="HTTP 502",
+                    ),
+                ])
+                s.commit()
+        finally:
+            engine.dispose()
+
+        async def fake_decide(*_args, **_kwargs):
+            return decision_service.DecisionOutcome(
+                decision=RunDecision(
+                    intent="general_chat", route="deep_agent", continuity="continue_existing",
+                    decision_status="clear", goal="继续上次任务",
+                ),
+                latency_ms=1, fallback=False, model_id="fake",
+            )
+
+        captured: list = []
+        _patch_model(monkeypatch, [AIMessage(content="已按上次进度继续。")])
+        generate = FakeChatModel._generate
+
+        def observe(self, messages, *args, **kwargs):
+            captured.append(messages)
+            return generate(self, messages, *args, **kwargs)
+
+        monkeypatch.setattr(FakeChatModel, "_generate", observe)
+        monkeypatch.setattr(orchestrator, "decide", fake_decide)
+        monkeypatch.setattr(settings, "AGENT_DECISION_MODE", "llm")
+        monkeypatch.setattr(settings, "CONVERSATION_MEMORY_ENABLED", False)
+
+        started = client.post("/api/v2/runs", headers=headers, json={
+            "conversation_id": conversation["id"], "message": "继续",
+            "assistant_id": assistant["id"], "use_memory": False,
+            "history_enabled": False, "approval_mode": "auto",
+        }).json()
+        info = _wait_run(client, started["run_id"], owner)
+        assert info["status"] == "completed"
+        assert captured
+        system_text = "\n".join(str(message.content) for message in captured[0]
+                                if message.type == "system")
+        assert "上次执行进度" in system_text
+        assert "创建项目结构" in system_text
+        assert "npm install" in system_text
+
+        events = _iter_v2_sse(client.get(started["events_url"], headers=headers))
+        routed = [event for event in events if event["event"] == "task.routed"]
+        assert routed and routed[-1]["data"].get("completion_resume") is True
+
+        with Session(engine) as s:
+            s.execute(delete(AgentRunEvent).where(
+                AgentRunEvent.run_id.in_([interrupted_id, started["run_id"]])))
+            s.execute(delete(AgentToolExecution).where(
+                AgentToolExecution.run_id.in_([interrupted_id, started["run_id"]])))
+            s.execute(delete(AgentRun).where(AgentRun.id == interrupted_id))
+            s.commit()
 
 # ── Team Runtime 快照 API（断线重连恢复）──────────────────────────────────────
 

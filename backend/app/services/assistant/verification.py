@@ -36,9 +36,20 @@ _NUMBER_RE = re.compile(r"\d[\d,]*\.?\d*%?")
 _WRITE_TOOLS = {"write_file", "edit_file"}
 _DB_TOOLS = {"db_query", "db_count", "db_aggregate"}
 _EXEC_TOOLS = {"python_exec"}
+# 能证明“实际执行过操作”的工具：写文件、执行命令、服务管理。
+_ACTION_TOOLS = _WRITE_TOOLS | _EXEC_TOOLS | {
+    "execute_command", "delete_file", "start_service", "stop_service",
+    "stop_all_services", "restart_service",
+}
 _WEB_TOOLS = {"web_search", "fetch_webpage", "http_get"}
 _READ_TOOLS = {"read_file"}
 _SIDE_EFFECT_TOOLS = {"http_post", "send_email_tool", "webhook_notify"}
+# 回答中“已经完成某类实际操作”的客观声明（用于核对是否留下执行证据）。
+_ACTION_CLAIM = re.compile(
+    r"(?:已|已经|刚刚|方才)\s*(?:成功)?\s*"
+    r"(?:清空|删除|移除|写入|保存|创建|新建|修改|更新|移动|重命名|"
+    r"执行|运行|安装|卸载|启动|停止|部署|上传|下载|导入|导出)"
+)
 # 正文对已读本地资料的引用标注：编号引用、来源清单、明确指代源文件/附件/原文
 _LOCAL_CITATION = re.compile(
     r"\[\d{1,3}\]|来源清单|参考(?:资料|文献|文件)|根据(?:附件|原文|源文件|文档|报告)"
@@ -249,6 +260,31 @@ def _check_exec_evidence(_final_text: str, evidence: Sequence[ToolEvidence]) -> 
     return CheckResult("exec_evidence", False, "代码任务未执行代码或写入文件")
 
 
+def _check_action_evidence(_final_text: str, evidence: Sequence[ToolEvidence]) -> CheckResult:
+    if _has_success(evidence, _ACTION_TOOLS):
+        return CheckResult("action_evidence", True, "")
+    return CheckResult(
+        "action_evidence", False,
+        "本轮要求实际执行操作，但没有成功的命令执行或文件写入记录；请先执行，再依据工具实际返回结果交付",
+    )
+
+
+def action_claim_present(final_text: str) -> bool:
+    """回答是否声称已经完成实际写操作（用于决定是否需要核对执行证据）。"""
+    return bool(_ACTION_CLAIM.search(final_text or ""))
+
+
+def action_claim_checks(final_text: str, evidence: Sequence[ToolEvidence]) -> List[CheckResult]:
+    """声称已完成实际操作时，必须能在工具账本/事件中找到成功执行记录。"""
+    if not action_claim_present(final_text) or _has_success(evidence, _ACTION_TOOLS):
+        return []
+    return [CheckResult(
+        "action_evidence", False,
+        "回答声称已完成实际操作，但没有成功的命令执行或文件写入记录；"
+        "请先实际执行并以工具返回结果为依据交付，不要复述历史回答或仅声明完成",
+    )]
+
+
 def _check_side_effect_evidence(_final_text: str, evidence: Sequence[ToolEvidence]) -> CheckResult:
     side_effects = [e for e in evidence if e.tool_name in _SIDE_EFFECT_TOOLS]
     succeeded = [e for e in side_effects if e.status == "succeeded"]
@@ -267,6 +303,7 @@ _CHECKS = {
     "computation_evidence": _check_computation_evidence,
     "db_evidence": _check_db_evidence,
     "exec_evidence": _check_exec_evidence,
+    "action_evidence": _check_action_evidence,
     "side_effect_evidence": _check_side_effect_evidence,
 }
 

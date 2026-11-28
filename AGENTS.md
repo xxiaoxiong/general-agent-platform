@@ -192,6 +192,13 @@ cd backend && python -m alembic upgrade head
 52. **团队工具必须登记风险**：`team_*` 未在 `_TOOL_RISK_REGISTRY` 登记会被 fail-closed 拒绝；新增团队工具必须在 `team/tools/team_tools.py` 注册并加入 Leader/Member 白名单。
 53. **成员用量必须同步父 Run 预算**：`MemberRuntimeManager._flush_usage` 把成员模型/工具/Token 增量累计到父 `RuntimeContext` 并刷新预算镜像；只记 `agent_team_members` 会让团队级预算失真。
 54. **真实模型团队 E2E 受供应商限流影响**：连续 10+ 次调用可能 429/空响应循环；用 `AGENT_TEAM_MODEL_MIN_INTERVAL`、并发上限、成员时限与预算缓解；验收链路可用 `backend/tests/e2e/team_mock_model.py` 做确定性 Docker E2E。
+55. **外部操作回执只阻止需要重新产生副作用的返工**：完成钩子只有在缺口不属于 `_BOOKKEEPING_CHECKS`（`plan_finished` / `goal_plan_present` / `goal_audit_present` / `answer_complete`）时才以 `external_operation` 停止；补记计划、补写目标核对或续写被截断正文不得因一次已成功的 `execute_command` 被强杀。
+56. **执行型声明必须有执行证据**：项目工作区会话中，最终回答声称“已清空/已删除/已写入……”等实际操作但工具账本/事件没有成功命令或文件写入记录时，`action_evidence` 必须判失败并返工；决策 `requires_action=true` 时无论回答措辞都要求执行证据。禁止仅凭模型文本或历史复述判定完成。
+57. **会话记忆是默认内置能力**：工作台不提供“记忆”开关，也不展示历史来源卡片；`history.sources` 事件仍保留用于审计/API，但前端不再渲染。不要重新加回开关或把该配置暴露给用户。
+58. **文件清空后必须能清理容器服务**：npm/vite 等子进程可能脱离 `Service.stop` 的进程组，形成残留；`POST /api/v2/workspaces/{id}/services/stop-all` 与 Agent 工具 `stop_all_services` 会按 UID 清理所有非 Agent 进程。`Service.to_dict` 在服务工作目录缺失时返回 `unhealthy`；浏览器会话/预览授权只允许 `healthy` 服务，已停止服务必须返回 409 而不是 502。不要只依赖逐个 `stop_service`。
+59. **中断续做必须带执行进度快照**：`resolve_completion_resume` 在最近 Assistant 消息缺失时必须回退到会话内最近一次失败/取消/待核对 Run；`handoff` 汇总上次计划、已执行命令、写入文件、服务状态和未决项并注入系统提示，todos 同步恢复。沙箱命令/服务类未决允许续做，外部业务副作用（邮件/Webhook 等）未决必须先人工核对。
+60. **needs_reconciliation 必须收口会话**：`_pause_run` 以 `finished=True` 提交暂停说明并释放 Session 执行权；不得只改 Run 状态而不写回 Assistant 消息，否则用户看不到中断原因，下一轮“继续”也没有任何历史上下文。
+61. **续做不得被歧义澄清短路**：存在 `execution_context.completion_resume` 时，“继续”不再按歧义澄清处理；决策可保留 ambiguous 标记，但服务端必须执行续做而不是只输出澄清问题。
 
 ## 修改范围原则
 

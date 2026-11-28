@@ -108,9 +108,6 @@ export function useWorkspaceState() {
   /** 联网检索开关：关闭后本次 Run 禁用网络检索工具（web_enabled=false） */
   const webSearchOn = ref(localStorage.getItem('web_search') !== 'off')
   watch(webSearchOn, (v) => localStorage.setItem('web_search', v ? 'on' : 'off'))
-  /** 历史会话检索开关：关闭后本次 Run 不做自动预取，也不注入历史检索工具 */
-  const historyMemoryOn = ref(localStorage.getItem('history_memory') !== 'off')
-  watch(historyMemoryOn, (v) => localStorage.setItem('history_memory', v ? 'on' : 'off'))
   const modelOptions = ref<Array<{ id: number; name: string; display_name?: string | null }>>([])
   const selectedModelId = ref<number>(0)
   /** 当前对话使用的助手：固定为 bootstrap 下发的默认助手（不再提供助手管理入口） */
@@ -341,7 +338,7 @@ export function useWorkspaceState() {
     activeRuns, historyStreams, pendingDecisions, runningConvIds, inactive,
     setActiveRun, clearActiveRun, streaming, historyRun, blockedReason, steerTarget,
     inputText, sending, repairingProject, projectRepairErrors, projectRepairKeys, uploading,
-    approvalMode, webSearchOn, historyMemoryOn, modelOptions, selectedModelId, currentAssistant, clock,
+    approvalMode, webSearchOn, modelOptions, selectedModelId, currentAssistant, clock,
     authStore, draftTeamMode, rememberedTeamModes, teamPreferenceKey, rememberTeamMode, teamMode,
     draftGoalMode, rememberedGoalModes, goalPreferenceKey, rememberGoalMode, goalMode,
     composer, historyToggle, historyMedia, historyOpen, historyLoading, historyFailed,
